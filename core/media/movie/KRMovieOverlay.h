@@ -15,6 +15,10 @@ class VideoPresentOverlay : public TVPMoviePlayer, public tTVPContinuousEventCal
 {
 protected:
     TVPSprite* pSprite;
+    bool spriteJoined = false;
+    bool continuousHookRegistered = false;
+    tjs_uint64 sessionGeneration = 0;
+    bool firstFramePresented = false;
 
     VideoPresentOverlay();
     ~VideoPresentOverlay();
@@ -22,6 +26,7 @@ protected:
 public:
     virtual void Stop() override;
     virtual void Play() override;
+    virtual void SetVisible(bool b) override;
     virtual void OnContinuousCallback(tjs_uint64 tick) override;
 };
 
@@ -45,3 +50,9 @@ public:
 };
 
 NS_KRMOVIE_END
+
+// Embedded hosts run multiple games in one process. A generation invalidates
+// decoder callbacks that arrive after their owning game session has ended.
+void TVPBeginMovieSession();
+void TVPInvalidateMovieSession();
+tjs_uint64 TVPGetMovieSessionGeneration();

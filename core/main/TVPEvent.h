@@ -277,10 +277,12 @@ public:
 };
 /*]*/
 //---------------------------------------------------------------------------
-extern void TVPAddCompactEventHook(tTVPCompactEventCallbackIntf* cb);
+extern void TVPAddCompactEventHook(tTVPCompactEventCallbackIntf* cb,
+                                   bool persistent = false);
 extern void TVPRemoveCompactEventHook(tTVPCompactEventCallbackIntf* cb);
 
 extern void TVPDeliverCompactEvent(tjs_int level);
+extern void TVPResetEventState();
 // must be called by each platforms's implementation
 //---------------------------------------------------------------------------
 

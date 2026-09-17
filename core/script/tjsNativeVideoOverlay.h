@@ -110,6 +110,7 @@ class tTJSNI_VideoOverlay : public tTJSNI_BaseVideoOverlay, public iTVPVideoCall
 
 public:
     tTJSNI_VideoOverlay();
+    ~tTJSNI_VideoOverlay() override;
     tjs_error Construct(tjs_int numparams, tTJSVariant** param, iTJSDispatch2* tjs_obj) override;
     void Invalidate() override;
 
@@ -117,6 +118,7 @@ public:
     void Open(const ttstr& name);
     void Close();
     void Shutdown();
+    void FinalizeSession() noexcept;
     void Disconnect() override; // tTJSNI_BaseVideoOverlay::Disconnect override
 
     void Play();
@@ -266,3 +268,6 @@ protected:
 //---------------------------------------------------------------------------
 extern tTJSNativeClass* TVPCreateNativeClass_VideoOverlay();
 //---------------------------------------------------------------------------
+
+// Synchronously releases all native movie players for the current host session.
+extern void TVPFinalizeVideoOverlaySession();

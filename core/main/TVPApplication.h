@@ -54,6 +54,7 @@ public:
 
     void RegisterActiveEvent(
         void* host, const std::function<void(void*, eTVPActiveEvent)>& func /*empty = unregister*/);
+    void NotifyActiveEvent(eTVPActiveEvent event);
 
 private:
     tTJSCriticalSection m_msgQueueLock;

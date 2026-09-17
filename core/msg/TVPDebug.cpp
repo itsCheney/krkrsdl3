@@ -357,6 +357,12 @@ void tTVPLogStreamHolder::Log(const ttstr& text)
 //---------------------------------------------------------------------------
 void TVPAddLog(const ttstr& line, bool appendtoimportant)
 {
+#if defined(KRKR_HOST_LIBRARY)
+    // Independent host sink: do not replace TVPOnLog or script log handlers.
+    extern void MikageKRKRForwardLog(const ttstr& line);
+    MikageKRKRForwardLog(line);
+#endif
+
     // add a line to the log.
     // exceeded lines over TVPLogMaxLines are eliminated.
     // this function is not thread-safe ...
@@ -412,7 +418,12 @@ void TVPAddLog(const ttstr& line, bool appendtoimportant)
         // OutputDebugStringW( L"\n" );
 #endif // ENABLE_DEBUGGER
 
+#if defined(KRKR_HOST_LIBRARY)
+    extern void MikageKRKRMirrorConsoleLog(const ttstr& line);
+    MikageKRKRMirrorConsoleLog(buf);
+#else
     TVPConsoleLog("%s", buf.c_str());
+#endif
 
     if (TVPLoggingToFile)
         TVPLogStreamHolder.Log(buf);

@@ -661,7 +661,7 @@ static void TVPPushToSegmentCache(const tTVPSegmentCacheSearchData& sdata,
 {
     if (!TVPClearSegmentCacheCallbackInit)
     {
-        TVPAddCompactEventHook(&TVPClearSegmentCacheCallback);
+        TVPAddCompactEventHook(&TVPClearSegmentCacheCallback, true);
         TVPClearSegmentCacheCallbackInit = true;
     }
 

@@ -7,6 +7,7 @@
 #include "TVPStorage.h"
 #include "LayerBitmap.h"
 #include "TVPMsg.h"
+#include "TVPDebug.h"
 #include "UtilStreams.h"
 #include "NativeEventQueue.h"
 
@@ -176,6 +177,8 @@ void tTVPAsyncImageLoader::HandleLoadedImage()
             if (cmd->result_.length() > 0)
             {
                 // error
+                TVPAddImportantLog(TJS_N("(error) Async image load failed: ") + cmd->path_ +
+                                   TJS_N(" : ") + cmd->result_);
                 tTJSVariant param[4];
                 param[0] = tTJSVariant((iTJSDispatch2*)NULL, (iTJSDispatch2*)NULL);
                 param[1] = 1;            // true async

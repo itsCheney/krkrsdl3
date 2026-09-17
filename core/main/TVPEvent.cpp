@@ -1013,11 +1013,19 @@ void TVPRemoveContinuousHandler(tTJSVariantClosure clo)
 // or etc ...
 //---------------------------------------------------------------------------
 static std::vector<tTVPCompactEventCallbackIntf*> TVPCompactEventVector; // TODO 全静态生命周期？
+static std::vector<tTVPCompactEventCallbackIntf*> TVPPersistentCompactEventVector;
 bool TVPEnableGlobalHeapCompaction = false;
 //---------------------------------------------------------------------------
-void TVPAddCompactEventHook(tTVPCompactEventCallbackIntf* cb)
+void TVPAddCompactEventHook(tTVPCompactEventCallbackIntf* cb, bool persistent)
 {
-    TVPCompactEventVector.push_back(cb);
+    if (std::find(TVPCompactEventVector.begin(), TVPCompactEventVector.end(), cb) ==
+        TVPCompactEventVector.end())
+        TVPCompactEventVector.push_back(cb);
+    if (persistent &&
+        std::find(TVPPersistentCompactEventVector.begin(),
+                  TVPPersistentCompactEventVector.end(), cb) ==
+            TVPPersistentCompactEventVector.end())
+        TVPPersistentCompactEventVector.push_back(cb);
 }
 //---------------------------------------------------------------------------
 void TVPRemoveCompactEventHook(tTVPCompactEventCallbackIntf* cb)
@@ -1072,6 +1080,38 @@ void TVPDeliverCompactEvent(tjs_int level)
         }
     }
     TVPDoSaveSystemVariables();
+}
+//---------------------------------------------------------------------------
+
+//---------------------------------------------------------------------------
+// Embedded runtime session reset
+//---------------------------------------------------------------------------
+void TVPResetEventState()
+{
+    TVPDestroyEventQueue();
+    TVPWinUpdateEventQueue.clear();
+    TVPDestroyContinuousHandlerVector();
+    TVPContinuousEventVector.clear();
+    TVPEndContinuousEvent();
+    TVPContinuousEventProcessing = false;
+    TVPProcessContinuousHandlerEventFlag = false;
+
+    TVPCompactEventVector.erase(
+        std::remove_if(
+            TVPCompactEventVector.begin(), TVPCompactEventVector.end(),
+            [](tTVPCompactEventCallbackIntf* callback) {
+                return !callback ||
+                       std::find(TVPPersistentCompactEventVector.begin(),
+                                 TVPPersistentCompactEventVector.end(), callback) ==
+                           TVPPersistentCompactEventVector.end();
+            }),
+        TVPCompactEventVector.end());
+
+    TVPExclusiveEventPosted = false;
+    TVPEventSequenceNumber = 0;
+    TVPEventSequenceNumberToProcess = 0;
+    TVPEventDisabled = false;
+    TVPEventInterrupting = false;
 }
 //---------------------------------------------------------------------------
 

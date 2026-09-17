@@ -9,6 +9,9 @@
 #include <sys/sysctl.h>
 
 #include <string>
+#if defined(_KRKRSDL3_IOS) && defined(KRKR_HOST_LIBRARY)
+extern "C" NSString* MikageKRKRFrameworkResourcePath(void);
+#endif
 
 //---------------------------------------------------------------------------
 tTVPMemoryStream* GetResourceStream(const ttstr& filename)
@@ -45,6 +48,15 @@ tTVPMemoryStream* GetResourceStream(const ttstr& filename)
             path = [[resRoot stringByAppendingPathComponent:@"Res"] stringByAppendingPathComponent:name];
             data = [NSData dataWithContentsOfFile:path];
         }
+#if defined(_KRKRSDL3_IOS) && defined(KRKR_HOST_LIBRARY)
+        if (!data)
+        {
+            NSString* frameworkRoot = MikageKRKRFrameworkResourcePath();
+            path = [[frameworkRoot stringByAppendingPathComponent:@"Res"]
+                stringByAppendingPathComponent:name];
+            data = [NSData dataWithContentsOfFile:path];
+        }
+#endif
         if (!data)
             return nullptr;
 
@@ -54,8 +66,17 @@ tTVPMemoryStream* GetResourceStream(const ttstr& filename)
     }
 }
 //---------------------------------------------------------------------------
+#if defined(_KRKRSDL3_IOS) && defined(KRKR_HOST_LIBRARY)
+extern "C" void MikageKRKRNotifyMenu(void);
+#endif
+
 void TVPInvokeMenu(int x, int y, void* _menu)
 {
+#if defined(_KRKRSDL3_IOS) && defined(KRKR_HOST_LIBRARY)
+    dispatch_async(dispatch_get_main_queue(), ^{
+        MikageKRKRNotifyMenu();
+    });
+#endif
 }
 //---------------------------------------------------------------------------
 void TVPGetMemoryInfo(TVPMemoryInfo& m)

@@ -208,16 +208,17 @@ static void TVPRemoveVideoOverlay(tTJSNI_VideoOverlay* ovl)
         TVPVideoOverlayVector.erase(i);
 }
 //---------------------------------------------------------------------------
-static void TVPShutdownVideoOverlay()
+void TVPFinalizeVideoOverlaySession()
 {
-    // shutdown all overlay object and release krmovie.dll / krflash.dll
-    std::vector<tTJSNI_VideoOverlay*>::iterator i;
-    for (i = TVPVideoOverlayVector.begin(); i != TVPVideoOverlayVector.end(); i++)
-    {
-        (*i)->Shutdown();
-    }
+    // Fully release every session player before SDL tears down its audio and
+    // rendering devices. The wrapper registry is repopulated by the next TJS session.
+    const auto overlays = TVPVideoOverlayVector;
+    for (auto* overlay : overlays)
+        if (overlay)
+            overlay->FinalizeSession();
+    TVPVideoOverlayVector.clear();
 }
-static tTVPAtExit TVPShutdownVideoOverlayAtExit(TVP_ATEXIT_PRI_PREPARE, TVPShutdownVideoOverlay);
+static tTVPAtExit TVPShutdownVideoOverlayAtExit(TVP_ATEXIT_PRI_PREPARE, TVPFinalizeVideoOverlaySession);
 //---------------------------------------------------------------------------
 
 //---------------------------------------------------------------------------
@@ -248,6 +249,13 @@ tTJSNI_VideoOverlay::tTJSNI_VideoOverlay() : EventQueue(this, &tTJSNI_VideoOverl
 
     Bitmap[0] = Bitmap[1] = NULL;
     BmpBits[0] = BmpBits[1] = NULL;
+    TVPAddVideOverlay(this);
+}
+//---------------------------------------------------------------------------
+tTJSNI_VideoOverlay::~tTJSNI_VideoOverlay()
+{
+    FinalizeSession();
+    TVPRemoveVideoOverlay(this);
 }
 //---------------------------------------------------------------------------
 tjs_error tTJSNI_VideoOverlay::Construct(tjs_int numparams,
@@ -321,10 +329,12 @@ void tTJSNI_VideoOverlay::Open(const ttstr& _name)
     // 'istream' is an IStream instance at this point
 
     // create video overlay object
+    bool reusedCachedOverlay = false;
     try
     {
         if (CachedOverlay && CachedOverlayMode == Mode && CachedPlayingFile == _name)
         {
+            reusedCachedOverlay = true;
             VideoOverlay = CachedOverlay;
             CachedOverlay = nullptr;
             VideoOverlay->Rewind();
@@ -379,6 +389,12 @@ void tTJSNI_VideoOverlay::Open(const ttstr& _name)
         throw;
     }
 
+    // Session-switch diagnostics: records the visibility the wrapper will push
+    // to the freshly opened player, plus whether the cached player was reused.
+    TVPAddImportantLog(ttstr(TJS_N("(info) Video overlay opened: mode ")) + ttstr((tjs_int)Mode) +
+                       TJS_N(", visible ") + ttstr((tjs_int)Visible) + TJS_N(", reused ") +
+                       ttstr((tjs_int)reusedCachedOverlay) + TJS_N(", ") + _name);
+
     // set Status
     ClearWndProcMessages();
     SetStatus(ssStop);
@@ -400,7 +416,10 @@ void tTJSNI_VideoOverlay::Close()
             CachedOverlay = nullptr;
         }
         VideoOverlay->SetVisible(false);
-        VideoOverlay->Pause();
+        // Stop() (not Pause()) takes the player off the compositor. A paused
+        // player keeps its last decoded frame, which would stay on screen while
+        // the closed overlay is held in the reuse cache.
+        VideoOverlay->Stop();
         CachedOverlay = VideoOverlay;
         VideoOverlay = NULL;
     }
@@ -435,7 +454,8 @@ void tTJSNI_VideoOverlay::Shutdown()
                 CachedOverlay = nullptr;
             }
             VideoOverlay->SetVisible(false);
-            VideoOverlay->Pause();
+            // Stop() (not Pause()) takes the player off the compositor; see Close().
+            VideoOverlay->Stop();
             CachedOverlay = VideoOverlay;
             VideoOverlay = NULL;
         }
@@ -446,6 +466,50 @@ void tTJSNI_VideoOverlay::Shutdown()
         throw;
     }
     CanDeliverEvents = c;
+}
+//---------------------------------------------------------------------------
+void tTJSNI_VideoOverlay::FinalizeSession() noexcept
+{
+    CanDeliverEvents = false;
+    ClearWndProcMessages();
+
+    iTVPVideoOverlay* active = VideoOverlay;
+    iTVPVideoOverlay* cached = CachedOverlay;
+    VideoOverlay = nullptr;
+    CachedOverlay = nullptr;
+
+    if (active)
+    {
+        try
+        {
+            active->SetVisible(false);
+            active->Pause();
+            active->Release();
+        }
+        catch (...)
+        {
+        }
+    }
+    if (cached && cached != active)
+    {
+        try
+        {
+            cached->Release();
+        }
+        catch (...)
+        {
+        }
+    }
+
+    if (LocalTempStorageHolder)
+        delete LocalTempStorageHolder, LocalTempStorageHolder = nullptr;
+    if (Bitmap[0])
+        delete Bitmap[0];
+    if (Bitmap[1])
+        delete Bitmap[1];
+    Bitmap[0] = Bitmap[1] = nullptr;
+    BmpBits[0] = BmpBits[1] = nullptr;
+    Status = ssUnload;
 }
 //---------------------------------------------------------------------------
 void tTJSNI_VideoOverlay::Disconnect()

@@ -182,6 +182,7 @@ TVPSprite* KRKR_Get_Current_Sprite();
 // 贴图管理
 void TVPJoinTexture(TVPSprite* sp);
 void TVPDepartTexture(TVPSprite* sp);
+void TVPResetCompositorSessionState();
 // 渲染函数
 void TVPRenderOnce(int winWidth, int winHeight);
 void TVPCreateTexture(TVPSprite& sp);

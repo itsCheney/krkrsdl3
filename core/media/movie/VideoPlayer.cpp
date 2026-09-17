@@ -174,6 +174,16 @@ BasePlayer::BasePlayer(CBaseRenderer* renderer)
     m_pRenderer(renderer),
     tTVPThread("TVPVideoPlayer")
 {
+    if (::Application)
+    {
+        ::Application->RegisterActiveEvent(this, [](void* host, eTVPActiveEvent event) {
+            BasePlayer* player = static_cast<BasePlayer*>(host);
+            if (event == eTVPActiveEvent::onActive)
+                player->OnActive();
+            else
+                player->OnDeactive();
+        });
+    }
     TVPInitDirectSound(); // to avoid initialize in other thread
     m_playSpeed = DVD_PLAYSPEED_NORMAL;
     m_newPlaySpeed = DVD_PLAYSPEED_NORMAL;

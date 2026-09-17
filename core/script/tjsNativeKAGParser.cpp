@@ -302,9 +302,16 @@ tTVPScenarioCacheItem* TVPGetScenario(const ttstr& storagename, bool isstring)
     // compact interface initialization
     if (!TVPClearScenarioCacheCallbackInit)
     {
-        TVPAddCompactEventHook(&TVPClearScenarioCacheCallback);
+        TVPAddCompactEventHook(&TVPClearScenarioCacheCallback, true);
         TVPClearScenarioCacheCallbackInit = true;
-        TJSAddStaticToRegisterHeap([](void*) { TVPScenarioCache.Clear(); }, NULL);
+        TJSAddStaticToRegisterHeap([](void*) {
+            TVPScenarioCache.Clear();
+            // Register-heap callbacks are consumed at the end of each session.
+            // Re-arm both hooks for the next game, including debug builds where
+            // the compact callback deliberately leaves the cache untouched.
+            TVPClearScenarioCacheCallbackInit = false;
+        }, NULL);
+        TVPAddLog(TJS_N("(info) Scenario cache session hooks armed: KAGParser"));
     }
 
     if (isstring)

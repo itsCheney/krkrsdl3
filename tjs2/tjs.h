@@ -300,6 +300,7 @@ public:
         }
         head = initialCapacity;
         freeStackSize = initialCapacity;
+        size = initialCapacity;
     }
 
     size_t registerObject(T* obj)
@@ -340,13 +341,16 @@ public:
         }
 
         // 重置空闲栈
-        size_t stackSize = freeStackSize.load(std::memory_order_acquire);
+        size_t stackSize = slots.size();
+        if (freeStack.size() < stackSize)
+            freeStack.resize(stackSize);
         for (size_t i = 0; i < stackSize; ++i)
         {
             freeStack[i] = i;
         }
+        freeStackSize.store(stackSize, std::memory_order_release);
         head.store(stackSize, std::memory_order_release);
-        size.store(0, std::memory_order_release);
+        size.store(stackSize, std::memory_order_release);
     }
 
     template<typename Func>
@@ -388,7 +392,7 @@ private:
         {
             size_t newHead = oldHead + 1;
             size_t stackSize = freeStackSize.load(std::memory_order_acquire);
-            if (newHead >= stackSize)
+            if (newHead > stackSize)
             {
                 growFreeStack();
                 // 重新加载 head，因为 growFreeStack 可能改变了它
@@ -418,7 +422,7 @@ private:
             {
                 size_t newHead = oldHead + 1;
                 size_t stackSize = freeStackSize.load(std::memory_order_acquire);
-                if (newHead >= stackSize)
+                if (newHead > stackSize)
                 {
                     growFreeStack();
                     oldHead = head.load(std::memory_order_acquire);

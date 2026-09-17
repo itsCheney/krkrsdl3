@@ -151,9 +151,10 @@ void TVPCauseAtInstallExtensionClass(iTJSDispatch2* global)
             dsp->Release();
             global->PropSet(TJS_MEMBERENSURE | TJS_IGNOREPROP, i->Name, NULL, &val, global);
         }
-        delete TVPAtClassInstallInfos;
-        TVPAtClassInstallInfos = NULL;
     }
+    // Registrations are created by static constructors only once, so retain
+    // them and allow the next embedded session to install the same classes.
+    TVPAtInstallClass = false;
 }
 //---------------------------------------------------------------------------
 
@@ -651,6 +652,7 @@ void TVPUninitScriptEngine()
             freed here in some occations.
     */
     TVPScriptEngine = NULL;
+    TVPStartupSuccess = false;
 }
 //---------------------------------------------------------------------------
 

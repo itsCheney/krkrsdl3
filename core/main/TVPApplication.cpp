@@ -24,6 +24,8 @@
 #include "WindowManager.h"
 #include "TVPEvent.h"
 #include "TVPCompositor.h"
+#include "KRMovieOverlay.h"
+#include "tjsNativeVideoOverlay.h"
 
 #include "TVPStorage.h"
 #include "TVPColor.h"
@@ -105,6 +107,9 @@ bool tTVPApplication::StartApplication()
         // TVPInitializeBaseSystems
         TVPInitializeBaseSystems();
         
+        krkrsdl3::TVPResetCompositorSessionState();
+        TVPBeginMovieSession();
+        TVPResetGraphicSessionState();
         image_load_thread_ = new tTVPAsyncImageLoader();
 
         TVPLoadPluigins(); // load plugin module *.tpm
@@ -179,21 +184,29 @@ void tTVPApplication::FilterUserMessage(
 
 void tTVPApplication::OnExit()
 {
+    // Invalidate decoder callbacks and synchronously release all movie players
+    // while their event hooks, renderer and SDL devices are still alive.
+    TVPInvalidateMovieSession();
+    TVPFinalizeVideoOverlaySession();
     TVPSystemUninit();
     TVPUnloadPlugins();
 
     delete image_load_thread_;
     image_load_thread_ = NULL;
+    TVPResetEventState();
     TVPDeliverCompactEvent(TVP_COMPACT_LEVEL_MAX);
+    TVPResetGraphicSessionState();
 
     if (TVPSystemControl)
         delete TVPSystemControl;
     TVPSystemControl = NULL;
+    TVPSystemControlAlive = false;
     TVPUninitScriptEngine();
     TVPClearAllAutoPath();
     TVPClearAllWindows();
     krkrsdl3::TVPClearAllTexture();
     iTVPTexture2D::RecycleProcess();
+    TVPProjectDirSelected = false;
 }
 
 void tTVPApplication::LoadImageRequest(class iTJSDispatch2* owner,
@@ -213,4 +226,14 @@ void tTVPApplication::RegisterActiveEvent(
         m_activeEvents.emplace(host, func);
     else
         m_activeEvents.erase(host);
+}
+
+void tTVPApplication::NotifyActiveEvent(eTVPActiveEvent event)
+{
+    auto callbacks = m_activeEvents;
+    for (const auto& item : callbacks)
+    {
+        if (item.second)
+            item.second(item.first, event);
+    }
 }

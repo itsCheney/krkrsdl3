@@ -6,10 +6,16 @@
 #include <iomanip>
 #include <unordered_set>
 #include <algorithm>
+#include <atomic>
 
 #include <SDL3/SDL_audio.h>
 #include <SDL3/SDL_log.h>
 #include <SDL3/SDL_init.h>
+
+class tTVPSoundBufferSDL;
+static tTJSCriticalSection s_hostAudioBuffersCS;
+static std::unordered_set<tTVPSoundBufferSDL*> s_hostAudioBuffers;
+static std::atomic<bool> s_hostAudioSuspended{false};
 
 class tTVPSoundBufferSDL : public iTVPSoundBuffer
 {
@@ -77,6 +83,10 @@ public:
       : _bufferLimitCount(bufcount),
         _frame_size(fmt.BitsPerSample * fmt.Channels)
     {
+        {
+            tTJSCriticalSectionHolder holder(s_hostAudioBuffersCS);
+            s_hostAudioBuffers.insert(this);
+        }
         _bufferSizeCache = new tjs_uint[bufcount];
         memset(&spec, 0, sizeof(spec));
         spec.freq = fmt.SamplesPerSec;
@@ -118,11 +128,17 @@ public:
             return false;
         }
         SDL_BindAudioStream(sdl_audio_device, _stream);
+        if (s_hostAudioSuspended.load(std::memory_order_acquire))
+            SDL_PauseAudioStreamDevice(_stream);
         return true;
     }
 
     virtual ~tTVPSoundBufferSDL()
     {
+        {
+            tTJSCriticalSectionHolder holder(s_hostAudioBuffersCS);
+            s_hostAudioBuffers.erase(this);
+        }
         Stop();
 
         if (_stream)
@@ -140,8 +156,9 @@ public:
     {
         if (_playing)
             return;
-        SDL_ResumeAudioStreamDevice(_stream);
         _playing = true;
+        if (!s_hostAudioSuspended.load(std::memory_order_acquire))
+            SDL_ResumeAudioStreamDevice(_stream);
     }
     virtual void Pause() override
     {
@@ -225,6 +242,16 @@ public:
     virtual tjs_uint GetLatencySamples() override { return 0; }
     virtual float GetLatencySeconds() override { return 0; }
 
+    void SetHostSuspended(bool suspended)
+    {
+        if (!_stream)
+            return;
+        if (suspended)
+            SDL_PauseAudioStreamDevice(_stream);
+        else if (_playing)
+            SDL_ResumeAudioStreamDevice(_stream);
+    }
+
     virtual void SetPosition(float x, float y, float z) override
     {
         // not implemented
@@ -269,4 +296,19 @@ iTVPSoundBuffer* TVPCreateSoundBuffer(tTVPWaveFormat& fmt, int bufcount)
         return s;
     else
         return nullptr;
+}
+
+void TVPSetAudioSuspended(bool suspended)
+{
+    s_hostAudioSuspended.store(suspended, std::memory_order_release);
+    tTJSCriticalSectionHolder holder(s_hostAudioBuffersCS);
+    for (auto* buffer : s_hostAudioBuffers)
+        buffer->SetHostSuspended(suspended);
+}
+
+void TVPResetAudioSessionState()
+{
+    s_hostAudioSuspended.store(true, std::memory_order_release);
+    tTJSCriticalSectionHolder holder(s_hostAudioBuffersCS);
+    s_hostAudioBuffers.clear();
 }

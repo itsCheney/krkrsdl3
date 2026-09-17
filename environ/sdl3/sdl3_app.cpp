@@ -40,9 +40,34 @@
 #endif
 #endif
 
-static SDL_Window* tvp_window;
+static SDL_Window* tvp_window = NULL;
 static SDL_Renderer* tvp_renderer = NULL;
 static SDL_GLContext tvp_glContext = NULL;
+static void* tvp_hostWindowScene = NULL;
+static bool tvp_hostMenuGestureEnabled = true;
+static int tvp_noWindowFrames = 0;
+static std::string tvp_activeRendererName;
+
+extern void TVPResetAudioSessionState();
+
+extern "C" void MikageKRKRSetWindowScene(void* scene)
+{
+    tvp_hostWindowScene = scene;
+}
+
+extern "C" SDL_Window* MikageKRKRGetSDLWindow(void)
+{
+    return tvp_window;
+}
+extern "C" const char* MikageKRKRGetActiveRendererName(void)
+{
+    return tvp_activeRendererName.c_str();
+}
+
+extern "C" void MikageKRKRSetMenuGestureEnabled(bool enabled)
+{
+    tvp_hostMenuGestureEnabled = enabled;
+}
 
 // 按后端名创建窗口（尺寸来自 TVPSettings，-window=WxH 可配置）
 static bool TVPCreateWindowForBackend(const std::string& renderer)
@@ -55,7 +80,7 @@ static bool TVPCreateWindowForBackend(const std::string& renderer)
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, TVPSettings.window_height);
     Uint64 flags = SDL_WINDOW_RESIZABLE;
 #if defined(_KRKRSDL3_IOS)
-    flags |= SDL_WINDOW_FULLSCREEN;
+    flags |= SDL_WINDOW_FULLSCREEN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     flags &= ~SDL_WINDOW_RESIZABLE;
 #endif
     if (renderer == "opengl")
@@ -72,6 +97,11 @@ static bool TVPCreateWindowForBackend(const std::string& renderer)
         }
 #endif
     }
+#if defined(_KRKRSDL3_IOS)
+    if (tvp_hostWindowScene)
+        SDL_SetPointerProperty(props, SDL_PROP_WINDOW_CREATE_WINDOWSCENE_POINTER,
+                               tvp_hostWindowScene);
+#endif
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, flags);
     tvp_window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
@@ -125,6 +155,7 @@ static bool TVPInitRenderBackend()
         // GL相关信息初始化
         krkrsdl3::TVPSetRenderBackend(new krkrsdl3::GLRenderBackend());
         krkrsdl3::fetchGLInfo();
+        tvp_activeRendererName = "opengl";
     }
 #endif
 #ifdef _KRKRSDL3_USE_VULKAN
@@ -177,6 +208,7 @@ static bool TVPInitRenderBackend()
         }
         // 设置
         krkrsdl3::TVPSetRenderBackend(backend);
+        tvp_activeRendererName = "vulkan";
     }
 #endif
     else
@@ -191,12 +223,15 @@ static bool TVPInitRenderBackend()
         SDL_SetRenderVSync(tvp_renderer, TVPSettings.vsync);
         SDL_Log("SWRender Backend: %s", SDL_GetRendererName(tvp_renderer));
         krkrsdl3::TVPSetRenderBackend(new krkrsdl3::SWRenderBackend());
+        tvp_activeRendererName = "software/";
+        tvp_activeRendererName += SDL_GetRendererName(tvp_renderer);
     }
     return true;
 }
 
 SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
 {
+    tvp_noWindowFrames = 0;
     // exeName gameNamey args
     if (argc < 2)
     {
@@ -287,6 +322,15 @@ static Uint64 rightClickStartTime;
 static const Uint32 RIGHT_CLICK_CONFIRM_DELAY = 150;
 void sendMouseEvent(int button, int eventType, float pX, float pY);
 void sendMouseMotion(float pX, float pY);
+void normalizedTouchToDrawable(float pX, float pY, int& pixelX, int& pixelY)
+{
+    int drawableWidth = 1, drawableHeight = 1;
+    SDL_GetWindowSizeInPixels(tvp_window, &drawableWidth, &drawableHeight);
+    drawableWidth = std::max(drawableWidth, 1);
+    drawableHeight = std::max(drawableHeight, 1);
+    pixelX = static_cast<int>(pX * drawableWidth);
+    pixelY = static_cast<int>(pY * drawableHeight);
+}
 void handleFingerDown(const SDL_TouchFingerEvent& e)
 {
     Finger f;
@@ -309,17 +353,20 @@ void handleFingerDown(const SDL_TouchFingerEvent& e)
         // 双击->右键
         _state = STATE_MULTI_FINGER;
     }
-    else
+    else if (tvp_hostMenuGestureEnabled)
     {
         // 三击->菜单
         _state = STATE_MENU;
-        int windowWidth, windowHeight;
-        SDL_GetWindowSize(tvp_window, &windowWidth, &windowHeight);
-        int pixelX = static_cast<int>(f.x * windowWidth);
-        int pixelY = static_cast<int>(f.y * windowHeight);
+        int pixelX = 0, pixelY = 0;
+        normalizedTouchToDrawable(f.x, f.y, pixelX, pixelY);
         TVPInvokeMenu(pixelX, pixelY);
         fingers.clear();
         _state = STATE_IDLE;
+    }
+    else
+    {
+        // Keep normal one/two-finger input intact when the host disables the menu gesture.
+        fingers.erase(e.fingerID);
     }
 }
 void handleFingerUp(const SDL_TouchFingerEvent& e)
@@ -379,10 +426,8 @@ void handleFingerMotion(const SDL_TouchFingerEvent& e)
 
 void sendMouseEvent(int button, int eventType, float pX, float pY)
 {
-    int windowWidth, windowHeight;
-    SDL_GetWindowSize(tvp_window, &windowWidth, &windowHeight);
-    int pixelX = static_cast<int>(pX * windowWidth);
-    int pixelY = static_cast<int>(pY * windowHeight);
+    int pixelX = 0, pixelY = 0;
+    normalizedTouchToDrawable(pX, pY, pixelX, pixelY);
 
     tTVPMouseButton tmp = mbX1;
     switch (button)
@@ -414,10 +459,8 @@ void sendMouseEvent(int button, int eventType, float pX, float pY)
 }
 void sendMouseMotion(float pX, float pY)
 {
-    int windowWidth, windowHeight;
-    SDL_GetWindowSize(tvp_window, &windowWidth, &windowHeight);
-    int pixelX = static_cast<int>(pX * windowWidth);
-    int pixelY = static_cast<int>(pY * windowHeight);
+    int pixelX = 0, pixelY = 0;
+    normalizedTouchToDrawable(pX, pY, pixelX, pixelY);
     krkrsdl3::KRKR_Trig_MouseMove(pixelX,pixelY);
 }
 #endif
@@ -544,9 +587,18 @@ SDL_AppResult SDL_AppIterate(void* appstate)
 {
     if (!::Application->Run())
         return SDL_APP_SUCCESS;
+    if (TVPGetWindowCount() == 0)
+    {
+        if (++tvp_noWindowFrames >= 3)
+            return SDL_APP_SUCCESS;
+    }
+    else
+    {
+        tvp_noWindowFrames = 0;
+    }
     // 写入缓冲区
     int RW = 1280, RH = 720;
-    SDL_GetWindowSize(tvp_window, &RW, &RH);
+    SDL_GetWindowSizeInPixels(tvp_window, &RW, &RH);
     // 合成器完成渲染（清屏/绘制/呈现全部由当前渲染后端负责）
     krkrsdl3::TVPRenderOnce(RW, RH);
     return SDL_APP_CONTINUE;
@@ -567,16 +619,24 @@ void SDL_AppQuit(void* appstate, SDL_AppResult result)
         delete Application;
         Application = NULL;
     }
+    TVPResetAudioSessionState();
     // 后端先于上下文销毁（GL 后端析构需要上下文仍有效）
     krkrsdl3::TVPShutdownRenderBackend();
     if (tvp_glContext)
+    {
         SDL_GL_DestroyContext(tvp_glContext);
+        tvp_glContext = NULL;
+    }
     if (tvp_renderer)
     {
         SDL_DestroyRenderer(tvp_renderer);
         tvp_renderer = NULL;
     }
-    SDL_DestroyWindow(tvp_window);
+    if (tvp_window)
+    {
+        SDL_DestroyWindow(tvp_window);
+        tvp_window = NULL;
+    }
 #ifdef _KRKRSDL3_USE_VULKAN
     if (TVPSettings.renderer == "vulkan")
         SDL_Vulkan_UnloadLibrary();
@@ -584,6 +644,16 @@ void SDL_AppQuit(void* appstate, SDL_AppResult result)
     SDL_Log("KRKRSDL3 quit successfully!");
     SDL_Quit();
     TVPClearAllArguments();
+    tvp_hostWindowScene = NULL;
+    tvp_hostMenuGestureEnabled = true;
+    tvp_noWindowFrames = 0;
+    tvp_activeRendererName.clear();
+#if defined(_KRKRSDL3_ANDROID) || defined(_KRKRSDL3_EMSCRIPTEN) || defined(_KRKRSDL3_IOS)
+    fingers.clear();
+    _state = STATE_IDLE;
+    rightClickX = rightClickY = 0;
+    rightClickStartTime = 0;
+#endif
 }
 
 void TVPSetWindowTitle(const char* title)

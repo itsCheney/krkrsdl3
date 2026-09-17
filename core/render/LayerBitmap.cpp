@@ -1923,7 +1923,7 @@ static tTVPCharacterData* TVPGetCharacter(const tTVPFontAndCharacterData& font,
     // compact interface initialization
     if (!TVPClearFontCacheCallbackInit)
     {
-        TVPAddCompactEventHook(&TVPClearFontCacheCallback);
+        TVPAddCompactEventHook(&TVPClearFontCacheCallback, true);
         TVPClearFontCacheCallbackInit = true;
     }
 

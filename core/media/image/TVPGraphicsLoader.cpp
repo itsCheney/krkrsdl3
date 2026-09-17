@@ -29,6 +29,8 @@
 #include "tjsNativeBitmap.h"
 #include "tjsNativeLayer.h"
 
+#include <mutex>
+
 //---------------------------------------------------------------------------
 // default handlers
 //---------------------------------------------------------------------------
@@ -79,6 +81,14 @@ public:
                 return;
             }
         }
+    }
+
+    void ResetToDefaultHandlers()
+    {
+        _handlers.clear();
+        _handlers.push_back(&_bmpGraphicInfo);
+        _handlers.push_back(&_tlgGraphicInfo);
+        Avail = true;
     }
 
     tTVPRegisterGraphicInfo* QuickTest(tTJSBinaryStream* src)
@@ -763,15 +773,18 @@ tTVPGraphicCache TVPGraphicCache;
 static bool TVPGraphicCacheEnabled = false;
 static tjs_uint64 TVPGraphicCacheLimit = 0;
 static tjs_uint64 TVPGraphicCacheTotalBytes = 0;
+static std::recursive_mutex TVPGraphicCacheMutex;
 tjs_uint64 TVPGraphicCacheSystemLimit = 0; // maximum possible value of  TVPGraphicCacheLimit
 //---------------------------------------------------------------------------
 tjs_uint64 TVPGetGraphicCacheTotalBytes()
 {
+    std::lock_guard<std::recursive_mutex> lock(TVPGraphicCacheMutex);
     return TVPGraphicCacheTotalBytes;
 }
 //---------------------------------------------------------------------------
 static void TVPCheckGraphicCacheLimit()
 {
+    std::lock_guard<std::recursive_mutex> lock(TVPGraphicCacheMutex);
     while (TVPGraphicCacheTotalBytes > TVPGraphicCacheLimit)
     {
         // chop last graphics
@@ -792,8 +805,20 @@ static void TVPCheckGraphicCacheLimit()
 //---------------------------------------------------------------------------
 void TVPClearGraphicCache()
 {
+    std::lock_guard<std::recursive_mutex> lock(TVPGraphicCacheMutex);
     TVPGraphicCache.Clear();
     TVPGraphicCacheTotalBytes = 0;
+}
+void TVPResetGraphicSessionState()
+{
+    std::lock_guard<std::recursive_mutex> lock(TVPGraphicCacheMutex);
+    TVPGraphicCache.Clear();
+    TVPGraphicCacheTotalBytes = 0;
+    TVPGraphicCacheEnabled = false;
+    TVPGraphicCacheLimit = 0;
+    TVPGraphicCacheSystemLimit = 0;
+    TVPAllocGraphicCacheOnHeap = false;
+    TVPGraphicType.ResetToDefaultHandlers();
 }
 static tTVPAtExit TVPUninitMessageLoad(TVP_ATEXIT_PRI_RELEASE, TVPClearGraphicCache);
 //---------------------------------------------------------------------------
@@ -814,12 +839,13 @@ void TVPPushGraphicCache(const ttstr& nname,
                          tTVPBitmap* bmp,
                          std::vector<tTVPGraphicMetaInfoPair>* meta)
 {
+    std::lock_guard<std::recursive_mutex> lock(TVPGraphicCacheMutex);
     if (TVPGraphicCacheEnabled)
     {
         // graphic compact initialization
         if (!TVPClearGraphicCacheCallbackInit)
         {
-            TVPAddCompactEventHook(&TVPClearGraphicCacheCallback);
+            TVPAddCompactEventHook(&TVPClearGraphicCacheCallback, true);
             TVPClearGraphicCacheCallbackInit = true;
         }
 
@@ -878,6 +904,7 @@ bool TVPCheckImageCache(const ttstr& nname,
                         tjs_int32 keyidx,
                         iTJSDispatch2** metainfo)
 {
+    std::lock_guard<std::recursive_mutex> lock(TVPGraphicCacheMutex);
     tjs_uint32 hash;
     tTVPGraphicsSearchData searchdata;
     if (TVPGraphicCacheEnabled)
@@ -907,6 +934,7 @@ bool TVPCheckImageCache(const ttstr& nname,
 bool TVPHasImageCache(
     const ttstr& nname, tTVPGraphicLoadMode mode, tjs_uint dw, tjs_uint dh, tjs_int32 keyidx)
 {
+    std::lock_guard<std::recursive_mutex> lock(TVPGraphicCacheMutex);
     tjs_uint32 hash;
     tTVPGraphicsSearchData searchdata;
     if (TVPGraphicCacheEnabled)
@@ -933,10 +961,11 @@ static std::vector<ttstr> _graphicAutoExtList = {
     ".jif", ".png",  ".tlg", ".tlg5", ".tlg6"}; // 用于后缀自动填充
 static void TVPNormalizeGraphicNames(ttstr& _name, ttstr* maskname, ttstr* provincename)
 {
+    std::lock_guard<std::recursive_mutex> lock(TVPGraphicCacheMutex);
     // graphic compact initialization
     if (!TVPClearGraphicCacheCallbackInit)
     {
-        TVPAddCompactEventHook(&TVPClearGraphicCacheCallback);
+        TVPAddCompactEventHook(&TVPClearGraphicCacheCallback, true);
         TVPClearGraphicCacheCallbackInit = true;
     }
 
@@ -1177,6 +1206,7 @@ tTVPRegisterGraphicInfo* TVPGetGraphicLoadHandler(const ttstr& fileName)
 void TVPLoadGraphicProvince(
     tTVPBaseBitmap* dest, const ttstr& name, tjs_int keyidx, tjs_uint desw, tjs_uint desh)
 {
+    std::lock_guard<std::recursive_mutex> lock(TVPGraphicCacheMutex);
     tjs_uint32 hash;
     ttstr nname = TVPNormalizeStorageName(name);
     tTVPGraphicsSearchData searchdata;
@@ -1255,6 +1285,7 @@ int TVPLoadGraphic(iTVPBaseBitmap* dest,
                    ttstr* provincename,
                    iTJSDispatch2** metainfo)
 {
+    std::lock_guard<std::recursive_mutex> lock(TVPGraphicCacheMutex);
     // loading with cache management
     ttstr nname = TVPNormalizeStorageName(name);
     tjs_uint32 hash;
@@ -1405,6 +1436,7 @@ public:
 //---------------------------------------------------------------------------
 void TVPTouchImages(const std::vector<ttstr>& storages, tjs_int64 limit, tjs_uint64 timeout)
 {
+    std::lock_guard<std::recursive_mutex> lock(TVPGraphicCacheMutex);
     // preload graphic files into the cache.
     // "limit" is a limit memory for preload, in bytes.
     // this function gives up when "timeout" (in ms) expired.
@@ -1532,6 +1564,7 @@ void TVPTouchImages(const std::vector<ttstr>& storages, tjs_int64 limit, tjs_uin
 //---------------------------------------------------------------------------
 void TVPSetGraphicCacheLimit(tjs_uint64 limit)
 {
+    std::lock_guard<std::recursive_mutex> lock(TVPGraphicCacheMutex);
     // set limit of graphic cache by total bytes.
     if (limit == 0)
     {
@@ -1559,6 +1592,7 @@ void TVPSetGraphicCacheLimit(tjs_uint64 limit)
 //---------------------------------------------------------------------------
 tjs_uint64 TVPGetGraphicCacheLimit()
 {
+    std::lock_guard<std::recursive_mutex> lock(TVPGraphicCacheMutex);
     return TVPGraphicCacheLimit;
 }
 //---------------------------------------------------------------------------

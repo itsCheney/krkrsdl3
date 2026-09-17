@@ -1,5 +1,6 @@
 #include "tjsCommHead.h"
 #include "TVPCompositor.h"
+#include "TVPDebug.h"
 
 #include <algorithm>
 #include <vector>
@@ -96,23 +97,63 @@ void fetchGLInfo()
         backend->FetchInfo();
 }
 
+//---------------------------------------------------------------------------
+// 会话切换诊断：只在合成状态发生变化时记录一行，避免每帧刷日志。
+// 用来区分"overlay 不在列表里"、"在列表但被判定不可见"和"窗口贴图本身为空"。
+// reset = true 时清空上一次会话的状态，保证新游戏的第一行一定被记录。
+//---------------------------------------------------------------------------
+static void TVPReportCompositorFrame(int spriteCount,
+                                     int overlayCandidates,
+                                     int overlayDrawn,
+                                     bool windowDrawn,
+                                     bool reset = false)
+{
+    static int lastSpriteCount = -1;
+    static int lastOverlayCandidates = -1;
+    static int lastOverlayDrawn = -1;
+    static int lastWindowDrawn = -1;
+    if (reset)
+    {
+        lastSpriteCount = -1;
+        lastOverlayCandidates = -1;
+        lastOverlayDrawn = -1;
+        lastWindowDrawn = -1;
+        return;
+    }
+    if (spriteCount == lastSpriteCount && overlayCandidates == lastOverlayCandidates &&
+        overlayDrawn == lastOverlayDrawn && (int)windowDrawn == lastWindowDrawn)
+        return;
+    lastSpriteCount = spriteCount;
+    lastOverlayCandidates = overlayCandidates;
+    lastOverlayDrawn = overlayDrawn;
+    lastWindowDrawn = (int)windowDrawn;
+    TVPAddImportantLog(ttstr(TJS_N("(info) Compositor: sprites ")) + ttstr(spriteCount) +
+                       TJS_N(", overlay ") + ttstr(overlayDrawn) + TJS_N("/") +
+                       ttstr(overlayCandidates) + TJS_N(" drawn, window ") +
+                       ttstr((tjs_int)windowDrawn));
+}
+
+void TVPResetCompositorSessionState()
+{
+    renderTexture.clear();
+    TVPReportCompositorFrame(0, 0, 0, false, true);
+}
+
 // 素材加入渲染
 void TVPJoinTexture(TVPSprite* sp)
 {
-    renderTexture.push_back(sp);
+    if (!sp)
+        return;
+    if (std::find(renderTexture.begin(), renderTexture.end(), sp) == renderTexture.end())
+        renderTexture.push_back(sp);
 }
 
 // 素材离开渲染
 void TVPDepartTexture(TVPSprite* sp)
 {
-    for (size_t i = 0; i < renderTexture.size(); i++)
-    {
-        if (renderTexture.at(i)->texture == sp->texture)
-        {
-            renderTexture.erase(renderTexture.begin() + i);
-            break;
-        }
-    }
+    renderTexture.erase(
+        std::remove(renderTexture.begin(), renderTexture.end(), sp),
+        renderTexture.end());
 }
 
 // 统一 letterbox 计算：保持宽高比地缩放并居中（所有后端共用同一套行为）
@@ -142,15 +183,22 @@ void TVPRenderOnce(int winWidth, int winHeight)
     }
 
     // 绘制 overlay
+    int overlayCandidates = 0;
+    int overlayDrawn = 0;
     for (auto texture : renderTexture)
     {
+        if (texture->type == 2)
+            overlayCandidates++;
         if (texture->isVisible && texture->type == 2 && texture->texture)
         {
+            overlayDrawn++;
             TVPCalcLetterbox(texture, winWidth, winHeight);
             backend->DrawWindowTexture(texture->texture, texture->xPos, texture->yPos,
                                        texture->scale * texture->width, texture->scale * texture->height);
         }
     }
+    TVPReportCompositorFrame((int)renderTexture.size(), overlayCandidates, overlayDrawn,
+                             retSpr != nullptr && retSpr->texture != nullptr);
 
     backend->EndFrame();
 }

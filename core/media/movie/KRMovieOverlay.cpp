@@ -9,12 +9,41 @@ extern "C"
 #include "NativeEventQueue.h"
 #include "CodecVideo.h"
 #include "PlatformAudio.h"
+#include "TVPDebug.h"
+#include "TVPMsg.h"
+
+#include <atomic>
+
+namespace
+{
+std::atomic<tjs_uint64> TVPMovieSessionGeneration{0};
+}
+
+void TVPBeginMovieSession()
+{
+    const auto generation = TVPMovieSessionGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+    TVPAddImportantLog(TVPFormatMessage(TJS_N("(info) Movie session %1 started"),
+                                       static_cast<tjs_int64>(generation)));
+}
+
+void TVPInvalidateMovieSession()
+{
+    const auto generation = TVPMovieSessionGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+    TVPAddImportantLog(TVPFormatMessage(TJS_N("(info) Movie session invalidated at %1"),
+                                       static_cast<tjs_int64>(generation)));
+}
+
+tjs_uint64 TVPGetMovieSessionGeneration()
+{
+    return TVPMovieSessionGeneration.load(std::memory_order_acquire);
+}
 
 NS_KRMOVIE_BEGIN
 #define DRAW_VIDEO_FRAME 30
 
 VideoPresentOverlay::VideoPresentOverlay()
 {
+    sessionGeneration = TVPGetMovieSessionGeneration();
     pSprite = new TVPSprite;
     pSprite->isVisible = true;
     pSprite->type = 2;
@@ -24,16 +53,28 @@ VideoPresentOverlay::VideoPresentOverlay()
 
 VideoPresentOverlay::~VideoPresentOverlay()
 {
+    // Session-switch diagnostics: a player destroyed right after presenting its
+    // first frame means the sprite leaves the compositor while the game still
+    // expects the movie on screen.
+    TVPAddImportantLog(ttstr(TJS_N("(info) Video overlay destroyed: session ")) +
+                       ttstr((tjs_int64)sessionGeneration) + TJS_N(", joined ") +
+                       ttstr((tjs_int)spriteJoined) + TJS_N(", presented ") +
+                       ttstr((tjs_int)firstFramePresented));
     if (pSprite != NULL)
     {
-        if (pSprite->texture != nullptr)
-        {
+        if (spriteJoined)
             krkrsdl3::TVPDepartTexture(pSprite);
+        spriteJoined = false;
+        if (pSprite->texture != nullptr)
             krkrsdl3::TVPDestroyTexture(pSprite);
-        }
         delete pSprite;
+        pSprite = nullptr;
     }
-    TVPRemoveContinuousEventHook(this);
+    if (continuousHookRegistered)
+    {
+        TVPRemoveContinuousEventHook(this);
+        continuousHookRegistered = false;
+    }
 }
 
 void VideoPresentOverlay::Play()
@@ -50,8 +91,20 @@ void VideoPresentOverlay::Stop()
     TVPMoviePlayer::Stop();
 }
 
+void VideoPresentOverlay::SetVisible(bool b)
+{
+    // Compositor visibility is owned by Play()/Stop() and by session teardown,
+    // not by this call. tTJSNI_VideoOverlay::ResetOverlayParams() re-pushes the
+    // wrapper's Visible member on every window geometry change, and that member
+    // is still false while a freshly opened movie is already playing, so binding
+    // pSprite->isVisible here hid movies the game was still showing.
+    TVPMoviePlayer::SetVisible(b);
+}
+
 void VideoPresentOverlay::OnContinuousCallback(tjs_uint64 tick)
 {
+    if (sessionGeneration != TVPGetMovieSessionGeneration())
+        return;
     if (!m_usedPicture)
         return;
     double m_curpts = m_pPlayer->GetClock() / DVD_TIME_BASE;
@@ -85,10 +138,26 @@ void VideoPresentOverlay::OnContinuousCallback(tjs_uint64 tick)
             pSprite->width = pic.width;
             pSprite->height = pic.height;
             krkrsdl3::TVPCreateTexture(*pSprite);
+            if (!pSprite->texture)
+            {
+                TVPAddImportantLog(TJS_N("(error) Video overlay texture creation failed"));
+                return;
+            }
+        }
+        if (!spriteJoined)
+        {
             krkrsdl3::TVPJoinTexture(pSprite);
+            spriteJoined = true;
         }
         int pitch = pic.width * 4;
         krkrsdl3::TVPUpdateTexture(pSprite, pic.rgba, pic.width, pic.height, pitch);
+        if (!firstFramePresented)
+        {
+            firstFramePresented = true;
+            TVPAddImportantLog(TVPFormatMessage(
+                TJS_N("(info) Video overlay first frame: %1x%2"),
+                pic.width, pic.height));
+        }
     }
 }
 
@@ -100,7 +169,11 @@ MoviePlayerOverlay::~MoviePlayerOverlay()
 
 void MoviePlayerOverlay::SetWindow(tTJSNI_Window* window)
 {
-    TVPAddContinuousEventHook(this);
+    if (!continuousHookRegistered)
+    {
+        TVPAddContinuousEventHook(this);
+        continuousHookRegistered = true;
+    }
 }
 
 void MoviePlayerOverlay::BuildGraph(iTVPVideoCallback* callbackwin,

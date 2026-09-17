@@ -183,6 +183,7 @@ extern tjs_uint64 TVPGraphicCacheSystemLimit;
 
 extern void TVPClearGraphicCache();
 // clear graphic cache
+extern void TVPResetGraphicSessionState();
 
 extern void TVPTouchImages(const std::vector<ttstr>& storages, tjs_int64 limit, tjs_uint64 timeout);
 

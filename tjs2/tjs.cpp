@@ -182,6 +182,15 @@ tTJS::~tTJS()
     TJSReleaseRegex();
 #endif
 
+    // Release the global object through normal reference counting before
+    // force-clearing fallback pools. The previous process-exit-only cleanup
+    // left live dispatch objects behind and corrupted the next TJS session.
+    if (Global)
+    {
+        Global->Release();
+        Global = nullptr;
+    }
+
     if (PPValues)
         delete PPValues;
     if (Cache)

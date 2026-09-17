@@ -294,7 +294,14 @@ static tTVPScenarioCacheItemEX* TVPGetScenario(const ttstr& storagename, bool is
     {
         TVPAddCompactEventHook(&TVPClearScenarioCacheCallback);
         TVPClearScenarioCacheCallbackInit = true;
-        TJSAddStaticToRegisterHeap([](void*) { TVPScenarioCache.Clear(); }, NULL);
+        TJSAddStaticToRegisterHeap([](void*) {
+            TVPScenarioCache.Clear();
+            // Event reset drops the compact hook; register-heap teardown also
+            // consumes this callback. Re-arm registration on every session so
+            // a later game cannot reuse another game's same-named .ks file.
+            TVPClearScenarioCacheCallbackInit = false;
+        }, NULL);
+        TVPAddLog(TJS_N("(info) Scenario cache session hooks armed: KAGParserEx"));
     }
 
     if (isstring)
