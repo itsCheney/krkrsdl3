@@ -1,258 +1,11 @@
 #include "emoterunner.h"
 
-#include "Platform.h"
+#include <cstdint>
 
-#define GLM_ASSERT_VALID(matrix) \
-    do \
-    { \
-        const glm::mat4& m = (matrix); \
-        for (int i = 0; i < 4; ++i) \
-        { \
-            for (int j = 0; j < 4; ++j) \
-            { \
-                assert(!std::isnan(m[i][j]) && "矩阵包含NaN值"); \
-                assert(!std::isinf(m[i][j]) && "矩阵包含无穷大值"); \
-            } \
-        } \
-    } while (0)
+#include "Platform.h"
 
 namespace emoteplayer
 {
-#pragma region BezierHelpers
-
-// Cubic Bezier basis functions
-static float B0(float t) { return (1.0f - t) * (1.0f - t) * (1.0f - t); }
-static float B1(float t) { return 3.0f * t * (1.0f - t) * (1.0f - t); }
-static float B2(float t) { return 3.0f * t * t * (1.0f - t); }
-static float B3(float t) { return t * t * t; }
-
-// Evaluate a single bicubic Bezier patch at (u, v)
-// controlPts[32] = 16 control points × 2 floats (x, y) stored row-major
-static void evalBezierSurface(const float controlPts[32], float u, float v,
-    float& outX, float& outY)
-{
-    float bu[4] = { B0(u), B1(u), B2(u), B3(u) };
-    float bv[4] = { B0(v), B1(v), B2(v), B3(v) };
-    float rx = 0.0f, ry = 0.0f;
-    for (int row = 0; row < 4; row++) {
-        for (int col = 0; col < 4; col++) {
-            int idx = (row * 4 + col) * 2;
-            float basis = bu[row] * bv[col];
-            rx += controlPts[idx] * basis;
-            ry += controlPts[idx + 1] * basis;
-        }
-    }
-    outX = rx;
-    outY = ry;
-}
-
-// Evaluate the full surface chain (same logic as the old tess eval shader)
-// Start with UV (u,v), iterate surfaces from innermost to outermost,
-// applying bezier deformation and matrix transform at each level.
-// The outermost surface (index 0) includes projection and outputs clip space [-1,1].
-// Inner surfaces have model-only matrices and output pixel space (relative to parent);
-// their output is normalized back to UV [0,1] (with axis swap) for the next surface.
-static void evaluateSurfaceChain(
-    const std::vector<emoteRender>& renderMethod,
-    float u, float v,
-    float& outClipX, float& outClipY)
-{
-    float lastX = 0;
-    float lastY = 0;
-    glm::vec4 trans = glm::vec4(1.0f);
-    int surfaceCount = (int)renderMethod.size();
-    uint32_t currInheritMask = 0xFFFFFFF;
-
-    // Iterate in reverse: renderMethod[surfaceCount-1] is innermost (first in shader)
-    for (int i = surfaceCount - 1; i >= 0; i--)
-    {
-        // inheritMask
-        currInheritMask &= renderMethod[i].currInheritMask;
-        // 构建变换矩阵 平移 currCoordx/currCoordy → 剪切 sx/sy → 缩放 zx/zy → 旋转 angle
-        glm::mat4 model = glm::mat4(1.0f); // 注:复合顺序是反过来的
-        // 考察InheritMask
-        if (i < surfaceCount - 1 && i > 0 && ((currInheritMask & 0x1FC) != 0x1FC))
-        {
-            model = glm::translate(
-                model, glm::vec3(renderMethod[i].currCoordx, renderMethod[i].currCoordy, 0));
-            // 0x00000010 角度
-            if ((currInheritMask & 0x10) == 0x10)
-            {
-                model = glm::rotate(model, glm::radians(renderMethod[i].currAngle), glm::vec3(0.0f, 0.0f, 1.0f));
-            }
-            // 0x00000020 ZoomX
-            if ((currInheritMask & 0x20) == 0x20)
-            {
-                model = glm::scale(model, glm::vec3(renderMethod[i].currZx, 1.0f, 1.0f));
-            }
-            // 0x00000040 ZoomY
-            if ((currInheritMask & 0x40) == 0x40)
-            {
-                model = glm::scale(model, glm::vec3(1.0f, renderMethod[i].currZy, 1.0f));
-            }
-            // 0x00000180 SlantX + lantY
-            if ((currInheritMask & 0x180) == 0x180)
-            {
-                model =
-                    glm::mat4(1.0f, renderMethod[i].currSy, 0.0f, 0.0f, renderMethod[i].currSx,
-                              1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f) *
-                    model;
-            }
-            // 0x00000080 SlantX
-            else if ((currInheritMask & 0x80) == 0x80)
-            {
-                model =
-                    glm::mat4(1.0f, 0.0f, 0.0f, 0.0f, renderMethod[i].currSx,
-                              1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f) *
-                    model;
-            }
-            // 0x00000100 SlantY
-            else if ((currInheritMask & 0x100) == 0x100)
-            {
-                model =
-                    glm::mat4(1.0f, renderMethod[i].currSy, 0.0f, 0.0f, 0.0f,
-                              1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f) *
-                    model;
-            }
-        }
-        else
-        {
-            model = glm::translate(
-                model, glm::vec3(renderMethod[i].currCoordx, renderMethod[i].currCoordy, 0));
-            model = glm::rotate(model, glm::radians(renderMethod[i].currAngle),
-                                glm::vec3(0.0f, 0.0f, 1.0f));
-            model =
-                glm::scale(model, glm::vec3(renderMethod[i].currZx, renderMethod[i].currZy, 1.0f));
-            model = glm::mat4(1.0f, renderMethod[i].currSy, 0.0f, 0.0f, renderMethod[i].currSx,
-                              1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f) *
-                    model;
-        }
-        // 非layout补充计算矩阵
-        if (renderMethod[i].type >= 1 && renderMethod[i].type <= 2)
-        {
-            model = glm::translate(
-                model, glm::vec3(-renderMethod[i].originX - renderMethod[i].currOx,
-                                 -renderMethod[i].originY - renderMethod[i].currOy, 0.0f));
-            model =
-                glm::scale(model, glm::vec3(renderMethod[i].width, renderMethod[i].height, 1.0f));
-        }
-        // 加入attach矩阵
-        model = renderMethod[i].attachMat * model;
-        GLM_ASSERT_VALID(model);
-
-        if (renderMethod[i].type == 3)
-        {
-            // Layout层 直接计算
-            trans = model * trans;
-        }
-        else
-        {
-            // 获取 lastX,lastY
-            if (i < surfaceCount - 1)
-            {
-                // Inner surfaces have model-only matrices; output is in parent's pixel space.
-                // Normalize back to UV [0,1] (with axis swap: parent-Y→U, parent-X→V)
-                // for the next (outer) surface's Bezier input.
-                lastX = (trans.y + renderMethod[i].originY) / renderMethod[i].height; // Y → U
-                lastY = (trans.x + renderMethod[i].originX) / renderMethod[i].width;  // X → V
-            }
-            else
-            {
-                lastX = u;
-                lastY = v;
-            }
-
-            // Evaluate bezier surface
-            float bx, by;
-            if (renderMethod[i].type == 1)
-            {
-                evalBezierSurface(renderMethod[i].controlPts, lastX, lastY, bx, by);
-            }
-            else
-            {
-                bx = lastY, by = lastX;
-            }
-
-            // Apply transformation matrix
-            trans = model * glm::vec4(bx, by, 0.0f, 1.0f);
-        }
-    }
-
-    // Final Y flip (same as shader: gl_Position = lastPt * vec4(1, -1, 1, 1))
-    outClipX = trans.x;
-    outClipY = -trans.y;
-}
-
-// Build subdivided mesh for a given icon node
-static void buildSubdivMesh(
-    const std::vector<emoteRender>& renderMethod,
-    int divX, int divY,
-    std::vector<emotenoderef::MeshVertex>& outVerts,
-    std::vector<uint16_t>& outIndices)
-{
-    outVerts.clear();
-    outIndices.clear();
-
-    // Generate vertices
-    outVerts.reserve((divX + 1) * (divY + 1));
-    for (int gy = 0; gy <= divY; gy++) {
-        float v = (float)gy / (float)divY;
-        for (int gx = 0; gx <= divX; gx++) {
-            float u = (float)gx / (float)divX;
-            float clipX, clipY;
-            evaluateSurfaceChain(renderMethod, u, v, clipX, clipY);
-            // tessCoord in old shader was (gl_TessCoord.y, gl_TessCoord.x) = (v, u)
-            outVerts.push_back({ clipX, clipY, v, u });
-        }
-    }
-
-    // Generate triangle indices (2 triangles per quad)
-    outIndices.reserve(divX * divY * 6);
-    for (int gy = 0; gy < divY; gy++) {
-        for (int gx = 0; gx < divX; gx++) {
-            uint16_t i0 = (uint16_t)(gy * (divX + 1) + gx);
-            uint16_t i1 = (uint16_t)(gy * (divX + 1) + gx + 1);
-            uint16_t i2 = (uint16_t)((gy + 1) * (divX + 1) + gx);
-            uint16_t i3 = (uint16_t)((gy + 1) * (divX + 1) + gx + 1);
-            // Triangle 1: p0-p1-p2
-            outIndices.push_back(i0);
-            outIndices.push_back(i1);
-            outIndices.push_back(i2);
-            // Triangle 2: p1-p3-p2
-            outIndices.push_back(i1);
-            outIndices.push_back(i3);
-            outIndices.push_back(i2);
-        }
-    }
-}
-// Build simple rectangle mesh (two triangles)
-static void buildRectMesh(const std::vector<emoteRender>& renderMethod,
-                          std::vector<emotenoderef::MeshVertex>& outVerts,
-                          std::vector<uint16_t>& outIndices)
-{
-    outVerts.clear();
-    outIndices.clear();
-    float cornerUV[4][2] = {{0.0f, 0.0f}, {1.0f, 0.0f}, {0.0f, 1.0f}, {1.0f, 1.0f}};
-
-    outVerts.reserve(4);
-    for (int i = 0; i < 4; i++)
-    {
-        float clipX, clipY;
-        evaluateSurfaceChain(renderMethod, cornerUV[i][0], cornerUV[i][1], clipX, clipY);
-        outVerts.push_back({clipX, clipY, cornerUV[i][1], cornerUV[i][0]});
-    }
-
-    outIndices.reserve(6);
-    outIndices.push_back(0);
-    outIndices.push_back(1);
-    outIndices.push_back(2);
-    outIndices.push_back(1);
-    outIndices.push_back(3);
-    outIndices.push_back(2);
-}
-
-#pragma endregion
-
 void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderList, emotelimit lim)
 {
     // 不绘制进行节点传递
@@ -283,8 +36,30 @@ void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderL
 
     if (frame == nullptr || !frame->hasContent)
     {
-        isNeedDraw = false;
-        return;
+        // motion 末尾的"结束帧"（type0 无 content）被命中时
+        //（tick 超过 motion 末帧且无循环回绕），回退到最后一个有 content 的帧：
+        // 静态层（如触摸判定 shape）在任何 tick 下都应保持其几何；
+        // 中间的空帧仍保持"隐藏"语义。此前直接隐藏，导致主 motion 播完后
+        // 触摸判定层整体消失
+        emoteframe* saved = frame;
+        if (currFrameIdx != (size_t)-1 && currFrameIdx == currentNode->frameList.size() - 1)
+        {
+            for (int i = (int)currFrameIdx - 1; i >= 0; --i)
+            {
+                if (currentNode->frameList.at(i)->hasContent)
+                {
+                    frame = currentNode->frameList.at(i);
+                    break;
+                }
+            }
+        }
+        if (frame == nullptr || !frame->hasContent)
+        {
+            frame = saved;
+            isNeedDraw = false;
+            return;
+        }
+        nextframe = nullptr; // 静态保持，不再向后续帧插值
     }
     nextframe = nullptr;
     if (currFrameIdx >= 0 && currFrameIdx < currentNode->frameList.size() - 1)
@@ -296,6 +71,7 @@ void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderL
     isNeedDraw = true;
     isIcon = false;
     isLayout = false;
+    isShape = false;
     emoteicon* tmpic = currentNode-> _filePtr->findsourceByName(frame->src);
     if (tmpic == nullptr)
         currentMtn = refTop->findmotionByName(frame->src);
@@ -320,15 +96,31 @@ void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderL
     else if (currentMtn != nullptr || strcmp(frame->src.c_str(), "layout") == 0 ||
              strcmp(frame->src.c_str(), "clip") == 0)
     {
-        isLayout = true;
-
-        // 直接用父类提供的区域
-        if (width != lim.width || height != lim.height)
+        // 部分导出的 PSB 会剥离 shape 帧的 src 字段
+        //（content 仅剩 coord/mask/zx/zy），解析后 src 落到默认值 "layout"，
+        // 此前一律当 layout 处理，shape 节点（node type==1）的判定区域
+        // 收集不到。type==1 即 shape 层，按 shape 处理并记录判定区域
+        if (strcmp(frame->src.c_str(), "layout") == 0 && currentNode->type == 1)
         {
-            width = lim.width;
-            height = lim.height;
-            originX = lim.originX;
-            originY = lim.originY;
+            isShape = true;
+            isNeedDraw = false;
+            // shape 像素尺寸 = zx/zy * 16 (PSB 规范: 单元正方形为 16x16)
+            width = height = 16.0f;
+            originX = width / 2;
+            originY = height / 2;
+        }
+        else
+        {
+            isLayout = true;
+
+            // 直接用父类提供的区域
+            if (width != lim.width || height != lim.height)
+            {
+                width = lim.width;
+                height = lim.height;
+                originX = lim.originX;
+                originY = lim.originY;
+            }
         }
     }
     else
@@ -336,6 +128,13 @@ void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderL
         std::istringstream iss(frame->src);
         std::string token;
         std::getline(iss, token, '/');
+        if (token == "src")
+        {
+            // emote 拼接前缀 "src/<type>/<name>"，跳过第一段。
+            // 此前直接拿 "src" 判类型，落入 unsupported 分支被丢弃，
+            // shape 判定层因此收集不到区域
+            std::getline(iss, token, '/');
+        }
         if (strcmp(token.c_str(), "blank") == 0)
         {
             std::getline(iss, token, ':');
@@ -360,10 +159,9 @@ void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderL
             // shape节点: 不绘制但记录区域信息
             // shape的像素尺寸 = zx/zy * 16 (PSB规范: 单元正方形为16x16)
             // shape子类型从src的第二部分获取: rect(默认)、circle、point、quad
-            const tjs_real shapeUnit = 16.0;
+            isShape = true; // 标记 shape 判定层
             isNeedDraw = false;
-            width = (tjs_real)frame->zx * shapeUnit;
-            height = (tjs_real)frame->zy * shapeUnit;
+            width = height = 16.0f;
             originX = width / 2;
             originY = height / 2;
         }
@@ -430,6 +228,14 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         // 时间戳判断 绘制信息检测
         checkDrawStatus(currTick, renderList, lim);
     }
+
+    // 注意：这里不能提前 return！官方实现中 isNeedDraw=false 的节点
+    // 仍会继续构建 renderMethod 并递归所有子节点（父容器节点某些帧无内容
+    // 但子孙 icon 可见是正常结构）。提前剪枝会导致整棵子树不被 progress，
+    // 子孙部件消失；蒙版层（layerNode）不被绘制时 hasStencil 会被置 false，
+    // 主体部件失去蒙版裁剪，纯色填充部件（bm21）以完整形态显示为色块。
+    // 子孙的可见性由它们自己的 checkDrawStatus 与 draw() 中的 isNeedDraw 判定。
+    // 修复（修复部分游戏emote立绘消失以及DRACU-RIOT!菜单问题。）
 
     // 构建渲染方法
     renderMethod.clear();
@@ -584,11 +390,13 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
             }
         }
 
-        // shape节点: 将currZx/currZy重置为1，避免与width/height双重缩放(px = zx * shapeUnit * 1)
-        if (!isIcon && frame != nullptr && frame->src.rfind("shape/", 0) == 0)
+        // Shape zoom stays in the shared transform, including frame interpolation.
+        if (isShape && frame->src.find("shape/point") != std::string::npos)
+            width = height = 2.0f; // one local unit around the node's center
+        if (isShape)
         {
-            currZx = 1.0f;
-            currZy = 1.0f;
+            originX = width * 0.5f;
+            originY = height * 0.5f;
         }
 
         // 渲染信息记录
@@ -624,64 +432,32 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         renderMethod.push_back(emt);
     }
 
-    // 对于icon保存大小信息
-    if (isIcon && renderMethod.size() > 0)
+    if (isShape && frame && !currentNode->removed && refMtn && !renderMethod.empty())
     {
-        // 两个端点就够了
-        float ot1x, ot1y, ot2x, ot2y;
-        evaluateSurfaceChain(renderMethod, 0, 0, ot1x, ot1y);
-        evaluateSurfaceChain(renderMethod, 1, 1, ot2x, ot2y);
-        glm::vec2 pt1(0, 0), pt2(1, 1);
-        // 边界缩放（最外层 surface 输出 clip → screen）
-        pt1.x = (ot1x / 2.0 + 0.5) * currentNode->_filePtr->_screenSize.width;
-        pt1.y = (ot1y / 2.0 + 0.5) * currentNode->_filePtr->_screenSize.height;
-        pt2.x = (ot2x / 2.0 + 0.5) * currentNode->_filePtr->_screenSize.width;
-        pt2.y = (ot2y / 2.0 + 0.5) * currentNode->_filePtr->_screenSize.height;
-        // 保存区域(使用独立的shapeList，避免状态重复)
-        emoterect tmprect;
-        tmprect.left = pt1.x;
-        tmprect.top = pt1.y;
-        tmprect.width = pt2.x - pt1.x;
-        tmprect.height = pt2.y - pt1.y;
-        shapeList.push_back(tmprect);
-    }
-
-    // 对于shape节点保存面积信息(用于contains检测和getLayerGetter的shape返回)
-    // 注: shape节点可能没有hasContent，用src判断即可
-    if (!isIcon && frame != nullptr && refMtn != nullptr)
-    {
-        std::string src(frame->src);
-        if (src.rfind("shape/", 0) == 0 && renderMethod.size() > 0)
+        emoterect area;
+        area.label = currentNode->label;
+        if (frame->src.find("shape/circle") != std::string::npos) area.shapeType = 1;
+        else if (frame->src.find("shape/point") != std::string::npos) area.shapeType = 0;
+        else if (frame->src.find("shape/quad") != std::string::npos) area.shapeType = 3;
+        buildShapeMesh(renderMethod, area.shapeType, area.vertices, area.indices);
+        const float vw = lim.viewW > 0 ? lim.viewW : renderMethod.front().width;
+        const float vh = lim.viewH > 0 ? lim.viewH : renderMethod.front().height;
+        float minX = 1, minY = 1, maxX = -1, maxY = -1;
+        if (!area.vertices.empty())
         {
-            // 两个端点就够了
-            float ot1x, ot1y, ot2x, ot2y;
-            evaluateSurfaceChain(renderMethod, 0, 0, ot1x, ot1y);
-            evaluateSurfaceChain(renderMethod, 1, 1, ot2x, ot2y);
-            glm::vec2 pt1(0, 0), pt2(1, 1);
-            // 边界缩放（最外层 surface 输出 clip → screen）
-            pt1.x = (ot1x / 2.0 + 0.5) * currentNode->_filePtr->_screenSize.width;
-            pt1.y = (ot1y / 2.0 + 0.5) * currentNode->_filePtr->_screenSize.height;
-            pt2.x = (ot2x / 2.0 + 0.5) * currentNode->_filePtr->_screenSize.width;
-            pt2.y = (ot2y / 2.0 + 0.5) * currentNode->_filePtr->_screenSize.height;
-            // 保存区域(使用独立的shapeList，避免状态重复)
-            emoterect tmprect;
-            tmprect.label = currentNode->label;
-            tmprect.left = pt1.x;
-            tmprect.top = pt1.y;
-            tmprect.width = pt2.x - pt1.x;
-            tmprect.height = pt2.y - pt1.y;
-            // 根据src后缀确定shape子类型: rect/circle/point/quad
-            std::string srcType = src.substr(6); // 去掉"shape/"
-            if (srcType == "circle")
-                tmprect.shapeType = 1;
-            else if (srcType == "point")
-                tmprect.shapeType = 0;
-            else if (srcType == "quad")
-                tmprect.shapeType = 3;
-            else
-                tmprect.shapeType = 2; // rect默认
-            refMtn->shapeNodeAreas.push_back(tmprect);
+            minX = maxX = area.vertices.front().x;
+            minY = maxY = area.vertices.front().y;
         }
+        for (const auto& v : area.vertices)
+        {
+            minX = std::min(minX, v.x); maxX = std::max(maxX, v.x);
+            minY = std::min(minY, v.y); maxY = std::max(maxY, v.y);
+        }
+        area.left = (minX + 1) * 0.5f * vw;
+        area.top = (minY + 1) * 0.5f * vh;
+        area.width = (maxX - minX) * 0.5f * vw;
+        area.height = (maxY - minY) * 0.5f * vh;
+        refMtn->shapeNodeAreas.push_back(std::move(area));
     }
 
     // 对于icon节点，在CPU上计算细分网格
@@ -690,6 +466,7 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         // 确定细分等级
         int div = currentNode ? (int)currentNode->meshDivision : 0;
         if (div < 2) div = 8; // 默认8x8，匹配原曲面细分着色器的细分等级
+        div = std::min(div, 254); // (div + 1)^2 must fit uint16_t indices
         // 检查是否包含mesh变形
         bool containsMesh = false;
         for (auto itm : renderMethod)
@@ -728,8 +505,10 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
             emotenoderef* childRef = refMtn->getNodeRef(ch);
             if (childRef)
             {
-                childRef->progress(tick, renderMethod, {originX, originY, width, height, lim.zMax});
-                shapeList.insert(shapeList.end(), childRef->getShapeList().begin(), childRef->getShapeList().end());
+                // Preserve the target viewport through nested motions.
+                childRef->progress(tick, renderMethod,
+                                   {originX, originY, width, height, lim.zMax, lim.viewW,
+                                    lim.viewH});
             }
         }
 
@@ -740,23 +519,20 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
             currentMtnRef = new emotemotionref(currentMtn, refTop, this);
             refMtn->_subMotionRefs.push_back(currentMtnRef);
             currentMtnRef->progress(tick + currTimeOffset, renderMethod,
-                            {originX, originY, width, height, lim.zMax});
-            // 收集子motion的shape
-            shapeList.insert(shapeList.end(), currentMtnRef->getShapeList().begin(),
-                             currentMtnRef->getShapeList().end());
+                            {originX, originY, width, height, lim.zMax, lim.viewW, lim.viewH});
         }
     }
 }
-void emotenoderef::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget)
+bool emotenoderef::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget)
 {
     if (!isNeedDraw || !isIcon || renderMethod.size() < 1 || currentNode->removed)
-        return; // 跳过无需绘制的 和 非icon的 和 无method 的节点
-    if (!renderer || !target)
-        return;
+        return false; // 跳过无需绘制的 和 非icon的 和 无method 的节点
+    if (!renderer || !target || !ic || !ic->selftexture)
+        return false;
 
     // 跳过空网格
     if (_meshVertices.empty() || _meshIndices.empty())
-        return;
+        return false;
 
     // 提前绘制好蒙版目标（不考虑复合蒙版的情况）
     if (renderMethod.at(0).hasStencil && maskTarget != 0)
@@ -787,6 +563,7 @@ void emotenoderef::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emo
         totalOpa *= renderMethod.at(i).opa;
     int blendMode = currbm;
     float uniformColor[4] = {0, 0, 0, 0};
+    float colorModulation[4] = {1, 1, 1, 1};
     if (blendMode == 21 && frame)
     {
         uniformColor[0] = ((frame->color) & 0xFF) / 255.0f;
@@ -794,13 +571,25 @@ void emotenoderef::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emo
         uniformColor[2] = ((frame->color >> 16) & 0xFF) / 255.0f;
         uniformColor[3] = ((frame->color >> 24) & 0xFF) / 255.0f;
     }
+    else if (frame && frame->hasColor && static_cast<uint32_t>(frame->color) != 0xff808080u)
+    {
+        // bm!=21 时 color 是乘性染色。0xff808080 是 PSB 中性灰，必须保持原图；
+        // 未写 color 时 hasColor=false，也不能用默认 0 去乘（会把虹膜乘成黑/灰）。
+        const uint32_t tint = static_cast<uint32_t>(frame->color);
+        colorModulation[0] = (tint & 0xFF) / 255.0f;
+        colorModulation[1] = ((tint >> 8) & 0xFF) / 255.0f;
+        colorModulation[2] = ((tint >> 16) & 0xFF) / 255.0f;
+        colorModulation[3] = ((tint >> 24) & 0xFF) / 255.0f;
+    }
     renderer->SetBlendMode(blendMode, blendMode == 21 ? uniformColor : nullptr);
-    if (blendMode == 6)
-        return; // 该模式不绘制（GL 后端原行为）
+    if (blendMode == 6 || totalOpa <= 0)
+        return false; // 该模式不绘制（GL 后端原行为）
 
     // 绘制网格（MeshVertex 布局与接口的交错 xyuv 格式一致，直接传递）
     renderer->DrawMesh((const float*)_meshVertices.data(), (int)_meshVertices.size(),
-                       _meshIndices.data(), (int)_meshIndices.size(), ic->selftexture, totalOpa);
+                       _meshIndices.data(), (int)_meshIndices.size(), ic->selftexture, totalOpa,
+                       colorModulation);
+    return true;
 }
 float emotenoderef::getCurrentRenderZ()
 {
@@ -881,7 +670,6 @@ emotenoderef* emotemotionref::getNodeRef(emotenode* node)
 void emotemotionref::progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim)
 {
     // 起始
-    shapeList.clear();
     shapeNodeAreas.clear();
     renderMethod.clear();
     renderMethod = renderList;
@@ -925,7 +713,6 @@ void emotemotionref::progress(float tick, std::vector<emoteRender>& renderList, 
         if (ref)
         {
             ref->progress(actualTick, localRender, lim);
-            shapeList.insert(shapeList.end(), ref->getShapeList().begin(), ref->getShapeList().end());
         }
     }
 }
@@ -952,7 +739,7 @@ void emotemotionref::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, e
         {
             drawList.push_back(current);
         }
-        else
+        else if (current->currentMtnRef)
         {
             for (auto it = current->currentMtnRef->_nodeCache.begin();
                  it != current->currentMtnRef->_nodeCache.end();
@@ -973,46 +760,54 @@ void emotemotionref::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, e
     {
         if (r != nullptr)
         {
-            r->draw(renderer, target, lim, maskTarget);
+            r->wasDrawn = r->draw(renderer, target, lim, maskTarget);
         }
     }
 }
-bool emotemotionref::contains(tjs_real x, tjs_real y)
+bool emotemotionref::contains(float x, float y, const char* label) const
 {
-     // 检查icon节点的shapeList
-    for (auto mtnRec : shapeList)
-    {
-        if (x >= mtnRec.left && x < mtnRec.left + mtnRec.width && y >= mtnRec.top && y < mtnRec.top + mtnRec.height)
-        {
+    for (const auto& area : shapeNodeAreas)
+        if ((!label || std::strcmp(area.label.c_str(), label) == 0) && area.contains(x, y))
             return true;
-        }
-    }
+    for (const auto* sub : _subMotionRefs)
+        if (sub->contains(x, y, label))
+            return true;
+    if (!label)
+        for (const auto& node : _nodeCache)
+            if (node.wasDrawn && containsMesh(node._meshVertices, node._meshIndices, x, y))
+                return true;
     return false;
 }
 
-emoteengine::~emoteengine()
+bool EmoteHitFrame::contains(const char* label, float x, float y, bool local) const
 {
-    if (_mainMotionRef)
-        delete _mainMotionRef;
+    if (!motion || width <= 0 || height <= 0)
+        return false;
+    if (local)
+    {
+        const auto clip = inputToClip * glm::vec4(x, y, 0, 1);
+        x = clip.x;
+        y = -clip.y; // same final Y flip as evaluateSurfaceChain
+    }
+    else
+    {
+        x = x * 2 / width - 1;
+        y = y * 2 / height - 1;
+    }
+    // Geometry outside the rendered target is clipped by all rendering backends.
+    return std::isfinite(x) && std::isfinite(y) && x >= -1 && x < 1 && y >= -1 && y < 1 &&
+           motion->contains(x, y, label);
 }
+
+emoteengine::~emoteengine() = default;
+
 void emoteengine::progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim)
 {
-    // 清除shape信息
-    shapeList.clear();
-
-    // 初始 _mainMotionRef
-    if (_mainmotion == nullptr)
+    _mainMotionRef.reset();
+    if (!_mainmotion)
         return;
-    if (_mainMotionRef == nullptr)
-        _mainMotionRef = new emotemotionref(_mainmotion, this);
-    if (_mainMotionRef->currentMotion != _mainmotion)
-        _mainMotionRef->currentMotion = _mainmotion;
-
-    // progress
+    _mainMotionRef = std::make_shared<emotemotionref>(_mainmotion, this);
     _mainMotionRef->progress(tick, renderList, lim);
-
-    // 收集shape信息
-    shapeList = _mainMotionRef->getShapeList();
 }
 void emoteengine::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget)
 {
@@ -1452,4 +1247,5 @@ tjs_real emoteengine::getVariable(const std::string& name)
 void emoteengine::updatePhysics(float tick)
 {
 }
-}
+
+} // namespace emoteplayer

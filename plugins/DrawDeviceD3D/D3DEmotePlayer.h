@@ -57,6 +57,13 @@ public:
     void startWind(tjs_real start, tjs_real goal, tjs_real speed, tjs_real powMin, tjs_real powMax);
     void stopWind();
 
+    // contains keeps the legacy layer-local coordinates; hitTest uses target pixels.
+    static tjs_error cb_contains(
+        tTJSVariant* result, tjs_int numparams, tTJSVariant** param, D3DEmotePlayer* objthis);
+
+    static tjs_error cb_hitTest(
+        tTJSVariant* result, tjs_int numparams, tTJSVariant** param, D3DEmotePlayer* objthis);
+
     void playTimeline(tTJSString name, tjs_int flags = 0);
     void stopTimeline(tTJSString name = "");
     void fadeOutTimeline(tTJSString name, tjs_real time = 0, tjs_real easing = 0);

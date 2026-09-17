@@ -24,6 +24,7 @@ class PlayerImpl
 public:
     emoteplayer::ResourceManager* RM = nullptr;
     emoteplayer::EmotePlayer* Player = nullptr;
+    emoteplayer::EmoteHitFrame HitFrame;
 
     PlayerImpl()
     {
@@ -224,6 +225,23 @@ tjs_real D3DEmotePlayer::getVariable(tTJSString name)
     if (Impl && Impl->Player)
         return Impl->Player->getVariable(name);
     return 0;
+}
+
+tjs_error D3DEmotePlayer::cb_contains(
+    tTJSVariant* result, tjs_int numparams, tTJSVariant** param, D3DEmotePlayer* objthis)
+{
+    if (!objthis) return TJS_E_FAIL;
+    return emoteplayer::dispatchEmoteHitTest(result, numparams, param,
+        [&](const char* label, tjs_real x, tjs_real y)
+        { return objthis->ShowFlag && objthis->Impl && objthis->Impl->HitFrame.contains(label, x, y, true); });
+}
+tjs_error D3DEmotePlayer::cb_hitTest(
+    tTJSVariant* result, tjs_int numparams, tTJSVariant** param, D3DEmotePlayer* objthis)
+{
+    if (!objthis) return TJS_E_FAIL;
+    return emoteplayer::dispatchEmoteHitTest(result, numparams, param,
+        [&](const char* label, tjs_real x, tjs_real y)
+        { return objthis->ShowFlag && objthis->Impl && objthis->Impl->HitFrame.contains(label, x, y); });
 }
 
 void D3DEmotePlayer::startWind(tjs_real start, tjs_real goal, tjs_real speed, tjs_real powMin,
@@ -433,15 +451,14 @@ void D3DEmotePlayer::DrawToTarget(void* target, void* maskTarget)
     if (!ShowFlag || !Impl || !Impl->Player || !Device || !Device->GetBackend() || !target)
         return;
     krkrsdl3::iTVPRenderBackend* backend = Device->GetBackend();
-    float sx = Layer ? fabsf(Layer->Matrix[0]) : 1.0f;
-    float sy = Layer ? fabsf(Layer->Matrix[5]) : 1.0f;
-    if (sx < 0.01f) sx = 1.0f;
-    if (sy < 0.01f) sy = 1.0f;
-    tjs_int limitW = (tjs_int)((float)Device->GetWidth() / sx);
-    tjs_int limitH = (tjs_int)((float)Device->GetHeight() / sy);
-    tjs_int originX = Layer ? (tjs_int)(((float)Device->GetWidth() * 0.5f + Layer->Matrix[12]) / sx) : 0;
-    tjs_int originY = Layer ? (tjs_int)(((float)Device->GetHeight() * 0.5f + Layer->Matrix[13]) / sy) : 0;
-    Impl->Player->drawToTarget(backend, target, maskTarget, true, limitW, limitH, originX, originY);
+    const int width = Device->GetWidth(), height = Device->GetHeight();
+    // Use the complete layer affine transform. No scale extraction, integer rounding,
+    // axis-specific fallback or inverse matrix is needed for rendering or hit testing.
+    glm::mat4 transform = Layer ? glm::make_mat4(Layer->Matrix) : glm::mat4(1.0f);
+    transform = glm::translate(glm::mat4(1.0f), glm::vec3(width * 0.5f, height * 0.5f, 0)) * transform;
+    Impl->Player->drawToTarget(backend, target, maskTarget, true, width, height, 0, 0,
+                               width, height, transform);
+    Impl->HitFrame = Impl->Player->getHitFrame();
     Animating = Impl->Player->get_animating();
 }
 

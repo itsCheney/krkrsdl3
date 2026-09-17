@@ -13,58 +13,27 @@ namespace emoteplayer
 iTJSDispatch2* ResourceManager::_kagWindow = nullptr;
 static SeparateLayerAdaptor* _motionWorkLayer = nullptr;
 
-// 递归查找 shapeNodeAreas 中指定名称的区域
-// 也作为后备: 直接检查节点的frame中的shape信息
-static bool findShapeAreaRecursive(emotemotionref* mtnRef, const char* name, emoterect& outArea)
+static const emoterect* findShapeAreaRecursive(const emotemotionref* motion, const char* name)
 {
-    if (mtnRef == nullptr) return false;
-
-    // 查找当前motion的预计算shapeNodeAreas
-    for (auto& area : mtnRef->shapeNodeAreas)
-    {
+    if (!motion) return nullptr;
+    for (const auto& area : motion->shapeNodeAreas)
         if (std::strcmp(area.label.c_str(), name) == 0)
-        {
-            outArea = area;
-            return true;
-        }
-    }
-
-    // 递归查找子motion的shapeNodeAreas
-    for (auto& n : mtnRef->_nodeCache)
-    {
-        if (n.currentMtn && n.currentMtnRef)
-        {
-            if (findShapeAreaRecursive(n.currentMtnRef, name, outArea))
-                return true;
-        }
-    }
-
-    return false;
+            return &area;
+    for (const auto* sub : motion->_subMotionRefs)
+        if (const auto* area = findShapeAreaRecursive(sub, name))
+            return area;
+    return nullptr;
 }
 
-// 递归查找子motion ref
-static emotemotionref* findMotionRefRecursive(emotemotionref* mtnRef, const char* name)
+static emotemotionref* findMotionRefRecursive(emotemotionref* motion, const char* name)
 {
-    if (mtnRef == nullptr) return nullptr;
-
-    for (auto& node : mtnRef->_nodeCache)
-    {
-        if (node.currentMtn && std::strcmp(node.currentNode->label.c_str(), name) == 0)
-        {
-            return node.currentMtnRef;
-        }
-    }
-
-    // 递归查找子motion
-    for (auto& node : mtnRef->_nodeCache)
-    {
-        if (node.currentMtn && node.currentMtnRef)
-        {
-            emotemotionref* found = findMotionRefRecursive(node.currentMtnRef, name);
-            if (found) return found;
-        }
-    }
-
+    if (!motion) return nullptr;
+    for (auto* sub : motion->_subMotionRefs)
+        if (std::strcmp(sub->label.c_str(), name) == 0)
+            return sub;
+    for (auto* sub : motion->_subMotionRefs)
+        if (auto* found = findMotionRefRecursive(sub, name))
+            return found;
     return nullptr;
 }
 
@@ -359,196 +328,123 @@ void D3DAdaptor::unloadUnusedTextures()
     }
 }
 
-// 专门用来保存contain信息 两类节点mtn和shape
-tTJSNativeClass* TVPCreateNativeClass_TmpMotionObj(EmotePlayer* ptr, emotemotionref* obj);
+// Getters retain the player and resolve their path against the last draw. Holding a raw
+// sub-motion pointer here is unsafe because the tree is rebuilt for each rendered frame.
+static tTJSVariant makeLayerGetter(EmotePlayer* player, emotemotionref* motion, const char* name);
 class TmpMotionObj : public tTJSNativeClass
 {
-    typedef tTJSNativeClass inherited;
-
 public:
-    TmpMotionObj(EmotePlayer* ptr, emotemotionref* obj)
-      : tTJSNativeClass(TJS_N("MotionObj"))
+    TmpMotionObj(EmotePlayer* player, emotemotionref* motion, const char* shape = nullptr)
+        : tTJSNativeClass(TJS_N("MotionObj")), _player(player), _isShape(shape != nullptr),
+          _shape(shape ? shape : "")
     {
-        _ptr = ptr;
-        _obj = obj;
+        _player->AddRef();
+        for (auto* ref = motion; ref && ref->parent; ref = ref->parent->refMtn)
+            _path.insert(_path.begin(), ref->label.c_str());
     }
-    tjs_error FuncCall(tjs_uint32 flag,
-        const tjs_char* membername,
-        tjs_uint32* hint,
-        tTJSVariant* result,
-        tjs_int numparams,
-        tTJSVariant** param,
-        iTJSDispatch2* objthis)
+    ~TmpMotionObj() { _player->Release(); }
+
+    tjs_error FuncCall(tjs_uint32 flag, const tjs_char* membername, tjs_uint32* hint,
+                       tTJSVariant* result, tjs_int numparams, tTJSVariant** param,
+                       iTJSDispatch2* objthis) override
     {
-        // 古法找函数
-        if (std::strcmp(membername, "contains") == 0)
+        if (!membername) return TJS_E_MEMBERNOTFOUND;
+        auto frame = _player->getHitFrame();
+        auto* motion = frame.motion.get();
+        for (const auto& name : _path)
         {
-            if (numparams < 2)
-                return TJS_E_BADPARAMCOUNT;
-            tjs_real x = *param[0];
-            tjs_real y = *param[1];
+            emotemotionref* next = nullptr;
+            if (motion)
+                for (auto* sub : motion->_subMotionRefs)
+                    if (std::strcmp(sub->label.c_str(), name.c_str()) == 0)
+                    {
+                        next = sub;
+                        break;
+                    }
+            motion = next;
+        }
+        if (std::strcmp(membername, "contains") == 0 || std::strcmp(membername, "hitTest") == 0)
+        {
+            frame.motion = std::shared_ptr<emotemotionref>(frame.motion, motion);
+            return dispatchEmoteHitTest(result, numparams, param,
+                [&](const char* label, tjs_real x, tjs_real y)
+                {
+                    const bool local = label && std::strcmp(membername, "contains") == 0;
+                    return frame.contains(_isShape ? _shape.c_str() : label, x, y, local);
+                });
+        }
+        if (std::strcmp(membername, "getLayerGetter") == 0)
+        {
+            if (numparams < 1) return TJS_E_BADPARAMCOUNT;
+            if (result) *result = makeLayerGetter(_player, motion, tTJSString(*param[0]).c_str());
+            return TJS_S_OK;
+        }
+        if (std::strcmp(membername, "getLayerMotion") == 0)
+        {
+            if (numparams < 1) return TJS_E_BADPARAMCOUNT;
+            auto* sub = findMotionRefRecursive(motion, tTJSString(*param[0]).c_str());
             if (result)
             {
-                if (_obj)
+                result->Clear();
+                if (sub)
                 {
-                    *result = _obj->contains(x, y);
-                }
-                else
-                {
-                    // 没有_obj: 这是shape节点，检查存储的l/t/w/h和shapeType进行碰撞检测
-                    tTJSVariant vl, vt, vw, vh, vst;
-                    bool hasL = TJS_SUCCEEDED(PropGet(0, TJS_N("l"), nullptr, &vl, this));
-                    bool hasT = TJS_SUCCEEDED(PropGet(0, TJS_N("t"), nullptr, &vt, this));
-                    bool hasW = TJS_SUCCEEDED(PropGet(0, TJS_N("w"), nullptr, &vw, this));
-                    bool hasH = TJS_SUCCEEDED(PropGet(0, TJS_N("h"), nullptr, &vh, this));
-                    bool hasST = TJS_SUCCEEDED(PropGet(0, TJS_N("shapeType"), nullptr, &vst, this));
-                    bool res = false;
-                    if (hasL && hasT && hasW && hasH)
-                    {
-                        double l = (double)vl, t = (double)vt;
-                        double w = (double)vw, h = (double)vh;
-                        int st = hasST ? (int)vst : 2; // 默认rect
-                        switch (st)
-                        {
-                        case 1: // circle: 检查点到圆心距离是否 <= 半径
-                        {
-                            double cx = l + w / 2.0, cy = t + h / 2.0;
-                            double r = w / 2.0; // 取宽的一半为半径
-                            double dx = x - cx, dy = y - cy;
-                            res = (dx * dx + dy * dy <= r * r);
-                            break;
-                        }
-                        case 0: // point: 检测一个很小的范围(即点到圆心距离<1)
-                        {
-                            double cx = l, cy = t;
-                            double dx = x - cx, dy = y - cy;
-                            res = (dx * dx + dy * dy <= 1.0);
-                            break;
-                        }
-                        case 3: // quad: 简化为矩形检测(精确quad需要存储4个顶点坐标)
-                        default: // rect
-                            res = (x >= l && x <= l + w && y >= t && y <= t + h);
-                            break;
-                        }
-                        *result = res;
-                    }
-                    else
-                    {
-                        *result = false;
-                    }
+                    auto* getter = new TmpMotionObj(_player, sub);
+                    *result = tTJSVariant(getter);
+                    getter->Release();
                 }
             }
             return TJS_S_OK;
         }
-        else if (std::strcmp(membername, "getLayerGetter") == 0)
+        if (std::strcmp(membername, "setVariable") == 0)
         {
-            if (numparams < 1)
-                return TJS_E_BADPARAMCOUNT;
-
-            ttstr name = *param[0];
-            iTJSDispatch2* dsp = TJSCreateDictionaryObject();
-
-            // 递归寻找子motion ref
-            emotemotionref* emtObj = findMotionRefRecursive(_obj, name.c_str());
-
-            if (emtObj)
-            {
-                // 子motion: 同时设置motion和shape，使路径解析(getLayerMotion/getLayerShape)都能正常工作
-                iTJSDispatch2* mtn = TVPCreateNativeClass_TmpMotionObj(_ptr, emtObj);
-                if (mtn)
-                {
-                    tTJSVariant mtnVar(mtn);
-                    dsp->PropSet(TJS_MEMBERENSURE, "motion", nullptr, &mtnVar, dsp);
-                    dsp->PropSet(TJS_MEMBERENSURE, "shape", nullptr, &mtnVar, dsp);
-                    mtn->Release();
-                }
-            }
-            else
-            {
-                // 没找到子motion，在预计算的shapeNodeAreas中递归查找(后备则直接从frame提取)
-                emoterect foundArea = {};
-                if (_obj != nullptr && findShapeAreaRecursive(_obj, name.c_str(), foundArea))
-                {
-                    iTJSDispatch2* shapeObj = TVPCreateNativeClass_TmpMotionObj(nullptr, nullptr);
-                    if (shapeObj)
-                    {
-                        tTJSVariant vL(foundArea.left), vT(foundArea.top);
-                        tTJSVariant vW(foundArea.width), vH(foundArea.height);
-                        tTJSVariant vST(foundArea.shapeType);
-                        shapeObj->PropSet(TJS_MEMBERENSURE, TJS_N("l"), nullptr, &vL, shapeObj);
-                        shapeObj->PropSet(TJS_MEMBERENSURE, TJS_N("t"), nullptr, &vT, shapeObj);
-                        shapeObj->PropSet(TJS_MEMBERENSURE, TJS_N("w"), nullptr, &vW, shapeObj);
-                        shapeObj->PropSet(TJS_MEMBERENSURE, TJS_N("h"), nullptr, &vH, shapeObj);
-                        shapeObj->PropSet(TJS_MEMBERENSURE, TJS_N("shapeType"), nullptr, &vST, shapeObj);
-                        tTJSVariant shapeVar(shapeObj);
-                        dsp->PropSet(TJS_MEMBERENSURE, TJS_N("shape"), nullptr, &shapeVar, dsp);
-                        shapeObj->Release();
-                    }
-                }
-            }
-
-            tTJSVariant var(dsp);
-            dsp->Release();
-            if (result)
-                *result = var;
+            if (numparams < 2) return TJS_E_BADPARAMCOUNT;
+            _player->setVariable(tTJSString(*param[0]), (tjs_real)*param[1]);
             return TJS_S_OK;
         }
-        else if (std::strcmp(membername, "getLayerMotion") == 0)
-        {
-            if (numparams < 1)
-                return TJS_E_BADPARAMCOUNT;
-            ttstr name = *param[0];
-
-            // 递归查找指定名称的子motion
-            emotemotionref* emtObj = findMotionRefRecursive(_obj, name.c_str());
-
-            if (emtObj && result)
-            {
-                iTJSDispatch2* mtn = TVPCreateNativeClass_TmpMotionObj(_ptr, emtObj);
-                if (mtn)
-                {
-                    tTJSVariant mtnVar(mtn);
-                    *result = mtnVar;
-                    mtn->Release();
-                }
-            }
-            return TJS_S_OK;
-        }
-        else if (std::strcmp(membername, "setVariable") == 0)
-        {
-            if (numparams < 2)
-                return TJS_E_BADPARAMCOUNT;
-            ttstr name = *param[0];
-            tjs_real value = *param[1];
-            if (_ptr)
-            {
-                _ptr->setVariable(name, value);
-            }
-            return TJS_S_OK;
-        }
-        else
-            return TJS_E_MEMBERNOTFOUND;
+        return TJS_E_MEMBERNOTFOUND;
     }
-
-    ~TmpMotionObj()
-    {
-        _ptr = NULL;
-        _obj = NULL;
-    }
-    static tjs_uint32 ClassID;
 
 protected:
-    tTJSNativeInstance* CreateNativeInstance() { return NULL; }
+    tTJSNativeInstance* CreateNativeInstance() override { return nullptr; }
 
 private:
-    EmotePlayer* _ptr = NULL;
-    emotemotionref* _obj = NULL;
+    EmotePlayer* _player;
+    std::vector<std::string> _path;
+    bool _isShape;
+    std::string _shape;
 };
-tTJSNativeClass* TVPCreateNativeClass_TmpMotionObj(EmotePlayer* ptr, emotemotionref* obj)
+
+static tTJSVariant makeLayerGetter(EmotePlayer* player, emotemotionref* motion, const char* name)
 {
-    return new TmpMotionObj(ptr, obj);
+    auto* dict = TJSCreateDictionaryObject();
+    if (auto* sub = findMotionRefRecursive(motion, name))
+    {
+        auto* getter = new TmpMotionObj(player, sub);
+        tTJSVariant value(getter);
+        dict->PropSet(TJS_MEMBERENSURE, TJS_N("motion"), nullptr, &value, dict);
+        dict->PropSet(TJS_MEMBERENSURE, TJS_N("shape"), nullptr, &value, dict);
+        getter->Release();
+    }
+    else
+    {
+        if (const auto* area = findShapeAreaRecursive(motion, name))
+        {
+            auto* getter = new TmpMotionObj(player, motion, name);
+            tTJSVariant l(area->left), t(area->top), w(area->width), h(area->height), st(area->shapeType);
+            getter->PropSet(TJS_MEMBERENSURE, TJS_N("l"), nullptr, &l, getter);
+            getter->PropSet(TJS_MEMBERENSURE, TJS_N("t"), nullptr, &t, getter);
+            getter->PropSet(TJS_MEMBERENSURE, TJS_N("w"), nullptr, &w, getter);
+            getter->PropSet(TJS_MEMBERENSURE, TJS_N("h"), nullptr, &h, getter);
+            getter->PropSet(TJS_MEMBERENSURE, TJS_N("shapeType"), nullptr, &st, getter);
+            tTJSVariant value(getter);
+            dict->PropSet(TJS_MEMBERENSURE, TJS_N("shape"), nullptr, &value, dict);
+            getter->Release();
+        }
+    }
+    tTJSVariant result(dict);
+    dict->Release();
+    return result;
 }
-tjs_uint32 TmpMotionObj::ClassID = (tjs_uint32)-1;
 
 #define setprop_t(d, p, ty) \
     { \
@@ -754,6 +650,7 @@ void EmotePlayer::clear(iTJSDispatch2* layer, tjs_uint32 neutralColor)
         {
             renderer->SetTarget(target);
             renderer->ClearTarget(true);
+            _hitFrame = {};
         }
     }
 }
@@ -766,44 +663,32 @@ void EmotePlayer::progress(tjs_real mstime)
     {
         if (_playing)
             clockPassed += mstime / speedRatio;
-        std::vector<emoteRender> empty;
-        empty.push_back(_renderMethod);
-        // mirror
-        if (emtEngine._mainfile->isMirror)
-        {
-            empty.at(0).attachMat = glm::scale(empty.at(0).attachMat, glm::vec3(-1.0f, 1.0f, 1.0f));
-        }
         // condition
         if (emtEngine._mainfile->_metadata->_varList.size() > 0)
         {
             // 更新控制参数(通过引擎调用)
             emtEngine.updateEyeControl(clockPassed, true);
             emtEngine.updateTimelineControl(clockPassed, true);
-            // 使用emoteengine::progress构建独立ref树
-            emtEngine.progress(0, empty, _limitArea);
         }
-        else
+        // 是否结束 —— 结束判定与 variableList 参数控制无关：
+        // 若仅在 varList 为空分支判定，带眨眼/口型/时间线控制的立绘
+        // 会 animating 永真，游戏等待动画结束的对话流程将永久挂起（修复猫娘乐园2出现emote立绘时无法进行任何操作）
+        if (!isMotion && clockPassed > emtEngine._mainmotion->lastTime)
         {
-            // 是否结束
-            if (!isMotion && clockPassed > emtEngine._mainmotion->lastTime)
+            _playing = false;
+        }
+        // 对于motion限制最后时间并结束
+        // 参考ref逻辑: syncTime优先, 其次是selfSyncTime, 最后用lastTime作为兜底
+        if (isMotion && emtEngine._mainmotion->loopTime < 0)
+        {
+            tjs_real endTime = emtEngine._mainmotion->syncTime;
+            if (endTime <= 0.0) endTime = emtEngine._mainmotion->selfSyncTime;
+            if (endTime <= 0.0) endTime = emtEngine._mainmotion->lastTime;
+            if (clockPassed > endTime)
             {
+                clockPassed = endTime;
                 _playing = false;
             }
-            // 对于motion限制最后时间并结束
-            // 参考ref逻辑: syncTime优先, 其次是selfSyncTime, 最后用lastTime作为兜底
-            if (isMotion && emtEngine._mainmotion->loopTime < 0)
-            {
-                tjs_real endTime = emtEngine._mainmotion->syncTime;
-                if (endTime <= 0.0) endTime = emtEngine._mainmotion->selfSyncTime;
-                if (endTime <= 0.0) endTime = emtEngine._mainmotion->lastTime;
-                if (clockPassed > endTime)
-                {
-                    clockPassed = endTime;
-                    _playing = false;
-                }
-            }
-            // 使用emoteengine::progress构建独立ref树
-            emtEngine.progress(clockPassed, empty, _limitArea);
         }
         // ping-pong触发更新draw，位置暂时选这里，让它频繁点
         if (_pipoVal == 0)
@@ -812,8 +697,25 @@ void EmotePlayer::progress(tjs_real mstime)
             _pipoVal = 0;
     }
 }
+void EmotePlayer::prepareFrame()
+{
+    updateTransMat();
+    std::vector<emoteRender> methods{_renderMethod};
+    if (emtEngine._mainfile->isMirror)
+        methods.front().attachMat = glm::scale(methods.front().attachMat, glm::vec3(-1, 1, 1));
+    const float tick = emtEngine._mainfile->_metadata->_varList.empty() ? clockPassed : 0;
+    emtEngine.progress(tick, methods, _limitArea);
+    _hitFrame.motion = emtEngine._mainMotionRef;
+    _hitFrame.inputToClip = _renderMethod.attachMat;
+    _hitFrame.width = _limitArea.viewW > 0 ? _limitArea.viewW : _limitArea.width;
+    _hitFrame.height = _limitArea.viewH > 0 ? _limitArea.viewH : _limitArea.height;
+}
+
 void EmotePlayer::draw(iTJSDispatch2* objthis)
 {
+    withD3DAdaptor = withoutAdaptor = false;
+    _targetTrans = glm::mat4(1.0f);
+    _limitArea.viewW = _limitArea.viewH = 0;
     auto* self = ncbInstanceAdaptor<SeparateLayerAdaptor>::GetNativeInstance(objthis);
     tTJSNI_BaseLayer* ths = NULL;
     D3DAdaptor* d3dAdaptor = NULL;
@@ -885,7 +787,8 @@ void EmotePlayer::draw(iTJSDispatch2* objthis)
             // isSelfClear: 自主清屏模式；否则由脚本 clear() 完成清屏
             renderer->ClearTarget(isSelfClear);
         }
-        // 使用emoteengine::draw进行绘制(使用progress阶段缓存的独立ref树)
+        if (!target) return;
+        prepareFrame();
         emtEngine.draw(renderer, target, _limitArea, maskTarget);
         if (!withD3DAdaptor)
         {
@@ -909,32 +812,22 @@ void EmotePlayer::drawToTarget(krkrsdl3::iTVPRenderBackend* renderer,
                                tjs_int width,
                                tjs_int height,
                                tjs_int originX,
-                               tjs_int originY)
+                               tjs_int originY,
+                               tjs_int viewW,
+                               tjs_int viewH,
+                               const glm::mat4& transform)
 {
     if (emtEngine._mainfile == nullptr || emtEngine._mainmotion == nullptr)
         return;
     if (!renderer || !target)
         return;
-    // D3D 直通路径不经 draw()/ResetDrawArea()：_limitArea 必须在这里初始化，
-    // 否则 progress() 因"区域为零"提前返回（动画不推进）、updateTransMat()
-    // 投影矩阵退化（什么都不画）。只补区域/变换，不创建软渲染目标。
-    if (width > 0 && height > 0 &&
-        (_limitArea.width == _limitArea.originX || _limitArea.height == _limitArea.originY ||
-         _width != width || _height != height || _limitArea.originX != originX ||
-         _limitArea.originY != originY))
-    {
-        _width = width;
-        _height = height;
-        _limitArea.originX = originX;
-        _limitArea.originY = originY;
-        _limitArea.width = width;
-        _limitArea.height = height;
-        if (emtEngine._mainfile != nullptr)
-            _limitArea.zMax = emtEngine.getZMax() * 2;
-        if (_limitArea.zMax < 30.0f)
-            _limitArea.zMax = 30.0f;
-        updateTransMat();
-    }
+    if (width <= 0 || height <= 0) return;
+    _width = width;
+    _height = height;
+    _limitArea = {(float)originX, (float)originY, (float)width, (float)height,
+                  std::max(30.0f, emtEngine.getZMax() * 2), (float)viewW, (float)viewH};
+    _targetTrans = transform;
+    prepareFrame();
     renderer->SetTarget(target);
     renderer->ClearTarget(selfClear);
     emtEngine.draw(renderer, target, _limitArea, maskTarget);
@@ -1011,13 +904,21 @@ void EmotePlayer::stopWind()
 {
     TVPConsoleLog("EmotePlayer::stopWind TODO");
 }
-bool EmotePlayer::contains(tjs_real x, tjs_real y)
+tjs_error EmotePlayer::cb_contains(
+    tTJSVariant* result, tjs_int numparams, tTJSVariant** param, EmotePlayer* objthis)
 {
-    if (emtEngine._mainMotionRef != nullptr)
-    {
-        return emtEngine._mainMotionRef->contains(x, y);
-    }
-    return false;
+    if (!objthis) return TJS_E_FAIL;
+    return dispatchEmoteHitTest(result, numparams, param,
+        [&](const char* label, tjs_real x, tjs_real y)
+        { return objthis->_hitFrame.contains(label, x, y, label != nullptr); });
+}
+tjs_error EmotePlayer::cb_hitTest(
+    tTJSVariant* result, tjs_int numparams, tTJSVariant** param, EmotePlayer* objthis)
+{
+    if (!objthis) return TJS_E_FAIL;
+    return dispatchEmoteHitTest(result, numparams, param,
+        [&](const char* label, tjs_real x, tjs_real y)
+        { return objthis->_hitFrame.contains(label, x, y); });
 }
 void EmotePlayer::skip()
 {
@@ -1238,48 +1139,7 @@ tTJSVariant EmotePlayer::getCommandList()
 }
 tTJSVariant EmotePlayer::getLayerGetter(tTJSString name)
 {
-    iTJSDispatch2* dsp = TJSCreateDictionaryObject();
-
-    // 递归寻找子motion ref
-    emotemotionref* emtObj = findMotionRefRecursive(emtEngine._mainMotionRef, name.c_str());
-
-    if (emtObj)
-    {
-        // motion
-        iTJSDispatch2* mtn = TVPCreateNativeClass_TmpMotionObj(this, emtObj);
-        if (mtn)
-        {
-            tTJSVariant mtnVar(mtn);
-            dsp->PropSet(TJS_MEMBERENSURE, "motion", nullptr, &mtnVar, dsp);
-            mtn->Release();
-        }
-    }
-    else if (emtEngine._mainMotionRef != nullptr)
-    {
-        // 在预计算的shapeNodeAreas中递归查找(后备则直接从frame提取)
-        emoterect foundArea = {};
-        if (findShapeAreaRecursive(emtEngine._mainMotionRef, name.c_str(), foundArea))
-        {
-            iTJSDispatch2* shapeObj = TVPCreateNativeClass_TmpMotionObj(nullptr, nullptr);
-            if (shapeObj)
-            {
-                tTJSVariant vL(foundArea.left), vT(foundArea.top), vW(foundArea.width), vH(foundArea.height);
-                tTJSVariant vST(foundArea.shapeType);
-                shapeObj->PropSet(TJS_MEMBERENSURE, TJS_N("l"), nullptr, &vL, shapeObj);
-                shapeObj->PropSet(TJS_MEMBERENSURE, TJS_N("t"), nullptr, &vT, shapeObj);
-                shapeObj->PropSet(TJS_MEMBERENSURE, TJS_N("w"), nullptr, &vW, shapeObj);
-                shapeObj->PropSet(TJS_MEMBERENSURE, TJS_N("h"), nullptr, &vH, shapeObj);
-                shapeObj->PropSet(TJS_MEMBERENSURE, TJS_N("shapeType"), nullptr, &vST, shapeObj);
-                tTJSVariant shapeVar(shapeObj);
-                dsp->PropSet(TJS_MEMBERENSURE, TJS_N("shape"), nullptr, &shapeVar, dsp);
-                shapeObj->Release();
-            }
-        }
-    }
-    
-    tTJSVariant var(dsp);
-    dsp->Release();
-    return var;
+    return makeLayerGetter(this, _hitFrame.motion.get(), name.c_str());
 }
 tTJSVariant EmotePlayer::getLayerMotion(tTJSString name)
 {
@@ -1318,20 +1178,28 @@ void EmotePlayer::updateTransMat()
 {
     _renderMethod.type = 3;
     _renderMethod.opa = 1.0f;
+    if (_limitArea.width <= 0 || _limitArea.height <= 0) return;
     // 构建变换矩阵
     glm::mat4 projection = glm::ortho(-_limitArea.originX, _limitArea.width - _limitArea.originX,
                                       _limitArea.height - _limitArea.originY, -_limitArea.originY,
                                       _limitArea.zMax, -_limitArea.zMax);
-    _renderMethod.attachMat = projection * _affineTrans;
+    _renderMethod.attachMat = projection * _targetTrans * _affineTrans;
     _renderMethod.currCoordx = currCoordx + currCamX;
     _renderMethod.currCoordy = currCoordy + currCamY;
     _renderMethod.currAngle = currAngle;
     _renderMethod.currZx = currZx;
     _renderMethod.currZy = currZy;
+    // 记录根投影参照系（shape 判定区域 clip→像素换算所用，
+    // 须与 cb_contains 的判定使用同一 limitArea；未传真实视口时的回退基准）
+    _renderMethod.originX = _limitArea.originX;
+    _renderMethod.originY = _limitArea.originY;
+    _renderMethod.width = _limitArea.width;
+    _renderMethod.height = _limitArea.height;
 }
 void EmotePlayer::ResetDrawArea(tjs_int width, tjs_int height)
 {
-    if (_width != width || _height != height)
+    if (_width != width || _height != height || !_target || !_maskTarget ||
+        _limitArea.originX != 0 || _limitArea.originY != 0)
     {
         // limit
         _limitArea.originX = 0;

@@ -25,6 +25,20 @@ enum PlayFlag
     PlayFlagForce
 };
 
+// Both plugin facades share one overload contract; argument count selects the signature.
+template <typename Query>
+tjs_error dispatchEmoteHitTest(tTJSVariant* result, tjs_int count, tTJSVariant** args, Query query)
+{
+    if (count != 2 && count != 3)
+        return TJS_E_BADPARAMCOUNT;
+    const int offset = count == 3 ? 1 : 0;
+    const std::string label = offset ? tTJSString(*args[0]).AsStdString() : std::string();
+    if (result)
+        *result = query(offset ? label.c_str() : nullptr,
+                        (tjs_real)*args[offset], (tjs_real)*args[offset + 1]);
+    return TJS_S_OK;
+}
+
 class Motion
 {
 public:
@@ -199,7 +213,13 @@ public:
 
     void startWind(tjs_real start, tjs_real goal, tjs_real speed, tjs_real powMin, tjs_real powMax);
     void stopWind();
-    bool contains(tjs_real x, tjs_real y);
+    // contains keeps the legacy affine input coordinates; hitTest uses target pixels.
+    // hitTest([label,] x, y) always uses the drawn target's top-left pixel coordinates.
+    static tjs_error cb_contains(tTJSVariant* result, tjs_int numparams, tTJSVariant** param,
+                                 EmotePlayer* objthis);
+    static tjs_error cb_hitTest(tTJSVariant* result, tjs_int numparams, tTJSVariant** param,
+                                EmotePlayer* objthis);
+    const EmoteHitFrame& getHitFrame() const { return _hitFrame; }
 
     void skip();
     void skipToSync();
@@ -208,11 +228,7 @@ public:
 
     // GPU 直通绘制：把动画网格直接绘制到给定后端离屏目标（不经引擎 Layer、无 CPU 回读）。
     // 供 DrawDeviceD3D 的 D3DEmotePlayer 使用；renderer/target/maskTarget 来自渲染后端抽象。
-    // GPU 直通绘制：width/height 为绘制区域（limit），originX/originY 为区域原点
-    //（该区域在 progress()/updateTransMat() 中被依赖；软渲染路径由
-    // ResetDrawArea() 初始化，直通路径必须显式传入）。
-    // 直通路径的兼容约定：D3D 用 dx_ 模型，画布 y 自底向上锚定
-    //（originY = canvasH - screenH），与软渲染 e- 模型（自上而下）不同。
+    // The outer transform is shared by drawing and legacy local-coordinate queries.
     void drawToTarget(krkrsdl3::iTVPRenderBackend* renderer,
                       void* target,
                       void* maskTarget,
@@ -220,7 +236,10 @@ public:
                       tjs_int width = 0,
                       tjs_int height = 0,
                       tjs_int originX = 0,
-                      tjs_int originY = 0);
+                      tjs_int originY = 0,
+                      tjs_int viewW = 0,
+                      tjs_int viewH = 0,
+                      const glm::mat4& transform = glm::mat4(1.0f));
     void playTimeline(tTJSString name, tjs_int flags = 0);
     void stopTimeline(tTJSString name = "");
     bool getTimelinePlaying(tTJSString name = "");
@@ -262,6 +281,7 @@ private:
     bool withoutAdaptor = false;
     // transform
     void updateTransMat();
+    void prepareFrame();
     void ResetDrawArea(tjs_int width, tjs_int height);
     tjs_int _width = 0, _height = 0;
     float currCoordx = 0, currCoordy = 0, currCoordz = 0; // 坐标
@@ -271,6 +291,8 @@ private:
     emoteRender _renderMethod;
     emotelimit _limitArea;
     glm::mat4 _affineTrans = glm::mat4(1.0f);
+    glm::mat4 _targetTrans = glm::mat4(1.0f);
+    EmoteHitFrame _hitFrame;
 
     ttstr _motionKey;
     ttstr _motion;
@@ -309,6 +331,16 @@ public:
     using EmotePlayer::setCameraOffset;
     using EmotePlayer::setColor;
     using EmotePlayer::setCoord;
+    static tjs_error cb_contains(tTJSVariant* result, tjs_int numparams, tTJSVariant** param,
+                                 Player* objthis)
+    {
+        return EmotePlayer::cb_contains(result, numparams, param, objthis);
+    }
+    static tjs_error cb_hitTest(tTJSVariant* result, tjs_int numparams, tTJSVariant** param,
+                                Player* objthis)
+    {
+        return EmotePlayer::cb_hitTest(result, numparams, param, objthis);
+    }
     using EmotePlayer::setDrawAffineTranslateMatrix;
     using EmotePlayer::setOuterForce;
     using EmotePlayer::setRotate;
