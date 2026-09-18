@@ -130,7 +130,7 @@ struct MetalRenderBackend::Impl
     id<MTLRenderPipelineState> meshPipelines[3] = {nil, nil, nil};
     id<MTLComputePipelineState> layerPipeline = nil, ordinaryLayerPipeline = nil;
     id<MTLBuffer> alphaTables = nil;
-    id<MTLTexture> ordinaryDummy = nil;
+    id<MTLTexture> ordinaryDummy = nil, ordinarySnapshot = nil, ordinarySourceSnapshot = nil;
     id<MTLTexture> destinationSnapshot = nil;
     dispatch_semaphore_t inFlight = dispatch_semaphore_create(2);
     std::shared_ptr<std::atomic<bool>> gpuFailed = std::make_shared<std::atomic<bool>>(false);
@@ -665,13 +665,17 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
         if(!overwrite || s==t) {
             id<MTLBlitCommandEncoder> blit=[p.Commands() blitCommandEncoder]; if(!blit) return false;
             if(!overwrite) {
-                snapshot=p.Texture(clip.Width(),clip.Height()); if(!snapshot) { [blit endEncoding]; return false; }
+                if(!p.ordinarySnapshot || p.ordinarySnapshot.width!=NSUInteger(clip.Width()) || p.ordinarySnapshot.height!=NSUInteger(clip.Height()))
+                    p.ordinarySnapshot=p.Texture(clip.Width(),clip.Height());
+                snapshot=p.ordinarySnapshot; if(!snapshot) { [blit endEncoding]; return false; }
                 [blit copyFromTexture:t->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(clip.left,clip.top,0)
                       sourceSize:MTLSizeMake(clip.Width(),clip.Height(),1) toTexture:snapshot destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
             }
             if(s==t) {
                 int x=std::min(src.left,src.right),y=std::min(src.top,src.bottom);
-                sourceTexture=p.Texture(std::abs(src.Width()),std::abs(src.Height()));
+                if(!p.ordinarySourceSnapshot || p.ordinarySourceSnapshot.width!=NSUInteger(std::abs(src.Width())) || p.ordinarySourceSnapshot.height!=NSUInteger(std::abs(src.Height())))
+                    p.ordinarySourceSnapshot=p.Texture(std::abs(src.Width()),std::abs(src.Height()));
+                sourceTexture=p.ordinarySourceSnapshot;
                 if(!sourceTexture) { [blit endEncoding]; return false; }
                 [blit copyFromTexture:s->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(x,y,0)
                       sourceSize:MTLSizeMake(std::abs(src.Width()),std::abs(src.Height()),1) toTexture:sourceTexture destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
@@ -692,7 +696,10 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
         [e setBuffer:p.alphaTables offset:0 atIndex:1];
         [e setTexture:sourceTexture atIndex:0]; [e setTexture:snapshot ? snapshot : sourceTexture atIndex:1]; [e setTexture:t->texture atIndex:2];
         [e dispatchThreads:MTLSizeMake(clip.Width(),clip.Height(),1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
-        [e endEncoding]; return true;
+        [e endEncoding];
+        p.transientBytes+=size_t(clip.Width())*clip.Height()*4;
+        if(p.transientBytes>=Impl::kSubmissionBudget) p.Submit();
+        return true;
     }
 }
 

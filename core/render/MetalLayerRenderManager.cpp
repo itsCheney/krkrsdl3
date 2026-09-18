@@ -193,6 +193,7 @@ public:
                 if(dst.right>int(t->GetWidth())) { src.right-=float(src.get_width())/dst.get_width()*(dst.right-t->GetWidth()); dst.right=t->GetWidth(); }
                 if(dst.top<0) { src.top+=float(sh)/dh*-dst.top; dst.top=0; }
                 if(dst.bottom>int(t->GetHeight())) { src.bottom-=float(src.get_height())/dst.get_height()*(dst.bottom-t->GetHeight()); dst.bottom=t->GetHeight(); }
+                if(src.get_width()==0 || src.get_height()==0 || dst.get_width()<=0 || dst.get_height()<=0) return true;
             } else if((sw<0 || sh<0) && (std::abs(sw)!=dw || std::abs(sh)!=dh)) return false;
         } else if(op.kind!=TVPLayerOperationKind::Fill && op.kind!=TVPLayerOperationKind::FillColor && op.kind!=TVPLayerOperationKind::FillMask) return false;
         if(!session->tablesReady) {
