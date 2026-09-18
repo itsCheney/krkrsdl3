@@ -1520,7 +1520,7 @@ public:
             tjs_int w = rctar.get_width(), h = rctar.get_height();
             assert(rcsrc.get_width() == -w && rcsrc.get_height() == h);
             tjs_int wbytes = w * pixelsize;
-            tjs_int srcright = rcsrc.right - 1;
+            tjs_int srcright = rcsrc.right; // half-open reversed rectangle: no read before its left edge
             if (pixelsize == 4)
             { // 32bpp
                 for (int y = 0; y < h; ++y)
@@ -1576,22 +1576,22 @@ public:
                      tjs_int h,
                      bool backwardCopy)
     {
-        // 32bpp
-        w *= sizeof(tjs_uint32);
+        const int pixelSize = dst->GetFormat()==TVPTextureFormat::Gray ? 1 : 4;
+        w *= pixelSize;
         if (backwardCopy)
         {
             for (tjs_int y = h - 1; y >= 0; --y)
             {
-                memmove(((tjs_uint32*)dst->GetScanLineForWrite(dy + y)) + dx,
-                        ((const tjs_uint32*)src->GetScanLineForRead(sy + y)) + sx, w);
+                memmove(static_cast<uint8_t*>(dst->GetScanLineForWrite(dy + y)) + dx*pixelSize,
+                        static_cast<const uint8_t*>(src->GetScanLineForRead(sy + y)) + sx*pixelSize, w);
             }
         }
         else
         {
             for (tjs_int y = 0; y < h; ++y)
             {
-                memmove(((tjs_uint32*)dst->GetScanLineForWrite(dy + y)) + dx,
-                        ((const tjs_uint32*)src->GetScanLineForRead(sy + y)) + sx, w);
+                memmove(static_cast<uint8_t*>(dst->GetScanLineForWrite(dy + y)) + dx*pixelSize,
+                        static_cast<const uint8_t*>(src->GetScanLineForRead(sy + y)) + sx*pixelSize, w);
             }
         }
     }
