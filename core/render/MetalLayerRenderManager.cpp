@@ -103,15 +103,30 @@ public:
         }
         return handle;
     }
-    void Update(const void* data,TVPTextureFormat::e f,int pitch,const tTVPRect& r) override {
-        if(!data || f!=format || r.left<0 || r.top<0 || r.right>Width || r.bottom>Height || r.get_width()<=0 || r.get_height()<=0)
-            throw std::runtime_error("Invalid GPU Layer update");
-        int bytes=r.get_width()*(format==TVPTextureFormat::Gray ? 1 : 4);
+    void Update(const void* data,TVPTextureFormat::e f,int pitch,const tTVPRect& requested) override {
+        // Video/AlphaMovie frames may extend beyond the canvas. Empty and fully
+        // clipped updates are no-ops; the source describes the requested ROI.
+        if(requested.get_width()<=0 || requested.get_height()<=0) return;
+        tTVPRect r(std::max(0,requested.left),std::max(0,requested.top),
+                   std::min(Width,requested.right),std::min(Height,requested.bottom));
+        if(r.get_width()<=0 || r.get_height()<=0) return;
+        int bpp=format==TVPTextureFormat::Gray ? 1 : 4;
+        if(!data || f!=format || pitch<=0 || size_t(pitch)<size_t(requested.get_width())*bpp) {
+            throw std::runtime_error("Invalid GPU Layer update: format="+std::to_string(int(f))+
+                " targetFormat="+std::to_string(int(format))+" pitch="+std::to_string(pitch)+
+                " texture="+std::to_string(Width)+"x"+std::to_string(Height)+
+                " rect="+std::to_string(requested.left)+","+std::to_string(requested.top)+","+
+                std::to_string(requested.right)+","+std::to_string(requested.bottom));
+        }
+        const auto* source=static_cast<const uint8_t*>(data)+size_t(r.top-requested.top)*pitch+
+                           size_t(r.left-requested.left)*bpp;
+        int bytes=r.get_width()*bpp;
         if(pinned || dirty || !handle) {
-            Read(); for(int y=0;y<r.get_height();++y) std::memcpy(pixels.data()+size_t(y+r.top)*GetPitch()+r.left*(format==TVPTextureFormat::Gray?1:4),static_cast<const uint8_t*>(data)+y*pitch,bytes);
+            Read(); for(int y=0;y<r.get_height();++y)
+                std::memcpy(pixels.data()+size_t(y+r.top)*GetPitch()+r.left*bpp,source+size_t(y)*pitch,bytes);
             dirty=true; return;
         }
-        if(!session->backend->UpdateLayerTexture(handle,static_cast<const uint8_t*>(data),pitch,Rect(r)))
+        if(!session->backend->UpdateLayerTexture(handle,source,pitch,Rect(r)))
             throw std::runtime_error("GPU Layer update failed");
         session->stats.uploadedBytes+=size_t(bytes)*r.get_height(); InvalidateCPUCache();
     }

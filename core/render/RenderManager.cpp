@@ -968,34 +968,24 @@ public:
     virtual void Update(const void* pixel,
                         TVPTextureFormat::e format,
                         int pitch,
-                        const tTVPRect& rc)
+                        const tTVPRect& requested) override
     {
-        assert(rc.left == 0);
-        unsigned char* src = (unsigned char*)pixel;
-        tjs_uint8* dst = (tjs_uint8*)Bitmap->GetScanLine(rc.top);
-        int dstPitch = Bitmap->GetPitch();
-        int h = std::min(rc.get_height(), (int)Bitmap->GetHeight()) - rc.top;
-        int w = rc.get_width();
-        if (w == Bitmap->GetWidth() && pitch == dstPitch)
-            memcpy(dst, src, pitch * h);
-        else if (format == TVPTextureFormat::RGB)
-        {
-            for (int y = 0; y < h; ++y)
-            {
-                TVPConvert24BitTo32Bit((tjs_uint32*)dst, src, w);
-                dst += dstPitch;
-                src += pitch;
-            }
-        }
-        else
-        {
-            int linesize = std::min(pitch, dstPitch);
-            for (int y = 0; y < h; ++y)
-            {
-                memcpy(dst, src, linesize);
-                dst += dstPitch;
-                src += pitch;
-            }
+        if(requested.get_width()<=0 || requested.get_height()<=0) return;
+        tTVPRect rc(std::max(0,requested.left),std::max(0,requested.top),
+                    std::min(int(Width),requested.right),std::min(int(Height),requested.bottom));
+        if(rc.get_width()<=0 || rc.get_height()<=0) return;
+        const int sourceBPP=format==TVPTextureFormat::RGB ? 3 : format==TVPTextureFormat::Gray ? 1 : 4;
+        const int destinationBPP=Bitmap->Is32bit() ? 4 : 1;
+        if(!pixel || pitch<=0 || size_t(pitch)<size_t(requested.get_width())*sourceBPP ||
+           (sourceBPP!=destinationBPP && !(sourceBPP==3 && destinationBPP==4)))
+            TVPThrowExceptionMessage(TJS_N("Invalid software Layer update"));
+        const auto* src=static_cast<const uint8_t*>(pixel)+size_t(rc.top-requested.top)*pitch+
+                        size_t(rc.left-requested.left)*sourceBPP;
+        for(int y=0;y<rc.get_height();++y) {
+            auto* dst=static_cast<uint8_t*>(Bitmap->GetScanLine(rc.top+y))+rc.left*destinationBPP;
+            if(sourceBPP==3) TVPConvert24BitTo32Bit(reinterpret_cast<tjs_uint32*>(dst),src,rc.get_width());
+            else std::memcpy(dst,src,size_t(rc.get_width())*destinationBPP);
+            src+=pitch;
         }
         Bitmap->IsOpaque = false;
     }
