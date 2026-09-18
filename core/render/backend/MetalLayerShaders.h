@@ -38,7 +38,7 @@ int4 layerSample(texture2d<float, access::read> texture, constant LayerParameter
     float4 c11 = float4(layerBytes(texture, base + bb));
     float4 value = (1-factor.x)*(1-factor.y)*c00 + factor.x*(1-factor.y)*c10 +
                    (1-factor.x)*factor.y*c01 + factor.x*factor.y*c11;
-    return int4(value + 0.5) & int4(255);
+    return int4(max(value + 0.5, float4(0))) & int4(255);
 }
 kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
                           constant LayerParameters& p [[buffer(0)]],
@@ -55,7 +55,7 @@ kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
     bool overwrite = kind == 1 || kind == 4 || kind == 5;
     int4 d = int4(0), s = int4(0), color = p.color, result = int4(0);
     if (!overwrite) d = layerBytes(snapshot, xy - p.clip.xy);
-    if (kind < 5 || kind >= 8) s = layerSample(source, p, xy);
+    if (kind < 5 || (kind >= 8 && kind <= 10)) s = layerSample(source, p, xy);
     switch (kind) {
         case 1: result = s; break;
         case 2: result = int4(s.rgb, d.a); break;
@@ -66,18 +66,19 @@ kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
         case 7: result = int4(d.rgb, opa); break;
         case 8:
         case 9:
-        case 10: {
+        case 10:
+        case 11: {
             int alpha;
-            if (kind == 9) alpha = opa;
+            if (kind == 9 || kind == 11) alpha = opa;
             else {
                 alpha = kind == 10 ? s.r : s.a;
                 if (!full) alpha = (alpha * opa) >> 8;
             }
-            int3 rgb = kind == 10 ? color.rgb : s.rgb;
+            int3 rgb = kind == 10 || kind == 11 ? color.rgb : s.rgb;
             if (straightDestination) {
                 uint index = uint((alpha << 8) + d.a);
                 int ratio = int(tables[index]);
-                result = int4(d.rgb + (((rgb - d.rgb) * ratio) >> 8), int(tables[65536 + index]));
+                result = int4(d.rgb + (((rgb - d.rgb) * ratio) >> 8), kind == 11 ? 255 - (((255-d.a)*(255-alpha))>>8) : int(tables[65536 + index]));
             } else if (premultipliedDestination) {
                 int3 premul = kind == 9 ? rgb : (rgb * alpha) >> 8;
                 int3 output = min(((d.rgb * (255 - alpha)) >> 8) + premul, int3(255));
@@ -85,7 +86,7 @@ kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
                 da -= da >> 8;
                 result = int4(output, da);
             } else {
-                result = int4(d.rgb + (((rgb - d.rgb) * alpha) >> 8), hold ? d.a : 0);
+                result = int4(kind == 11 ? ((d.rgb * (255-alpha) + rgb * alpha)>>8) : d.rgb + (((rgb - d.rgb) * alpha) >> 8), hold ? d.a : 0);
             }
             break;
         }

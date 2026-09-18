@@ -177,7 +177,7 @@ public:
     bool GPU(iTVPRenderMethod* method,iTVPTexture2D* target,iTVPTexture2D* reference,tTVPRect dst,const tRenderTexRectArray& inputs) {
         auto* t=dynamic_cast<LayerTexture*>(target); TVPLayerOperation op;
         if(!session || !t || !t->Belongs(session) || t->IsCPUResident() || inputs.size()>1 ||
-            (reference && reference!=target) || !method->DescribeGpuOperation(op) || stretch<0 || stretch>2) return false;
+            !method->DescribeGpuOperation(op) || stretch<0 || stretch>2) return false;
         if(op.opacity<0 || op.opacity>255) return false;
         LayerTexture* source=nullptr; tTVPRect src(0,0,1,1);
         if(inputs.size()) {
@@ -195,7 +195,7 @@ public:
                 if(dst.bottom>int(t->GetHeight())) { src.bottom-=float(src.get_height())/dst.get_height()*(dst.bottom-t->GetHeight()); dst.bottom=t->GetHeight(); }
                 if(src.get_width()==0 || src.get_height()==0 || dst.get_width()<=0 || dst.get_height()<=0) return true;
             } else if((sw<0 || sh<0) && (std::abs(sw)!=dw || std::abs(sh)!=dh)) return false;
-        } else if(op.kind!=TVPLayerOperationKind::Fill && op.kind!=TVPLayerOperationKind::FillColor && op.kind!=TVPLayerOperationKind::FillMask) return false;
+        } else if(op.kind!=TVPLayerOperationKind::Fill && op.kind!=TVPLayerOperationKind::FillColor && op.kind!=TVPLayerOperationKind::FillMask && op.kind!=TVPLayerOperationKind::FillBlend) return false;
         if(!session->tablesReady) {
             if(!session->backend->SetLayerAlphaTables(TVPOpacityOnOpacityTable,TVPNegativeMulTable)) return false;
             session->tablesReady=true;

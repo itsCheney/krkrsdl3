@@ -649,7 +649,7 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
     @autoreleasepool {
         auto& p=*impl_; auto* t=p.Find(target); auto* s=p.Find(source);
         int kind=static_cast<int>(operation.kind);
-        bool needsSource=kind<5 || kind>=8;
+        bool needsSource=kind<5 || (kind>=8 && kind<=10);
         if(!p.ordinaryLayerPipeline || !t || t->bytesPerPixel!=4 || kind==0 || (needsSource && !s) ||
             dst.Width()<=0 || dst.Height()<=0 || sampling<0 || sampling>1) return false;
         if(needsSource && (src.Width()==0 || src.Height()==0 || std::min(src.left,src.right)<0 ||

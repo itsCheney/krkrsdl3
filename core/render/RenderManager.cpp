@@ -191,10 +191,13 @@ inline uint32_t SampleBilinear(const uint8_t* src, int srcW, int srcH, int srcPi
     const uint8_t* p01 = p00 + (srcH == 1 ? 0 : srcPitch);
     const uint8_t* p11 = p01 + (srcW == 1 ? 0 : 4);
 
-    uint8_t r = (uint8_t)(ifx * ify * p00[0] + fx * ify * p10[0] + ifx * fy * p01[0] + fx * fy * p11[0] + 0.5f);
-    uint8_t g = (uint8_t)(ifx * ify * p00[1] + fx * ify * p10[1] + ifx * fy * p01[1] + fx * fy * p11[1] + 0.5f);
-    uint8_t b = (uint8_t)(ifx * ify * p00[2] + fx * ify * p10[2] + ifx * fy * p01[2] + fx * fy * p11[2] + 0.5f);
-    uint8_t a = (uint8_t)(ifx * ify * p00[3] + fx * ify * p10[3] + ifx * fy * p01[3] + fx * fy * p11[3] + 0.5f);
+    // ARM float-to-unsigned conversion clamps negative extrapolation to zero.
+    // Make that behavior defined and identical on the desktop test oracle.
+    auto byte = [](float v) { return uint8_t(uint32_t(std::max(0.0f, v + 0.5f))); };
+    uint8_t r = byte(ifx * ify * p00[0] + fx * ify * p10[0] + ifx * fy * p01[0] + fx * fy * p11[0]);
+    uint8_t g = byte(ifx * ify * p00[1] + fx * ify * p10[1] + ifx * fy * p01[1] + fx * fy * p11[1]);
+    uint8_t b = byte(ifx * ify * p00[2] + fx * ify * p10[2] + ifx * fy * p01[2] + fx * fy * p11[2]);
+    uint8_t a = byte(ifx * ify * p00[3] + fx * ify * p10[3] + ifx * fy * p01[3] + fx * fy * p11[3]);
 
     return (uint32_t)a << 24 | (uint32_t)b << 16 | (uint32_t)g << 8 | r;
 }
@@ -1360,7 +1363,7 @@ public:
             return 1;
         return -1;
     }
-    virtual void SetParameterColor4B(int id, unsigned int v) { clr = v; }
+    virtual void SetParameterColor4B(int id, unsigned int v) { clr = v; iTVPRenderMethod::SetParameterColor4B(id, v); }
     virtual void SetParameterOpa(int id, int v) { opa = v; iTVPRenderMethod::SetParameterOpa(id, v); }
 
     virtual void DoRender(iTVPTexture2D* _tar,
@@ -2694,6 +2697,9 @@ void iTVPRenderManager::RegisterRenderMethod(const char* name, iTVPRenderMethod*
         {"CopyMask", K::CopyMask, 0, false}, {"CopyOpaqueImage", K::CopyOpaque, 0, false},
         {"FillARGB", K::Fill, 0, false}, {"FillColor", K::FillColor, 0, false},
         {"FillMask", K::FillMask, 0, true},
+        {"ConstColorAlphaBlend", K::FillBlend, TVP_LAYER_HOLD_ALPHA, true},
+        {"ConstColorAlphaBlend_d", K::FillBlend, TVP_LAYER_DEST_ALPHA, true},
+        {"ConstColorAlphaBlend_a", K::FillBlend, TVP_LAYER_DEST_PREMULTIPLIED, true},
         {"AlphaBlend", K::Alpha, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
         {"AlphaBlend_HDA", K::Alpha, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
         {"AlphaBlend_d", K::Alpha, TVP_LAYER_DEST_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
