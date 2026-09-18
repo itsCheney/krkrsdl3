@@ -45,7 +45,11 @@ kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
                           const device uchar* tables [[buffer(1)]],
                           texture2d<float, access::read> source [[texture(0)]],
                           texture2d<float, access::read> snapshot [[texture(1)]],
+#ifdef TVP_LAYER_IN_PLACE
+                          texture2d<float, access::read_write> target [[texture(2)]]) {
+#else
                           texture2d<float, access::write> target [[texture(2)]]) {
+#endif
     int2 xy = p.clip.xy + int2(tid);
     if (any(xy >= p.clip.zw)) return;
     int kind = p.operation.x, opa = p.operation.y, flags = p.operation.z;
@@ -54,7 +58,15 @@ kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
     bool full = opa == 255 && (flags & 8) != 0;
     bool overwrite = kind == 1 || kind == 4 || kind == 5;
     int4 d = int4(0), s = int4(0), color = p.color, result = int4(0);
-    if (!overwrite) d = layerBytes(snapshot, xy - p.clip.xy);
+    if (!overwrite) {
+#ifdef TVP_LAYER_IN_PLACE
+        // Each thread snapshots only its own pixel in registers. Source aliases
+        // are copied separately before dispatch; no neighboring target is read.
+        d = int4(round(target.read(uint2(xy)) * 255.0));
+#else
+        d = layerBytes(snapshot, xy - p.clip.xy);
+#endif
+    }
     if (kind < 5 || (kind >= 8 && kind <= 10)) s = layerSample(source, p, xy);
     switch (kind) {
         case 1: result = s; break;

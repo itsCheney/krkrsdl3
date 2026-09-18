@@ -16,6 +16,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 
 namespace krkrsdl3
@@ -128,7 +129,9 @@ struct MetalRenderBackend::Impl
     id<MTLCommandBuffer> commands = nil, lastSubmitted = nil;
     id<MTLRenderPipelineState> windowPipeline = nil, capturePipeline = nil;
     id<MTLRenderPipelineState> meshPipelines[3] = {nil, nil, nil};
-    id<MTLComputePipelineState> layerPipeline = nil, ordinaryLayerPipeline = nil;
+    id<MTLComputePipelineState> layerPipeline = nil, ordinaryLayerPipeline = nil, ordinaryInPlacePipeline = nil;
+    id<MTLComputeCommandEncoder> ordinaryEncoder = nil;
+    id<MTLTexture> ordinaryBoundSource = nil, ordinaryBoundTarget = nil;
     id<MTLBuffer> alphaTables = nil;
     id<MTLTexture> ordinaryDummy = nil, ordinarySnapshot = nil, ordinarySourceSnapshot = nil;
     id<MTLTexture> destinationSnapshot = nil;
@@ -192,8 +195,24 @@ struct MetalRenderBackend::Impl
         }
         return commands;
     }
+    void EndOrdinary() {
+        if(ordinaryEncoder) { [ordinaryEncoder endEncoding]; ordinaryEncoder=nil; }
+        ordinaryBoundSource=nil; ordinaryBoundTarget=nil;
+    }
+    id<MTLBlitCommandEncoder> Blit() { EndOrdinary(); return [Commands() blitCommandEncoder]; }
+    id<MTLComputeCommandEncoder> Compute() { EndOrdinary(); return [Commands() computeCommandEncoder]; }
+    id<MTLComputeCommandEncoder> OrdinaryCompute() {
+        if(!ordinaryEncoder) {
+            // Serial dispatches provide write/read ordering for tracked textures.
+            ordinaryEncoder=[Commands() computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+            [ordinaryEncoder setComputePipelineState:ordinaryInPlacePipeline];
+            [ordinaryEncoder setBuffer:alphaTables offset:0 atIndex:1];
+        }
+        return ordinaryEncoder;
+    }
     bool Submit(bool wait = false)
     {
+        EndOrdinary();
         if (commands) {
             lastSubmitted = commands;
             [commands commit];
@@ -217,6 +236,7 @@ struct MetalRenderBackend::Impl
     }
     id<MTLRenderCommandEncoder> Pass(id<MTLTexture> texture, bool clear)
     {
+        EndOrdinary();
         MTLRenderPassDescriptor* p = [MTLRenderPassDescriptor renderPassDescriptor];
         p.colorAttachments[0].texture = texture;
         p.colorAttachments[0].loadAction = clear ? MTLLoadActionClear : MTLLoadActionLoad;
@@ -259,7 +279,7 @@ struct MetalRenderBackend::Impl
         for (int y = 0; y < h; ++y)
             std::memcpy(static_cast<uint8_t*>(staging.contents) + y * rowBytes,
                         pixels + static_cast<size_t>(y) * pitch, static_cast<size_t>(w) * 4);
-        id<MTLBlitCommandEncoder> e = [Commands() blitCommandEncoder];
+        id<MTLBlitCommandEncoder> e = Blit();
         if (!e) throw std::runtime_error("Metal blit encoder allocation failed");
         [e copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:rowBytes sourceBytesPerImage:rowBytes * h
               sourceSize:MTLSizeMake(w, h, 1) toTexture:r->texture destinationSlice:0 destinationLevel:0
@@ -283,7 +303,7 @@ struct MetalRenderBackend::Impl
         const size_t rowBytes = (w * bpp + 255) & ~size_t(255);
         id<MTLBuffer> staging = [device newBufferWithLength:rowBytes * h options:MTLResourceStorageModeShared];
         if (!staging) return false;
-        id<MTLBlitCommandEncoder> e = [Commands() blitCommandEncoder];
+        id<MTLBlitCommandEncoder> e = Blit();
         if (!e) return false;
         [e copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(x, y, 0)
                 sourceSize:MTLSizeMake(w, h, 1) toBuffer:staging destinationOffset:0
@@ -302,7 +322,7 @@ struct MetalRenderBackend::Impl
             destinationSnapshot.height != static_cast<NSUInteger>(r->height))
             destinationSnapshot = Texture(r->width, r->height);
         if (!destinationSnapshot) throw std::runtime_error("Metal snapshot texture allocation failed");
-        id<MTLBlitCommandEncoder> e = [Commands() blitCommandEncoder];
+        id<MTLBlitCommandEncoder> e = Blit();
         if (!e) throw std::runtime_error("Metal blit encoder allocation failed");
         [e copyFromTexture:r->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
                 sourceSize:MTLSizeMake(r->width, r->height, 1) toTexture:destinationSnapshot
@@ -388,6 +408,18 @@ struct MetalRenderBackend::Impl
                                                       options:ordinaryOptions error:&error];
         if (ordinary) ordinaryLayerPipeline = [device newComputePipelineStateWithFunction:
                                                [ordinary newFunctionWithName:@"ordinaryLayer"] error:&error];
+        if(ordinaryLayerPipeline && device.readWriteTextureSupport == MTLReadWriteTextureTier2) {
+            // These kernels read only their own destination pixel, into registers,
+            // before overwriting it. Aliased sources still require region snapshots.
+            std::string inPlaceSource("#define TVP_LAYER_IN_PLACE 1\n");
+            inPlaceSource+=kMetalLayerShaders;
+            id<MTLLibrary> inPlace=[device newLibraryWithSource:[NSString stringWithUTF8String:inPlaceSource.c_str()]
+                                                      options:ordinaryOptions error:&error];
+            if(inPlace) ordinaryInPlacePipeline=[device newComputePipelineStateWithFunction:
+                                                  [inPlace newFunctionWithName:@"ordinaryLayer"] error:&error];
+            if(!ordinaryInPlacePipeline) SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
+                "GPU Layer in-place optimization unavailable; region snapshots retained: %s",error.localizedDescription.UTF8String);
+        }
         if (!ordinaryLayerPipeline) SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
             "GPU Layer initialization failed; software composition retained: %s", error.localizedDescription.UTF8String);
         return windowPipeline && capturePipeline && meshPipelines[0] && meshPipelines[1] &&
@@ -568,7 +600,7 @@ void MetalRenderBackend::LayerDrawRect(void* h, float x, float y, float w, float
         Params uniforms = p.layerParams;
         uniforms.rect = simd_make_float4(x, y, w, height);
         uniforms.uv = simd_make_float4(u0, v0, u1, v1);
-        id<MTLComputeCommandEncoder> e = [p.Commands() computeCommandEncoder];
+        id<MTLComputeCommandEncoder> e = p.Compute();
         if (!e) throw std::runtime_error("Metal compute encoder allocation failed");
         [e setComputePipelineState:p.layerPipeline];
         [e setBytes:&uniforms length:sizeof(uniforms) atIndex:0];
@@ -638,7 +670,7 @@ bool MetalRenderBackend::UpdateLayerTexture(void* handle, const uint8_t* pixels,
         id<MTLBuffer> staging=[p.device newBufferWithLength:row*rc.Height() options:MTLResourceStorageModeShared];
         if (!staging) return false;
         for(int y=0;y<rc.Height();++y) std::memcpy(static_cast<uint8_t*>(staging.contents)+y*row,pixels+y*pitch,bytes);
-        id<MTLBlitCommandEncoder> e=[p.Commands() blitCommandEncoder]; if(!e) return false;
+        id<MTLBlitCommandEncoder> e=p.Blit(); if(!e) return false;
         [e copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:row sourceBytesPerImage:row*rc.Height()
               sourceSize:MTLSizeMake(rc.Width(),rc.Height(),1) toTexture:r->texture destinationSlice:0 destinationLevel:0
               destinationOrigin:MTLOriginMake(rc.left,rc.top,0)];
@@ -666,13 +698,14 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
         TVPLayerRect clip={std::max(0,dst.left),std::max(0,dst.top),std::min(t->width,dst.right),std::min(t->height,dst.bottom)};
         if(clip.Width()<=0 || clip.Height()<=0) return true;
         bool overwrite=kind==1 || kind==4 || kind==5;
+        bool inPlace=p.ordinaryInPlacePipeline!=nil;
         id<MTLTexture> snapshot=nil, sourceTexture=s ? s->texture : p.ordinaryDummy;
         if(!sourceTexture) { p.ordinaryDummy=p.Texture(1,1); sourceTexture=p.ordinaryDummy; }
         // Snapshot only affected destination pixels. Source aliases need a
         // separate region snapshot before any write, including overlapping copies.
-        if(!overwrite || s==t) {
-            id<MTLBlitCommandEncoder> blit=[p.Commands() blitCommandEncoder]; if(!blit) return false;
-            if(!overwrite) {
+        if((!inPlace && !overwrite) || s==t) {
+            id<MTLBlitCommandEncoder> blit=p.Blit(); if(!blit) return false;
+            if(!inPlace && !overwrite) {
                 if(!p.ordinarySnapshot || p.ordinarySnapshot.width!=NSUInteger(clip.Width()) || p.ordinarySnapshot.height!=NSUInteger(clip.Height()))
                     p.ordinarySnapshot=p.Texture(clip.Width(),clip.Height());
                 snapshot=p.ordinarySnapshot; if(!snapshot) { [blit endEncoding]; return false; }
@@ -697,14 +730,19 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
         params.clip={clip.left,clip.top,clip.right,clip.bottom};
         params.operation={kind,operation.opacity,static_cast<int>(operation.flags),sampling};
         params.color={int(operation.color&255),int((operation.color>>8)&255),int((operation.color>>16)&255),int(operation.color>>24)};
-        id<MTLComputeCommandEncoder> e=[p.Commands() computeCommandEncoder]; if(!e) return false;
-        [e setComputePipelineState:p.ordinaryLayerPipeline]; [e setBytes:&params length:sizeof(params) atIndex:0];
-        // Unused arguments still need valid bindings on Metal validation.
         if(!p.alphaTables) p.alphaTables=[p.device newBufferWithLength:131072 options:MTLResourceStorageModeShared];
-        [e setBuffer:p.alphaTables offset:0 atIndex:1];
-        [e setTexture:sourceTexture atIndex:0]; [e setTexture:snapshot ? snapshot : sourceTexture atIndex:1]; [e setTexture:t->texture atIndex:2];
+        id<MTLComputeCommandEncoder> e=inPlace ? p.OrdinaryCompute() : p.Compute(); if(!e) return false;
+        [e setBytes:&params length:sizeof(params) atIndex:0];
+        if(inPlace) {
+            if(p.ordinaryBoundSource!=sourceTexture) { [e setTexture:sourceTexture atIndex:0]; p.ordinaryBoundSource=sourceTexture; }
+            if(p.ordinaryBoundTarget!=t->texture) { [e setTexture:t->texture atIndex:2]; p.ordinaryBoundTarget=t->texture; }
+        } else {
+            [e setComputePipelineState:p.ordinaryLayerPipeline];
+            [e setBuffer:p.alphaTables offset:0 atIndex:1];
+            [e setTexture:sourceTexture atIndex:0]; [e setTexture:snapshot ? snapshot : sourceTexture atIndex:1]; [e setTexture:t->texture atIndex:2];
+        }
         [e dispatchThreads:MTLSizeMake(clip.Width(),clip.Height(),1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
-        [e endEncoding];
+        if(!inPlace) [e endEncoding];
         p.transientBytes+=size_t(clip.Width())*clip.Height()*4;
         if(p.transientBytes>=Impl::kSubmissionBudget) p.Submit();
         return true;
