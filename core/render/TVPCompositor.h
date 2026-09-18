@@ -21,7 +21,7 @@ namespace krkrsdl3
 //   - "software" : SDL 软渲染（各平台入口通过 PlatformView.h 的平台函数提供）
 //   - "opengl"   : OpenGL 3.3 Core / OpenGL ES 3.0（桌面 glad / 移动 GLES3）
 //   - "vulkan"   : Vulkan 1.0（SDL3 窗口表面，位于 environ/sdl3/render/）
-//   - "metal"    : 预留（未来 macOS，接口已按 Metal 适配设计，见 docs）
+//   - "metal"    : 原生 Metal（Apple SDL3 窗口与离屏渲染）
 //
 // 每个后端只有一个实现类，同时承担两个角色（合并设计）：
 //   - 窗口贴图合成（上屏）：BeginFrame/EndFrame + *WindowTexture 方法
@@ -151,6 +151,13 @@ public:
 
     // 后端信息采集（GL 的厂商/版本/扩展日志等），无操作默认实现
     virtual void FetchInfo() {}
+
+    // Optional screenshot: top-down RGBA8, allocated only on request.
+    // Unsupported backends retain the host screenshot path.
+    virtual bool CaptureFrame(std::vector<uint8_t>&, int&, int&, int&)
+    {
+        return false;
+    }
 };
 
 //---------------------------------------------------------------------------

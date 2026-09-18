@@ -21,6 +21,9 @@
 #include "TVPDebug.h"
 
 #include "backend/SWRenderBackend.h"
+#ifdef _KRKRSDL3_USE_METAL
+#include "backend/MetalRenderBackend.h"
+#endif
 #ifdef _KRKRSDL3_USE_OPENGL
 #ifdef _KRKRSDL3_GL
 #include "glad/glad.h"
@@ -85,6 +88,10 @@ static bool TVPCreateWindowForBackend(const std::string& renderer)
 #endif
     if (renderer == "opengl")
         flags |= SDL_WINDOW_OPENGL;
+#ifdef _KRKRSDL3_USE_METAL
+    else if (renderer == "metal")
+        flags |= SDL_WINDOW_METAL;
+#endif
     else if (renderer == "vulkan")
     {
         flags |= SDL_WINDOW_VULKAN;
@@ -117,8 +124,22 @@ static bool TVPCreateWindowForBackend(const std::string& renderer)
 static bool TVPInitRenderBackend()
 {
     if (false) { }
+#ifdef _KRKRSDL3_USE_METAL
+    else if (TVPSettings.renderer == "metal")
+    {
+        auto* backend = krkrsdl3::MetalRenderBackend::Create(tvp_window, TVPSettings.vsync != 0);
+        if (!backend)
+        {
+            SDL_Log("Failed to initialize native Metal backend");
+            return false;
+        }
+        krkrsdl3::TVPSetRenderBackend(backend);
+        backend->FetchInfo();
+        tvp_activeRendererName = "metal";
+    }
+#endif
 #ifdef _KRKRSDL3_USE_OPENGL
-    if (TVPSettings.renderer == "opengl")
+    else if (TVPSettings.renderer == "opengl")
     {
 #ifdef _KRKRSDL3_GL
         // 使用opengl3.3
@@ -214,7 +235,13 @@ static bool TVPInitRenderBackend()
     else
     {
         // SDL模拟软渲染器，虽然可能选择GPU，但对于App来说是软渲染
-        tvp_renderer = SDL_CreateRenderer(tvp_window, NULL);
+        const char* driver = TVPSettings.renderer == "software-metal" ? "metal" : nullptr;
+        tvp_renderer = SDL_CreateRenderer(tvp_window, driver);
+        if (!tvp_renderer && driver)
+        {
+            SDL_Log("SDL Metal presenter unavailable: %s; trying platform default", SDL_GetError());
+            tvp_renderer = SDL_CreateRenderer(tvp_window, nullptr);
+        }
         if (tvp_renderer == NULL)
         {
             SDL_Log("Failed to create SDL renderer: %s", SDL_GetError());
@@ -254,7 +281,7 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
     {
         SDL_Log("Window creation failed for renderer %s, falling back to software.",
                 TVPSettings.renderer.c_str());
-        TVPSettings.renderer = "software";
+        TVPSettings.renderer = TVPSettings.renderer == "metal" ? "software-metal" : "software";
         if (!TVPCreateWindowForBackend(TVPSettings.renderer))
             return SDL_APP_FAILURE;
     }
@@ -265,7 +292,7 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
         krkrsdl3::TVPShutdownRenderBackend();
         SDL_DestroyWindow(tvp_window);
         tvp_window = NULL;
-        TVPSettings.renderer = "software";
+        TVPSettings.renderer = TVPSettings.renderer == "metal" ? "software-metal" : "software";
         if (!TVPCreateWindowForBackend(TVPSettings.renderer) || !TVPInitRenderBackend())
             return SDL_APP_FAILURE;
     }

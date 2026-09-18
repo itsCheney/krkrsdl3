@@ -147,6 +147,14 @@ static void TVPDetectRender()
                 TVPAddImportantLog(ttstr(TJS_N("Renderer 'd3d9' is not available, using '")) +
                                    ttstr(TVPSettings.renderer) + TJS_N("'"));
         }
+        else if (str == TJS_N("software-metal"))
+        {
+#if defined(_KRKRSDL3_IOS) || defined(_KRKRSDL3_MACOS)
+            TVPSettings.renderer = "software-metal";
+#else
+            TVPAddImportantLog(TJS_N("SDL Metal presentation unavailable on this platform; using software"));
+#endif
+        }
         else if (str == TJS_N("software") || str == TJS_N("sw"))
         {
             TVPSettings.renderer = "software";
