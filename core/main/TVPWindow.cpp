@@ -909,6 +909,16 @@ bool TVPWindow::DoClose()
     return false;
 }
 //---------------------------------------------------------------------------
+void TVPWindow::RequestUserClose()
+{
+    if (Closing || ProgramClosing)
+        return;
+    // With ProgramClosing false, OnCloseQuery queues the normal user-close
+    // input event. The game receives onCloseQuery and may cancel or show its UI.
+    if (OnCloseQuery())
+        Close();
+}
+//---------------------------------------------------------------------------
 void TVPWindow::Close()
 {
     // closing action by "close" method

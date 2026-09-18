@@ -599,6 +599,8 @@ public:
 
         // not exist in the cache
         tTVPArchive* arc = TVPOpenArchive(name, true);
+        if (!arc)
+            TVPThrowExceptionMessage(TJS_N("Cannot open archive %1: unsupported or unavailable format"), name);
         tHolder holder(arc);
         ArchiveCache.AddWithHash(name, hash, holder);
         return arc;
