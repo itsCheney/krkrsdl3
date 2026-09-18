@@ -130,6 +130,7 @@ struct MetalRenderBackend::Impl
     id<MTLTexture> destinationSnapshot = nil;
     dispatch_semaphore_t inFlight = dispatch_semaphore_create(2);
     std::shared_ptr<std::atomic<bool>> gpuFailed = std::make_shared<std::atomic<bool>>(false);
+    std::shared_ptr<std::atomic<double>> gpuTimeMS = std::make_shared<std::atomic<double>>(-1.0);
     std::unordered_map<void*, std::unique_ptr<Resource>> resources;
     std::vector<WindowDraw> windows;
     Resource* current = nullptr;
@@ -137,6 +138,7 @@ struct MetalRenderBackend::Impl
     Params mesh, layerParams;
     int width = 0, height = 0;
     size_t transientBytes = 0;
+    double pendingQueueWaitMS = 0, lastPresentationWaitMS = -1;
     static constexpr size_t kSubmissionBudget = 16 * 1024 * 1024;
 
     ~Impl()
@@ -160,7 +162,9 @@ struct MetalRenderBackend::Impl
         if (gpuFailed->load(std::memory_order_relaxed))
             throw std::runtime_error("Metal GPU command execution failed (see render log)");
         if (!commands) {
+            const Uint64 waitStarted = SDL_GetTicksNS();
             dispatch_semaphore_wait(inFlight, DISPATCH_TIME_FOREVER);
+            pendingQueueWaitMS += static_cast<double>(SDL_GetTicksNS() - waitStarted) / 1000000.0;
             commands = [queue commandBuffer];
             if (!commands) {
                 dispatch_semaphore_signal(inFlight);
@@ -170,11 +174,15 @@ struct MetalRenderBackend::Impl
             // outlive the C++ resource wrappers).
             dispatch_semaphore_t semaphore = inFlight;
             auto fault = gpuFailed;
+            auto timing = gpuTimeMS;
             [commands addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
                 if (buffer.status == MTLCommandBufferStatusError) {
                     fault->store(true, std::memory_order_relaxed);
                     SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Metal GPU error: %s", buffer.error.localizedDescription.UTF8String);
                 }
+                if (buffer.status == MTLCommandBufferStatusCompleted && buffer.GPUStartTime > 0 &&
+                    buffer.GPUEndTime >= buffer.GPUStartTime)
+                    timing->store((buffer.GPUEndTime - buffer.GPUStartTime) * 1000.0, std::memory_order_relaxed);
                 dispatch_semaphore_signal(semaphore);
             }];
         }
@@ -342,7 +350,9 @@ struct MetalRenderBackend::Impl
         layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         layer.framebufferOnly = YES;
         layer.opaque = YES;
-        layer.maximumDrawableCount = 2;
+        // One surface can be on screen while two frame submissions are being
+        // prepared/presented. Drawable availability is separate from GPU work.
+        layer.maximumDrawableCount = 3;
 #if TARGET_OS_OSX
         layer.displaySyncEnabled = vsync;
 #else
@@ -385,6 +395,14 @@ void MetalRenderBackend::FetchInfo()
 {
     SDL_Log("Native Metal backend: %s (GPU textures, on-demand CPU readback)", impl_->device.name.UTF8String);
 }
+double MetalRenderBackend::GetGpuSubmissionTimeMilliseconds() const
+{
+    return impl_->gpuTimeMS->load(std::memory_order_relaxed);
+}
+double MetalRenderBackend::GetPresentationWaitTimeMilliseconds() const
+{
+    return impl_->lastPresentationWaitMS;
+}
 void MetalRenderBackend::BeginFrame(int w, int h)
 {
     impl_->width = w; impl_->height = h;
@@ -394,15 +412,21 @@ void MetalRenderBackend::EndFrame()
 {
     @autoreleasepool {
         auto& p = *impl_;
+        double drawableWaitMS = 0;
         if (p.width > 0 && p.height > 0 && !(SDL_GetWindowFlags(p.window) & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED))) {
-            p.layer.drawableSize = CGSizeMake(p.width, p.height);
+            if (p.layer.drawableSize.width != p.width || p.layer.drawableSize.height != p.height)
+                p.layer.drawableSize = CGSizeMake(p.width, p.height);
+            const Uint64 waitStarted = SDL_GetTicksNS();
             id<CAMetalDrawable> drawable = [p.layer nextDrawable];
+            drawableWaitMS = static_cast<double>(SDL_GetTicksNS() - waitStarted) / 1000000.0;
             if (drawable) {
                 p.DrawWindows(drawable.texture, p.windowPipeline);
                 [p.Commands() presentDrawable:drawable];
             }
         }
         p.Submit(); // Offscreen work must still complete when no drawable is available.
+        p.lastPresentationWaitMS = p.pendingQueueWaitMS + drawableWaitMS;
+        p.pendingQueueWaitMS = 0;
     }
 }
 void* MetalRenderBackend::CreateTexture(int w, int h) { @autoreleasepool { return impl_->Create(w, h, false); } }

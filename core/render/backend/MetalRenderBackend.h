@@ -16,6 +16,8 @@ public:
     const char* GetName() const override { return "metal"; }
     bool IsHardware() const override { return true; }
     void FetchInfo() override;
+    double GetGpuSubmissionTimeMilliseconds() const override;
+    double GetPresentationWaitTimeMilliseconds() const override;
     void BeginFrame(int width, int height) override;
     void EndFrame() override;
     void* CreateWindowTexture(int width, int height) override;

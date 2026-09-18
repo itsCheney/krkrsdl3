@@ -152,6 +152,13 @@ public:
     // 后端信息采集（GL 的厂商/版本/扩展日志等），无操作默认实现
     virtual void FetchInfo() {}
 
+    // Duration of the last completed GPU submission, excluding queue wait.
+    // Negative means unsupported/not available; reading never waits for GPU.
+    virtual double GetGpuSubmissionTimeMilliseconds() const { return -1.0; }
+    // Main-thread waits for command-buffer capacity and a presentation surface
+    // during the last frame. Negative means unsupported; included in step time.
+    virtual double GetPresentationWaitTimeMilliseconds() const { return -1.0; }
+
     // Optional screenshot: top-down RGBA8, allocated only on request.
     // Unsupported backends retain the host screenshot path.
     virtual bool CaptureFrame(std::vector<uint8_t>&, int&, int&, int&)

@@ -178,9 +178,12 @@ tTJS::tTJS()
 //---------------------------------------------------------------------------
 tTJS::~tTJS()
 {
-#ifndef TJS_NO_REGEXP
-    TJSReleaseRegex();
-#endif
+    // Returned VM registers retain object references. Drain them BEFORE
+    // clearing Global: their finalize methods may resolve global properties
+    // and allocate more registers. Disabling pooling prevents those finalizers
+    // from leaving new references to be released after Global is gone.
+    if (VariantArrayStack)
+        VariantArrayStack->BeginShutdown();
 
     // Release the global object through normal reference counting before
     // force-clearing fallback pools. The previous process-exit-only cleanup
@@ -196,6 +199,12 @@ tTJS::~tTJS()
     if (Cache)
         delete Cache;
 
+    delete VariantArrayStack;
+    VariantArrayStack = nullptr;
+#ifndef TJS_NO_REGEXP
+    TJSReleaseRegex();
+#endif
+
     if (TJSEnableDebugMode)
     {
         TJSReleaseStackTracer();
@@ -205,9 +214,6 @@ tTJS::~tTJS()
     TJSReleaseGlobalStringMap();
 
     TJSReservedWordsHashRelease();
-
-    delete VariantArrayStack;
-    VariantArrayStack = nullptr;
 
     // 清除所有难以自动释放的堆内存
     TJSClearScriptBlockHeap();
@@ -496,7 +502,9 @@ tjs_int32 tTJS::GetPPValue(const tjs_char* name)
 void tTJS::DoGarbageCollection()
 {
     // do garbage collection
-    TJSVariantArrayStackCompactNow();
+    // The former global CompactNow hook is empty; compact this VM's pool.
+    if (VariantArrayStack)
+        VariantArrayStack->Compact();
     TJSCompactStringHeap();
 }
 //---------------------------------------------------------------------------
