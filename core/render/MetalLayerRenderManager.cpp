@@ -75,10 +75,10 @@ public:
     TVPTextureFormat::e GetFormat() const override { return format; }
     tjs_int GetPitch() const override { return Width*(format==TVPTextureFormat::Gray ? 1 : 4); }
     bool IsCPUResident() const override { return pinned || !handle; }
-    bool IsStatic() override { return readonly; }
+    bool IsStatic() override { return readonly && !pinned; }
     bool IsOpaque() override { return false; }
     const void* GetScanLineForRead(tjs_uint y) override { Read(); return pixels.data()+size_t(y)*GetPitch(); }
-    void* GetScanLineForWrite(tjs_uint y) override { Read(); dirty=true; return pixels.data()+size_t(y)*GetPitch(); }
+    void* GetScanLineForWrite(tjs_uint y) override { Read(); if(handle) dirty=true; return pixels.data()+size_t(y)*GetPitch(); }
     void* LockCPURead() override { Read(); ++locks; return pixels.data(); }
     void UnlockCPU() override { if(locks) --locks; }
     void MarkCPUModified() override { Read(); dirty=true; }

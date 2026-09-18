@@ -3129,7 +3129,8 @@ public:
             vmemsize = 0;
             return false;
         }
-        vmemsize = static_cast<iTVPSoftwareTexture2D*>(texture)->GetBitmapSize();
+        auto* software = dynamic_cast<iTVPSoftwareTexture2D*>(texture);
+        vmemsize = software ? software->GetBitmapSize() : uint64_t(texture->GetPitch())*texture->GetHeight();
         return true;
     }
 

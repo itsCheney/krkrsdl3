@@ -160,7 +160,7 @@ bool iTVPBaseBitmap::SetPoint(tjs_int x, tjs_int y, tjs_uint32 value)
     if (x < 0 || y < 0 || x >= (tjs_int)GetWidth() || y >= (tjs_int)GetHeight())
         TVPThrowExceptionMessage(TVPOutOfRectangle);
 
-    Bitmap->SetPoint(x, y, TVP_REVRGB(value));
+    GetTextureForRender(true, nullptr)->SetPoint(x, y, Is32BPP() ? TVP_REVRGB(value) : value);
     return true;
 }
 //---------------------------------------------------------------------------
@@ -177,7 +177,7 @@ bool iTVPBaseBitmap::SetPointMain(tjs_int x, tjs_int y, tjs_uint32 color)
     tjs_uint32 clr = Bitmap->GetPoint(x, y);
     clr &= 0xff000000;
     clr += TVP_REVRGB(color) & 0xffffff;
-    Bitmap->SetPoint(x, y, clr);
+    GetTextureForRender(true, nullptr)->SetPoint(x, y, clr);
 
     return true;
 }
@@ -195,7 +195,7 @@ bool iTVPBaseBitmap::SetPointMask(tjs_int x, tjs_int y, tjs_int mask)
     tjs_uint32 clr = Bitmap->GetPoint(x, y);
     clr &= 0x00ffffff;
     clr += (mask & 0xff) << 24;
-    Bitmap->SetPoint(x, y, clr);
+    GetTextureForRender(true, nullptr)->SetPoint(x, y, clr);
 
     return true;
 }
