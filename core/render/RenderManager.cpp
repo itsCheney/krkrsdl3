@@ -178,18 +178,18 @@ inline uint32_t SampleBilinear(const uint8_t* src, int srcW, int srcH, int srcPi
     int ix = (int)sx;
     int iy = (int)sy;
     if (ix < 0) ix = 0;
-    if (ix >= srcW - 1) ix = srcW - 2;
+    if (ix >= srcW - 1) ix = std::max(0, srcW - 2);
     if (iy < 0) iy = 0;
-    if (iy >= srcH - 1) iy = srcH - 2;
-    float fx = sx - ix;
-    float fy = sy - iy;
+    if (iy >= srcH - 1) iy = std::max(0, srcH - 2);
+    float fx = srcW == 1 ? 0 : sx - ix;
+    float fy = srcH == 1 ? 0 : sy - iy;
     float ifx = 1.0f - fx;
     float ify = 1.0f - fy;
 
     const uint8_t* p00 = src + iy * srcPitch + ix * 4;
-    const uint8_t* p10 = p00 + 4;
-    const uint8_t* p01 = p00 + srcPitch;
-    const uint8_t* p11 = p01 + 4;
+    const uint8_t* p10 = p00 + (srcW == 1 ? 0 : 4);
+    const uint8_t* p01 = p00 + (srcH == 1 ? 0 : srcPitch);
+    const uint8_t* p11 = p01 + (srcW == 1 ? 0 : 4);
 
     uint8_t r = (uint8_t)(ifx * ify * p00[0] + fx * ify * p10[0] + ifx * fy * p01[0] + fx * fy * p11[0] + 0.5f);
     uint8_t g = (uint8_t)(ifx * ify * p00[1] + fx * ify * p10[1] + ifx * fy * p01[1] + fx * fy * p11[1] + 0.5f);
@@ -1064,8 +1064,8 @@ public:
             return -1;
     }
 
-    virtual void SetParameterOpa(int id, int v) { opa = v; }
-    virtual void SetParameterColor4B(int id, unsigned int v) { color = v; }
+    virtual void SetParameterOpa(int id, int v) { opa = v; iTVPRenderMethod::SetParameterOpa(id, v); }
+    virtual void SetParameterColor4B(int id, unsigned int v) { color = v; iTVPRenderMethod::SetParameterColor4B(id, v); }
     virtual void DoRender(iTVPTexture2D* _tar,
                           const tTVPRect& rctar,
                           iTVPTexture2D* _dst,
@@ -1111,7 +1111,7 @@ public:
             return -1;
     }
 
-    virtual void SetParameterOpa(int id, int v) { opa = v; }
+    virtual void SetParameterOpa(int id, int v) { opa = v; iTVPRenderMethod::SetParameterOpa(id, v); }
     virtual void DoRender(iTVPTexture2D* _tar,
                           const tTVPRect& rctar,
                           iTVPTexture2D* _dst,
@@ -1175,7 +1175,7 @@ public:
             return 0;
         return -1;
     }
-    virtual void SetParameterColor4B(int id, tjs_uint32 v) { clr = v; }
+    virtual void SetParameterColor4B(int id, tjs_uint32 v) { clr = v; iTVPRenderMethod::SetParameterColor4B(id, v); }
 
     virtual void DoRender(iTVPTexture2D* _tar,
                           const tTVPRect& rect,
@@ -1322,7 +1322,7 @@ class tTVPRenderMethod_FillWithColor
             return 0;
         return -1;
     }
-    virtual void SetParameterColor4B(int id, unsigned int v) { inherit::SetParamValue(v); }
+    virtual void SetParameterColor4B(int id, unsigned int v) { inherit::SetParamValue(v); iTVPRenderMethod::SetParameterColor4B(id, v); }
 };
 
 template<typename TDst, int THREAD_FACTOR, typename TPix, void (*&Func)(TDst*, tjs_int, TPix)>
@@ -1336,7 +1336,7 @@ class tTVPRenderMethod_FillWithOpacity
             return 0;
         return -1;
     }
-    virtual void SetParameterOpa(int id, int v) { inherit::SetParamValue(v); }
+    virtual void SetParameterOpa(int id, int v) { inherit::SetParamValue(v); iTVPRenderMethod::SetParameterOpa(id, v); }
 };
 
 template<typename TDst, int THREAD_FACTOR, void (*&Func)(TDst*, tjs_int, tjs_uint32, tjs_int)>
@@ -1361,7 +1361,7 @@ public:
         return -1;
     }
     virtual void SetParameterColor4B(int id, unsigned int v) { clr = v; }
-    virtual void SetParameterOpa(int id, int v) { opa = v; }
+    virtual void SetParameterOpa(int id, int v) { opa = v; iTVPRenderMethod::SetParameterOpa(id, v); }
 
     virtual void DoRender(iTVPTexture2D* _tar,
                           const tTVPRect& rect,
@@ -1726,7 +1726,7 @@ public:
             return ParameterIDBegin;
         return -1;
     }
-    virtual void SetParameterOpa(int id, int v) { opa = v; }
+    virtual void SetParameterOpa(int id, int v) { opa = v; iTVPRenderMethod::SetParameterOpa(id, v); }
 
     virtual void PartialProc(iTVPTexture2D* tar,
                              tjs_int tx,
@@ -1880,7 +1880,7 @@ public:
             return 0;
         return -1;
     }
-    virtual void SetParameterOpa(int id, int v) { opa = v; }
+    virtual void SetParameterOpa(int id, int v) { opa = v; iTVPRenderMethod::SetParameterOpa(id, v); }
     virtual void PartialFill(iTVPTexture2D* _dst,
                              iTVPTexture2D* src,
                              tjs_int sx,
@@ -1923,7 +1923,7 @@ public:
             return 0;
         return -1;
     }
-    virtual void SetParameterOpa(int id, int v) { opa = v; }
+    virtual void SetParameterOpa(int id, int v) { opa = v; iTVPRenderMethod::SetParameterOpa(id, v); }
     virtual void PartialFill(iTVPTexture2D* _dst,
                              iTVPTexture2D* src,
                              tjs_int sx,
@@ -1955,7 +1955,7 @@ public:
             return 0;
         return -1;
     }
-    virtual void SetParameterOpa(int id, int v) { opa = v; }
+    virtual void SetParameterOpa(int id, int v) { opa = v; iTVPRenderMethod::SetParameterOpa(id, v); }
     virtual void PartialFill(iTVPTexture2D* _dst,
                              iTVPTexture2D* src,
                              tjs_int sx,
@@ -2684,6 +2684,33 @@ void iTVPRenderManager::RegisterRenderMethod(const char* name, iTVPRenderMethod*
     assert(method && AllMethods.find(hash) == AllMethods.end());
     AllMethods[hash] = method;
     method->SetName(name);
+    // Canonical software methods live for the process. Semantic metadata is
+    // attached to those same objects, so static pointers/parameter IDs remain
+    // valid across software and GPU sessions (including registered aliases).
+    using K = TVPLayerOperationKind;
+    struct Entry { const char* name; K kind; uint32_t flags; bool opacity; };
+    static const Entry entries[] = {
+        {"Copy", K::Copy, 0, false}, {"CopyColor", K::CopyColor, 0, false},
+        {"CopyMask", K::CopyMask, 0, false}, {"CopyOpaqueImage", K::CopyOpaque, 0, false},
+        {"FillARGB", K::Fill, 0, false}, {"FillColor", K::FillColor, 0, false},
+        {"FillMask", K::FillMask, 0, true},
+        {"AlphaBlend", K::Alpha, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"AlphaBlend_HDA", K::Alpha, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"AlphaBlend_d", K::Alpha, TVP_LAYER_DEST_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"AlphaBlend_a", K::Alpha, TVP_LAYER_DEST_PREMULTIPLIED | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"ConstAlphaBlend", K::ConstAlpha, 0, true},
+        {"ConstAlphaBlend_HDA", K::ConstAlpha, TVP_LAYER_HOLD_ALPHA, true},
+        {"ConstAlphaBlend_d", K::ConstAlpha, TVP_LAYER_DEST_ALPHA, true},
+        {"ConstAlphaBlend_a", K::ConstAlpha, TVP_LAYER_DEST_PREMULTIPLIED, true},
+        {"ApplyColorMap", K::ColorMap, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"ApplyColorMap_d", K::ColorMap, TVP_LAYER_DEST_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"ApplyColorMap_a", K::ColorMap, TVP_LAYER_DEST_PREMULTIPLIED | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+    };
+    for (const auto& entry : entries)
+        if (!strcmp(name, entry.name)) {
+            method->ConfigureGpuOperation(entry.kind, entry.flags, entry.opacity);
+            break;
+        }
 }
 
 iTVPRenderMethod* iTVPRenderManager::CompileRenderMethod(const char* name,
@@ -2866,6 +2893,10 @@ public:
             RegisterRenderMethod("ConstAlphaBlend", &method);
         }
         {
+            static tTVPRenderMethod_BltWithOpa<59, TVPConstAlphaBlend_HDA> method;
+            RegisterRenderMethod("ConstAlphaBlend_HDA", &method);
+        }
+        {
             static tTVPRenderMethod_BltWithOpa<59, TVPConstAlphaBlend_a> method;
             RegisterRenderMethod("ConstAlphaBlend_a", &method);
         }
@@ -2946,6 +2977,7 @@ public:
     }
 
         REGISER_BLEND_4(52, Alpha);
+        RegisterRenderMethod("AlphaBlend_HDA", GetRenderMethod("AlphaBlend"));
         {
             static tTVPRenderMethod_BltAndOpa<52, TVPAlphaBlend_d, TVPAlphaBlend_do> method;
             RegisterRenderMethod("AlphaBlend_d", &method);

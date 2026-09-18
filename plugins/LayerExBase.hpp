@@ -1,3 +1,4 @@
+#include "MetalLayerRenderManager.h"
 #ifndef _layExBase_hpp_
 #define _layExBase_hpp_
 
@@ -179,7 +180,7 @@ struct layerExBase_GL
     {
         _width = (GeometryT)_this->GetImageWidth();
         _height = (GeometryT)_this->GetImageHeight();
-        if (TVPIsSoftwareRenderManager())
+        if (TVPIsSoftwareRenderManager() || TVPMetalLayerCompositionActive())
         {
             _buffer = (BufferT)_this->GetMainImagePixelBufferForWrite();
             _pitch = (PitchT)_this->GetMainImagePixelBufferPitch();

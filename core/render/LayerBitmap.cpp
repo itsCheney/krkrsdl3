@@ -2471,62 +2471,7 @@ bool tTVPNativeBaseBitmap::InternalBlendText(tTVPCharacterData* data,
     opa_id = _opa_id; \
     clr_id = _clr_id;
 
-    static bool fastGPURoute = !TVPIsSoftwareRenderManager();
-
     iTVPTexture2D* pTexSrc;
-    if (fastGPURoute && dtdata->bltmode == bmAlphaOnAlpha && dtdata->opa > 0)
-    {
-        // convert to addalpha bitmap
-        tTVPBitmap* tmp = new tTVPBitmap(w, h, 32);
-        tjs_int spitch = pitch;
-        tjs_int dpitch = tmp->GetPitch();
-        tjs_uint8* src = bp;
-        tjs_uint8* dst = (tjs_uint8*)tmp->GetBits();
-        for (tjs_int y = 0; y < h; ++y)
-        {
-            for (tjs_int x = 0; x < w; ++x)
-            {
-                ((tjs_uint32*)dst)[x] = (color & 0xFFFFFF) | (src[x] << 24);
-            }
-            TVPConvertAlphaToAdditiveAlpha((tjs_uint32*)dst, w);
-            dst += dpitch;
-            src += spitch;
-        }
-        if (_CharacterTextureRGBA)
-        {
-            if (_CharacterTextureRGBA->GetFormat() != TVPTextureFormat::RGBA)
-            {
-                _CharacterTextureRGBA->Release();
-                _CharacterTextureRGBA = nullptr;
-            }
-        }
-        if (!_CharacterTextureRGBA)
-        {
-            _CharacterTextureRGBA = GetRenderManager()->CreateTexture2D(
-                tmp->GetBits(), dpitch, w, h, TVPTextureFormat::RGBA,
-                RENDER_CREATE_TEXTURE_FLAG_NO_COMPRESS);
-        }
-        else if (_CharacterTextureRGBA->GetInternalWidth() < w ||
-                 _CharacterTextureRGBA->GetInternalHeight() < h)
-        {
-            _CharacterTextureRGBA->Release();
-            _CharacterTextureRGBA = GetRenderManager()->CreateTexture2D(
-                tmp->GetBits(), dpitch, w, h, TVPTextureFormat::RGBA,
-                RENDER_CREATE_TEXTURE_FLAG_NO_COMPRESS);
-        }
-        else
-        {
-            _CharacterTextureRGBA->Update(tmp->GetBits(), TVPTextureFormat::RGBA, dpitch,
-                                          tTVPRect(0, 0, w, h));
-        }
-
-        tmp->Release();
-
-        GEMTHOD_OPA_CLR(AlphaBlend_a);
-        method->SetParameterOpa(opa_id, dtdata->opa);
-        pTexSrc = _CharacterTextureRGBA;
-    }
-    else
     {
         if (dtdata->bltmode == bmAlphaOnAlpha)
         {

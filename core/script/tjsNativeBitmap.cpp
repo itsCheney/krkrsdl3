@@ -224,14 +224,14 @@ const void* tTJSNI_Bitmap::GetPixelBuffer() const
 {
     if (!Bitmap)
         return NULL;
-    return Bitmap->GetScanLine(0);
+    return Bitmap->GetTexture()->GetPersistentCPUData(false);
 }
 //----------------------------------------------------------------------
 void* tTJSNI_Bitmap::GetPixelBufferForWrite()
 {
     if (!Bitmap)
         return NULL;
-    return Bitmap->GetScanLineForWrite(0);
+    return Bitmap->GetTextureForRender(true, nullptr)->GetPersistentCPUData(true);
 }
 //----------------------------------------------------------------------
 tjs_int tTJSNI_Bitmap::GetPixelBufferPitch() const

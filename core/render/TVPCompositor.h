@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "PlatformView.h"
+#include "LayerRenderOperation.h"
 
 //---------------------------------------------------------------------------
 // TVPCompositor
@@ -151,6 +152,17 @@ public:
 
     // 后端信息采集（GL 的厂商/版本/扩展日志等），无操作默认实现
     virtual void FetchInfo() {}
+
+    // Optional ordinary-Layer resources. Rectangles use integer pixels, not
+    // normalized Emote UVs. Unsupported backends keep software RenderManager.
+    virtual bool SupportsLayerOperations() const { return false; }
+    virtual bool SetLayerAlphaTables(const uint8_t*, const uint8_t*) { return false; }
+    virtual void* CreateLayerTexture(int, int, TVPLayerTextureFormat) { return nullptr; }
+    virtual void DestroyLayerTexture(void*) {}
+    virtual bool UpdateLayerTexture(void*, const uint8_t*, int, const TVPLayerRect&) { return false; }
+    virtual bool ReadLayerTexture(void*, std::vector<uint8_t>&, int&) { return false; }
+    virtual bool OperateLayerRect(const TVPLayerOperation&, void*, const TVPLayerRect&,
+                                  void*, const TVPLayerRect&, int) { return false; }
 
     // Duration of the last completed GPU submission, excluding queue wait.
     // Negative means unsupported/not available; reading never waits for GPU.

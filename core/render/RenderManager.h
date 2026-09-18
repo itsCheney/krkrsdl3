@@ -1,4 +1,5 @@
 #pragma once
+#include "LayerRenderOperation.h"
 
 #include "ComplexRect.h"
 #include <unordered_map>
@@ -72,7 +73,7 @@ public:
 
     // ---- 纹理驻留与显式同步（防 GPU→CPU 隐式回读，见 docs/gpu-readback-design.md）----
     // 默认实现为 CPU 驻留（软件纹理，零拷贝）；GPU 纹理实现需 override。
-    // 原则：读不切换驻留（只从缓存读）、写才标记脏、单帧同一纹理至多一次回读+一次上传。
+    // CPU reads share a content-version cache; every intervening write invalidates it.
     virtual bool IsCPUResident() const { return true; }
     bool IsGPUResident() const { return !IsCPUResident(); }
     // GPU 驻留时的后端纹理句柄（供上屏 sprite 别名，零拷贝）；CPU 驻留返回 nullptr
@@ -84,6 +85,11 @@ public:
     virtual void MarkCPUModified() {}
     // 纹理已驻留 GPU，CPU 缓存失效
     virtual void InvalidateCPUCache() {}
+    // Raw script/plugin addresses may outlive a call. GPU adapters demote this
+    // texture to CPU authority before exposing a stable pointer.
+    virtual void* GetPersistentCPUData(bool write) {
+        return write ? GetScanLineForWrite(0) : const_cast<void*>(GetScanLineForRead(0));
+    }
 
     static void RecycleProcess();
 };
@@ -93,6 +99,7 @@ class iTVPRenderMethod
 protected:
     virtual ~iTVPRenderMethod() {} // undeletable
     std::string Name;
+    TVPLayerOperation GpuOperation;
 
 public:
     // the parameter id should not change in whole lifecycle, valid id >= 0
@@ -101,8 +108,8 @@ public:
     virtual void SetParameterInt(int id, int Value){};
     virtual void SetParameterPtr(int id, const void* Value){};
     virtual void SetParameterFloat(int id, float Value){};
-    virtual void SetParameterColor4B(int id, unsigned int clr){};
-    virtual void SetParameterOpa(int id, int Value){};
+    virtual void SetParameterColor4B(int id, unsigned int clr) { GpuOperation.color = clr; };
+    virtual void SetParameterOpa(int id, int Value) { GpuOperation.opacity = Value; };
     virtual void SetParameterFloatArray(int id, float* Value, int nElem){};
     virtual iTVPRenderMethod* SetBlendFuncSeparate(
         int func, int srcRGB, int dstRGB, int srcAlpha, int dstAlpha)
@@ -112,6 +119,15 @@ public:
     virtual bool IsBlendTarget() { return true; }
     void SetName(const std::string& name) { Name = name; }
     const std::string& GetName() { return Name; }
+    void ConfigureGpuOperation(TVPLayerOperationKind kind, uint32_t flags, bool opacity) {
+        if (GpuOperation.kind != TVPLayerOperationKind::Unsupported) return;
+        GpuOperation.kind = kind; GpuOperation.flags = flags;
+        GpuOperation.opacity = opacity ? 0 : 255;
+    }
+    virtual bool DescribeGpuOperation(TVPLayerOperation& operation) const {
+        operation = GpuOperation;
+        return operation.kind != TVPLayerOperationKind::Unsupported;
+    }
 };
 
 template<typename TElem>

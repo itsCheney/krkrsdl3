@@ -1,4 +1,5 @@
 #include "MetalRenderBackend.h"
+#include "MetalLayerShaders.h"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -110,6 +111,7 @@ struct MetalRenderBackend::Impl
     {
         id<MTLTexture> texture = nil;
         int width = 0, height = 0;
+        int bytesPerPixel = 4;
         bool target = false;
         std::vector<uint8_t> readback;
     };
@@ -126,7 +128,9 @@ struct MetalRenderBackend::Impl
     id<MTLCommandBuffer> commands = nil, lastSubmitted = nil;
     id<MTLRenderPipelineState> windowPipeline = nil, capturePipeline = nil;
     id<MTLRenderPipelineState> meshPipelines[3] = {nil, nil, nil};
-    id<MTLComputePipelineState> layerPipeline = nil;
+    id<MTLComputePipelineState> layerPipeline = nil, ordinaryLayerPipeline = nil;
+    id<MTLBuffer> alphaTables = nil;
+    id<MTLTexture> ordinaryDummy = nil;
     id<MTLTexture> destinationSnapshot = nil;
     dispatch_semaphore_t inFlight = dispatch_semaphore_create(2);
     std::shared_ptr<std::atomic<bool>> gpuFailed = std::make_shared<std::atomic<bool>>(false);
@@ -270,7 +274,8 @@ struct MetalRenderBackend::Impl
     {
         pitch = 0;
         const size_t w = texture.width, h = texture.height;
-        const size_t rowBytes = (w * 4 + 255) & ~size_t(255);
+        const size_t bpp = texture.pixelFormat == MTLPixelFormatR8Unorm ? 1 : 4;
+        const size_t rowBytes = (w * bpp + 255) & ~size_t(255);
         id<MTLBuffer> staging = [device newBufferWithLength:rowBytes * h options:MTLResourceStorageModeShared];
         if (!staging) return false;
         id<MTLBlitCommandEncoder> e = [Commands() blitCommandEncoder];
@@ -280,8 +285,8 @@ struct MetalRenderBackend::Impl
                 destinationBytesPerRow:rowBytes destinationBytesPerImage:rowBytes * h];
         [e endEncoding];
         if (!Submit(true)) return false;
-        pixels.resize(w * h * 4);
-        pitch = static_cast<int>(w * 4);
+        pixels.resize(w * h * bpp);
+        pitch = static_cast<int>(w * bpp);
         for (size_t y = 0; y < h; ++y)
             std::memcpy(pixels.data() + y * pitch, static_cast<uint8_t*>(staging.contents) + y * rowBytes, pitch);
         return true;
@@ -372,6 +377,14 @@ struct MetalRenderBackend::Impl
         for (int i = 0; i < 3; ++i) meshPipelines[i] = Pipeline(lib, @"meshMain", MTLPixelFormatRGBA8Unorm, i);
         layerPipeline = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"layerMain"] error:&error];
         if (!layerPipeline) SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Metal layer pipeline: %s", error.localizedDescription.UTF8String);
+        MTLCompileOptions* ordinaryOptions = [MTLCompileOptions new];
+        ordinaryOptions.fastMathEnabled = NO;
+        id<MTLLibrary> ordinary = [device newLibraryWithSource:[NSString stringWithUTF8String:kMetalLayerShaders]
+                                                      options:ordinaryOptions error:&error];
+        if (ordinary) ordinaryLayerPipeline = [device newComputePipelineStateWithFunction:
+                                               [ordinary newFunctionWithName:@"ordinaryLayer"] error:&error];
+        if (!ordinaryLayerPipeline) SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
+            "GPU Layer initialization failed; software composition retained: %s", error.localizedDescription.UTF8String);
         return windowPipeline && capturePipeline && meshPipelines[0] && meshPipelines[1] &&
                meshPipelines[2] && layerPipeline;
     }
@@ -586,4 +599,101 @@ struct MetalRegistration
     }
 } metalRegistration;
 }
+bool MetalRenderBackend::SupportsLayerOperations() const { return impl_->ordinaryLayerPipeline != nil; }
+bool MetalRenderBackend::SetLayerAlphaTables(const uint8_t* opacity, const uint8_t* negative) {
+    @autoreleasepool {
+        if (!opacity || !negative || !SupportsLayerOperations()) return false;
+        impl_->alphaTables = [impl_->device newBufferWithLength:131072 options:MTLResourceStorageModeShared];
+        if (!impl_->alphaTables) return false;
+        std::memcpy(impl_->alphaTables.contents, opacity, 65536);
+        std::memcpy(static_cast<uint8_t*>(impl_->alphaTables.contents)+65536, negative, 65536);
+        return true;
+    }
+}
+void* MetalRenderBackend::CreateLayerTexture(int w, int h, TVPLayerTextureFormat format) {
+    @autoreleasepool {
+        auto& p = *impl_;
+        if (!SupportsLayerOperations()) return nullptr;
+        auto r = std::make_unique<Impl::Resource>();
+        r->bytesPerPixel = format == TVPLayerTextureFormat::R8 ? 1 : 4;
+        r->texture = p.Texture(w,h,r->bytesPerPixel == 1 ? MTLPixelFormatR8Unorm : MTLPixelFormatRGBA8Unorm);
+        if (!r->texture) return nullptr;
+        r->width=w; r->height=h; r->target=true;
+        [p.Pass(r->texture,true) endEncoding];
+        void* handle=r.get(); p.resources.emplace(handle,std::move(r)); return handle;
+    }
+}
+void MetalRenderBackend::DestroyLayerTexture(void* handle) { impl_->Destroy(handle,true); }
+bool MetalRenderBackend::UpdateLayerTexture(void* handle, const uint8_t* pixels, int pitch, const TVPLayerRect& rc) {
+    @autoreleasepool {
+        auto& p=*impl_; auto* r=p.Find(handle);
+        if (!r || !pixels || rc.left<0 || rc.top<0 || rc.right>r->width || rc.bottom>r->height ||
+            rc.Width()<=0 || rc.Height()<=0 || pitch<rc.Width()*r->bytesPerPixel) return false;
+        size_t bytes=rc.Width()*r->bytesPerPixel, row=(bytes+255)&~size_t(255);
+        id<MTLBuffer> staging=[p.device newBufferWithLength:row*rc.Height() options:MTLResourceStorageModeShared];
+        if (!staging) return false;
+        for(int y=0;y<rc.Height();++y) std::memcpy(static_cast<uint8_t*>(staging.contents)+y*row,pixels+y*pitch,bytes);
+        id<MTLBlitCommandEncoder> e=[p.Commands() blitCommandEncoder]; if(!e) return false;
+        [e copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:row sourceBytesPerImage:row*rc.Height()
+              sourceSize:MTLSizeMake(rc.Width(),rc.Height(),1) toTexture:r->texture destinationSlice:0 destinationLevel:0
+              destinationOrigin:MTLOriginMake(rc.left,rc.top,0)];
+        [e endEncoding]; p.transientBytes+=row*rc.Height();
+        if(p.transientBytes>=Impl::kSubmissionBudget) p.Submit(); return true;
+    }
+}
+bool MetalRenderBackend::ReadLayerTexture(void* handle,std::vector<uint8_t>& pixels,int& pitch) {
+    @autoreleasepool { auto* r=impl_->Find(handle); return r && impl_->Read(r->texture,pixels,pitch); }
+}
+bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,void* target,const TVPLayerRect& dst,
+                                         void* source,const TVPLayerRect& src,int sampling) {
+    @autoreleasepool {
+        auto& p=*impl_; auto* t=p.Find(target); auto* s=p.Find(source);
+        int kind=static_cast<int>(operation.kind);
+        bool needsSource=kind<5 || kind>=8;
+        if(!p.ordinaryLayerPipeline || !t || t->bytesPerPixel!=4 || kind==0 || (needsSource && !s) ||
+            dst.Width()<=0 || dst.Height()<=0 || sampling<0 || sampling>1) return false;
+        if(needsSource && (src.Width()==0 || src.Height()==0 || std::min(src.left,src.right)<0 ||
+            std::min(src.top,src.bottom)<0 || std::max(src.left,src.right)>s->width || std::max(src.top,src.bottom)>s->height)) return false;
+        if((operation.flags & TVP_LAYER_DEST_ALPHA) && !p.alphaTables) return false;
+        TVPLayerRect clip={std::max(0,dst.left),std::max(0,dst.top),std::min(t->width,dst.right),std::min(t->height,dst.bottom)};
+        if(clip.Width()<=0 || clip.Height()<=0) return true;
+        bool overwrite=kind==1 || kind==4 || kind==5;
+        id<MTLTexture> snapshot=nil, sourceTexture=s ? s->texture : p.ordinaryDummy;
+        if(!sourceTexture) { p.ordinaryDummy=p.Texture(1,1); sourceTexture=p.ordinaryDummy; }
+        // Snapshot only affected destination pixels. Source aliases need a
+        // separate region snapshot before any write, including overlapping copies.
+        if(!overwrite || s==t) {
+            id<MTLBlitCommandEncoder> blit=[p.Commands() blitCommandEncoder]; if(!blit) return false;
+            if(!overwrite) {
+                snapshot=p.Texture(clip.Width(),clip.Height()); if(!snapshot) { [blit endEncoding]; return false; }
+                [blit copyFromTexture:t->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(clip.left,clip.top,0)
+                      sourceSize:MTLSizeMake(clip.Width(),clip.Height(),1) toTexture:snapshot destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+            }
+            if(s==t) {
+                int x=std::min(src.left,src.right),y=std::min(src.top,src.bottom);
+                sourceTexture=p.Texture(std::abs(src.Width()),std::abs(src.Height()));
+                if(!sourceTexture) { [blit endEncoding]; return false; }
+                [blit copyFromTexture:s->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(x,y,0)
+                      sourceSize:MTLSizeMake(std::abs(src.Width()),std::abs(src.Height()),1) toTexture:sourceTexture destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+            }
+            [blit endEncoding];
+        }
+        struct LayerParameters { simd_int4 destination,source,clip,operation,color; } params;
+        params.destination={dst.left,dst.top,dst.right,dst.bottom};
+        params.source={src.left,src.top,src.right,src.bottom};
+        if(s==t) { int x=std::min(src.left,src.right),y=std::min(src.top,src.bottom); params.source-=simd_int4{x,y,x,y}; }
+        params.clip={clip.left,clip.top,clip.right,clip.bottom};
+        params.operation={kind,operation.opacity,static_cast<int>(operation.flags),sampling};
+        params.color={int(operation.color&255),int((operation.color>>8)&255),int((operation.color>>16)&255),int(operation.color>>24)};
+        id<MTLComputeCommandEncoder> e=[p.Commands() computeCommandEncoder]; if(!e) return false;
+        [e setComputePipelineState:p.ordinaryLayerPipeline]; [e setBytes:&params length:sizeof(params) atIndex:0];
+        // Unused arguments still need valid bindings on Metal validation.
+        if(!p.alphaTables) p.alphaTables=[p.device newBufferWithLength:131072 options:MTLResourceStorageModeShared];
+        [e setBuffer:p.alphaTables offset:0 atIndex:1];
+        [e setTexture:sourceTexture atIndex:0]; [e setTexture:snapshot ? snapshot : sourceTexture atIndex:1]; [e setTexture:t->texture atIndex:2];
+        [e dispatchThreads:MTLSizeMake(clip.Width(),clip.Height(),1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+        [e endEncoding]; return true;
+    }
+}
+
 } // namespace krkrsdl3

@@ -2967,7 +2967,7 @@ const void* tTJSNI_BaseLayer::GetMainImagePixelBuffer() const
 {
     if (!MainImage)
         return NULL;
-    return MainImage->GetScanLine(0);
+    return MainImage->GetTexture()->GetPersistentCPUData(false);
 }
 //---------------------------------------------------------------------------
 void* tTJSNI_BaseLayer::GetMainImagePixelBufferForWrite()
@@ -2975,7 +2975,7 @@ void* tTJSNI_BaseLayer::GetMainImagePixelBufferForWrite()
     if (!MainImage)
         return NULL;
     ImageModified = true;
-    return MainImage->GetScanLineForWrite(0);
+    return MainImage->GetTextureForRender(true, nullptr)->GetPersistentCPUData(true);
 }
 //---------------------------------------------------------------------------
 tjs_int tTJSNI_BaseLayer::GetMainImagePixelBufferPitch() const

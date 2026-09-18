@@ -1,3 +1,6 @@
+#include "MetalLayerRenderManager.h"
+#include "tjsCommHead.h"
+#include "RenderManager.h"
 #define SDL_MAIN_USE_CALLBACKS
 #define SDL_MAIN_NOIMPL
 #include <SDL3/SDL_main.h>
@@ -136,6 +139,7 @@ static bool TVPInitRenderBackend()
         krkrsdl3::TVPSetRenderBackend(backend);
         backend->FetchInfo();
         tvp_activeRendererName = "metal";
+        SDL_Log("Layer composition: %s", TVPBindMetalLayerRenderManager(backend) ? "GPU Metal" : "software (GPU Layer unavailable)");
     }
 #endif
 #ifdef _KRKRSDL3_USE_OPENGL
@@ -648,6 +652,8 @@ void SDL_AppQuit(void* appstate, SDL_AppResult result)
     }
     TVPResetAudioSessionState();
     // 后端先于上下文销毁（GL 后端析构需要上下文仍有效）
+    iTVPTexture2D::RecycleProcess();
+    TVPUnbindMetalLayerRenderManager();
     krkrsdl3::TVPShutdownRenderBackend();
     if (tvp_glContext)
     {

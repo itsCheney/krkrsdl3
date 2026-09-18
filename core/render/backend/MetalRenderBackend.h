@@ -16,6 +16,14 @@ public:
     const char* GetName() const override { return "metal"; }
     bool IsHardware() const override { return true; }
     void FetchInfo() override;
+    bool SupportsLayerOperations() const override;
+    bool SetLayerAlphaTables(const uint8_t*, const uint8_t*) override;
+    void* CreateLayerTexture(int, int, TVPLayerTextureFormat) override;
+    void DestroyLayerTexture(void*) override;
+    bool UpdateLayerTexture(void*, const uint8_t*, int, const TVPLayerRect&) override;
+    bool ReadLayerTexture(void*, std::vector<uint8_t>&, int&) override;
+    bool OperateLayerRect(const TVPLayerOperation&, void*, const TVPLayerRect&,
+                          void*, const TVPLayerRect&, int) override;
     double GetGpuSubmissionTimeMilliseconds() const override;
     double GetPresentationWaitTimeMilliseconds() const override;
     void BeginFrame(int width, int height) override;
