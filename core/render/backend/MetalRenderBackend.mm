@@ -270,17 +270,22 @@ struct MetalRenderBackend::Impl
         // Bound staging lifetime independently of presentation/frame cadence.
         if (transientBytes >= kSubmissionBudget) Submit();
     }
-    bool Read(id<MTLTexture> texture, std::vector<uint8_t>& pixels, int& pitch)
+    bool Read(id<MTLTexture> texture, std::vector<uint8_t>& pixels, int& pitch, const TVPLayerRect* region = nullptr)
     {
         pitch = 0;
-        const size_t w = texture.width, h = texture.height;
+        const int x=region ? region->left : 0, y=region ? region->top : 0;
+        const int regionWidth=region ? region->Width() : int(texture.width);
+        const int regionHeight=region ? region->Height() : int(texture.height);
+        if(x<0 || y<0 || regionWidth<=0 || regionHeight<=0 ||
+           size_t(x)+regionWidth>texture.width || size_t(y)+regionHeight>texture.height) return false;
+        const size_t w=regionWidth,h=regionHeight;
         const size_t bpp = texture.pixelFormat == MTLPixelFormatR8Unorm ? 1 : 4;
         const size_t rowBytes = (w * bpp + 255) & ~size_t(255);
         id<MTLBuffer> staging = [device newBufferWithLength:rowBytes * h options:MTLResourceStorageModeShared];
         if (!staging) return false;
         id<MTLBlitCommandEncoder> e = [Commands() blitCommandEncoder];
         if (!e) return false;
-        [e copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+        [e copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(x, y, 0)
                 sourceSize:MTLSizeMake(w, h, 1) toBuffer:staging destinationOffset:0
                 destinationBytesPerRow:rowBytes destinationBytesPerImage:rowBytes * h];
         [e endEncoding];
@@ -643,6 +648,9 @@ bool MetalRenderBackend::UpdateLayerTexture(void* handle, const uint8_t* pixels,
 }
 bool MetalRenderBackend::ReadLayerTexture(void* handle,std::vector<uint8_t>& pixels,int& pitch) {
     @autoreleasepool { auto* r=impl_->Find(handle); return r && impl_->Read(r->texture,pixels,pitch); }
+}
+bool MetalRenderBackend::ReadLayerTextureRegion(void* handle,const TVPLayerRect& region,std::vector<uint8_t>& pixels,int& pitch) {
+    @autoreleasepool { auto* r=impl_->Find(handle); return r && impl_->Read(r->texture,pixels,pitch,&region); }
 }
 bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,void* target,const TVPLayerRect& dst,
                                          void* source,const TVPLayerRect& src,int sampling) {

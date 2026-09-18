@@ -139,7 +139,8 @@ static bool TVPInitRenderBackend()
         krkrsdl3::TVPSetRenderBackend(backend);
         backend->FetchInfo();
         tvp_activeRendererName = "metal";
-        SDL_Log("Layer composition: %s", TVPBindMetalLayerRenderManager(backend) ? "GPU Metal" : "software (GPU Layer unavailable)");
+        if(TVPBindMetalLayerRenderManager(backend)) SDL_Log("Layer composition: GPU Metal");
+        else SDL_Log("Layer composition: software; GPU Layer fallback: %s",TVPMetalLayerFallbackReason());
     }
 #endif
 #ifdef _KRKRSDL3_USE_OPENGL

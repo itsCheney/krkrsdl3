@@ -4,6 +4,7 @@
 #include "LayerBitmap.h"
 #include "TVPCompositor.h"
 #include "gl/tvpgl.h"
+#include "Platform.h"
 #include <algorithm>
 #include <cstring>
 #include <memory>
@@ -20,6 +21,7 @@ extern unsigned char TVPNegativeMulTable[65536];
 namespace {
 using krkrsdl3::iTVPRenderBackend;
 class LayerTexture;
+std::string fallbackReason;
 struct Session {
     iTVPRenderBackend* backend;
     TVPLayerRenderStats stats;
@@ -59,7 +61,12 @@ public:
         session->textures.erase(this);
     }
     void Detach() {
-        Read();
+        try { Read(); }
+        catch(const std::exception& error) {
+            TVPConsoleLog("GPU Layer shutdown readback failed: %s",error.what());
+            if(pixels.size()!=Bytes()) pixels.assign(Bytes(),0);
+            if(!valid) { valid=true; session->stats.cpuCacheBytes+=Bytes(); }
+        }
         session->backend->DestroyLayerTexture(handle); handle=nullptr;
         session->stats.gpuResidentBytes-=Bytes();
         if(!pinned) { pinned=true; ++session->stats.pinnedCPUTextures; }
@@ -228,9 +235,24 @@ LayerManager& Manager() { static auto* manager=new LayerManager; return *manager
 }
 bool TVPBindMetalLayerRenderManager(krkrsdl3::iTVPRenderBackend* backend) {
     TVPUnbindMetalLayerRenderManager();
-    if(!backend || !backend->SupportsLayerOperations()) return false;
-    auto& manager=Manager(); manager.RenderMethodCache=TVPGetRenderManager(ttstr("software"))->RenderMethodCache; manager.session=std::make_shared<Session>(backend); manager.stretch=0;
-    TVPSetRenderManager(&manager); return true;
+    fallbackReason.clear();
+    if(!backend || !backend->SupportsLayerOperations()) {
+        fallbackReason="ordinary Layer pipeline unavailable"; return false;
+    }
+    try {
+        // Probe both required resource types before binding/creating any Layer.
+        for(auto format:{TVPLayerTextureFormat::RGBA8,TVPLayerTextureFormat::R8}) {
+            void* probe=backend->CreateLayerTexture(1,1,format);
+            if(!probe) { fallbackReason="RGBA/R8 Layer resource initialization failed"; return false; }
+            backend->DestroyLayerTexture(probe);
+        }
+        auto& manager=Manager();
+        manager.RenderMethodCache=TVPGetRenderManager(ttstr("software"))->RenderMethodCache;
+        manager.session=std::make_shared<Session>(backend); manager.stretch=0;
+        TVPSetRenderManager(&manager); return true;
+    } catch(const std::exception& error) {
+        fallbackReason=error.what(); return false;
+    }
 }
 void TVPUnbindMetalLayerRenderManager() {
     auto& manager=Manager(); TVPSetRenderManager(nullptr);
@@ -242,3 +264,5 @@ void TVPUnbindMetalLayerRenderManager() {
 }
 bool TVPMetalLayerCompositionActive() { return bool(Manager().session); }
 TVPLayerRenderStats TVPGetMetalLayerRenderStats() { return Manager().session?Manager().session->stats:TVPLayerRenderStats{}; }
+
+const char* TVPMetalLayerFallbackReason() { return fallbackReason.c_str(); }

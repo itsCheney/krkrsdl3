@@ -5,5 +5,6 @@ namespace krkrsdl3 { class iTVPRenderBackend; }
 // session scoped. Unbind after clearing layers and recycling deleted textures.
 bool TVPBindMetalLayerRenderManager(krkrsdl3::iTVPRenderBackend* backend);
 void TVPUnbindMetalLayerRenderManager();
+const char* TVPMetalLayerFallbackReason();
 bool TVPMetalLayerCompositionActive();
 TVPLayerRenderStats TVPGetMetalLayerRenderStats();
