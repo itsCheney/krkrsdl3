@@ -1,4 +1,5 @@
 #include "tjsNativeBitmap.h"
+#include "RenderManager.h"
 
 #include "TVPMsg.h"
 #include "TVPEvent.h"
