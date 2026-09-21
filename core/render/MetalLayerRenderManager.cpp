@@ -59,13 +59,16 @@ class LayerTexture final : public iTVPTexture2D {
         damage.right=std::max(damage.right,r.right); damage.bottom=std::max(damage.bottom,r.bottom);
     }
     void MarkDirtyAll() { MarkDirty(tTVPRect(0,0,Width,Height)); }
-    void Read() {
+    void Read(TVPLayerReadbackSource source) {
         if(valid) return;
         if(!session->backend || !handle) throw std::runtime_error("GPU Layer read without a session");
         int pitch=0;
         if(!session->backend->ReadLayerTexture(handle,pixels,pitch) || pitch!=GetPitch())
             throw std::runtime_error("GPU Layer readback failed");
         session->stats.readbackBytes+=Bytes(); session->stats.cpuCacheBytes+=Bytes(); valid=true;
+        const int index=static_cast<int>(source);
+        session->stats.readbackBytesBySource[index]+=Bytes();
+        ++session->stats.readbackCountBySource[index];
     }
 public:
     LayerTexture(std::shared_ptr<Session> s,unsigned w,unsigned h,TVPTextureFormat::e f,bool ro)
@@ -82,7 +85,7 @@ public:
         session->textures.erase(this);
     }
     void Detach() {
-        try { Read(); }
+        try { Read(TVPLayerReadbackSource::Detach); }
         catch(const std::exception& error) {
             TVPConsoleLog("GPU Layer shutdown readback failed: %s",error.what());
             if(pixels.size()!=Bytes()) pixels.assign(Bytes(),0);
@@ -93,23 +96,29 @@ public:
         if(!pinned) { pinned=true; ++session->stats.pinnedCPUTextures; }
     }
     bool Belongs(const std::shared_ptr<Session>& s) const { return session==s && handle; }
+    // Used when building a borrowed software view for a CPU fallback, so the
+    // readback is billed to the fallback rather than to ordinary pixel access.
+    const void* ScanLineForFallback() {
+        Read(TVPLayerReadbackSource::Fallback);
+        return pixels.data();
+    }
     TVPTextureFormat::e GetFormat() const override { return format; }
     tjs_int GetPitch() const override { return Width*(format==TVPTextureFormat::Gray ? 1 : 4); }
     bool IsCPUResident() const override { return pinned || !handle; }
     bool IsStatic() override { return readonly && !pinned; }
     bool IsOpaque() override { return false; }
-    const void* GetScanLineForRead(tjs_uint y) override { Read(); return pixels.data()+size_t(y)*GetPitch(); }
+    const void* GetScanLineForRead(tjs_uint y) override { Read(TVPLayerReadbackSource::Pixels); return pixels.data()+size_t(y)*GetPitch(); }
     void* GetScanLineForWrite(tjs_uint y) override {
-        Read();
+        Read(TVPLayerReadbackSource::Pixels);
         // Callers commonly stride past the requested row, so this cannot be
         // narrowed to a single row without a contract they do not follow.
         if(handle) MarkDirtyAll();
         return pixels.data()+size_t(y)*GetPitch();
     }
-    void* LockCPURead() override { Read(); ++locks; return pixels.data(); }
+    void* LockCPURead() override { Read(TVPLayerReadbackSource::Lock); ++locks; return pixels.data(); }
     void UnlockCPU() override { if(locks) --locks; }
-    void MarkCPUModified() override { Read(); MarkDirtyAll(); }
-    void MarkCPUModified(const tTVPRect& written) override { Read(); MarkDirty(written); }
+    void MarkCPUModified() override { Read(TVPLayerReadbackSource::Fallback); MarkDirtyAll(); }
+    void MarkCPUModified(const tTVPRect& written) override { Read(TVPLayerReadbackSource::Fallback); MarkDirty(written); }
     void InvalidateCPUCache() override {
         // The GPU now owns these pixels, so no pre-lease CPU damage survives.
         dirty=false; leaseHadDamage=false;
@@ -119,7 +128,7 @@ public:
         if(!locks && !pinned) std::vector<uint8_t>().swap(pixels);
     }
     void* GetPersistentCPUData(bool write) override {
-        Read(); if(!pinned) { pinned=true; ++session->stats.pinnedCPUTextures; }
+        Read(TVPLayerReadbackSource::Persistent); if(!pinned) { pinned=true; ++session->stats.pinnedCPUTextures; }
         if(write) {
             if(!writeLeased) { leaseHadDamage=dirty; leaseDamage=damage; writeLeased=true; }
             MarkDirtyAll();
@@ -158,7 +167,7 @@ public:
         // pointer alive but is not itself a reason to re-send unchanged pixels.
         if(dirty || writeLeased) {
             if(writeLeased) MarkDirtyAll();
-            Read();
+            Read(TVPLayerReadbackSource::Pixels);
             const int bpp=format==TVPTextureFormat::Gray ? 1 : 4;
             const auto* source=pixels.data()+size_t(damage.top)*GetPitch()+size_t(damage.left)*bpp;
             if(!session->backend->UpdateLayerTexture(handle,source,GetPitch(),Rect(damage)))
@@ -187,7 +196,7 @@ public:
                            size_t(r.left-requested.left)*bpp;
         int bytes=r.get_width()*bpp;
         if(pinned || dirty || !handle) {
-            Read(); for(int y=0;y<r.get_height();++y)
+            Read(TVPLayerReadbackSource::Pixels); for(int y=0;y<r.get_height();++y)
                 std::memcpy(pixels.data()+size_t(y+r.top)*GetPitch()+r.left*bpp,source+size_t(y)*pitch,bytes);
             MarkDirty(r); return;
         }
@@ -216,9 +225,10 @@ class CPUViews {
     std::unordered_map<iTVPTexture2D*,std::unique_ptr<iTVPTexture2D>> views;
 public:
     iTVPTexture2D* Get(iTVPTexture2D* t) {
-        if(!t || !dynamic_cast<LayerTexture*>(t)) return t;
+        auto* layer=dynamic_cast<LayerTexture*>(t);
+        if(!layer) return t;
         auto& v=views[t];
-        if(!v) v.reset(TVPGetSoftwareRenderManager()->CreateTexture2D(t->GetScanLineForRead(0),t->GetPitch(),t->GetWidth(),t->GetHeight(),t->GetFormat()));
+        if(!v) v.reset(TVPGetSoftwareRenderManager()->CreateTexture2D(layer->ScanLineForFallback(),t->GetPitch(),t->GetWidth(),t->GetHeight(),t->GetFormat()));
         return v.get();
     }
 };

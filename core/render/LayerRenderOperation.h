@@ -28,10 +28,31 @@ struct TVPLayerRect
     int Height() const { return bottom - top; }
 };
 enum class TVPLayerTextureFormat { RGBA8, R8 };
+// Why a GPU->CPU readback happened. Readbacks are synchronous and dominate
+// main-thread time, so attribution matters more than the total: the same byte
+// count means very different things for a per-frame present than for a one-off
+// script query.
+enum class TVPLayerReadbackSource
+{
+    // Explicit read lock, e.g. layer hit testing sampling a single pixel.
+    Lock = 0,
+    // A software operator ran because the GPU path could not take it.
+    Fallback,
+    // Raw pixel pointer exposed to a script or plugin.
+    Persistent,
+    // Scanline access, GetPoint, or a partial Update needing existing pixels.
+    Pixels,
+    // Session teardown moving a texture back to CPU ownership.
+    Detach,
+    Count
+};
 struct TVPLayerRenderStats
 {
     uint64_t gpuOperations = 0, cpuFallbacks = 0;
     uint64_t uploadedBytes = 0, readbackBytes = 0;
     uint64_t gpuResidentBytes = 0, cpuCacheBytes = 0;
     uint64_t pinnedCPUTextures = 0;
+    // Indexed by TVPLayerReadbackSource; sums to readbackBytes.
+    uint64_t readbackBytesBySource[static_cast<int>(TVPLayerReadbackSource::Count)] = {};
+    uint64_t readbackCountBySource[static_cast<int>(TVPLayerReadbackSource::Count)] = {};
 };
