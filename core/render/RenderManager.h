@@ -83,6 +83,8 @@ public:
     virtual void UnlockCPU() {}
     // CPU 数据已修改，下次 GPU 使用前需上传
     virtual void MarkCPUModified() {}
+    // 同上，但已知被写区域，仅上传该区域
+    virtual void MarkCPUModified(const tTVPRect& written) { MarkCPUModified(); }
     // 纹理已驻留 GPU，CPU 缓存失效
     virtual void InvalidateCPUCache() {}
     // Raw script/plugin addresses may outlive a call. GPU adapters demote this
@@ -90,6 +92,10 @@ public:
     virtual void* GetPersistentCPUData(bool write) {
         return write ? GetScanLineForWrite(0) : const_cast<void*>(GetScanLineForRead(0));
     }
+    // Closes a GetPersistentCPUData(true) lease. Pass the region actually
+    // written to limit the upload; nullptr means "assume the whole surface".
+    // Software textures own their pixels and ignore this.
+    virtual void ReleasePersistentCPUData(const tTVPRect* written) {}
 
     static void RecycleProcess();
 };

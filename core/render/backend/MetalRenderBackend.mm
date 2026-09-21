@@ -147,6 +147,62 @@ struct MetalRenderBackend::Impl
     size_t transientBytes = 0;
     double pendingQueueWaitMS = 0, lastPresentationWaitMS = -1;
     static constexpr size_t kSubmissionBudget = 16 * 1024 * 1024;
+    // Staging buffers are recycled instead of reallocated: uploads and readbacks
+    // churn hundreds of MB/s through here. A buffer stays checked out until the
+    // command buffer referencing it completes, so reuse is driven by Submit.
+    std::vector<id<MTLBuffer>> stagingPool;
+    // Buffers handed to command buffers that have not completed yet. Ownership
+    // returns to the pool once the referencing command buffer reports done;
+    // all pool mutation stays on the render thread.
+    std::vector<std::pair<id<MTLCommandBuffer>, std::vector<id<MTLBuffer>>>> stagingInFlight;
+    // Checked out for the command buffer currently being encoded. If encoding
+    // fails these stay here and attach to the next submission instead, so they
+    // are never handed out while an open command buffer still references them.
+    std::vector<id<MTLBuffer>> stagingPending;
+    static constexpr size_t kStagingPoolBytes = 64 * 1024 * 1024;
+    size_t stagingPoolBytes = 0;
+    static bool Retired(id<MTLCommandBuffer> buffer)
+    {
+        MTLCommandBufferStatus status = buffer.status;
+        return status == MTLCommandBufferStatusCompleted || status == MTLCommandBufferStatusError;
+    }
+    void ReturnToPool(id<MTLBuffer> buffer)
+    {
+        if (!buffer || stagingPoolBytes + buffer.length > kStagingPoolBytes) return;
+        stagingPoolBytes += buffer.length;
+        stagingPool.push_back(buffer);
+    }
+    void DrainStaging()
+    {
+        for (auto it = stagingInFlight.begin(); it != stagingInFlight.end();) {
+            if (!Retired(it->first)) { ++it; continue; }
+            for (id<MTLBuffer> buffer : it->second) ReturnToPool(buffer);
+            it = stagingInFlight.erase(it);
+        }
+    }
+    id<MTLBuffer> AcquireStaging(size_t length)
+    {
+        if (!length) return nil;
+        DrainStaging();
+        // Reuse the smallest buffer that fits so a single oversized request
+        // cannot starve the common small-upload path.
+        size_t best = stagingPool.size();
+        for (size_t i = 0; i < stagingPool.size(); ++i)
+            if (stagingPool[i].length >= length &&
+                (best == stagingPool.size() || stagingPool[i].length < stagingPool[best].length))
+                best = i;
+        id<MTLBuffer> buffer = nil;
+        if (best != stagingPool.size()) {
+            buffer = stagingPool[best];
+            stagingPoolBytes -= buffer.length;
+            stagingPool.erase(stagingPool.begin() + best);
+        } else {
+            buffer = [device newBufferWithLength:length options:MTLResourceStorageModeShared];
+            if (!buffer) return nil;
+        }
+        stagingPending.push_back(buffer);
+        return buffer;
+    }
 
     ~Impl()
     {
@@ -215,12 +271,17 @@ struct MetalRenderBackend::Impl
         EndOrdinary();
         if (commands) {
             lastSubmitted = commands;
+            // Staging written into this batch stays checked out until it completes.
+            if (!stagingPending.empty())
+                stagingInFlight.emplace_back(commands, std::move(stagingPending));
+            stagingPending.clear();
             [commands commit];
             commands = nil;
             transientBytes = 0;
         }
         if (wait && lastSubmitted) {
             [lastSubmitted waitUntilCompleted];
+            DrainStaging();
             return lastSubmitted.status == MTLCommandBufferStatusCompleted;
         }
         return true;
@@ -274,7 +335,7 @@ struct MetalRenderBackend::Impl
         if (!r || !pixels || !ValidSize(w, h) || w > r->width || h > r->height || pitch < w * 4) return;
         const size_t rowBytes = (static_cast<size_t>(w) * 4 + 255) & ~size_t(255);
         if (static_cast<size_t>(h) > std::numeric_limits<size_t>::max() / rowBytes) return;
-        id<MTLBuffer> staging = [device newBufferWithLength:rowBytes * h options:MTLResourceStorageModeShared];
+        id<MTLBuffer> staging = AcquireStaging(rowBytes * h);
         if (!staging) throw std::runtime_error("Metal upload buffer allocation failed");
         for (int y = 0; y < h; ++y)
             std::memcpy(static_cast<uint8_t*>(staging.contents) + y * rowBytes,
@@ -301,7 +362,7 @@ struct MetalRenderBackend::Impl
         const size_t w=regionWidth,h=regionHeight;
         const size_t bpp = texture.pixelFormat == MTLPixelFormatR8Unorm ? 1 : 4;
         const size_t rowBytes = (w * bpp + 255) & ~size_t(255);
-        id<MTLBuffer> staging = [device newBufferWithLength:rowBytes * h options:MTLResourceStorageModeShared];
+        id<MTLBuffer> staging = AcquireStaging(rowBytes * h);
         if (!staging) return false;
         id<MTLBlitCommandEncoder> e = Blit();
         if (!e) return false;
@@ -667,7 +728,7 @@ bool MetalRenderBackend::UpdateLayerTexture(void* handle, const uint8_t* pixels,
         if (!r || !pixels || rc.left<0 || rc.top<0 || rc.right>r->width || rc.bottom>r->height ||
             rc.Width()<=0 || rc.Height()<=0 || pitch<rc.Width()*r->bytesPerPixel) return false;
         size_t bytes=rc.Width()*r->bytesPerPixel, row=(bytes+255)&~size_t(255);
-        id<MTLBuffer> staging=[p.device newBufferWithLength:row*rc.Height() options:MTLResourceStorageModeShared];
+        id<MTLBuffer> staging=p.AcquireStaging(row*rc.Height());
         if (!staging) return false;
         for(int y=0;y<rc.Height();++y) std::memcpy(static_cast<uint8_t*>(staging.contents)+y*row,pixels+y*pitch,bytes);
         id<MTLBlitCommandEncoder> e=p.Blit(); if(!e) return false;

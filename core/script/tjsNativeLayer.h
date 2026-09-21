@@ -485,6 +485,10 @@ public:
 
     const void* GetMainImagePixelBuffer() const;
     void* GetMainImagePixelBufferForWrite();
+    // Closes the write lease opened by GetMainImagePixelBufferForWrite so a GPU
+    // adapter can upload only `written` instead of the whole surface. Callers
+    // that cannot describe their writes may skip this and pay a full upload.
+    void ReleaseMainImagePixelBufferForWrite(const tTVPRect& written);
     tjs_int GetMainImagePixelBufferPitch() const;
     const void* GetProvinceImagePixelBuffer() const;
     void* GetProvinceImagePixelBufferForWrite();

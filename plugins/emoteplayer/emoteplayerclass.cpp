@@ -314,6 +314,7 @@ void D3DAdaptor::captureCanvas(iTJSDispatch2* targetLayer)
     if (buff && pixels)
         std::memcpy(buff, pixels, (size_t)_width * _height * 4);
     renderer->UnlockTarget(_target);
+    ths->ReleaseMainImagePixelBufferForWrite(tTVPRect(0, 0, _width, _height));
     ths->Update();
 }
 void D3DAdaptor::unloadUnusedTextures()
@@ -799,6 +800,8 @@ void EmotePlayer::draw(iTJSDispatch2* objthis)
             if (buff && pixels)
                 std::memcpy(buff, pixels, (size_t)_width * _height * 4);
             renderer->UnlockTarget(target);
+            // 写入范围即上面这块，据此关闭写租约，GPU 后端只需上传该区域
+            ths->ReleaseMainImagePixelBufferForWrite(tTVPRect(0, 0, _width, _height));
             ths->Update();
         }
     }

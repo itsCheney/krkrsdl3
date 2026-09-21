@@ -36,8 +36,29 @@ class LayerTexture final : public iTVPTexture2D {
     void* handle = nullptr;
     std::vector<uint8_t> pixels;
     bool valid = false, dirty = false, pinned = false, readonly;
+    // An outstanding raw write pointer may be written at any time without
+    // telling us, so such a texture re-uploads until the lease is released.
+    bool writeLeased = false;
     unsigned locks = 0;
+    // Union of CPU writes since the last upload; meaningful only while dirty.
+    tTVPRect damage;
+    // Damage outstanding when the current write lease opened. A lease widens
+    // damage to the whole surface while it is held, so releasing it must restore
+    // this rather than drop writes the lease did not make.
+    bool leaseHadDamage = false;
+    tTVPRect leaseDamage;
     size_t Bytes() const { return size_t(GetPitch())*Height; }
+    // Writers report what they touched so an upload carries only those rows.
+    // Callers that cannot describe their writes report the whole surface.
+    void MarkDirty(const tTVPRect& requested) {
+        tTVPRect r(std::max(0,requested.left),std::max(0,requested.top),
+                   std::min(int(Width),requested.right),std::min(int(Height),requested.bottom));
+        if(r.get_width()<=0 || r.get_height()<=0) return;
+        if(!dirty) { damage=r; dirty=true; return; }
+        damage.left=std::min(damage.left,r.left); damage.top=std::min(damage.top,r.top);
+        damage.right=std::max(damage.right,r.right); damage.bottom=std::max(damage.bottom,r.bottom);
+    }
+    void MarkDirtyAll() { MarkDirty(tTVPRect(0,0,Width,Height)); }
     void Read() {
         if(valid) return;
         if(!session->backend || !handle) throw std::runtime_error("GPU Layer read without a session");
@@ -78,12 +99,20 @@ public:
     bool IsStatic() override { return readonly && !pinned; }
     bool IsOpaque() override { return false; }
     const void* GetScanLineForRead(tjs_uint y) override { Read(); return pixels.data()+size_t(y)*GetPitch(); }
-    void* GetScanLineForWrite(tjs_uint y) override { Read(); if(handle) dirty=true; return pixels.data()+size_t(y)*GetPitch(); }
+    void* GetScanLineForWrite(tjs_uint y) override {
+        Read();
+        // Callers commonly stride past the requested row, so this cannot be
+        // narrowed to a single row without a contract they do not follow.
+        if(handle) MarkDirtyAll();
+        return pixels.data()+size_t(y)*GetPitch();
+    }
     void* LockCPURead() override { Read(); ++locks; return pixels.data(); }
     void UnlockCPU() override { if(locks) --locks; }
-    void MarkCPUModified() override { Read(); dirty=true; }
+    void MarkCPUModified() override { Read(); MarkDirtyAll(); }
+    void MarkCPUModified(const tTVPRect& written) override { Read(); MarkDirty(written); }
     void InvalidateCPUCache() override {
-        dirty=false;
+        // The GPU now owns these pixels, so no pre-lease CPU damage survives.
+        dirty=false; leaseHadDamage=false;
         if(valid) { valid=false; session->stats.cpuCacheBytes-=Bytes(); }
         // A stale read pointer is only valid through its read lock. Retaining
         // allocation prevents accidental relocation during an active lock.
@@ -91,15 +120,38 @@ public:
     }
     void* GetPersistentCPUData(bool write) override {
         Read(); if(!pinned) { pinned=true; ++session->stats.pinnedCPUTextures; }
-        if(write) dirty=true; return pixels.data();
+        if(write) {
+            if(!writeLeased) { leaseHadDamage=dirty; leaseDamage=damage; writeLeased=true; }
+            MarkDirtyAll();
+        }
+        return pixels.data();
+    }
+    // Ends a write lease opened by GetPersistentCPUData(true). Writers that can
+    // describe what they touched report it here and stop paying for full
+    // re-uploads; the pointer stays valid because the texture remains pinned.
+    void ReleasePersistentCPUData(const tTVPRect* written) override {
+        if(!writeLeased) return;
+        writeLeased=false;
+        if(written) {
+            // Re-narrow to what the lease actually wrote, plus anything that was
+            // already pending when it opened.
+            dirty=leaseHadDamage; damage=leaseDamage; MarkDirty(*written);
+        } else MarkDirtyAll();
+        leaseHadDamage=false;
     }
     void* GetTextureHandle() override {
         if(!session->backend || !handle) return nullptr;
-        if(dirty || pinned) {
-            Read(); TVPLayerRect r{0,0,Width,Height};
-            if(!session->backend->UpdateLayerTexture(handle,pixels.data(),GetPitch(),r))
+        // Only actual CPU writes need an upload. A pinned texture keeps its raw
+        // pointer alive but is not itself a reason to re-send unchanged pixels.
+        if(dirty || writeLeased) {
+            if(writeLeased) MarkDirtyAll();
+            Read();
+            const int bpp=format==TVPTextureFormat::Gray ? 1 : 4;
+            const auto* source=pixels.data()+size_t(damage.top)*GetPitch()+size_t(damage.left)*bpp;
+            if(!session->backend->UpdateLayerTexture(handle,source,GetPitch(),Rect(damage)))
                 throw std::runtime_error("GPU Layer upload failed");
-            session->stats.uploadedBytes+=Bytes(); dirty=false;
+            session->stats.uploadedBytes+=size_t(damage.get_width())*bpp*damage.get_height();
+            dirty=false; leaseHadDamage=false;
         }
         return handle;
     }
@@ -124,7 +176,7 @@ public:
         if(pinned || dirty || !handle) {
             Read(); for(int y=0;y<r.get_height();++y)
                 std::memcpy(pixels.data()+size_t(y+r.top)*GetPitch()+r.left*bpp,source+size_t(y)*pitch,bytes);
-            dirty=true; return;
+            MarkDirty(r); return;
         }
         if(!session->backend->UpdateLayerTexture(handle,source,pitch,Rect(r)))
             throw std::runtime_error("GPU Layer update failed");
@@ -231,7 +283,9 @@ public:
         CPUViews views; std::vector<std::pair<iTVPTexture2D*,tTVPRect>> textures;
         for(size_t i=0;i<inputs.size();++i) textures.emplace_back(views.Get(inputs[i].first),inputs[i].second);
         Software()->OperateRect(method,views.Get(target),views.Get(reference),dst,tRenderTexRectArray(textures.data(),textures.size()));
-        if(target) target->MarkCPUModified(); if(session) ++session->stats.cpuFallbacks;
+        // The software manager clips its writes to dst, so the upload can too.
+        if(target) target->MarkCPUModified(dst);
+        if(session) ++session->stats.cpuFallbacks;
     }
     void OperateTriangles(iTVPRenderMethod* method,int count,iTVPTexture2D* target,iTVPTexture2D* reference,const tTVPRect& clip,const tTVPPointD* points,const tRenderTexQuadArray& inputs) override {
         CPUViews views; std::vector<std::pair<iTVPTexture2D*,const tTVPPointD*>> textures;
