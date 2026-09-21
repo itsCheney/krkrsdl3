@@ -796,7 +796,9 @@ void EmotePlayer::draw(iTJSDispatch2* objthis)
             // 回读 CPU 像素并交给图层（GL 后端经 glReadPixels，软渲染后端零拷贝）
             int pitch = 0;
             uint8_t* pixels = renderer->LockTarget(target, pitch);
-            tjs_uint8* buff = (tjs_uint8*)ths->GetMainImagePixelBufferForWrite();
+            // 紧接的 memcpy 覆盖整个图层（_width/_height 来自上面的 ResetDrawArea），
+            // 图层原有像素不会被读取，因此无需为保留它们做一次 GPU 回读。
+            tjs_uint8* buff = (tjs_uint8*)ths->GetMainImagePixelBufferForOverwrite();
             if (buff && pixels)
                 std::memcpy(buff, pixels, (size_t)_width * _height * 4);
             renderer->UnlockTarget(target);

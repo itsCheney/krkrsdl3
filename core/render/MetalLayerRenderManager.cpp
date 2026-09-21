@@ -126,6 +126,19 @@ public:
         }
         return pixels.data();
     }
+    // The caller overwrites every pixel, so the GPU's current contents are
+    // irrelevant: allocate the cache without a readback rather than fetching
+    // pixels that are about to be discarded.
+    void* GetPersistentCPUDataForOverwrite() override {
+        if(!valid) {
+            if(pixels.size()!=Bytes()) pixels.resize(Bytes());
+            valid=true; session->stats.cpuCacheBytes+=Bytes();
+        }
+        if(!pinned) { pinned=true; ++session->stats.pinnedCPUTextures; }
+        if(!writeLeased) { leaseHadDamage=dirty; leaseDamage=damage; writeLeased=true; }
+        MarkDirtyAll();
+        return pixels.data();
+    }
     // Ends a write lease opened by GetPersistentCPUData(true). Writers that can
     // describe what they touched report it here and stop paying for full
     // re-uploads; the pointer stays valid because the texture remains pinned.

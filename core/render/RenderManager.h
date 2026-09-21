@@ -92,6 +92,11 @@ public:
     virtual void* GetPersistentCPUData(bool write) {
         return write ? GetScanLineForWrite(0) : const_cast<void*>(GetScanLineForRead(0));
     }
+    // Same as GetPersistentCPUData(true), but the caller promises to overwrite
+    // every pixel before anything reads them. A GPU adapter can then skip the
+    // readback that would otherwise fetch pixels only to have them discarded.
+    // Callers that cannot keep that promise must use GetPersistentCPUData.
+    virtual void* GetPersistentCPUDataForOverwrite() { return GetPersistentCPUData(true); }
     // Closes a GetPersistentCPUData(true) lease. Pass the region actually
     // written to limit the upload; nullptr means "assume the whole surface".
     // Software textures own their pixels and ignore this.

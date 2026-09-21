@@ -2978,6 +2978,14 @@ void* tTJSNI_BaseLayer::GetMainImagePixelBufferForWrite()
     return MainImage->GetTextureForRender(true, nullptr)->GetPersistentCPUData(true);
 }
 //---------------------------------------------------------------------------
+void* tTJSNI_BaseLayer::GetMainImagePixelBufferForOverwrite()
+{
+    if (!MainImage)
+        return NULL;
+    ImageModified = true;
+    return MainImage->GetTextureForRender(true, nullptr)->GetPersistentCPUDataForOverwrite();
+}
+//---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::ReleaseMainImagePixelBufferForWrite(const tTVPRect& written)
 {
     if (!MainImage)

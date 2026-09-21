@@ -485,6 +485,9 @@ public:
 
     const void* GetMainImagePixelBuffer() const;
     void* GetMainImagePixelBufferForWrite();
+    // For callers that replace every pixel of the layer. Skips the GPU readback
+    // that GetMainImagePixelBufferForWrite performs to preserve existing content.
+    void* GetMainImagePixelBufferForOverwrite();
     // Closes the write lease opened by GetMainImagePixelBufferForWrite so a GPU
     // adapter can upload only `written` instead of the whole surface. Callers
     // that cannot describe their writes may skip this and pay a full upload.
