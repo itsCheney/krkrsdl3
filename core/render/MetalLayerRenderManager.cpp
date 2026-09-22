@@ -26,6 +26,8 @@ struct Session {
     iTVPRenderBackend* backend;
     TVPLayerRenderStats stats;
     std::set<LayerTexture*> textures;
+    std::unordered_map<std::string,uint64_t> multipleInputMethods;
+    std::unordered_map<std::string,uint64_t> unsupportedMethods;
     bool tablesReady = false;
     explicit Session(iTVPRenderBackend* b) : backend(b) {}
 };
@@ -248,6 +250,17 @@ public:
         if(session) ++session->stats.gpuRejectCountByReason[static_cast<int>(reason)];
         return false;
     }
+    bool RejectMethod(TVPLayerGPURejectReason reason, iTVPRenderMethod* method, size_t inputCount=0) {
+        if(session) {
+            ++session->stats.gpuRejectCountByReason[static_cast<int>(reason)];
+            const std::string name = method && !method->GetName().empty() ? method->GetName() : "<unnamed>";
+            if(reason==TVPLayerGPURejectReason::MultipleInputs)
+                ++session->multipleInputMethods[name+"["+std::to_string(inputCount)+"]"];
+            else if(reason==TVPLayerGPURejectReason::UnsupportedMethod)
+                ++session->unsupportedMethods[name];
+        }
+        return false;
+    }
     const char* GetName() override { return "Metal Layer"; }
     // This facade keeps the software ABI, including CPU plugin operations.
     bool IsSoftware() override { return false; }
@@ -285,8 +298,8 @@ public:
         auto* t=dynamic_cast<LayerTexture*>(target); TVPLayerOperation op;
         if(!session || !t || !t->Belongs(session)) return Reject(TVPLayerGPURejectReason::TargetUnavailable);
         if(t->IsCPUResident()) return Reject(TVPLayerGPURejectReason::TargetCPUResident);
-        if(inputs.size()>1) return Reject(TVPLayerGPURejectReason::MultipleInputs);
-        if(!method->DescribeGpuOperation(op)) return Reject(TVPLayerGPURejectReason::UnsupportedMethod);
+        if(inputs.size()>1) return RejectMethod(TVPLayerGPURejectReason::MultipleInputs,method,inputs.size());
+        if(!method->DescribeGpuOperation(op)) return RejectMethod(TVPLayerGPURejectReason::UnsupportedMethod,method);
         if(stretch<0 || stretch>2) return Reject(TVPLayerGPURejectReason::UnsupportedStretch);
         if(op.opacity<0 || op.opacity>255) return Reject(TVPLayerGPURejectReason::InvalidOpacity);
         LayerTexture* source=nullptr; tTVPRect src(0,0,1,1);
@@ -390,5 +403,28 @@ void TVPUnbindMetalLayerRenderManager() {
 }
 bool TVPMetalLayerCompositionActive() { return bool(Manager().session); }
 TVPLayerRenderStats TVPGetMetalLayerRenderStats() { return Manager().session?Manager().session->stats:TVPLayerRenderStats{}; }
+
+static std::string FormatMethodSummary(const std::unordered_map<std::string,uint64_t>& methods) {
+    std::vector<std::pair<std::string,uint64_t>> ordered(methods.begin(),methods.end());
+    std::sort(ordered.begin(),ordered.end(),[](const auto& a,const auto& b) {
+        return a.second!=b.second ? a.second>b.second : a.first<b.first;
+    });
+    constexpr size_t limit=8;
+    std::string out;
+    for(size_t i=0;i<ordered.size() && i<limit;++i) {
+        if(!out.empty()) out.push_back(',');
+        out+=ordered[i].first+":"+std::to_string(ordered[i].second);
+    }
+    if(ordered.size()>limit) out+=",otherMethods:"+std::to_string(ordered.size()-limit);
+    return out;
+}
+std::string TVPGetMetalLayerMultipleInputMethodSummary() {
+    auto& manager=Manager();
+    return manager.session?FormatMethodSummary(manager.session->multipleInputMethods):std::string();
+}
+std::string TVPGetMetalLayerUnsupportedMethodSummary() {
+    auto& manager=Manager();
+    return manager.session?FormatMethodSummary(manager.session->unsupportedMethods):std::string();
+}
 
 const char* TVPMetalLayerFallbackReason() { return fallbackReason.c_str(); }
