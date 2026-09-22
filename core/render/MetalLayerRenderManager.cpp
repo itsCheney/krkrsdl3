@@ -310,6 +310,15 @@ public:
                 return Reject(TVPLayerGPURejectReason::SourceUnavailable);
             if(source1->GetFormat()!=TVPTextureFormat::RGBA || source2->GetFormat()!=TVPTextureFormat::RGBA)
                 return Reject(TVPLayerGPURejectReason::SourceFormat);
+            const auto sameRect=[](const tTVPRect& a,const tTVPRect& b) {
+                return a.left==b.left && a.top==b.top && a.right==b.right && a.bottom==b.bottom;
+            };
+            // Software transitions can read and write the same backing buffer.
+            // If an aliased source is offset from the output rect, software
+            // semantics are order-dependent; snapshotting would subtly change it.
+            // Only accelerate the unambiguous one-pixel-to-one-pixel alias case.
+            if((source1==t && !sameRect(src1,dst)) || (source2==t && !sameRect(src2,dst)))
+                return RejectMethod(TVPLayerGPURejectReason::MultipleInputs,method,inputs.size());
             const int dw=dst.get_width(),dh=dst.get_height();
             if(dw<=0 || dh<=0 || src1.get_width()!=dw || src1.get_height()!=dh ||
                src2.get_width()!=dw || src2.get_height()!=dh)

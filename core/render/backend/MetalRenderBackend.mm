@@ -832,6 +832,10 @@ bool MetalRenderBackend::OperateLayerRectDualSource(const TVPLayerOperation& ope
         const int w=dst.Width(),h=dst.Height();
         if(w<=0 || h<=0 || src1.Width()!=w || src1.Height()!=h ||
            src2.Width()!=w || src2.Height()!=h) return false;
+        const auto sameRect=[](const TVPLayerRect& a,const TVPLayerRect& b) {
+            return a.left==b.left && a.top==b.top && a.right==b.right && a.bottom==b.bottom;
+        };
+        if((s1==t && !sameRect(src1,dst)) || (s2==t && !sameRect(src2,dst))) return false;
         auto validRect=[](const TVPLayerRect& r,const Impl::Resource* s) {
             return r.left>=0 && r.top>=0 && r.right<=s->width && r.bottom<=s->height &&
                    r.Width()>0 && r.Height()>0;
