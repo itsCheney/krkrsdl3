@@ -7,6 +7,8 @@
 #include "tjsCommHead.h"
 #include "tjsNativeLayer.h"
 
+#include <algorithm>
+
 namespace emoteplayer
 {
 
