@@ -223,6 +223,41 @@ void TVPRecordEmoteCaptureGPUCopy(uint64_t bytes);
 TVPEmoteCaptureStats TVPGetEmoteCaptureStats();
 void TVPResetEmoteCaptureStats();
 
+struct TVPRuntimeProfileStats {
+    uint64_t emoteProgressCalls = 0;
+    uint64_t emoteProgressTimeNS = 0;
+    uint64_t emotePrepareCalls = 0;
+    uint64_t emotePrepareTimeNS = 0;
+    uint64_t emoteDrawCalls = 0;
+    uint64_t emoteDrawTimeNS = 0;
+    uint64_t emoteCaptureProfileCalls = 0;
+    uint64_t emoteCaptureTimeNS = 0;
+    uint64_t meshDrawCalls = 0;
+    uint64_t meshVertices = 0;
+    uint64_t meshIndices = 0;
+    uint64_t meshCPUTimeNS = 0;
+    uint64_t meshValidationTimeNS = 0;
+    uint64_t meshBufferAllocations = 0;
+    uint64_t meshBufferBytes = 0;
+    uint64_t meshBufferAllocationTimeNS = 0;
+    uint64_t metalSubmits = 0;
+    uint64_t metalSyncWaits = 0;
+    uint64_t metalSyncWaitTimeNS = 0;
+    uint64_t metalQueueWaitTimeNS = 0;
+};
+void TVPRecordEmoteProgress(uint64_t nanoseconds);
+void TVPRecordEmotePrepare(uint64_t nanoseconds);
+void TVPRecordEmoteDraw(uint64_t nanoseconds);
+void TVPRecordEmoteCaptureTime(uint64_t nanoseconds);
+void TVPRecordMeshDraw(uint64_t vertices, uint64_t indices, uint64_t cpuTimeNS,
+                       uint64_t validationTimeNS, uint64_t bufferAllocations,
+                       uint64_t bufferBytes, uint64_t bufferAllocationTimeNS);
+void TVPRecordMetalSubmit();
+void TVPRecordMetalSyncWait(uint64_t nanoseconds);
+void TVPRecordMetalQueueWait(uint64_t nanoseconds);
+TVPRuntimeProfileStats TVPGetRuntimeProfileStats();
+void TVPResetRuntimeProfileStats();
+
 // 销毁当前后端并清空指针
 void TVPShutdownRenderBackend();
 

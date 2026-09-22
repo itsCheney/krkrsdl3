@@ -229,7 +229,9 @@ struct MetalRenderBackend::Impl
         if (!commands) {
             const Uint64 waitStarted = SDL_GetTicksNS();
             dispatch_semaphore_wait(inFlight, DISPATCH_TIME_FOREVER);
-            pendingQueueWaitMS += static_cast<double>(SDL_GetTicksNS() - waitStarted) / 1000000.0;
+            const Uint64 queueWaitNS = SDL_GetTicksNS() - waitStarted;
+            pendingQueueWaitMS += static_cast<double>(queueWaitNS) / 1000000.0;
+            TVPRecordMetalQueueWait(queueWaitNS);
             commands = [queue commandBuffer];
             if (!commands) {
                 dispatch_semaphore_signal(inFlight);
@@ -278,11 +280,14 @@ struct MetalRenderBackend::Impl
                 stagingInFlight.emplace_back(commands, std::move(stagingPending));
             stagingPending.clear();
             [commands commit];
+            TVPRecordMetalSubmit();
             commands = nil;
             transientBytes = 0;
         }
         if (wait && lastSubmitted) {
+            const Uint64 waitStarted = SDL_GetTicksNS();
             [lastSubmitted waitUntilCompleted];
+            TVPRecordMetalSyncWait(SDL_GetTicksNS() - waitStarted);
             DrainStaging();
             return lastSubmitted.status == MTLCommandBufferStatusCompleted;
         }
@@ -612,15 +617,22 @@ void MetalRenderBackend::DrawMesh(const float* vertices, int vertexCount, const 
         auto& p = *impl_;
         auto r = p.Find(handle);
         if (!p.current || !r || !vertices || !indices || vertexCount <= 0 || indexCount < 3 || p.mesh.flags.x == 6) return;
-        for (int i = 0; i < indexCount; ++i) if (indices[i] >= vertexCount) return;
+        const Uint64 cpuStarted = SDL_GetTicksNS();
+        const Uint64 validationStarted = cpuStarted;
+        for (int n = 0; n < indexCount; ++n) if (indices[n] >= vertexCount) return;
+        const Uint64 validationTimeNS = SDL_GetTicksNS() - validationStarted;
         id<MTLTexture> source = r->texture;
         // Avoid sampling the render attachment, including when it is also the mask.
         id<MTLTexture> snapshot = (r == p.current || p.mask == p.current) ? p.Snapshot(p.current) : nil;
         if (r == p.current) source = snapshot;
-        id<MTLBuffer> v = [p.device newBufferWithBytes:vertices length:static_cast<size_t>(vertexCount) * 4 * sizeof(float)
+        const size_t vertexBytes = static_cast<size_t>(vertexCount) * 4 * sizeof(float);
+        const size_t indexBytes = static_cast<size_t>(indexCount) * sizeof(uint16_t);
+        const Uint64 allocationStarted = SDL_GetTicksNS();
+        id<MTLBuffer> v = [p.device newBufferWithBytes:vertices length:vertexBytes
                                             options:MTLResourceStorageModeShared];
-        id<MTLBuffer> i = [p.device newBufferWithBytes:indices length:static_cast<size_t>(indexCount) * sizeof(uint16_t)
+        id<MTLBuffer> i = [p.device newBufferWithBytes:indices length:indexBytes
                                             options:MTLResourceStorageModeShared];
+        const Uint64 allocationTimeNS = SDL_GetTicksNS() - allocationStarted;
         if (!v || !i) throw std::runtime_error("Metal mesh buffer allocation failed");
         Params uniforms = p.mesh;
         uniforms.modulation = modulation ? Color(modulation) : simd_make_float4(1, 1, 1, 1);
@@ -636,9 +648,11 @@ void MetalRenderBackend::DrawMesh(const float* vertices, int vertexCount, const 
         [e drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:indexCount indexType:MTLIndexTypeUInt16
                      indexBuffer:i indexBufferOffset:0];
         [e endEncoding];
-        p.transientBytes += static_cast<size_t>(vertexCount) * 4 * sizeof(float) +
-                            static_cast<size_t>(indexCount) * sizeof(uint16_t);
+        p.transientBytes += vertexBytes + indexBytes;
         if (p.transientBytes >= Impl::kSubmissionBudget) p.Submit();
+        TVPRecordMeshDraw(static_cast<uint64_t>(vertexCount),static_cast<uint64_t>(indexCount),
+                          SDL_GetTicksNS() - cpuStarted,validationTimeNS,2,
+                          static_cast<uint64_t>(vertexBytes + indexBytes),allocationTimeNS);
     }
 }
 void MetalRenderBackend::LayerSetBlend(int method, float opacity, const float* color)

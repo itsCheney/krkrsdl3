@@ -311,6 +311,12 @@ void D3DAdaptor::captureCanvas(iTJSDispatch2* targetLayer)
     if (!renderer)
         return;
 
+    struct CaptureProfileScope {
+        Uint64 started = SDL_GetTicksNS();
+        ~CaptureProfileScope() {
+            krkrsdl3::TVPRecordEmoteCaptureTime(SDL_GetTicksNS() - started);
+        }
+    } captureProfile;
     krkrsdl3::TVPRecordEmoteCaptureCall();
     const tjs_int layerWidth = ths->GetWidth();
     const tjs_int layerHeight = ths->GetHeight();
@@ -710,6 +716,7 @@ void EmotePlayer::progress(tjs_real mstime)
 {
     if (_isStop)
         return;
+    const Uint64 profileStarted = SDL_GetTicksNS();
     if (emtEngine._mainfile != nullptr && emtEngine._mainmotion != nullptr && clockPassed > -1.0 &&
         _limitArea.width != _limitArea.originX && _limitArea.height != _limitArea.originY)
     {
@@ -748,9 +755,11 @@ void EmotePlayer::progress(tjs_real mstime)
         else
             _pipoVal = 0;
     }
+    krkrsdl3::TVPRecordEmoteProgress(SDL_GetTicksNS() - profileStarted);
 }
 void EmotePlayer::prepareFrame()
 {
+    const Uint64 profileStarted = SDL_GetTicksNS();
     updateTransMat();
     std::vector<emoteRender> methods{_renderMethod};
     if (emtEngine._mainfile->isMirror)
@@ -761,6 +770,7 @@ void EmotePlayer::prepareFrame()
     _hitFrame.inputToClip = _renderMethod.attachMat;
     _hitFrame.width = _limitArea.viewW > 0 ? _limitArea.viewW : _limitArea.width;
     _hitFrame.height = _limitArea.viewH > 0 ? _limitArea.viewH : _limitArea.height;
+    krkrsdl3::TVPRecordEmotePrepare(SDL_GetTicksNS() - profileStarted);
 }
 
 void EmotePlayer::draw(iTJSDispatch2* objthis)
@@ -841,7 +851,9 @@ void EmotePlayer::draw(iTJSDispatch2* objthis)
         }
         if (!target) return;
         prepareFrame();
+        const Uint64 drawStarted = SDL_GetTicksNS();
         emtEngine.draw(renderer, target, _limitArea, maskTarget);
+        krkrsdl3::TVPRecordEmoteDraw(SDL_GetTicksNS() - drawStarted);
         if (!withD3DAdaptor)
         {
             // 回读 CPU 像素并交给图层（GL 后端经 glReadPixels，软渲染后端零拷贝）
@@ -886,7 +898,9 @@ void EmotePlayer::drawToTarget(krkrsdl3::iTVPRenderBackend* renderer,
     prepareFrame();
     renderer->SetTarget(target);
     renderer->ClearTarget(selfClear);
+    const Uint64 drawStarted = SDL_GetTicksNS();
     emtEngine.draw(renderer, target, _limitArea, maskTarget);
+    krkrsdl3::TVPRecordEmoteDraw(SDL_GetTicksNS() - drawStarted);
 }
 void EmotePlayer::assign(iTJSDispatch2* anotherAdaptor)
 {
