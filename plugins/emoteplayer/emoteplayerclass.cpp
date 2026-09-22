@@ -9,6 +9,7 @@
 #include "tjsNativeLayer.h"
 
 #include <algorithm>
+#include <cstdint>
 
 namespace emoteplayer
 {
@@ -863,6 +864,8 @@ void EmotePlayer::draw(iTJSDispatch2* objthis)
             renderer->ClearTarget(isSelfClear);
         }
         if (!target) return;
+        krkrsdl3::TVPRecordEmotePlayerDraw(
+            reinterpret_cast<uintptr_t>(this), reinterpret_cast<uintptr_t>(target));
         prepareFrame();
         const Uint64 drawStarted = SDL_GetTicksNS();
         emtEngine.draw(renderer, target, _limitArea, maskTarget);

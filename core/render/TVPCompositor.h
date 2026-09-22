@@ -281,6 +281,17 @@ struct TVPRuntimeProfileStats {
     uint64_t emoteGPUDeformDraws = 0;
     uint64_t emoteGPUDeformVertices = 0;
 
+    // Per-MikageKRKRStep Emote draw cadence. These distinguish multiple
+    // legitimate players from redundant repeated draws of the same player.
+    uint64_t emoteRenderSteps = 0;
+    uint64_t emotePlayerDraws = 0;
+    uint64_t emoteDistinctPlayerDraws = 0;
+    uint64_t emoteRepeatedPlayerDraws = 0;
+    uint64_t emoteDistinctTargets = 0;
+    uint64_t emoteMaxDrawsPerStep = 0;
+    uint64_t emoteMaxPlayersPerStep = 0;
+    uint64_t emoteMaxDrawsPerPlayerStep = 0;
+
     uint64_t meshDrawCalls = 0;
     uint64_t meshVertices = 0;
     uint64_t meshIndices = 0;
@@ -293,6 +304,16 @@ struct TVPRuntimeProfileStats {
     uint64_t metalSyncWaits = 0;
     uint64_t metalSyncWaitTimeNS = 0;
     uint64_t metalQueueWaitTimeNS = 0;
+
+    // Persistent transient-upload arena statistics.
+    uint64_t metalRingBytes = 0;
+    uint64_t metalRingSuballocs = 0;
+    uint64_t metalRingSuballocTimeNS = 0;
+    uint64_t metalRingWraps = 0;
+    uint64_t metalRingStallTimeNS = 0;
+    uint64_t metalRingHighWaterBytes = 0;
+    uint64_t metalRingFallbackAllocations = 0;
+    uint64_t metalRingFallbackBytes = 0;
 };
 void TVPRecordEmoteProgress(uint64_t nanoseconds);
 void TVPRecordEmotePrepare(uint64_t nanoseconds);
@@ -308,6 +329,13 @@ void TVPRecordEmoteShapeBuild(uint64_t nanoseconds, uint64_t vertices);
 void TVPRecordEmoteMeshBuild(uint64_t nanoseconds, uint64_t vertices,
                              uint64_t deformedVertices);
 void TVPRecordEmoteGPUDeform(uint64_t vertices);
+
+// Mikage host brackets one SDL_AppIterate call with these. EmotePlayer records
+// its identity and render target when an actual render request is made.
+void TVPBeginRuntimeStep();
+void TVPRecordEmotePlayerDraw(uintptr_t playerIdentity, uintptr_t targetIdentity);
+void TVPEndRuntimeStep();
+
 void TVPCommitEmotePrepareDetail(uint64_t transformTimeNS,
                                  uint64_t motionProgressTimeNS,
                                  uint64_t snapshotTimeNS);
@@ -318,6 +346,11 @@ void TVPRecordMeshDraw(uint64_t vertices, uint64_t indices, uint64_t cpuTimeNS,
 void TVPRecordMetalSubmit();
 void TVPRecordMetalSyncWait(uint64_t nanoseconds);
 void TVPRecordMetalQueueWait(uint64_t nanoseconds);
+void TVPRecordMetalRingSuballoc(uint64_t bytes, uint64_t highWaterBytes,
+                                uint64_t nanoseconds);
+void TVPRecordMetalRingWrap();
+void TVPRecordMetalRingStall(uint64_t nanoseconds);
+void TVPRecordMetalRingFallback(uint64_t bytes);
 TVPRuntimeProfileStats TVPGetRuntimeProfileStats();
 void TVPResetRuntimeProfileStats();
 

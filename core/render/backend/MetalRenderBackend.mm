@@ -11,6 +11,7 @@
 #include <TargetConditionals.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -221,6 +222,26 @@ struct MetalRenderBackend::Impl
     std::vector<id<MTLBuffer>> stagingPending;
     static constexpr size_t kStagingPoolBytes = 64 * 1024 * 1024;
     size_t stagingPoolBytes = 0;
+
+    // High-frequency mesh uploads use persistent command-buffer-scoped arenas
+    // instead of allocating one MTLBuffer per vertex/index payload.
+    struct RingPage {
+        id<MTLBuffer> buffer = nil;
+        size_t offset = 0;
+        id<MTLCommandBuffer> owner = nil;
+    };
+    struct RingSlice {
+        id<MTLBuffer> buffer = nil;
+        size_t offset = 0;
+        size_t length = 0;
+    };
+    static constexpr size_t kRingPageBytes = 4 * 1024 * 1024;
+    static constexpr size_t kRingAlignment = 256;
+    std::array<RingPage, 3> ringPages;
+    int currentRingPage = -1;
+    static size_t AlignRing(size_t value) {
+        return (value + kRingAlignment - 1) & ~(kRingAlignment - 1);
+    }
     static bool Retired(id<MTLCommandBuffer> buffer)
     {
         MTLCommandBufferStatus status = buffer.status;
@@ -313,6 +334,63 @@ struct MetalRenderBackend::Impl
         }
         return commands;
     }
+    RingPage& AcquireRingPage()
+    {
+        Commands(); // Reserve an in-flight slot before binding arena lifetime.
+        if (currentRingPage >= 0) return ringPages[static_cast<size_t>(currentRingPage)];
+
+        for (size_t i = 0; i < ringPages.size(); ++i) {
+            auto& page = ringPages[i];
+            if (page.owner && Retired(page.owner)) {
+                page.owner = nil;
+                page.offset = 0;
+            }
+            if (!page.owner) {
+                if (!page.buffer) {
+                    page.buffer = [device newBufferWithLength:kRingPageBytes
+                                                    options:MTLResourceStorageModeShared];
+                    if (!page.buffer)
+                        throw std::runtime_error("Metal transient ring allocation failed");
+                }
+                currentRingPage = static_cast<int>(i);
+                return page;
+            }
+        }
+
+        // With three pages and at most two in-flight command buffers this should
+        // be rare, but keep a measured safety path instead of allocating forever.
+        auto& page = ringPages[0];
+        const Uint64 stallStarted = SDL_GetTicksNS();
+        [page.owner waitUntilCompleted];
+        TVPRecordMetalRingStall(SDL_GetTicksNS() - stallStarted);
+        page.owner = nil;
+        page.offset = 0;
+        currentRingPage = 0;
+        return page;
+    }
+    RingSlice AcquireRing(size_t length)
+    {
+        if (!length) return {};
+        const Uint64 started = SDL_GetTicksNS();
+        if (length > kRingPageBytes) {
+            id<MTLBuffer> fallback = AcquireStaging(length);
+            if (!fallback) return {};
+            TVPRecordMetalRingFallback(length);
+            return {fallback, 0, length};
+        }
+
+        auto* page = &AcquireRingPage();
+        size_t offset = AlignRing(page->offset);
+        if (offset + length > kRingPageBytes) {
+            TVPRecordMetalRingWrap();
+            Submit();
+            page = &AcquireRingPage();
+            offset = AlignRing(page->offset);
+        }
+        page->offset = offset + length;
+        TVPRecordMetalRingSuballoc(length, page->offset, SDL_GetTicksNS() - started);
+        return {page->buffer, offset, length};
+    }
     void EndOrdinary() {
         if(ordinaryEncoder) { [ordinaryEncoder endEncoding]; ordinaryEncoder=nil; }
         ordinaryBoundSource=nil; ordinaryBoundTarget=nil;
@@ -333,6 +411,11 @@ struct MetalRenderBackend::Impl
         EndOrdinary();
         if (commands) {
             lastSubmitted = commands;
+            if (currentRingPage >= 0) {
+                auto& page = ringPages[static_cast<size_t>(currentRingPage)];
+                page.owner = commands;
+                currentRingPage = -1;
+            }
             // Staging written into this batch stays checked out until it completes.
             if (!stagingPending.empty())
                 stagingInFlight.emplace_back(commands, std::move(stagingPending));
@@ -731,13 +814,13 @@ void MetalRenderBackend::DrawMesh(const float* vertices, int vertexCount, const 
         if (r == p.current) source = snapshot;
         const size_t vertexBytes = static_cast<size_t>(vertexCount) * 4 * sizeof(float);
         const size_t indexBytes = static_cast<size_t>(indexCount) * sizeof(uint16_t);
-        const Uint64 allocationStarted = SDL_GetTicksNS();
-        id<MTLBuffer> v = [p.device newBufferWithBytes:vertices length:vertexBytes
-                                            options:MTLResourceStorageModeShared];
-        id<MTLBuffer> i = [p.device newBufferWithBytes:indices length:indexBytes
-                                            options:MTLResourceStorageModeShared];
-        const Uint64 allocationTimeNS = SDL_GetTicksNS() - allocationStarted;
-        if (!v || !i) throw std::runtime_error("Metal mesh buffer allocation failed");
+        const size_t indexOffset = Impl::AlignRing(vertexBytes);
+        const size_t uploadBytes = indexOffset + indexBytes;
+        auto upload = p.AcquireRing(uploadBytes);
+        if (!upload.buffer) throw std::runtime_error("Metal mesh ring allocation failed");
+        auto* uploadBytesPtr = static_cast<uint8_t*>(upload.buffer.contents) + upload.offset;
+        std::memcpy(uploadBytesPtr, vertices, vertexBytes);
+        std::memcpy(uploadBytesPtr + indexOffset, indices, indexBytes);
         Params uniforms = p.mesh;
         uniforms.modulation = modulation ? Color(modulation) : simd_make_float4(1, 1, 1, 1);
         uniforms.flags.y = p.mask != nullptr;
@@ -745,18 +828,18 @@ void MetalRenderBackend::DrawMesh(const float* vertices, int vertexCount, const 
         int pipeline = (uniforms.flags.x == 1 || uniforms.flags.x == 4) ? 1 : uniforms.flags.x == 21 ? 2 : 0;
         id<MTLRenderCommandEncoder> e = p.Pass(p.current->texture, false);
         [e setRenderPipelineState:p.meshPipelines[pipeline]];
-        [e setVertexBuffer:v offset:0 atIndex:0];
+        [e setVertexBuffer:upload.buffer offset:upload.offset atIndex:0];
         [e setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
         [e setFragmentTexture:source atIndex:0];
         [e setFragmentTexture:p.mask ? (p.mask == p.current ? snapshot : p.mask->texture) : source atIndex:1];
         [e drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:indexCount indexType:MTLIndexTypeUInt16
-                     indexBuffer:i indexBufferOffset:0];
+                     indexBuffer:upload.buffer indexBufferOffset:upload.offset + indexOffset];
         [e endEncoding];
-        p.transientBytes += vertexBytes + indexBytes;
+        p.transientBytes += uploadBytes;
         if (p.transientBytes >= Impl::kSubmissionBudget) p.Submit();
         TVPRecordMeshDraw(static_cast<uint64_t>(vertexCount),static_cast<uint64_t>(indexCount),
-                          SDL_GetTicksNS() - cpuStarted,validationTimeNS,2,
-                          static_cast<uint64_t>(vertexBytes + indexBytes),allocationTimeNS);
+                          SDL_GetTicksNS() - cpuStarted,validationTimeNS,0,
+                          static_cast<uint64_t>(vertexBytes + indexBytes),0);
     }
 }
 bool MetalRenderBackend::DrawDeformedMesh(int divX, int divY,
@@ -774,9 +857,11 @@ bool MetalRenderBackend::DrawDeformedMesh(int divX, int divY,
 
         const Uint64 cpuStarted = SDL_GetTicksNS();
         const size_t surfaceBytes = static_cast<size_t>(surfaceCount) * sizeof(TVPMeshDeformSurface);
-        id<MTLBuffer> surfaceBuffer = p.AcquireStaging(surfaceBytes);
-        if (!surfaceBuffer) throw std::runtime_error("Metal deformation parameter allocation failed");
-        std::memcpy(surfaceBuffer.contents, surfaces, surfaceBytes);
+        auto surfaceUpload = p.AcquireRing(surfaceBytes);
+        if (!surfaceUpload.buffer)
+            throw std::runtime_error("Metal deformation parameter ring allocation failed");
+        std::memcpy(static_cast<uint8_t*>(surfaceUpload.buffer.contents) + surfaceUpload.offset,
+                    surfaces, surfaceBytes);
 
         id<MTLTexture> source = r->texture;
         id<MTLTexture> snapshot = (r == p.current || p.mask == p.current) ? p.Snapshot(p.current) : nil;
@@ -793,7 +878,7 @@ bool MetalRenderBackend::DrawDeformedMesh(int divX, int divY,
         id<MTLRenderCommandEncoder> e = p.Pass(p.current->texture, false);
         [e setRenderPipelineState:p.deformPipelines[pipeline]];
         [e setVertexBuffer:topology->uv offset:0 atIndex:0];
-        [e setVertexBuffer:surfaceBuffer offset:0 atIndex:1];
+        [e setVertexBuffer:surfaceUpload.buffer offset:surfaceUpload.offset atIndex:1];
         [e setVertexBytes:&count length:sizeof(count) atIndex:2];
         [e setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
         [e setFragmentTexture:source atIndex:0];
