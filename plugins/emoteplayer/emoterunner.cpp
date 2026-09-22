@@ -549,12 +549,27 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         // 处理子motion: 创建子emotemotionref递归处理
         if (currentMtn != nullptr)
         {
-            // Nested motion refs are still rebuilt each frame in M6.1.
+            // Sub-motion refs are pooled per owning emotemotion and reused across
+            // frames. A steady animation reaches its high-water mark once and then
+            // allocates nothing; only the active set is re-collected each frame.
             const Uint64 submotionRebuildStarted = SDL_GetTicksNS();
-            currentMtnRef = new emotemotionref(currentMtn, refTop, this);
+            uint64_t submotionCreated = 0;
+            {
+                auto& pool = refMtn->_subMotionPool[currentMtn];
+                size_t& used = refMtn->_subMotionUsed[currentMtn];
+                if (used == pool.size())
+                {
+                    pool.push_back(std::make_unique<emotemotionref>(currentMtn, refTop, this));
+                    submotionCreated = 1;
+                }
+                currentMtnRef = pool[used++].get();
+                // Reused entries can carry a different parent node than last frame.
+                currentMtnRef->parent = this;
+                currentMtnRef->label = currentNode ? currentNode->label : "";
+            }
             refMtn->_subMotionRefs.push_back(currentMtnRef);
             krkrsdl3::TVPRecordEmoteSubmotionRebuild(
-                SDL_GetTicksNS() - submotionRebuildStarted, 1);
+                SDL_GetTicksNS() - submotionRebuildStarted, submotionCreated);
             currentMtnRef->progress(tick + currTimeOffset, renderMethod,
                             {originX, originY, width, height, lim.zMax, lim.viewW, lim.viewH});
         }
@@ -674,9 +689,10 @@ float emotenoderef::getCurrentRenderZ()
 
 emotemotionref::~emotemotionref()
 {
-    for (auto sub : _subMotionRefs)
-        delete sub;
+    // _subMotionRefs only borrows; _subMotionPool owns and releases recursively.
     _subMotionRefs.clear();
+    _subMotionUsed.clear();
+    _subMotionPool.clear();
 }
 float emotemotionref::getTickByIdx(int32_t idx)
 {
@@ -768,17 +784,22 @@ void emotemotionref::progress(float tick, std::vector<emoteRender>& renderList, 
         _nodeCache.reserve(count);
         for (size_t i = 0; i < count; ++i)
             _nodeCache.emplace_back(currentMotion->nodeList[i], refTop, this);
+        // Pooled sub-motion refs hold emotenoderef* parents that point into
+        // _nodeCache. Rebuilding it invalidates them, so the pool cannot survive.
+        _subMotionRefs.clear();
+        _subMotionUsed.clear();
+        _subMotionPool.clear();
     }
 
-    // Nested motion refs are still rebuilt for correctness because the active
-    // sub-motion can change with keyframes. Reset parent raw pointers before
-    // deleting them, while keeping the top-level node/mesh storage persistent.
+    // The active sub-motion set can change with keyframes, so it is re-collected
+    // every frame. The ref objects are pooled by owning motion and survive, which
+    // keeps their node/mesh storage warm instead of churning the heap.
     const Uint64 submotionCleanupStarted = SDL_GetTicksNS();
     for (auto& ref : _nodeCache)
         ref.currentMtnRef = nullptr;
-    for (auto sub : _subMotionRefs)
-        delete sub;
     _subMotionRefs.clear();
+    for (auto& entry : _subMotionUsed)
+        entry.second = 0;
     krkrsdl3::TVPRecordEmoteSubmotionRebuild(
         SDL_GetTicksNS() - submotionCleanupStarted, 0);
 

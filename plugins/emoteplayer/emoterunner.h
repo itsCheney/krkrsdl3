@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vector>
+#include <unordered_map>
 #include <list>
 #include <memory>
 
@@ -131,6 +132,13 @@ namespace emoteplayer
         std::vector<emotenoderef> _nodeCache;
         // 子motion引用缓存(progress阶段创建，draw阶段使用)
         std::vector<emotemotionref*> _subMotionRefs;
+        // Sub-motion refs retained across frames, keyed by the emotemotion they
+        // were built for. The active set is rebuilt every frame into
+        // _subMotionRefs, but the objects themselves are reused so a steady
+        // animation stops churning the heap. Owns everything it holds.
+        std::unordered_map<emotemotion*, std::vector<std::unique_ptr<emotemotionref>>> _subMotionPool;
+        // Per-frame high-water mark of pool entries handed out per motion.
+        std::unordered_map<emotemotion*, size_t> _subMotionUsed;
 
         // shape节点区域(用于 getLayerGetter/getLayerMotion 的shape返回和contains检测)
         std::vector<emoterect> shapeNodeAreas;

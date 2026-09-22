@@ -196,7 +196,9 @@ struct MetalRenderBackend::Impl
     id<MTLTexture> ordinaryDummy = nil, ordinarySnapshot = nil, ordinarySourceSnapshot = nil;
     id<MTLTexture> dualSourceSnapshot1 = nil, dualSourceSnapshot2 = nil;
     id<MTLTexture> destinationSnapshot = nil;
-    dispatch_semaphore_t inFlight = dispatch_semaphore_create(2);
+    // Depth 3 lets the CPU stay a frame ahead of the GPU. Depth 2 stalled
+    // every frame that issued more than two command buffers.
+    dispatch_semaphore_t inFlight = dispatch_semaphore_create(3);
     std::shared_ptr<std::atomic<bool>> gpuFailed = std::make_shared<std::atomic<bool>>(false);
     std::shared_ptr<std::atomic<double>> gpuTimeMS = std::make_shared<std::atomic<double>>(-1.0);
     std::unordered_map<void*, std::unique_ptr<Resource>> resources;
@@ -205,9 +207,20 @@ struct MetalRenderBackend::Impl
     Resource* mask = nullptr;
     Params mesh, layerParams;
     int width = 0, height = 0;
+    // Host-visible bytes staged into the current command buffer: staging uploads
+    // and mesh ring suballocations only. GPU-to-GPU blits and compute dispatches
+    // consume none of this memory, so counting them here forced a submit every
+    // few frames and serialized the CPU against inFlight for no benefit.
     size_t transientBytes = 0;
+    // Encoder count for the current command buffer. Bounds how much work one
+    // buffer accumulates now that pixel throughput no longer does.
+    size_t transientOps = 0;
     double pendingQueueWaitMS = 0, lastPresentationWaitMS = -1;
+    // Cumulative inFlight wait so CPU-side profilers can subtract the block
+    // instead of attributing it to whatever called Commands().
+    uint64_t queueWaitAccumNS = 0;
     static constexpr size_t kSubmissionBudget = 16 * 1024 * 1024;
+    static constexpr size_t kSubmissionOpBudget = 2048;
     // Staging buffers are recycled instead of reallocated: uploads and readbacks
     // churn hundreds of MB/s through here. A buffer stays checked out until the
     // command buffer referencing it completes, so reuse is driven by Submit.
@@ -237,7 +250,9 @@ struct MetalRenderBackend::Impl
     };
     static constexpr size_t kRingPageBytes = 4 * 1024 * 1024;
     static constexpr size_t kRingAlignment = 256;
-    std::array<RingPage, 3> ringPages;
+    // One more page than in-flight command buffers so AcquireRingPage never
+    // has to block on waitUntilCompleted. Pages allocate lazily.
+    std::array<RingPage, 4> ringPages;
     int currentRingPage = -1;
     static size_t AlignRing(size_t value) {
         return (value + kRingAlignment - 1) & ~(kRingAlignment - 1);
@@ -310,6 +325,7 @@ struct MetalRenderBackend::Impl
             dispatch_semaphore_wait(inFlight, DISPATCH_TIME_FOREVER);
             const Uint64 queueWaitNS = SDL_GetTicksNS() - waitStarted;
             pendingQueueWaitMS += static_cast<double>(queueWaitNS) / 1000000.0;
+            queueWaitAccumNS += queueWaitNS;
             TVPRecordMetalQueueWait(queueWaitNS);
             commands = [queue commandBuffer];
             if (!commands) {
@@ -372,6 +388,9 @@ struct MetalRenderBackend::Impl
     {
         if (!length) return {};
         const Uint64 started = SDL_GetTicksNS();
+        // AcquireRingPage -> Commands() can block on inFlight; that wait belongs
+        // to the queue, not to suballocation.
+        const uint64_t waitBefore = queueWaitAccumNS;
         if (length > kRingPageBytes) {
             id<MTLBuffer> fallback = AcquireStaging(length);
             if (!fallback) return {};
@@ -388,7 +407,10 @@ struct MetalRenderBackend::Impl
             offset = AlignRing(page->offset);
         }
         page->offset = offset + length;
-        TVPRecordMetalRingSuballoc(length, page->offset, SDL_GetTicksNS() - started);
+        const uint64_t elapsedNS = SDL_GetTicksNS() - started;
+        const uint64_t blockedNS = queueWaitAccumNS - waitBefore;
+        TVPRecordMetalRingSuballoc(length, page->offset,
+                                   elapsedNS > blockedNS ? elapsedNS - blockedNS : 0);
         return {page->buffer, offset, length};
     }
     void EndOrdinary() {
@@ -424,6 +446,7 @@ struct MetalRenderBackend::Impl
             TVPRecordMetalSubmit();
             commands = nil;
             transientBytes = 0;
+            transientOps = 0;
         }
         if (wait && lastSubmitted) {
             const Uint64 waitStarted = SDL_GetTicksNS();
@@ -497,7 +520,7 @@ struct MetalRenderBackend::Impl
         transientBytes += rowBytes * h;
         // Asset loading can upload many textures before the first BeginFrame.
         // Bound staging lifetime independently of presentation/frame cadence.
-        if (transientBytes >= kSubmissionBudget) Submit();
+        if (transientBytes >= kSubmissionBudget || ++transientOps >= kSubmissionOpBudget) Submit();
     }
     bool Read(id<MTLTexture> texture, std::vector<uint8_t>& pixels, int& pitch, const TVPLayerRect* region = nullptr)
     {
@@ -836,7 +859,8 @@ void MetalRenderBackend::DrawMesh(const float* vertices, int vertexCount, const 
                      indexBuffer:upload.buffer indexBufferOffset:upload.offset + indexOffset];
         [e endEncoding];
         p.transientBytes += uploadBytes;
-        if (p.transientBytes >= Impl::kSubmissionBudget) p.Submit();
+        if (p.transientBytes >= Impl::kSubmissionBudget || ++p.transientOps >= Impl::kSubmissionOpBudget)
+            p.Submit();
         TVPRecordMeshDraw(static_cast<uint64_t>(vertexCount),static_cast<uint64_t>(indexCount),
                           SDL_GetTicksNS() - cpuStarted,validationTimeNS,0,
                           static_cast<uint64_t>(vertexBytes + indexBytes),0);
@@ -892,7 +916,8 @@ bool MetalRenderBackend::DrawDeformedMesh(int divX, int divY,
         [e endEncoding];
 
         p.transientBytes += surfaceBytes;
-        if (p.transientBytes >= Impl::kSubmissionBudget) p.Submit();
+        if (p.transientBytes >= Impl::kSubmissionBudget || ++p.transientOps >= Impl::kSubmissionOpBudget)
+            p.Submit();
         TVPRecordEmoteGPUDeform(static_cast<uint64_t>(topology->vertexCount));
         TVPRecordMeshDraw(static_cast<uint64_t>(topology->vertexCount),
                           static_cast<uint64_t>(topology->indexCount),
@@ -1005,7 +1030,9 @@ bool MetalRenderBackend::UpdateLayerTexture(void* handle, const uint8_t* pixels,
               sourceSize:MTLSizeMake(rc.Width(),rc.Height(),1) toTexture:r->texture destinationSlice:0 destinationLevel:0
               destinationOrigin:MTLOriginMake(rc.left,rc.top,0)];
         [e endEncoding]; p.transientBytes+=row*rc.Height();
-        if(p.transientBytes>=Impl::kSubmissionBudget) p.Submit(); return true;
+        if(p.transientBytes>=Impl::kSubmissionBudget || ++p.transientOps>=Impl::kSubmissionOpBudget)
+            p.Submit();
+        return true;
     }
 }
 bool MetalRenderBackend::CopyTargetToLayerTexture(void* sourceHandle, void* destinationHandle) {
@@ -1025,8 +1052,10 @@ bool MetalRenderBackend::CopyTargetToLayerTexture(void* sourceHandle, void* dest
               toTexture:destination->texture destinationSlice:0 destinationLevel:0
               destinationOrigin:MTLOriginMake(0,0,0)];
         [e endEncoding];
-        p.transientBytes+=size_t(source->width)*source->height*4;
-        if(p.transientBytes>=Impl::kSubmissionBudget) p.Submit();
+        // GPU-to-GPU blit: no host-visible staging involved. Counting its pixels
+        // against the staging budget made full-surface Emote captures (~8.5 MB
+        // each) force a submit roughly every other capture.
+        if(++p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
         return true;
     }
 }
@@ -1095,8 +1124,8 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
         }
         [e dispatchThreads:MTLSizeMake(clip.Width(),clip.Height(),1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
         if(!inPlace) [e endEncoding];
-        p.transientBytes+=size_t(clip.Width())*clip.Height()*4;
-        if(p.transientBytes>=Impl::kSubmissionBudget) p.Submit();
+        // Compute dispatch over existing GPU textures; no host-visible bytes.
+        if(++p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
         return true;
     }
 }
@@ -1177,8 +1206,8 @@ bool MetalRenderBackend::OperateLayerRectDualSource(const TVPLayerOperation& ope
         [e dispatchThreads:MTLSizeMake(clip.Width(),clip.Height(),1)
              threadsPerThreadgroup:MTLSizeMake(8,8,1)];
         [e endEncoding];
-        p.transientBytes+=size_t(clip.Width())*clip.Height()*4;
-        if(p.transientBytes>=Impl::kSubmissionBudget) p.Submit();
+        // Compute dispatch over existing GPU textures; no host-visible bytes.
+        if(++p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
         return true;
     }
 }
