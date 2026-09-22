@@ -230,6 +230,26 @@ public:
     }
     uint32_t GetPoint(int x,int y) override {
         if(x<0 || y<0 || x>=Width || y>=Height) return 0;
+        const int bpp=format==TVPTextureFormat::Gray ? 1 : 4;
+        if(valid) {
+            const auto* p=pixels.data()+size_t(y)*GetPitch()+size_t(x)*bpp;
+            if(format==TVPTextureFormat::Gray) return *p;
+            uint32_t v; std::memcpy(&v,p,4); return v;
+        }
+        if(handle && session->backend) {
+            std::vector<uint8_t> sample; int pitch=0;
+            const TVPLayerRect region{x,y,x+1,y+1};
+            if(session->backend->ReadLayerTextureRegion(handle,region,sample,pitch) &&
+               pitch>=bpp && sample.size()>=size_t(bpp)) {
+                session->stats.readbackBytes+=bpp;
+                const int index=static_cast<int>(TVPLayerReadbackSource::Point);
+                session->stats.readbackBytesBySource[index]+=bpp;
+                ++session->stats.readbackCountBySource[index];
+                if(format==TVPTextureFormat::Gray) return sample[0];
+                uint32_t v; std::memcpy(&v,sample.data(),4); return v;
+            }
+        }
+        // Preserve correctness for unsupported/failed region readback paths.
         auto* p=static_cast<const uint8_t*>(GetScanLineForRead(y));
         if(format==TVPTextureFormat::Gray) return p[x];
         uint32_t v; std::memcpy(&v,p+x*4,4); return v;

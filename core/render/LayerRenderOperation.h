@@ -45,6 +45,8 @@ enum class TVPLayerReadbackSource
     Pixels,
     // Session teardown moving a texture back to CPU ownership.
     Detach,
+    // Single-pixel query satisfied by a tiny backend region readback.
+    Point,
     Count
 };
 // Which operand first forced a GPU texture into CPU memory during a software

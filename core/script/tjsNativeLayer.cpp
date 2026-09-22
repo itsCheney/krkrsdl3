@@ -3248,16 +3248,10 @@ bool tTJSNI_BaseLayer::_HitTestNoVisibleCheck(tjs_int x, tjs_int y)
                 tjs_uint32 cl;
                 if (MainImage->GetBPP() == 32)
                 {
-                    // 经显式回读缓存取像素（GPU 驻留时同一事件内多次命中共享一次回读，
-                    // 避免逐点隐式 GPU→CPU 回读；软件路径零拷贝，行为不变）
-                    cl = 0;
-                    void* pixels = MainImage->GetTexture()->LockCPURead();
-                    if (pixels)
-                    {
-                        tjs_int pitch = MainImage->GetPitchBytes();
-                        cl = ((tjs_uint32*)pixels)[py * (pitch / 4) + px];
-                        MainImage->GetTexture()->UnlockCPU();
-                    }
+                    // Read the current render texture, not the stale bitmap side.
+                    // GPU Layer textures satisfy this as a 1x1 region readback;
+                    // software textures remain a direct memory read.
+                    cl = MainImage->GetTexture()->GetPoint(px, py);
                 }
                 else
                 {
