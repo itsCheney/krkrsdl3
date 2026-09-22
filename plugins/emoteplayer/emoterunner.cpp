@@ -1,8 +1,10 @@
 #include "emoterunner.h"
 
 #include <cstdint>
+#include <SDL3/SDL.h>
 
 #include "Platform.h"
+#include "TVPCompositor.h"
 
 namespace emoteplayer
 {
@@ -175,6 +177,7 @@ void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderL
 }
 void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim)
 {
+    const Uint64 nodeProfileStarted = SDL_GetTicksNS();
     // 参数化时可能改变
     currTick = tick;
     // 对于motion，增加终结机制, 即无法越过selfSyncTime
@@ -439,7 +442,10 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         if (frame->src.find("shape/circle") != std::string::npos) area.shapeType = 1;
         else if (frame->src.find("shape/point") != std::string::npos) area.shapeType = 0;
         else if (frame->src.find("shape/quad") != std::string::npos) area.shapeType = 3;
+        const Uint64 shapeBuildStarted = SDL_GetTicksNS();
         buildShapeMesh(renderMethod, area.shapeType, area.vertices, area.indices, &_surfaceMatrices);
+        krkrsdl3::TVPRecordEmoteShapeBuild(
+            SDL_GetTicksNS() - shapeBuildStarted, area.vertices.size());
         const float vw = lim.viewW > 0 ? lim.viewW : renderMethod.front().width;
         const float vh = lim.viewH > 0 ? lim.viewH : renderMethod.front().height;
         float minX = 1, minY = 1, maxX = -1, maxY = -1;
@@ -478,6 +484,7 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
             }
         }
         // 变换
+        const Uint64 meshBuildStarted = SDL_GetTicksNS();
         if (containsMesh)
         {
             // 顶点位置每帧变化，但规则网格索引拓扑仅在 division 改变时变化。
@@ -496,6 +503,11 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
             buildRectMesh(renderMethod, _meshVertices, _meshIndices, &_surfaceMatrices,
                           rebuildIndices);
         }
+        const uint64_t meshVertexCount = _meshVertices.size();
+        krkrsdl3::TVPRecordEmoteMeshBuild(
+            SDL_GetTicksNS() - meshBuildStarted,
+            meshVertexCount,
+            containsMesh ? meshVertexCount : 0);
     }
     else
     {
@@ -503,6 +515,10 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         // do not churn heap allocations. draw() already rejects non-visible nodes.
         _meshVertices.clear();
     }
+
+    // Local node work ends here. Recursive children/submotions account for
+    // themselves so node time can be summed without double-counting recursion.
+    krkrsdl3::TVPRecordEmoteNodeProgress(SDL_GetTicksNS() - nodeProfileStarted);
 
     // 传递给子类: 通过_parentMotion查找对应ref，避免创建重复状态
     if (refMtn != nullptr)
@@ -522,9 +538,12 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         // 处理子motion: 创建子emotemotionref递归处理
         if (currentMtn != nullptr)
         {
-            // 在引擎中创建持久化的子motion ref
+            // Nested motion refs are still rebuilt each frame in M6.1.
+            const Uint64 submotionRebuildStarted = SDL_GetTicksNS();
             currentMtnRef = new emotemotionref(currentMtn, refTop, this);
             refMtn->_subMotionRefs.push_back(currentMtnRef);
+            krkrsdl3::TVPRecordEmoteSubmotionRebuild(
+                SDL_GetTicksNS() - submotionRebuildStarted, 1);
             currentMtnRef->progress(tick + currTimeOffset, renderMethod,
                             {originX, originY, width, height, lim.zMax, lim.viewW, lim.viewH});
         }
@@ -708,11 +727,14 @@ void emotemotionref::progress(float tick, std::vector<emoteRender>& renderList, 
     // Nested motion refs are still rebuilt for correctness because the active
     // sub-motion can change with keyframes. Reset parent raw pointers before
     // deleting them, while keeping the top-level node/mesh storage persistent.
+    const Uint64 submotionCleanupStarted = SDL_GetTicksNS();
     for (auto& ref : _nodeCache)
         ref.currentMtnRef = nullptr;
     for (auto sub : _subMotionRefs)
         delete sub;
     _subMotionRefs.clear();
+    krkrsdl3::TVPRecordEmoteSubmotionRebuild(
+        SDL_GetTicksNS() - submotionCleanupStarted, 0);
 
     //  对每个layer节点调用对应的ref->progress
     //  注意: ref的progress内部会通过_parentMotion递归处理children和sub-motion

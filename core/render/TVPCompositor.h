@@ -232,6 +232,25 @@ struct TVPRuntimeProfileStats {
     uint64_t emoteDrawTimeNS = 0;
     uint64_t emoteCaptureProfileCalls = 0;
     uint64_t emoteCaptureTimeNS = 0;
+
+    // M6.2 Emote prepare breakdown. Node time is local work only (recursive
+    // children/submotions are measured by their own node records). Shape/mesh
+    // build time is intentionally a subset of node time.
+    uint64_t emotePrepareTransformTimeNS = 0;
+    uint64_t emotePrepareMotionProgressTimeNS = 0;
+    uint64_t emotePrepareSnapshotTimeNS = 0;
+    uint64_t emoteNodeProgressCalls = 0;
+    uint64_t emoteNodeProgressTimeNS = 0;
+    uint64_t emoteSubmotionCreates = 0;
+    uint64_t emoteSubmotionRebuildTimeNS = 0;
+    uint64_t emoteShapeBuildCalls = 0;
+    uint64_t emoteShapeBuildTimeNS = 0;
+    uint64_t emoteShapeVertices = 0;
+    uint64_t emoteMeshBuildCalls = 0;
+    uint64_t emoteMeshBuildTimeNS = 0;
+    uint64_t emoteMeshVerticesBuilt = 0;
+    uint64_t emoteDeformedVerticesBuilt = 0;
+
     uint64_t meshDrawCalls = 0;
     uint64_t meshVertices = 0;
     uint64_t meshIndices = 0;
@@ -249,6 +268,19 @@ void TVPRecordEmoteProgress(uint64_t nanoseconds);
 void TVPRecordEmotePrepare(uint64_t nanoseconds);
 void TVPRecordEmoteDraw(uint64_t nanoseconds);
 void TVPRecordEmoteCaptureTime(uint64_t nanoseconds);
+
+// Detailed M6.2 prepare profiling accumulates in thread-local storage during one
+// prepareFrame and commits once, avoiding atomics in the per-node hot path.
+void TVPBeginEmotePrepareDetail();
+void TVPRecordEmoteNodeProgress(uint64_t nanoseconds);
+void TVPRecordEmoteSubmotionRebuild(uint64_t nanoseconds, uint64_t creations);
+void TVPRecordEmoteShapeBuild(uint64_t nanoseconds, uint64_t vertices);
+void TVPRecordEmoteMeshBuild(uint64_t nanoseconds, uint64_t vertices,
+                             uint64_t deformedVertices);
+void TVPCommitEmotePrepareDetail(uint64_t transformTimeNS,
+                                 uint64_t motionProgressTimeNS,
+                                 uint64_t snapshotTimeNS);
+
 void TVPRecordMeshDraw(uint64_t vertices, uint64_t indices, uint64_t cpuTimeNS,
                        uint64_t validationTimeNS, uint64_t bufferAllocations,
                        uint64_t bufferBytes, uint64_t bufferAllocationTimeNS);

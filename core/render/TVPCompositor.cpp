@@ -47,6 +47,32 @@ std::atomic<uint64_t> profileEmoteProgressCalls{0}, profileEmoteProgressTimeNS{0
 std::atomic<uint64_t> profileEmotePrepareCalls{0}, profileEmotePrepareTimeNS{0};
 std::atomic<uint64_t> profileEmoteDrawCalls{0}, profileEmoteDrawTimeNS{0};
 std::atomic<uint64_t> profileEmoteCaptureCalls{0}, profileEmoteCaptureTimeNS{0};
+std::atomic<uint64_t> profileEmotePrepareTransformTimeNS{0};
+std::atomic<uint64_t> profileEmotePrepareMotionProgressTimeNS{0};
+std::atomic<uint64_t> profileEmotePrepareSnapshotTimeNS{0};
+std::atomic<uint64_t> profileEmoteNodeProgressCalls{0}, profileEmoteNodeProgressTimeNS{0};
+std::atomic<uint64_t> profileEmoteSubmotionCreates{0}, profileEmoteSubmotionRebuildTimeNS{0};
+std::atomic<uint64_t> profileEmoteShapeBuildCalls{0}, profileEmoteShapeBuildTimeNS{0};
+std::atomic<uint64_t> profileEmoteShapeVertices{0};
+std::atomic<uint64_t> profileEmoteMeshBuildCalls{0}, profileEmoteMeshBuildTimeNS{0};
+std::atomic<uint64_t> profileEmoteMeshVerticesBuilt{0}, profileEmoteDeformedVerticesBuilt{0};
+
+struct EmotePrepareDetailAccumulator {
+    bool active = false;
+    uint64_t nodeCalls = 0;
+    uint64_t nodeTimeNS = 0;
+    uint64_t submotionCreates = 0;
+    uint64_t submotionRebuildTimeNS = 0;
+    uint64_t shapeBuildCalls = 0;
+    uint64_t shapeBuildTimeNS = 0;
+    uint64_t shapeVertices = 0;
+    uint64_t meshBuildCalls = 0;
+    uint64_t meshBuildTimeNS = 0;
+    uint64_t meshVertices = 0;
+    uint64_t deformedVertices = 0;
+};
+thread_local EmotePrepareDetailAccumulator emotePrepareDetail;
+
 std::atomic<uint64_t> profileMeshDrawCalls{0}, profileMeshVertices{0}, profileMeshIndices{0};
 std::atomic<uint64_t> profileMeshCPUTimeNS{0}, profileMeshValidationTimeNS{0};
 std::atomic<uint64_t> profileMeshBufferAllocations{0}, profileMeshBufferBytes{0};
@@ -99,6 +125,53 @@ void TVPRecordEmoteCaptureTime(uint64_t ns) {
     profileEmoteCaptureCalls.fetch_add(1,std::memory_order_relaxed);
     profileEmoteCaptureTimeNS.fetch_add(ns,std::memory_order_relaxed);
 }
+
+void TVPBeginEmotePrepareDetail() {
+    emotePrepareDetail = {};
+    emotePrepareDetail.active = true;
+}
+void TVPRecordEmoteNodeProgress(uint64_t ns) {
+    if (!emotePrepareDetail.active) return;
+    ++emotePrepareDetail.nodeCalls;
+    emotePrepareDetail.nodeTimeNS += ns;
+}
+void TVPRecordEmoteSubmotionRebuild(uint64_t ns, uint64_t creations) {
+    if (!emotePrepareDetail.active) return;
+    emotePrepareDetail.submotionCreates += creations;
+    emotePrepareDetail.submotionRebuildTimeNS += ns;
+}
+void TVPRecordEmoteShapeBuild(uint64_t ns, uint64_t vertices) {
+    if (!emotePrepareDetail.active) return;
+    ++emotePrepareDetail.shapeBuildCalls;
+    emotePrepareDetail.shapeBuildTimeNS += ns;
+    emotePrepareDetail.shapeVertices += vertices;
+}
+void TVPRecordEmoteMeshBuild(uint64_t ns, uint64_t vertices, uint64_t deformedVertices) {
+    if (!emotePrepareDetail.active) return;
+    ++emotePrepareDetail.meshBuildCalls;
+    emotePrepareDetail.meshBuildTimeNS += ns;
+    emotePrepareDetail.meshVertices += vertices;
+    emotePrepareDetail.deformedVertices += deformedVertices;
+}
+void TVPCommitEmotePrepareDetail(uint64_t transformNS, uint64_t motionNS, uint64_t snapshotNS) {
+    if (!emotePrepareDetail.active) return;
+    profileEmotePrepareTransformTimeNS.fetch_add(transformNS,std::memory_order_relaxed);
+    profileEmotePrepareMotionProgressTimeNS.fetch_add(motionNS,std::memory_order_relaxed);
+    profileEmotePrepareSnapshotTimeNS.fetch_add(snapshotNS,std::memory_order_relaxed);
+    profileEmoteNodeProgressCalls.fetch_add(emotePrepareDetail.nodeCalls,std::memory_order_relaxed);
+    profileEmoteNodeProgressTimeNS.fetch_add(emotePrepareDetail.nodeTimeNS,std::memory_order_relaxed);
+    profileEmoteSubmotionCreates.fetch_add(emotePrepareDetail.submotionCreates,std::memory_order_relaxed);
+    profileEmoteSubmotionRebuildTimeNS.fetch_add(emotePrepareDetail.submotionRebuildTimeNS,std::memory_order_relaxed);
+    profileEmoteShapeBuildCalls.fetch_add(emotePrepareDetail.shapeBuildCalls,std::memory_order_relaxed);
+    profileEmoteShapeBuildTimeNS.fetch_add(emotePrepareDetail.shapeBuildTimeNS,std::memory_order_relaxed);
+    profileEmoteShapeVertices.fetch_add(emotePrepareDetail.shapeVertices,std::memory_order_relaxed);
+    profileEmoteMeshBuildCalls.fetch_add(emotePrepareDetail.meshBuildCalls,std::memory_order_relaxed);
+    profileEmoteMeshBuildTimeNS.fetch_add(emotePrepareDetail.meshBuildTimeNS,std::memory_order_relaxed);
+    profileEmoteMeshVerticesBuilt.fetch_add(emotePrepareDetail.meshVertices,std::memory_order_relaxed);
+    profileEmoteDeformedVerticesBuilt.fetch_add(emotePrepareDetail.deformedVertices,std::memory_order_relaxed);
+    emotePrepareDetail.active = false;
+}
+
 void TVPRecordMeshDraw(uint64_t vertices,uint64_t indices,uint64_t cpuTimeNS,
                        uint64_t validationTimeNS,uint64_t bufferAllocations,
                        uint64_t bufferBytes,uint64_t bufferAllocationTimeNS) {
@@ -129,6 +202,20 @@ TVPRuntimeProfileStats TVPGetRuntimeProfileStats() {
     s.emoteDrawTimeNS=profileEmoteDrawTimeNS.load(std::memory_order_relaxed);
     s.emoteCaptureProfileCalls=profileEmoteCaptureCalls.load(std::memory_order_relaxed);
     s.emoteCaptureTimeNS=profileEmoteCaptureTimeNS.load(std::memory_order_relaxed);
+    s.emotePrepareTransformTimeNS=profileEmotePrepareTransformTimeNS.load(std::memory_order_relaxed);
+    s.emotePrepareMotionProgressTimeNS=profileEmotePrepareMotionProgressTimeNS.load(std::memory_order_relaxed);
+    s.emotePrepareSnapshotTimeNS=profileEmotePrepareSnapshotTimeNS.load(std::memory_order_relaxed);
+    s.emoteNodeProgressCalls=profileEmoteNodeProgressCalls.load(std::memory_order_relaxed);
+    s.emoteNodeProgressTimeNS=profileEmoteNodeProgressTimeNS.load(std::memory_order_relaxed);
+    s.emoteSubmotionCreates=profileEmoteSubmotionCreates.load(std::memory_order_relaxed);
+    s.emoteSubmotionRebuildTimeNS=profileEmoteSubmotionRebuildTimeNS.load(std::memory_order_relaxed);
+    s.emoteShapeBuildCalls=profileEmoteShapeBuildCalls.load(std::memory_order_relaxed);
+    s.emoteShapeBuildTimeNS=profileEmoteShapeBuildTimeNS.load(std::memory_order_relaxed);
+    s.emoteShapeVertices=profileEmoteShapeVertices.load(std::memory_order_relaxed);
+    s.emoteMeshBuildCalls=profileEmoteMeshBuildCalls.load(std::memory_order_relaxed);
+    s.emoteMeshBuildTimeNS=profileEmoteMeshBuildTimeNS.load(std::memory_order_relaxed);
+    s.emoteMeshVerticesBuilt=profileEmoteMeshVerticesBuilt.load(std::memory_order_relaxed);
+    s.emoteDeformedVerticesBuilt=profileEmoteDeformedVerticesBuilt.load(std::memory_order_relaxed);
     s.meshDrawCalls=profileMeshDrawCalls.load(std::memory_order_relaxed);
     s.meshVertices=profileMeshVertices.load(std::memory_order_relaxed);
     s.meshIndices=profileMeshIndices.load(std::memory_order_relaxed);
@@ -152,6 +239,21 @@ void TVPResetRuntimeProfileStats() {
     profileEmoteDrawTimeNS.store(0,std::memory_order_relaxed);
     profileEmoteCaptureCalls.store(0,std::memory_order_relaxed);
     profileEmoteCaptureTimeNS.store(0,std::memory_order_relaxed);
+    profileEmotePrepareTransformTimeNS.store(0,std::memory_order_relaxed);
+    profileEmotePrepareMotionProgressTimeNS.store(0,std::memory_order_relaxed);
+    profileEmotePrepareSnapshotTimeNS.store(0,std::memory_order_relaxed);
+    profileEmoteNodeProgressCalls.store(0,std::memory_order_relaxed);
+    profileEmoteNodeProgressTimeNS.store(0,std::memory_order_relaxed);
+    profileEmoteSubmotionCreates.store(0,std::memory_order_relaxed);
+    profileEmoteSubmotionRebuildTimeNS.store(0,std::memory_order_relaxed);
+    profileEmoteShapeBuildCalls.store(0,std::memory_order_relaxed);
+    profileEmoteShapeBuildTimeNS.store(0,std::memory_order_relaxed);
+    profileEmoteShapeVertices.store(0,std::memory_order_relaxed);
+    profileEmoteMeshBuildCalls.store(0,std::memory_order_relaxed);
+    profileEmoteMeshBuildTimeNS.store(0,std::memory_order_relaxed);
+    profileEmoteMeshVerticesBuilt.store(0,std::memory_order_relaxed);
+    profileEmoteDeformedVerticesBuilt.store(0,std::memory_order_relaxed);
+    emotePrepareDetail = {};
     profileMeshDrawCalls.store(0,std::memory_order_relaxed);
     profileMeshVertices.store(0,std::memory_order_relaxed);
     profileMeshIndices.store(0,std::memory_order_relaxed);

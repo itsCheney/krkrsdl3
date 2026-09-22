@@ -761,16 +761,28 @@ void EmotePlayer::progress(tjs_real mstime)
 void EmotePlayer::prepareFrame()
 {
     const Uint64 profileStarted = SDL_GetTicksNS();
+    krkrsdl3::TVPBeginEmotePrepareDetail();
+
+    const Uint64 transformStarted = SDL_GetTicksNS();
     updateTransMat();
     std::vector<emoteRender> methods{_renderMethod};
     if (emtEngine._mainfile->isMirror)
         methods.front().attachMat = glm::scale(methods.front().attachMat, glm::vec3(-1, 1, 1));
     const float tick = emtEngine._mainfile->_metadata->_varList.empty() ? clockPassed : 0;
+    const Uint64 transformTimeNS = SDL_GetTicksNS() - transformStarted;
+
+    const Uint64 motionStarted = SDL_GetTicksNS();
     emtEngine.progress(tick, methods, _limitArea);
+    const Uint64 motionTimeNS = SDL_GetTicksNS() - motionStarted;
+
+    const Uint64 snapshotStarted = SDL_GetTicksNS();
     _hitFrame.motion = emtEngine._mainMotionRef;
     _hitFrame.inputToClip = _renderMethod.attachMat;
     _hitFrame.width = _limitArea.viewW > 0 ? _limitArea.viewW : _limitArea.width;
     _hitFrame.height = _limitArea.viewH > 0 ? _limitArea.viewH : _limitArea.height;
+    const Uint64 snapshotTimeNS = SDL_GetTicksNS() - snapshotStarted;
+
+    krkrsdl3::TVPCommitEmotePrepareDetail(transformTimeNS, motionTimeNS, snapshotTimeNS);
     krkrsdl3::TVPRecordEmotePrepare(SDL_GetTicksNS() - profileStarted);
 }
 
