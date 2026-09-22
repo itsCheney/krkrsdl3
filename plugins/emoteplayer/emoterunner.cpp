@@ -439,7 +439,7 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         if (frame->src.find("shape/circle") != std::string::npos) area.shapeType = 1;
         else if (frame->src.find("shape/point") != std::string::npos) area.shapeType = 0;
         else if (frame->src.find("shape/quad") != std::string::npos) area.shapeType = 3;
-        buildShapeMesh(renderMethod, area.shapeType, area.vertices, area.indices);
+        buildShapeMesh(renderMethod, area.shapeType, area.vertices, area.indices, &_surfaceMatrices);
         const float vw = lim.viewW > 0 ? lim.viewW : renderMethod.front().width;
         const float vh = lim.viewH > 0 ? lim.viewH : renderMethod.front().height;
         float minX = 1, minY = 1, maxX = -1, maxY = -1;
@@ -480,21 +480,28 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         // 变换
         if (containsMesh)
         {
-            // 细分并变形
+            // 顶点位置每帧变化，但规则网格索引拓扑仅在 division 改变时变化。
+            const size_t expectedIndices = size_t(div) * size_t(div) * 6;
+            const bool rebuildIndices =
+                _meshDivX != div || _meshDivY != div || _meshIndices.size() != expectedIndices;
             _meshDivX = div;
             _meshDivY = div;
-            buildSubdivMesh(renderMethod, _meshDivX, _meshDivY, _meshVertices, _meshIndices);
+            buildSubdivMesh(renderMethod, _meshDivX, _meshDivY, _meshVertices, _meshIndices,
+                            &_surfaceMatrices, rebuildIndices);
         }
         else
         {
-            // 进行简单三角剖分
-            buildRectMesh(renderMethod, _meshVertices, _meshIndices);
+            // 矩形索引恒定；保留 topology 与 vector capacity 跨帧复用。
+            const bool rebuildIndices = _meshIndices.size() != 6;
+            buildRectMesh(renderMethod, _meshVertices, _meshIndices, &_surfaceMatrices,
+                          rebuildIndices);
         }
     }
     else
     {
+        // Hidden/non-icon nodes keep allocated storage so reappearing animations
+        // do not churn heap allocations. draw() already rejects non-visible nodes.
         _meshVertices.clear();
-        _meshIndices.clear();
     }
 
     // 传递给子类: 通过_parentMotion查找对应ref，避免创建重复状态
@@ -669,22 +676,40 @@ emotenoderef* emotemotionref::getNodeRef(emotenode* node)
 }
 void emotemotionref::progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim)
 {
-    // 起始
+    // 起始。clear() 保留 capacity，避免每帧重新申请容器存储。
     shapeNodeAreas.clear();
-    renderMethod.clear();
     renderMethod = renderList;
 
-    // 按priority顺序构建_nodeCache
-    _nodeCache.clear();
     if (currentMotion == nullptr) return;
-    size_t count = currentMotion->nodeList.size();
-    _nodeCache.reserve(count);
-    for (size_t i = 0; i < count; i++)
+
+    // Motion topology 通常在整个播放期间不变。只在 nodeList 真正变化时
+    // 重建 refs；否则保留每个 node 的 mesh/vector capacity 跨帧复用。
+    const size_t count = currentMotion->nodeList.size();
+    bool topologyChanged = _nodeCache.size() != count;
+    if (!topologyChanged)
     {
-        _nodeCache.emplace_back(currentMotion->nodeList[i], refTop, this);
+        for (size_t i = 0; i < count; ++i)
+        {
+            if (_nodeCache[i].currentNode != currentMotion->nodeList[i])
+            {
+                topologyChanged = true;
+                break;
+            }
+        }
+    }
+    if (topologyChanged)
+    {
+        _nodeCache.clear();
+        _nodeCache.reserve(count);
+        for (size_t i = 0; i < count; ++i)
+            _nodeCache.emplace_back(currentMotion->nodeList[i], refTop, this);
     }
 
-    // 清理旧的子motion ref
+    // Nested motion refs are still rebuilt for correctness because the active
+    // sub-motion can change with keyframes. Reset parent raw pointers before
+    // deleting them, while keeping the top-level node/mesh storage persistent.
+    for (auto& ref : _nodeCache)
+        ref.currentMtnRef = nullptr;
     for (auto sub : _subMotionRefs)
         delete sub;
     _subMotionRefs.clear();
@@ -803,10 +828,17 @@ emoteengine::~emoteengine() = default;
 
 void emoteengine::progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim)
 {
-    _mainMotionRef.reset();
     if (!_mainmotion)
+    {
+        _mainMotionRef.reset();
         return;
-    _mainMotionRef = std::make_shared<emotemotionref>(_mainmotion, this);
+    }
+
+    // Reuse the runtime tree while the selected motion is unchanged. The node
+    // cache owns the expensive mesh/vector capacity and is refreshed in-place.
+    if (!_mainMotionRef || _mainMotionRef->currentMotion != _mainmotion)
+        _mainMotionRef = std::make_shared<emotemotionref>(_mainmotion, this);
+
     _mainMotionRef->progress(tick, renderList, lim);
 }
 void emoteengine::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget)
