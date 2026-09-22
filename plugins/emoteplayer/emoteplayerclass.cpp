@@ -310,11 +310,38 @@ void D3DAdaptor::captureCanvas(iTJSDispatch2* targetLayer)
         return;
     int pitch = 0;
     uint8_t* pixels = renderer->LockTarget(_target, pitch);
-    tjs_uint8* buff = (tjs_uint8*)ths->GetMainImagePixelBufferForWrite();
-    if (buff && pixels)
-        std::memcpy(buff, pixels, (size_t)_width * _height * 4);
+
+    const tjs_int layerWidth = ths->GetWidth();
+    const tjs_int layerHeight = ths->GetHeight();
+    const tjs_int copyWidth = std::min(_width, layerWidth);
+    const tjs_int copyHeight = std::min(_height, layerHeight);
+    const bool fullOverwrite =
+        copyWidth == layerWidth && copyHeight == layerHeight &&
+        _width == layerWidth && _height == layerHeight;
+
+    // captureCanvas overwrites the complete destination layer in the common
+    // D3DAdaptor path. Tell the Layer texture that the old GPU contents are
+    // disposable so Metal does not perform a full-surface Persistent readback
+    // immediately before memcpy replaces every pixel.
+    tjs_uint8* buff = (tjs_uint8*)(fullOverwrite
+        ? ths->GetMainImagePixelBufferForOverwrite()
+        : ths->GetMainImagePixelBufferForWrite());
+
+    if (buff && pixels && copyWidth > 0 && copyHeight > 0)
+    {
+        const tjs_int dstPitch = ths->GetMainImagePixelBufferPitch();
+        const size_t rowBytes = (size_t)copyWidth * 4;
+        if (pitch == dstPitch && copyWidth == _width && copyWidth == layerWidth)
+            std::memcpy(buff, pixels, rowBytes * copyHeight);
+        else
+            for (tjs_int y = 0; y < copyHeight; ++y)
+                std::memcpy(buff + (size_t)y * dstPitch,
+                            pixels + (size_t)y * pitch,
+                            rowBytes);
+    }
+
     renderer->UnlockTarget(_target);
-    ths->ReleaseMainImagePixelBufferForWrite(tTVPRect(0, 0, _width, _height));
+    ths->ReleaseMainImagePixelBufferForWrite(tTVPRect(0, 0, copyWidth, copyHeight));
     ths->Update();
 }
 void D3DAdaptor::unloadUnusedTextures()
