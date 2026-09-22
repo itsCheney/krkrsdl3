@@ -43,6 +43,7 @@ namespace emoteplayer
         // method
         void checkDrawStatus(float tick, std::vector<emoteRender>& renderList, emotelimit lim);
         void progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim);
+        bool containsCurrentMesh(float x, float y) const;
         // 通过 core/render 的 2D 渲染抽象绘制（插件无渲染后端区分）
         bool draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget);
         float getCurrentRenderZ();
@@ -95,6 +96,8 @@ namespace emoteplayer
         int _meshDivY = 8;
         std::vector<MeshVertex> _meshVertices;
         std::vector<uint16_t> _meshIndices;
+        bool _useGPUDeform = false;
+        std::vector<krkrsdl3::TVPMeshDeformSurface> _gpuDeformSurfaces;
         // Per-node scratch storage survives frames. Surface matrices are rebuilt
         // once per mesh update, while index topology is retained until division
         // or mesh mode actually changes.

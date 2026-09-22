@@ -466,7 +466,10 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         refMtn->shapeNodeAreas.push_back(std::move(area));
     }
 
-    // 对于icon节点，在CPU上计算细分网格
+    // Deformed icon meshes can be evaluated directly in the Metal vertex
+    // shader. Other backends retain the exact CPU geometry path.
+    _useGPUDeform = false;
+    _gpuDeformSurfaces.clear();
     if (isIcon && isNeedDraw && renderMethod.size() > 0)
     {
         // 确定细分等级
@@ -485,35 +488,43 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         }
         // 变换
         const Uint64 meshBuildStarted = SDL_GetTicksNS();
-        if (containsMesh)
+        _meshDivX = div;
+        _meshDivY = div;
+        auto* backend = krkrsdl3::TVPGetRenderBackend();
+        if (containsMesh && backend && backend->SupportsMeshDeformation())
         {
-            // 顶点位置每帧变化，但规则网格索引拓扑仅在 division 改变时变化。
+            buildGPUDeformSurfaces(renderMethod, _surfaceMatrices, _gpuDeformSurfaces);
+            _useGPUDeform = true;
+            _meshVertices.clear();
+        }
+        else if (containsMesh)
+        {
             const size_t expectedIndices = size_t(div) * size_t(div) * 6;
-            const bool rebuildIndices =
-                _meshDivX != div || _meshDivY != div || _meshIndices.size() != expectedIndices;
-            _meshDivX = div;
-            _meshDivY = div;
+            const bool rebuildIndices = _meshIndices.size() != expectedIndices;
             buildSubdivMesh(renderMethod, _meshDivX, _meshDivY, _meshVertices, _meshIndices,
                             &_surfaceMatrices, rebuildIndices);
         }
         else
         {
-            // 矩形索引恒定；保留 topology 与 vector capacity 跨帧复用。
             const bool rebuildIndices = _meshIndices.size() != 6;
             buildRectMesh(renderMethod, _meshVertices, _meshIndices, &_surfaceMatrices,
                           rebuildIndices);
         }
-        const uint64_t meshVertexCount = _meshVertices.size();
+        const uint64_t meshVertexCount = containsMesh
+            ? uint64_t(div + 1) * uint64_t(div + 1)
+            : uint64_t(_meshVertices.size());
         krkrsdl3::TVPRecordEmoteMeshBuild(
             SDL_GetTicksNS() - meshBuildStarted,
             meshVertexCount,
-            containsMesh ? meshVertexCount : 0);
+            containsMesh && !_useGPUDeform ? meshVertexCount : 0);
     }
     else
     {
         // Hidden/non-icon nodes keep allocated storage so reappearing animations
         // do not churn heap allocations. draw() already rejects non-visible nodes.
         _meshVertices.clear();
+        _useGPUDeform = false;
+        _gpuDeformSurfaces.clear();
     }
 
     // Local node work ends here. Recursive children/submotions account for
@@ -549,6 +560,19 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         }
     }
 }
+bool emotenoderef::containsCurrentMesh(float x, float y) const
+{
+    if (!_useGPUDeform)
+        return containsMesh(_meshVertices, _meshIndices, x, y);
+
+    // Hit testing is much less frequent than rendering. Materialize the exact
+    // CPU geometry only when a query is made instead of paying this cost every frame.
+    std::vector<EmoteVertex> vertices;
+    std::vector<uint16_t> indices;
+    buildSubdivMesh(renderMethod, _meshDivX, _meshDivY, vertices, indices);
+    return containsMesh(vertices, indices, x, y);
+}
+
 bool emotenoderef::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget)
 {
     if (!isNeedDraw || !isIcon || renderMethod.size() < 1 || currentNode->removed)
@@ -556,8 +580,12 @@ bool emotenoderef::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emo
     if (!renderer || !target || !ic || !ic->selftexture)
         return false;
 
-    // 跳过空网格
-    if (_meshVertices.empty() || _meshIndices.empty())
+    // CPU and GPU deformation paths carry different geometry payloads.
+    if (_useGPUDeform)
+    {
+        if (_gpuDeformSurfaces.empty()) return false;
+    }
+    else if (_meshVertices.empty() || _meshIndices.empty())
         return false;
 
     // 提前绘制好蒙版目标（不考虑复合蒙版的情况）
@@ -611,7 +639,25 @@ bool emotenoderef::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emo
     if (blendMode == 6 || totalOpa <= 0)
         return false; // 该模式不绘制（GL 后端原行为）
 
-    // 绘制网格（MeshVertex 布局与接口的交错 xyuv 格式一致，直接传递）
+    if (_useGPUDeform)
+    {
+        if (renderer->DrawDeformedMesh(_meshDivX, _meshDivY,
+                                       _gpuDeformSurfaces.data(),
+                                       static_cast<int>(_gpuDeformSurfaces.size()),
+                                       ic->selftexture, totalOpa, colorModulation))
+            return true;
+
+        // Backend declined the accelerated draw after prepare; preserve behavior
+        // by materializing the same CPU geometry for this draw.
+        std::vector<EmoteVertex> fallbackVertices;
+        std::vector<uint16_t> fallbackIndices;
+        buildSubdivMesh(renderMethod, _meshDivX, _meshDivY, fallbackVertices, fallbackIndices);
+        renderer->DrawMesh((const float*)fallbackVertices.data(), (int)fallbackVertices.size(),
+                           fallbackIndices.data(), (int)fallbackIndices.size(), ic->selftexture,
+                           totalOpa, colorModulation);
+        return true;
+    }
+
     renderer->DrawMesh((const float*)_meshVertices.data(), (int)_meshVertices.size(),
                        _meshIndices.data(), (int)_meshIndices.size(), ic->selftexture, totalOpa,
                        colorModulation);
@@ -821,7 +867,7 @@ bool emotemotionref::contains(float x, float y, const char* label) const
             return true;
     if (!label)
         for (const auto& node : _nodeCache)
-            if (node.wasDrawn && containsMesh(node._meshVertices, node._meshIndices, x, y))
+            if (node.wasDrawn && node.containsCurrentMesh(x, y))
                 return true;
     return false;
 }

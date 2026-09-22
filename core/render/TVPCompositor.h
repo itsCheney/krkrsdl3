@@ -14,6 +14,19 @@
 //---------------------------------------------------------------------------
 namespace krkrsdl3
 {
+// GPU mesh-deformation input. Matrices are column-major and already include
+// inheritance/attach transforms. Keeping this representation renderer-neutral
+// lets plugins use an accelerated path without exposing their own types here.
+struct TVPMeshDeformSurface
+{
+    float matrix[16] = {0};
+    float originX = 0, originY = 0, width = 0, height = 0;
+    int32_t type = 0;
+    int32_t reserved[3] = {0, 0, 0};
+    float controlPts[32] = {0};
+};
+static_assert(sizeof(TVPMeshDeformSurface) == 224, "GPU deformation surface layout");
+
 //---------------------------------------------------------------------------
 // 渲染后端抽象层（合并接口）
 //
@@ -114,6 +127,21 @@ public:
                           void* texture,
                           float opacity,
                           const float* colorModulation = nullptr) = 0;
+
+    // Optional regular-grid deformation path. divX/divY define a static UV grid;
+    // the backend evaluates the surface chain per vertex. False means callers
+    // must use the CPU-generated DrawMesh path.
+    virtual bool SupportsMeshDeformation() const { return false; }
+    virtual bool DrawDeformedMesh(int divX,
+                                  int divY,
+                                  const TVPMeshDeformSurface* surfaces,
+                                  int surfaceCount,
+                                  void* texture,
+                                  float opacity,
+                                  const float* colorModulation = nullptr)
+    {
+        return false;
+    }
 
     // ---- Layer 合成（图层合成路径，供 DrawDeviceD3D 的 GPU RenderManager 使用）----
     // 与 2D 网格（DrawMesh，emoteplayer 用）的区别：混合公式遵循软件 RenderManager
@@ -250,6 +278,8 @@ struct TVPRuntimeProfileStats {
     uint64_t emoteMeshBuildTimeNS = 0;
     uint64_t emoteMeshVerticesBuilt = 0;
     uint64_t emoteDeformedVerticesBuilt = 0;
+    uint64_t emoteGPUDeformDraws = 0;
+    uint64_t emoteGPUDeformVertices = 0;
 
     uint64_t meshDrawCalls = 0;
     uint64_t meshVertices = 0;
@@ -277,6 +307,7 @@ void TVPRecordEmoteSubmotionRebuild(uint64_t nanoseconds, uint64_t creations);
 void TVPRecordEmoteShapeBuild(uint64_t nanoseconds, uint64_t vertices);
 void TVPRecordEmoteMeshBuild(uint64_t nanoseconds, uint64_t vertices,
                              uint64_t deformedVertices);
+void TVPRecordEmoteGPUDeform(uint64_t vertices);
 void TVPCommitEmotePrepareDetail(uint64_t transformTimeNS,
                                  uint64_t motionProgressTimeNS,
                                  uint64_t snapshotTimeNS);

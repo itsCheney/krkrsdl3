@@ -56,6 +56,7 @@ std::atomic<uint64_t> profileEmoteShapeBuildCalls{0}, profileEmoteShapeBuildTime
 std::atomic<uint64_t> profileEmoteShapeVertices{0};
 std::atomic<uint64_t> profileEmoteMeshBuildCalls{0}, profileEmoteMeshBuildTimeNS{0};
 std::atomic<uint64_t> profileEmoteMeshVerticesBuilt{0}, profileEmoteDeformedVerticesBuilt{0};
+std::atomic<uint64_t> profileEmoteGPUDeformDraws{0}, profileEmoteGPUDeformVertices{0};
 
 struct EmotePrepareDetailAccumulator {
     bool active = false;
@@ -153,6 +154,10 @@ void TVPRecordEmoteMeshBuild(uint64_t ns, uint64_t vertices, uint64_t deformedVe
     emotePrepareDetail.meshVertices += vertices;
     emotePrepareDetail.deformedVertices += deformedVertices;
 }
+void TVPRecordEmoteGPUDeform(uint64_t vertices) {
+    profileEmoteGPUDeformDraws.fetch_add(1,std::memory_order_relaxed);
+    profileEmoteGPUDeformVertices.fetch_add(vertices,std::memory_order_relaxed);
+}
 void TVPCommitEmotePrepareDetail(uint64_t transformNS, uint64_t motionNS, uint64_t snapshotNS) {
     if (!emotePrepareDetail.active) return;
     profileEmotePrepareTransformTimeNS.fetch_add(transformNS,std::memory_order_relaxed);
@@ -216,6 +221,8 @@ TVPRuntimeProfileStats TVPGetRuntimeProfileStats() {
     s.emoteMeshBuildTimeNS=profileEmoteMeshBuildTimeNS.load(std::memory_order_relaxed);
     s.emoteMeshVerticesBuilt=profileEmoteMeshVerticesBuilt.load(std::memory_order_relaxed);
     s.emoteDeformedVerticesBuilt=profileEmoteDeformedVerticesBuilt.load(std::memory_order_relaxed);
+    s.emoteGPUDeformDraws=profileEmoteGPUDeformDraws.load(std::memory_order_relaxed);
+    s.emoteGPUDeformVertices=profileEmoteGPUDeformVertices.load(std::memory_order_relaxed);
     s.meshDrawCalls=profileMeshDrawCalls.load(std::memory_order_relaxed);
     s.meshVertices=profileMeshVertices.load(std::memory_order_relaxed);
     s.meshIndices=profileMeshIndices.load(std::memory_order_relaxed);
@@ -253,6 +260,8 @@ void TVPResetRuntimeProfileStats() {
     profileEmoteMeshBuildTimeNS.store(0,std::memory_order_relaxed);
     profileEmoteMeshVerticesBuilt.store(0,std::memory_order_relaxed);
     profileEmoteDeformedVerticesBuilt.store(0,std::memory_order_relaxed);
+    profileEmoteGPUDeformDraws.store(0,std::memory_order_relaxed);
+    profileEmoteGPUDeformVertices.store(0,std::memory_order_relaxed);
     emotePrepareDetail = {};
     profileMeshDrawCalls.store(0,std::memory_order_relaxed);
     profileMeshVertices.store(0,std::memory_order_relaxed);

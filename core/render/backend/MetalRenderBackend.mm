@@ -30,9 +30,59 @@ const char* kShaders = R"MSL(
 using namespace metal;
 struct Vertex { float2 xy; float2 uv; };
 struct Varying { float4 position [[position]]; float2 uv; };
+struct DeformSurface {
+    float4x4 matrix;
+    float4 geometry;
+    int4 flags;
+    float2 control[16];
+};
 struct Params { float4 color, modulation, rect, uv; int4 flags; float4 values; };
 vertex Varying vertexMain(uint i [[vertex_id]], const device Vertex* v [[buffer(0)]]) {
     return {float4(v[i].xy.x, -v[i].xy.y, 0, 1), v[i].uv};
+}
+float4 bezierBasis(float t) {
+    float omt = 1.0 - t;
+    return float4(omt * omt * omt,
+                  3.0 * t * omt * omt,
+                  3.0 * t * t * omt,
+                  t * t * t);
+}
+float2 evalBezier(const device DeformSurface& surface, float u, float v) {
+    float4 bu = bezierBasis(u);
+    float4 bv = bezierBasis(v);
+    float2 result = float2(0.0);
+    for (int row = 0; row < 4; ++row)
+        for (int col = 0; col < 4; ++col)
+            result += surface.control[row * 4 + col] * bu[row] * bv[col];
+    return result;
+}
+vertex Varying deformVertexMain(uint i [[vertex_id]],
+                                const device float2* gridUV [[buffer(0)]],
+                                const device DeformSurface* surfaces [[buffer(1)]],
+                                constant uint& surfaceCount [[buffer(2)]]) {
+    float u = gridUV[i].x, v = gridUV[i].y;
+    float lastX = 0.0, lastY = 0.0;
+    float4 trans = float4(1.0);
+    for (int n = int(surfaceCount) - 1; n >= 0; --n) {
+        const device DeformSurface& surface = surfaces[n];
+        if (surface.flags.x == 3) {
+            trans = surface.matrix * trans;
+            continue;
+        }
+        if (n < int(surfaceCount) - 1) {
+            lastX = (trans.y + surface.geometry.y) / surface.geometry.w;
+            lastY = (trans.x + surface.geometry.x) / surface.geometry.z;
+        } else {
+            lastX = u;
+            lastY = v;
+        }
+        float2 p = surface.flags.x == 1 ? evalBezier(surface, lastX, lastY)
+                                        : float2(lastY, lastX);
+        trans = surface.matrix * float4(p, 0.0, 1.0);
+    }
+    // CPU geometry stores y=-trans.y and vertexMain flips it again for Metal.
+    // Emit the final Metal clip-space value directly here.
+    return {float4(trans.x, trans.y, 0.0, 1.0), float2(v, u)};
 }
 fragment float4 windowMain(Varying v [[stage_in]], texture2d<float> src [[texture(0)]]) {
     constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
@@ -129,6 +179,14 @@ struct MetalRenderBackend::Impl
     id<MTLCommandBuffer> commands = nil, lastSubmitted = nil;
     id<MTLRenderPipelineState> windowPipeline = nil, capturePipeline = nil;
     id<MTLRenderPipelineState> meshPipelines[3] = {nil, nil, nil};
+    id<MTLRenderPipelineState> deformPipelines[3] = {nil, nil, nil};
+    struct DeformTopology {
+        id<MTLBuffer> uv = nil;
+        id<MTLBuffer> indices = nil;
+        int vertexCount = 0;
+        int indexCount = 0;
+    };
+    std::unordered_map<uint32_t, DeformTopology> deformTopologies;
     id<MTLComputePipelineState> layerPipeline = nil, ordinaryLayerPipeline = nil, ordinaryInPlacePipeline = nil;
     id<MTLComputePipelineState> dualSourceLayerPipeline = nil;
     id<MTLComputeCommandEncoder> ordinaryEncoder = nil;
@@ -413,11 +471,11 @@ struct MetalRenderBackend::Impl
         }
         [e endEncoding];
     }
-    id<MTLRenderPipelineState> Pipeline(id<MTLLibrary> lib, NSString* fragment,
+    id<MTLRenderPipelineState> Pipeline(id<MTLLibrary> lib, NSString* vertex, NSString* fragment,
                                        MTLPixelFormat format, int blend)
     {
         MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
-        d.vertexFunction = [lib newFunctionWithName:@"vertexMain"];
+        d.vertexFunction = [lib newFunctionWithName:vertex];
         d.fragmentFunction = [lib newFunctionWithName:fragment];
         auto a = d.colorAttachments[0];
         a.pixelFormat = format;
@@ -435,6 +493,48 @@ struct MetalRenderBackend::Impl
         if (!p) SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Metal pipeline: %s", error.localizedDescription.UTF8String);
         return p;
     }
+    DeformTopology* DeformGrid(int divX, int divY)
+    {
+        if (divX < 1 || divY < 1 || divX > 254 || divY > 254) return nullptr;
+        const uint32_t key = (static_cast<uint32_t>(divX) << 16) | static_cast<uint32_t>(divY);
+        auto found = deformTopologies.find(key);
+        if (found != deformTopologies.end()) return &found->second;
+
+        const int vertexCount = (divX + 1) * (divY + 1);
+        const int indexCount = divX * divY * 6;
+        std::vector<simd_float2> uv(static_cast<size_t>(vertexCount));
+        size_t vertex = 0;
+        for (int gy = 0; gy <= divY; ++gy)
+            for (int gx = 0; gx <= divX; ++gx)
+                uv[vertex++] = simd_make_float2(static_cast<float>(gx) / divX,
+                                                static_cast<float>(gy) / divY);
+        std::vector<uint16_t> indices(static_cast<size_t>(indexCount));
+        size_t index = 0;
+        for (int gy = 0; gy < divY; ++gy) {
+            for (int gx = 0; gx < divX; ++gx) {
+                const uint16_t i0 = static_cast<uint16_t>(gy * (divX + 1) + gx);
+                const uint16_t i1 = static_cast<uint16_t>(i0 + 1);
+                const uint16_t i2 = static_cast<uint16_t>((gy + 1) * (divX + 1) + gx);
+                const uint16_t i3 = static_cast<uint16_t>(i2 + 1);
+                indices[index++] = i0; indices[index++] = i1; indices[index++] = i2;
+                indices[index++] = i1; indices[index++] = i3; indices[index++] = i2;
+            }
+        }
+        DeformTopology topology;
+        topology.uv = [device newBufferWithBytes:uv.data()
+                                          length:uv.size() * sizeof(simd_float2)
+                                         options:MTLResourceStorageModeShared];
+        topology.indices = [device newBufferWithBytes:indices.data()
+                                               length:indices.size() * sizeof(uint16_t)
+                                              options:MTLResourceStorageModeShared];
+        if (!topology.uv || !topology.indices)
+            throw std::runtime_error("Metal deformation topology allocation failed");
+        topology.vertexCount = vertexCount;
+        topology.indexCount = indexCount;
+        auto inserted = deformTopologies.emplace(key, topology);
+        return &inserted.first->second;
+    }
+
     bool Initialize(SDL_Window* w, bool vsync)
     {
         window = w;
@@ -465,9 +565,12 @@ struct MetalRenderBackend::Impl
             SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Metal shaders: %s", error.localizedDescription.UTF8String);
             return false;
         }
-        windowPipeline = Pipeline(lib, @"windowMain", MTLPixelFormatBGRA8Unorm, -1);
-        capturePipeline = Pipeline(lib, @"windowMain", MTLPixelFormatRGBA8Unorm, -1);
-        for (int i = 0; i < 3; ++i) meshPipelines[i] = Pipeline(lib, @"meshMain", MTLPixelFormatRGBA8Unorm, i);
+        windowPipeline = Pipeline(lib, @"vertexMain", @"windowMain", MTLPixelFormatBGRA8Unorm, -1);
+        capturePipeline = Pipeline(lib, @"vertexMain", @"windowMain", MTLPixelFormatRGBA8Unorm, -1);
+        for (int i = 0; i < 3; ++i) {
+            meshPipelines[i] = Pipeline(lib, @"vertexMain", @"meshMain", MTLPixelFormatRGBA8Unorm, i);
+            deformPipelines[i] = Pipeline(lib, @"deformVertexMain", @"meshMain", MTLPixelFormatRGBA8Unorm, i);
+        }
         layerPipeline = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"layerMain"] error:&error];
         if (!layerPipeline) SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Metal layer pipeline: %s", error.localizedDescription.UTF8String);
         MTLCompileOptions* ordinaryOptions = [MTLCompileOptions new];
@@ -498,7 +601,8 @@ struct MetalRenderBackend::Impl
             "GPU Layer dual-source pipeline unavailable; SD transitions use software fallback: %s",
             error.localizedDescription.UTF8String);
         return windowPipeline && capturePipeline && meshPipelines[0] && meshPipelines[1] &&
-               meshPipelines[2] && layerPipeline;
+               meshPipelines[2] && deformPipelines[0] && deformPipelines[1] &&
+               deformPipelines[2] && layerPipeline;
     }
 };
 
@@ -653,6 +757,63 @@ void MetalRenderBackend::DrawMesh(const float* vertices, int vertexCount, const 
         TVPRecordMeshDraw(static_cast<uint64_t>(vertexCount),static_cast<uint64_t>(indexCount),
                           SDL_GetTicksNS() - cpuStarted,validationTimeNS,2,
                           static_cast<uint64_t>(vertexBytes + indexBytes),allocationTimeNS);
+    }
+}
+bool MetalRenderBackend::DrawDeformedMesh(int divX, int divY,
+                                          const TVPMeshDeformSurface* surfaces,
+                                          int surfaceCount, void* handle, float opacity,
+                                          const float* modulation)
+{
+    @autoreleasepool {
+        auto& p = *impl_;
+        auto r = p.Find(handle);
+        if (!p.current || !r || !surfaces || surfaceCount <= 0 || p.mesh.flags.x == 6)
+            return false;
+        auto* topology = p.DeformGrid(divX, divY);
+        if (!topology) return false;
+
+        const Uint64 cpuStarted = SDL_GetTicksNS();
+        const size_t surfaceBytes = static_cast<size_t>(surfaceCount) * sizeof(TVPMeshDeformSurface);
+        id<MTLBuffer> surfaceBuffer = p.AcquireStaging(surfaceBytes);
+        if (!surfaceBuffer) throw std::runtime_error("Metal deformation parameter allocation failed");
+        std::memcpy(surfaceBuffer.contents, surfaces, surfaceBytes);
+
+        id<MTLTexture> source = r->texture;
+        id<MTLTexture> snapshot = (r == p.current || p.mask == p.current) ? p.Snapshot(p.current) : nil;
+        if (r == p.current) source = snapshot;
+
+        Params uniforms = p.mesh;
+        uniforms.modulation = modulation ? Color(modulation) : simd_make_float4(1, 1, 1, 1);
+        uniforms.flags.y = p.mask != nullptr;
+        uniforms.values = simd_make_float4(std::clamp(opacity, 0.0f, 1.0f),
+                                           p.current->width, p.current->height, 0);
+        const int pipeline = (uniforms.flags.x == 1 || uniforms.flags.x == 4) ? 1 :
+                             uniforms.flags.x == 21 ? 2 : 0;
+        const uint32_t count = static_cast<uint32_t>(surfaceCount);
+        id<MTLRenderCommandEncoder> e = p.Pass(p.current->texture, false);
+        [e setRenderPipelineState:p.deformPipelines[pipeline]];
+        [e setVertexBuffer:topology->uv offset:0 atIndex:0];
+        [e setVertexBuffer:surfaceBuffer offset:0 atIndex:1];
+        [e setVertexBytes:&count length:sizeof(count) atIndex:2];
+        [e setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+        [e setFragmentTexture:source atIndex:0];
+        [e setFragmentTexture:p.mask ? (p.mask == p.current ? snapshot : p.mask->texture) : source
+                         atIndex:1];
+        [e drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                       indexCount:topology->indexCount
+                        indexType:MTLIndexTypeUInt16
+                      indexBuffer:topology->indices
+                indexBufferOffset:0];
+        [e endEncoding];
+
+        p.transientBytes += surfaceBytes;
+        if (p.transientBytes >= Impl::kSubmissionBudget) p.Submit();
+        TVPRecordEmoteGPUDeform(static_cast<uint64_t>(topology->vertexCount));
+        TVPRecordMeshDraw(static_cast<uint64_t>(topology->vertexCount),
+                          static_cast<uint64_t>(topology->indexCount),
+                          SDL_GetTicksNS() - cpuStarted, 0, 0,
+                          static_cast<uint64_t>(surfaceBytes), 0);
+        return true;
     }
 }
 void MetalRenderBackend::LayerSetBlend(int method, float opacity, const float* color)

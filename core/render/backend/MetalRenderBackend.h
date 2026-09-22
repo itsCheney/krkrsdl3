@@ -52,6 +52,9 @@ public:
     void SetBlendMode(int mode, const float* color) override;
     void DrawMesh(const float*, int, const uint16_t*, int, void*, float,
                   const float* colorModulation = nullptr) override;
+    bool SupportsMeshDeformation() const override { return true; }
+    bool DrawDeformedMesh(int, int, const TVPMeshDeformSurface*, int, void*, float,
+                          const float* colorModulation = nullptr) override;
     void LayerSetBlend(int method, float opacity, const float* color) override;
     void LayerDrawRect(void*, float, float, float, float, float, float, float, float) override;
     bool CaptureFrame(std::vector<uint8_t>& pixels, int& width, int& height, int& pitch) override;

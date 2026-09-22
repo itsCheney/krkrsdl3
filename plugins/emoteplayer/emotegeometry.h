@@ -7,6 +7,7 @@
 #include <string>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
 
 namespace emoteplayer
 {
@@ -103,6 +104,27 @@ inline void buildSurfaceMatrices(
             model = glm::scale(model, glm::vec3(surface.width, surface.height, 1.0f));
         }
         matrices[i] = surface.attachMat * model;
+    }
+}
+
+inline void buildGPUDeformSurfaces(
+    const std::vector<emoteRender>& renderMethod,
+    std::vector<glm::mat4>& matrices,
+    std::vector<krkrsdl3::TVPMeshDeformSurface>& surfaces)
+{
+    buildSurfaceMatrices(renderMethod, matrices);
+    surfaces.resize(renderMethod.size());
+    for (size_t i = 0; i < renderMethod.size(); ++i)
+    {
+        auto& out = surfaces[i];
+        const auto& in = renderMethod[i];
+        std::copy(glm::value_ptr(matrices[i]), glm::value_ptr(matrices[i]) + 16, out.matrix);
+        out.originX = in.originX;
+        out.originY = in.originY;
+        out.width = in.width;
+        out.height = in.height;
+        out.type = in.type;
+        std::copy(std::begin(in.controlPts), std::end(in.controlPts), out.controlPts);
     }
 }
 
