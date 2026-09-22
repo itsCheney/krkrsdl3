@@ -160,6 +160,9 @@ public:
     virtual void* CreateLayerTexture(int, int, TVPLayerTextureFormat) { return nullptr; }
     virtual void DestroyLayerTexture(void*) {}
     virtual bool UpdateLayerTexture(void*, const uint8_t*, int, const TVPLayerRect&) { return false; }
+    // Fast full-surface copy from an offscreen render target into a Layer texture.
+    // Backends that cannot guarantee identical RGBA8 dimensions return false.
+    virtual bool CopyTargetToLayerTexture(void*, void*) { return false; }
     virtual bool ReadLayerTexture(void*, std::vector<uint8_t>&, int&) { return false; }
     virtual bool ReadLayerTextureRegion(void*, const TVPLayerRect&, std::vector<uint8_t>&, int&) { return false; }
     virtual bool OperateLayerRect(const TVPLayerOperation&, void*, const TVPLayerRect&,
@@ -206,6 +209,20 @@ bool TVPRenderBackendAvailable(const std::string& name);
 //---------------------------------------------------------------------------
 void TVPSetRenderBackend(iTVPRenderBackend* backend);
 iTVPRenderBackend* TVPGetRenderBackend();
+
+struct TVPEmoteCaptureStats {
+    uint64_t calls = 0;
+    uint64_t cpuFallbacks = 0;
+    uint64_t cpuBytes = 0;
+    uint64_t gpuCopies = 0;
+    uint64_t gpuBytes = 0;
+};
+void TVPRecordEmoteCaptureCall();
+void TVPRecordEmoteCaptureCPUFallback(uint64_t bytes);
+void TVPRecordEmoteCaptureGPUCopy(uint64_t bytes);
+TVPEmoteCaptureStats TVPGetEmoteCaptureStats();
+void TVPResetEmoteCaptureStats();
+
 // 销毁当前后端并清空指针
 void TVPShutdownRenderBackend();
 

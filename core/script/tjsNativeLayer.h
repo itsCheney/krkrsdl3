@@ -488,6 +488,10 @@ public:
     // For callers that replace every pixel of the layer. Skips the GPU readback
     // that GetMainImagePixelBufferForWrite performs to preserve existing content.
     void* GetMainImagePixelBufferForOverwrite();
+    // Full-surface GPU overwrite path used by render plugins. The handle is
+    // borrowed; commit only after the backend copy succeeds.
+    void* GetMainImageGPUHandleForOverwrite();
+    void CommitMainImageGPUOverwrite();
     // Closes the write lease opened by GetMainImagePixelBufferForWrite so a GPU
     // adapter can upload only `written` instead of the whole surface. Callers
     // that cannot describe their writes may skip this and pay a full upload.

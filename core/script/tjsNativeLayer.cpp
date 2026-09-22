@@ -2986,6 +2986,25 @@ void* tTJSNI_BaseLayer::GetMainImagePixelBufferForOverwrite()
     return MainImage->GetTextureForRender(true, nullptr)->GetPersistentCPUDataForOverwrite();
 }
 //---------------------------------------------------------------------------
+void* tTJSNI_BaseLayer::GetMainImageGPUHandleForOverwrite()
+{
+    if (!MainImage)
+        return NULL;
+    iTVPTexture2D* texture = MainImage->GetTextureForRender(true, nullptr);
+    return texture ? texture->GetTextureHandleForOverwrite() : NULL;
+}
+//---------------------------------------------------------------------------
+void tTJSNI_BaseLayer::CommitMainImageGPUOverwrite()
+{
+    if (!MainImage)
+        return;
+    iTVPTexture2D* texture = MainImage->GetTexture();
+    if (!texture)
+        return;
+    texture->CommitGPUOverwrite();
+    ImageModified = true;
+}
+//---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::ReleaseMainImagePixelBufferForWrite(const tTVPRect& written)
 {
     if (!MainImage)

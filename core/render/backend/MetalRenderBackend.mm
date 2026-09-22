@@ -748,6 +748,28 @@ bool MetalRenderBackend::UpdateLayerTexture(void* handle, const uint8_t* pixels,
         if(p.transientBytes>=Impl::kSubmissionBudget) p.Submit(); return true;
     }
 }
+bool MetalRenderBackend::CopyTargetToLayerTexture(void* sourceHandle, void* destinationHandle) {
+    @autoreleasepool {
+        auto& p=*impl_;
+        auto* source=p.Find(sourceHandle);
+        auto* destination=p.Find(destinationHandle);
+        if(!source || !destination || source==destination || !source->target || !destination->target ||
+           source->bytesPerPixel!=4 || destination->bytesPerPixel!=4 ||
+           source->width!=destination->width || source->height!=destination->height ||
+           source->width<=0 || source->height<=0) return false;
+        id<MTLBlitCommandEncoder> e=p.Blit();
+        if(!e) return false;
+        [e copyFromTexture:source->texture sourceSlice:0 sourceLevel:0
+              sourceOrigin:MTLOriginMake(0,0,0)
+              sourceSize:MTLSizeMake(source->width,source->height,1)
+              toTexture:destination->texture destinationSlice:0 destinationLevel:0
+              destinationOrigin:MTLOriginMake(0,0,0)];
+        [e endEncoding];
+        p.transientBytes+=size_t(source->width)*source->height*4;
+        if(p.transientBytes>=Impl::kSubmissionBudget) p.Submit();
+        return true;
+    }
+}
 bool MetalRenderBackend::ReadLayerTexture(void* handle,std::vector<uint8_t>& pixels,int& pitch) {
     @autoreleasepool { auto* r=impl_->Find(handle); return r && impl_->Read(r->texture,pixels,pitch); }
 }

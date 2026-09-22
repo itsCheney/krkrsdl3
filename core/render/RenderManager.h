@@ -78,6 +78,10 @@ public:
     bool IsGPUResident() const { return !IsCPUResident(); }
     // GPU 驻留时的后端纹理句柄（供上屏 sprite 别名，零拷贝）；CPU 驻留返回 nullptr
     virtual void* GetTextureHandle() { return nullptr; }
+    // Full-surface GPU overwrite lease. Getting the handle must not discard
+    // CPU state; CommitGPUOverwrite is called only after the backend copy succeeds.
+    virtual void* GetTextureHandleForOverwrite() { return nullptr; }
+    virtual void CommitGPUOverwrite() {}
     // 显式回读（带缓存）：返回 CPU 像素；软件实现零拷贝返回真实缓冲
     virtual void* LockCPURead() { return const_cast<void*>(GetPixelData()); }
     virtual void UnlockCPU() {}

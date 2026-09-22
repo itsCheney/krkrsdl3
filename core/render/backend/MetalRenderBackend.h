@@ -21,6 +21,7 @@ public:
     void* CreateLayerTexture(int, int, TVPLayerTextureFormat) override;
     void DestroyLayerTexture(void*) override;
     bool UpdateLayerTexture(void*, const uint8_t*, int, const TVPLayerRect&) override;
+    bool CopyTargetToLayerTexture(void*, void*) override;
     bool ReadLayerTexture(void*, std::vector<uint8_t>&, int&) override;
     bool ReadLayerTextureRegion(void*, const TVPLayerRect&, std::vector<uint8_t>&, int&) override;
     bool OperateLayerRect(const TVPLayerOperation&, void*, const TVPLayerRect&,

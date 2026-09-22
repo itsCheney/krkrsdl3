@@ -184,6 +184,23 @@ public:
         }
         return handle;
     }
+    void* GetTextureHandleForOverwrite() override {
+        // A raw CPU address or active read/write lease can be observed outside
+        // this call; replacing GPU contents behind it would violate that contract.
+        if(!session->backend || !handle || pinned || locks || writeLeased) return nullptr;
+        return handle;
+    }
+    void CommitGPUOverwrite() override {
+        // Called only after a successful full-surface GPU copy. Old CPU damage
+        // and cached pixels are obsolete and must never upload over the copy.
+        if(pinned || locks || writeLeased) return;
+        dirty=false; leaseHadDamage=false;
+        if(valid) {
+            valid=false;
+            session->stats.cpuCacheBytes-=Bytes();
+        }
+        std::vector<uint8_t>().swap(pixels);
+    }
     void Update(const void* data,TVPTextureFormat::e f,int pitch,const tTVPRect& requested) override {
         // Video/AlphaMovie frames may extend beyond the canvas. Empty and fully
         // clipped updates are no-ops; the source describes the requested ROI.

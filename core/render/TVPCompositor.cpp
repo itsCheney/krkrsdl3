@@ -3,6 +3,7 @@
 #include "TVPDebug.h"
 
 #include <algorithm>
+#include <atomic>
 #include <vector>
 
 //---------------------------------------------------------------------------
@@ -33,6 +34,42 @@ static iTVPRenderBackend*& GetCurrentBackendRef()
 {
     static iTVPRenderBackend* backend = nullptr;
     return backend;
+}
+
+namespace {
+std::atomic<uint64_t> emoteCaptureCalls{0};
+std::atomic<uint64_t> emoteCaptureCPUFallbacks{0};
+std::atomic<uint64_t> emoteCaptureCPUBytes{0};
+std::atomic<uint64_t> emoteCaptureGPUCopies{0};
+std::atomic<uint64_t> emoteCaptureGPUBytes{0};
+}
+
+void TVPRecordEmoteCaptureCall() {
+    emoteCaptureCalls.fetch_add(1, std::memory_order_relaxed);
+}
+void TVPRecordEmoteCaptureCPUFallback(uint64_t bytes) {
+    emoteCaptureCPUFallbacks.fetch_add(1, std::memory_order_relaxed);
+    emoteCaptureCPUBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+void TVPRecordEmoteCaptureGPUCopy(uint64_t bytes) {
+    emoteCaptureGPUCopies.fetch_add(1, std::memory_order_relaxed);
+    emoteCaptureGPUBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+TVPEmoteCaptureStats TVPGetEmoteCaptureStats() {
+    TVPEmoteCaptureStats stats;
+    stats.calls=emoteCaptureCalls.load(std::memory_order_relaxed);
+    stats.cpuFallbacks=emoteCaptureCPUFallbacks.load(std::memory_order_relaxed);
+    stats.cpuBytes=emoteCaptureCPUBytes.load(std::memory_order_relaxed);
+    stats.gpuCopies=emoteCaptureGPUCopies.load(std::memory_order_relaxed);
+    stats.gpuBytes=emoteCaptureGPUBytes.load(std::memory_order_relaxed);
+    return stats;
+}
+void TVPResetEmoteCaptureStats() {
+    emoteCaptureCalls.store(0, std::memory_order_relaxed);
+    emoteCaptureCPUFallbacks.store(0, std::memory_order_relaxed);
+    emoteCaptureCPUBytes.store(0, std::memory_order_relaxed);
+    emoteCaptureGPUCopies.store(0, std::memory_order_relaxed);
+    emoteCaptureGPUBytes.store(0, std::memory_order_relaxed);
 }
 
 void TVPRegisterRenderBackend(const TVPRenderBackendDesc& desc)
@@ -136,6 +173,7 @@ static void TVPReportCompositorFrame(int spriteCount,
 void TVPResetCompositorSessionState()
 {
     renderTexture.clear();
+    TVPResetEmoteCaptureStats();
     TVPReportCompositorFrame(0, 0, 0, false, true);
 }
 
