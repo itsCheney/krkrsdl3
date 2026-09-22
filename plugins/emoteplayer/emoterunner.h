@@ -98,8 +98,6 @@ namespace emoteplayer
         // Per-node scratch reused across frames. Surface matrices change each frame,
         // but their storage and the mesh index topology normally do not.
         std::vector<glm::mat4> _surfaceMatrices;
-        int _meshIndexDivX = -1;
-        int _meshIndexDivY = -1;
         // Per-node scratch storage survives frames. Surface matrices are rebuilt
         // once per mesh update, while index topology is retained until division
         // or mesh mode actually changes.
