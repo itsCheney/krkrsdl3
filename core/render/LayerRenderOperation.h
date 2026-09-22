@@ -46,6 +46,36 @@ enum class TVPLayerReadbackSource
     Detach,
     Count
 };
+// Which operand first forced a GPU texture into CPU memory during a software
+// fallback. Attribution is only recorded when an actual readback happens.
+enum class TVPLayerFallbackReadbackRole
+{
+    Target = 0,
+    Source,
+    Reference,
+    Count
+};
+// Why an operation could not stay on the Metal Layer path. Rect operations
+// record one reason before entering software; triangle/perspective calls are
+// tracked explicitly because they do not attempt the rect GPU path.
+enum class TVPLayerGPURejectReason
+{
+    TargetUnavailable = 0,
+    TargetCPUResident,
+    MultipleInputs,
+    UnsupportedMethod,
+    UnsupportedStretch,
+    InvalidOpacity,
+    SourceUnavailable,
+    SourceFormat,
+    InvalidGeometry,
+    UnsupportedKind,
+    AlphaTables,
+    BackendFailure,
+    Triangles,
+    Perspective,
+    Count
+};
 struct TVPLayerRenderStats
 {
     uint64_t gpuOperations = 0, cpuFallbacks = 0;
@@ -55,4 +85,9 @@ struct TVPLayerRenderStats
     // Indexed by TVPLayerReadbackSource; sums to readbackBytes.
     uint64_t readbackBytesBySource[static_cast<int>(TVPLayerReadbackSource::Count)] = {};
     uint64_t readbackCountBySource[static_cast<int>(TVPLayerReadbackSource::Count)] = {};
+    // Fallback-only attribution and GPU reject reasons. These are diagnostic
+    // counters and do not affect render-path selection.
+    uint64_t fallbackReadbackBytesByRole[static_cast<int>(TVPLayerFallbackReadbackRole::Count)] = {};
+    uint64_t fallbackReadbackCountByRole[static_cast<int>(TVPLayerFallbackReadbackRole::Count)] = {};
+    uint64_t gpuRejectCountByReason[static_cast<int>(TVPLayerGPURejectReason::Count)] = {};
 };

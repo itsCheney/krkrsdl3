@@ -59,8 +59,8 @@ class LayerTexture final : public iTVPTexture2D {
         damage.right=std::max(damage.right,r.right); damage.bottom=std::max(damage.bottom,r.bottom);
     }
     void MarkDirtyAll() { MarkDirty(tTVPRect(0,0,Width,Height)); }
-    void Read(TVPLayerReadbackSource source) {
-        if(valid) return;
+    bool Read(TVPLayerReadbackSource source) {
+        if(valid) return false;
         if(!session->backend || !handle) throw std::runtime_error("GPU Layer read without a session");
         int pitch=0;
         if(!session->backend->ReadLayerTexture(handle,pixels,pitch) || pitch!=GetPitch())
@@ -69,6 +69,7 @@ class LayerTexture final : public iTVPTexture2D {
         const int index=static_cast<int>(source);
         session->stats.readbackBytesBySource[index]+=Bytes();
         ++session->stats.readbackCountBySource[index];
+        return true;
     }
 public:
     LayerTexture(std::shared_ptr<Session> s,unsigned w,unsigned h,TVPTextureFormat::e f,bool ro)
@@ -98,8 +99,12 @@ public:
     bool Belongs(const std::shared_ptr<Session>& s) const { return session==s && handle; }
     // Used when building a borrowed software view for a CPU fallback, so the
     // readback is billed to the fallback rather than to ordinary pixel access.
-    const void* ScanLineForFallback() {
-        Read(TVPLayerReadbackSource::Fallback);
+    const void* ScanLineForFallback(TVPLayerFallbackReadbackRole role) {
+        if(Read(TVPLayerReadbackSource::Fallback)) {
+            const int index=static_cast<int>(role);
+            session->stats.fallbackReadbackBytesByRole[index]+=Bytes();
+            ++session->stats.fallbackReadbackCountByRole[index];
+        }
         return pixels.data();
     }
     TVPTextureFormat::e GetFormat() const override { return format; }
@@ -224,11 +229,12 @@ public:
 class CPUViews {
     std::unordered_map<iTVPTexture2D*,std::unique_ptr<iTVPTexture2D>> views;
 public:
-    iTVPTexture2D* Get(iTVPTexture2D* t) {
+    iTVPTexture2D* Get(iTVPTexture2D* t, TVPLayerFallbackReadbackRole role) {
         auto* layer=dynamic_cast<LayerTexture*>(t);
         if(!layer) return t;
         auto& v=views[t];
-        if(!v) v.reset(TVPGetSoftwareRenderManager()->CreateTexture2D(layer->ScanLineForFallback(),t->GetPitch(),t->GetWidth(),t->GetHeight(),t->GetFormat()));
+        if(!v) v.reset(TVPGetSoftwareRenderManager()->CreateTexture2D(
+            layer->ScanLineForFallback(role),t->GetPitch(),t->GetWidth(),t->GetHeight(),t->GetFormat()));
         return v.get();
     }
 };
@@ -238,6 +244,10 @@ public:
     std::shared_ptr<Session> session;
     int stretch=0;
     iTVPRenderManager* Software() { return TVPGetSoftwareRenderManager(); }
+    bool Reject(TVPLayerGPURejectReason reason) {
+        if(session) ++session->stats.gpuRejectCountByReason[static_cast<int>(reason)];
+        return false;
+    }
     const char* GetName() override { return "Metal Layer"; }
     // This facade keeps the software ABI, including CPU plugin operations.
     bool IsSoftware() override { return false; }
@@ -273,17 +283,23 @@ public:
     }
     bool GPU(iTVPRenderMethod* method,iTVPTexture2D* target,iTVPTexture2D* reference,tTVPRect dst,const tRenderTexRectArray& inputs) {
         auto* t=dynamic_cast<LayerTexture*>(target); TVPLayerOperation op;
-        if(!session || !t || !t->Belongs(session) || t->IsCPUResident() || inputs.size()>1 ||
-            !method->DescribeGpuOperation(op) || stretch<0 || stretch>2) return false;
-        if(op.opacity<0 || op.opacity>255) return false;
+        if(!session || !t || !t->Belongs(session)) return Reject(TVPLayerGPURejectReason::TargetUnavailable);
+        if(t->IsCPUResident()) return Reject(TVPLayerGPURejectReason::TargetCPUResident);
+        if(inputs.size()>1) return Reject(TVPLayerGPURejectReason::MultipleInputs);
+        if(!method->DescribeGpuOperation(op)) return Reject(TVPLayerGPURejectReason::UnsupportedMethod);
+        if(stretch<0 || stretch>2) return Reject(TVPLayerGPURejectReason::UnsupportedStretch);
+        if(op.opacity<0 || op.opacity>255) return Reject(TVPLayerGPURejectReason::InvalidOpacity);
         LayerTexture* source=nullptr; tTVPRect src(0,0,1,1);
         if(inputs.size()) {
             source=dynamic_cast<LayerTexture*>(inputs[0].first); src=inputs[0].second;
-            if(!source || !source->Belongs(session)) return false;
-            if(op.kind==TVPLayerOperationKind::ColorMap) { if(source->GetFormat()!=TVPTextureFormat::Gray) return false; }
-            else if(source->GetFormat()!=TVPTextureFormat::RGBA) return false;
+            if(!source || !source->Belongs(session)) return Reject(TVPLayerGPURejectReason::SourceUnavailable);
+            if(op.kind==TVPLayerOperationKind::ColorMap) {
+                if(source->GetFormat()!=TVPTextureFormat::Gray) return Reject(TVPLayerGPURejectReason::SourceFormat);
+            } else if(source->GetFormat()!=TVPTextureFormat::RGBA) {
+                return Reject(TVPLayerGPURejectReason::SourceFormat);
+            }
             int sw=src.get_width(),sh=src.get_height(),dw=dst.get_width(),dh=dst.get_height();
-            if(sw==0 || sh==0 || dw<=0 || dh<=0) return false;
+            if(sw==0 || sh==0 || dw<=0 || dh<=0) return Reject(TVPLayerGPURejectReason::InvalidGeometry);
             if(sw>0 && sh>0 && (sw!=dw || sh!=dh)) {
                 // Match the software manager's integer source adjustments before resize.
                 if(dst.left<0) { src.left+=float(sw)/dw*-dst.left; dst.left=0; }
@@ -291,35 +307,53 @@ public:
                 if(dst.top<0) { src.top+=float(sh)/dh*-dst.top; dst.top=0; }
                 if(dst.bottom>int(t->GetHeight())) { src.bottom-=float(src.get_height())/dst.get_height()*(dst.bottom-t->GetHeight()); dst.bottom=t->GetHeight(); }
                 if(src.get_width()==0 || src.get_height()==0 || dst.get_width()<=0 || dst.get_height()<=0) return true;
-            } else if((sw<0 || sh<0) && (std::abs(sw)!=dw || std::abs(sh)!=dh)) return false;
-        } else if(op.kind!=TVPLayerOperationKind::Fill && op.kind!=TVPLayerOperationKind::FillColor && op.kind!=TVPLayerOperationKind::FillMask && op.kind!=TVPLayerOperationKind::FillBlend) return false;
+            } else if((sw<0 || sh<0) && (std::abs(sw)!=dw || std::abs(sh)!=dh)) {
+                return Reject(TVPLayerGPURejectReason::InvalidGeometry);
+            }
+        } else if(op.kind!=TVPLayerOperationKind::Fill && op.kind!=TVPLayerOperationKind::FillColor &&
+                  op.kind!=TVPLayerOperationKind::FillMask && op.kind!=TVPLayerOperationKind::FillBlend) {
+            return Reject(TVPLayerGPURejectReason::UnsupportedKind);
+        }
         if(!session->tablesReady) {
-            if(!session->backend->SetLayerAlphaTables(TVPOpacityOnOpacityTable,TVPNegativeMulTable)) return false;
+            if(!session->backend->SetLayerAlphaTables(TVPOpacityOnOpacityTable,TVPNegativeMulTable))
+                return Reject(TVPLayerGPURejectReason::AlphaTables);
             session->tablesReady=true;
         }
         void* sh=source?source->GetTextureHandle():nullptr;
-        if(!session->backend->OperateLayerRect(op,t->GetTextureHandle(),Rect(dst),sh,Rect(src),stretch==0?0:1)) return false;
+        if(!session->backend->OperateLayerRect(op,t->GetTextureHandle(),Rect(dst),sh,Rect(src),stretch==0?0:1))
+            return Reject(TVPLayerGPURejectReason::BackendFailure);
         t->InvalidateCPUCache(); ++session->stats.gpuOperations; return true;
     }
     void OperateRect(iTVPRenderMethod* method,iTVPTexture2D* target,iTVPTexture2D* reference,const tTVPRect& dst,const tRenderTexRectArray& inputs) override {
         if(GPU(method,target,reference,dst,inputs)) return;
         CPUViews views; std::vector<std::pair<iTVPTexture2D*,tTVPRect>> textures;
-        for(size_t i=0;i<inputs.size();++i) textures.emplace_back(views.Get(inputs[i].first),inputs[i].second);
-        Software()->OperateRect(method,views.Get(target),views.Get(reference),dst,tRenderTexRectArray(textures.data(),textures.size()));
+        auto* targetView=views.Get(target,TVPLayerFallbackReadbackRole::Target);
+        auto* referenceView=views.Get(reference,TVPLayerFallbackReadbackRole::Reference);
+        for(size_t i=0;i<inputs.size();++i)
+            textures.emplace_back(views.Get(inputs[i].first,TVPLayerFallbackReadbackRole::Source),inputs[i].second);
+        Software()->OperateRect(method,targetView,referenceView,dst,tRenderTexRectArray(textures.data(),textures.size()));
         // The software manager clips its writes to dst, so the upload can too.
         if(target) target->MarkCPUModified(dst);
         if(session) ++session->stats.cpuFallbacks;
     }
     void OperateTriangles(iTVPRenderMethod* method,int count,iTVPTexture2D* target,iTVPTexture2D* reference,const tTVPRect& clip,const tTVPPointD* points,const tRenderTexQuadArray& inputs) override {
+        Reject(TVPLayerGPURejectReason::Triangles);
         CPUViews views; std::vector<std::pair<iTVPTexture2D*,const tTVPPointD*>> textures;
-        for(size_t i=0;i<inputs.size();++i) textures.emplace_back(views.Get(inputs[i].first),inputs[i].second);
-        Software()->OperateTriangles(method,count,views.Get(target),views.Get(reference),clip,points,tRenderTexQuadArray(textures.data(),textures.size()));
+        auto* targetView=views.Get(target,TVPLayerFallbackReadbackRole::Target);
+        auto* referenceView=views.Get(reference,TVPLayerFallbackReadbackRole::Reference);
+        for(size_t i=0;i<inputs.size();++i)
+            textures.emplace_back(views.Get(inputs[i].first,TVPLayerFallbackReadbackRole::Source),inputs[i].second);
+        Software()->OperateTriangles(method,count,targetView,referenceView,clip,points,tRenderTexQuadArray(textures.data(),textures.size()));
         if(target) target->MarkCPUModified(); if(session) ++session->stats.cpuFallbacks;
     }
     void OperatePerspective(iTVPRenderMethod* method,int count,iTVPTexture2D* target,iTVPTexture2D* reference,const tTVPRect& clip,const tTVPPointD* points,const tRenderTexQuadArray& inputs) override {
+        Reject(TVPLayerGPURejectReason::Perspective);
         CPUViews views; std::vector<std::pair<iTVPTexture2D*,const tTVPPointD*>> textures;
-        for(size_t i=0;i<inputs.size();++i) textures.emplace_back(views.Get(inputs[i].first),inputs[i].second);
-        Software()->OperatePerspective(method,count,views.Get(target),views.Get(reference),clip,points,tRenderTexQuadArray(textures.data(),textures.size()));
+        auto* targetView=views.Get(target,TVPLayerFallbackReadbackRole::Target);
+        auto* referenceView=views.Get(reference,TVPLayerFallbackReadbackRole::Reference);
+        for(size_t i=0;i<inputs.size();++i)
+            textures.emplace_back(views.Get(inputs[i].first,TVPLayerFallbackReadbackRole::Source),inputs[i].second);
+        Software()->OperatePerspective(method,count,targetView,referenceView,clip,points,tRenderTexQuadArray(textures.data(),textures.size()));
         if(target) target->MarkCPUModified(); if(session) ++session->stats.cpuFallbacks;
     }
 };
