@@ -49,10 +49,38 @@ class LayerTexture final : public iTVPTexture2D {
     // this rather than drop writes the lease did not make.
     bool leaseHadDamage = false;
     tTVPRect leaseDamage;
+    struct PointCacheEntry {
+        int x = -1, y = -1;
+        uint32_t value = 0;
+        bool valid = false;
+    };
+    static constexpr size_t kPointCacheSize = 32;
+    PointCacheEntry pointCache[kPointCacheSize];
+    size_t pointCacheNext = 0;
+    void InvalidatePointCache() {
+        for(auto& entry:pointCache) entry.valid=false;
+        pointCacheNext=0;
+    }
+    bool FindPointCache(int x,int y,uint32_t& value) {
+        for(const auto& entry:pointCache) {
+            if(entry.valid && entry.x==x && entry.y==y) {
+                value=entry.value;
+                ++session->stats.pointCacheHits;
+                return true;
+            }
+        }
+        ++session->stats.pointCacheMisses;
+        return false;
+    }
+    void StorePointCache(int x,int y,uint32_t value) {
+        auto& entry=pointCache[pointCacheNext++ % kPointCacheSize];
+        entry.x=x; entry.y=y; entry.value=value; entry.valid=true;
+    }
     size_t Bytes() const { return size_t(GetPitch())*Height; }
     // Writers report what they touched so an upload carries only those rows.
     // Callers that cannot describe their writes report the whole surface.
     void MarkDirty(const tTVPRect& requested) {
+        InvalidatePointCache();
         tTVPRect r(std::max(0,requested.left),std::max(0,requested.top),
                    std::min(int(Width),requested.right),std::min(int(Height),requested.bottom));
         if(r.get_width()<=0 || r.get_height()<=0) return;
@@ -127,6 +155,7 @@ public:
     void MarkCPUModified() override { Read(TVPLayerReadbackSource::Fallback); MarkDirtyAll(); }
     void MarkCPUModified(const tTVPRect& written) override { Read(TVPLayerReadbackSource::Fallback); MarkDirty(written); }
     void InvalidateCPUCache() override {
+        InvalidatePointCache();
         // The GPU now owns these pixels, so no pre-lease CPU damage survives.
         dirty=false; leaseHadDamage=false;
         if(valid) { valid=false; session->stats.cpuCacheBytes-=Bytes(); }
@@ -194,6 +223,7 @@ public:
         // Called only after a successful full-surface GPU copy. Old CPU damage
         // and cached pixels are obsolete and must never upload over the copy.
         if(pinned || locks || writeLeased) return;
+        InvalidatePointCache();
         dirty=false; leaseHadDamage=false;
         if(valid) {
             valid=false;
@@ -236,6 +266,8 @@ public:
             if(format==TVPTextureFormat::Gray) return *p;
             uint32_t v; std::memcpy(&v,p,4); return v;
         }
+        uint32_t cached=0;
+        if(FindPointCache(x,y,cached)) return cached;
         if(handle && session->backend) {
             std::vector<uint8_t> sample; int pitch=0;
             const TVPLayerRect region{x,y,x+1,y+1};
@@ -245,8 +277,11 @@ public:
                 const int index=static_cast<int>(TVPLayerReadbackSource::Point);
                 session->stats.readbackBytesBySource[index]+=bpp;
                 ++session->stats.readbackCountBySource[index];
-                if(format==TVPTextureFormat::Gray) return sample[0];
-                uint32_t v; std::memcpy(&v,sample.data(),4); return v;
+                uint32_t value=0;
+                if(format==TVPTextureFormat::Gray) value=sample[0];
+                else std::memcpy(&value,sample.data(),4);
+                StorePointCache(x,y,value);
+                return value;
             }
         }
         // Preserve correctness for unsupported/failed region readback paths.

@@ -93,4 +93,6 @@ struct TVPLayerRenderStats
     uint64_t fallbackReadbackBytesByRole[static_cast<int>(TVPLayerFallbackReadbackRole::Count)] = {};
     uint64_t fallbackReadbackCountByRole[static_cast<int>(TVPLayerFallbackReadbackRole::Count)] = {};
     uint64_t gpuRejectCountByReason[static_cast<int>(TVPLayerGPURejectReason::Count)] = {};
+    uint64_t pointCacheHits = 0;
+    uint64_t pointCacheMisses = 0;
 };
