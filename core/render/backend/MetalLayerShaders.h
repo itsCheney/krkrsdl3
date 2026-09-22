@@ -110,4 +110,58 @@ kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
     }
     target.write(float4(result & int4(255)) / 255.0, uint2(xy));
 }
+
+struct DualLayerParameters {
+    int4 destination, source1, source2, clip;
+    int4 operation; // kind, opacity, flags, reserved
+};
+uint layerPack(int4 c) {
+    return (uint(c.r) & 255u) | ((uint(c.g) & 255u) << 8) |
+           ((uint(c.b) & 255u) << 16) | ((uint(c.a) & 255u) << 24);
+}
+int4 layerUnpack(uint c) {
+    return int4(int(c & 255u), int((c >> 8) & 255u),
+                int((c >> 16) & 255u), int((c >> 24) & 255u));
+}
+uint constAlphaSD(uint s1, uint s2, uint opa) {
+    uint rb = s1 & 0x00ff00ffu;
+    rb = (rb + ((((s2 & 0x00ff00ffu) - rb) * opa) >> 8)) & 0x00ff00ffu;
+    uint g1 = s1 & 0x0000ff00u;
+    uint g2 = s2 & 0x0000ff00u;
+    return rb | ((g1 + (((g2 - g1) * opa) >> 8)) & 0x0000ff00u);
+}
+uint constAlphaSDDestAlpha(uint s1, uint s2, uint opacity, const device uchar* tables) {
+    uint opa = opacity;
+    if (opa > 127u) ++opa; // exact tvpgl rounding adjustment
+    uint iopa = 256u - opa;
+    uint a1 = s1 >> 24, a2 = s2 >> 24;
+    uint addr = ((a2 * opa) & 0xff00u) + ((a1 * iopa) >> 8);
+    uint alpha = uint(tables[addr]);
+
+    uint rb = s1 & 0x00ff00ffu;
+    rb = (rb + ((((s2 & 0x00ff00ffu) - rb) * alpha) >> 8)) & 0x00ff00ffu;
+    uint g1 = s1 & 0x0000ff00u;
+    uint g2 = s2 & 0x0000ff00u;
+    uint out = rb | ((g1 + (((g2 - g1) * alpha) >> 8)) & 0x0000ff00u);
+    out |= (a1 + (((a2 - a1) * opa) >> 8)) << 24;
+    return out;
+}
+kernel void dualSourceLayer(uint2 tid [[thread_position_in_grid]],
+                            constant DualLayerParameters& p [[buffer(0)]],
+                            const device uchar* tables [[buffer(1)]],
+                            texture2d<float, access::read> source1 [[texture(0)]],
+                            texture2d<float, access::read> source2 [[texture(1)]],
+                            texture2d<float, access::write> target [[texture(2)]]) {
+    int2 xy = p.clip.xy + int2(tid);
+    if (any(xy >= p.clip.zw)) return;
+    int2 offset = xy - p.destination.xy;
+    int2 p1 = p.source1.xy + offset;
+    int2 p2 = p.source2.xy + offset;
+    uint s1 = layerPack(layerBytes(source1, p1));
+    uint s2 = layerPack(layerBytes(source2, p2));
+    uint out = (p.operation.z & 2) != 0
+        ? constAlphaSDDestAlpha(s1, s2, uint(p.operation.y), tables)
+        : constAlphaSD(s1, s2, uint(p.operation.y));
+    target.write(float4(layerUnpack(out)) / 255.0, uint2(xy));
+}
 )MSL";

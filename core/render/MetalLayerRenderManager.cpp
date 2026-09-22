@@ -298,7 +298,34 @@ public:
         auto* t=dynamic_cast<LayerTexture*>(target); TVPLayerOperation op;
         if(!session || !t || !t->Belongs(session)) return Reject(TVPLayerGPURejectReason::TargetUnavailable);
         if(t->IsCPUResident()) return Reject(TVPLayerGPURejectReason::TargetCPUResident);
-        if(inputs.size()>1) return RejectMethod(TVPLayerGPURejectReason::MultipleInputs,method,inputs.size());
+        if(inputs.size()>1) {
+            if(inputs.size()!=2 || !method->DescribeGpuOperation(op) ||
+               op.kind!=TVPLayerOperationKind::ConstAlphaSD)
+                return RejectMethod(TVPLayerGPURejectReason::MultipleInputs,method,inputs.size());
+            if(op.opacity<0 || op.opacity>255) return Reject(TVPLayerGPURejectReason::InvalidOpacity);
+            auto* source1=dynamic_cast<LayerTexture*>(inputs[0].first);
+            auto* source2=dynamic_cast<LayerTexture*>(inputs[1].first);
+            const tTVPRect src1=inputs[0].second,src2=inputs[1].second;
+            if(!source1 || !source2 || !source1->Belongs(session) || !source2->Belongs(session))
+                return Reject(TVPLayerGPURejectReason::SourceUnavailable);
+            if(source1->GetFormat()!=TVPTextureFormat::RGBA || source2->GetFormat()!=TVPTextureFormat::RGBA)
+                return Reject(TVPLayerGPURejectReason::SourceFormat);
+            const int dw=dst.get_width(),dh=dst.get_height();
+            if(dw<=0 || dh<=0 || src1.get_width()!=dw || src1.get_height()!=dh ||
+               src2.get_width()!=dw || src2.get_height()!=dh)
+                return Reject(TVPLayerGPURejectReason::InvalidGeometry);
+            if(!session->tablesReady) {
+                if(!session->backend->SetLayerAlphaTables(TVPOpacityOnOpacityTable,TVPNegativeMulTable))
+                    return Reject(TVPLayerGPURejectReason::AlphaTables);
+                session->tablesReady=true;
+            }
+            if(!session->backend->OperateLayerRectDualSource(
+                    op,t->GetTextureHandle(),Rect(dst),
+                    source1->GetTextureHandle(),Rect(src1),
+                    source2->GetTextureHandle(),Rect(src2)))
+                return Reject(TVPLayerGPURejectReason::BackendFailure);
+            t->InvalidateCPUCache(); ++session->stats.gpuOperations; return true;
+        }
         if(!method->DescribeGpuOperation(op)) return RejectMethod(TVPLayerGPURejectReason::UnsupportedMethod,method);
         if(stretch<0 || stretch>2) return Reject(TVPLayerGPURejectReason::UnsupportedStretch);
         if(op.opacity<0 || op.opacity>255) return Reject(TVPLayerGPURejectReason::InvalidOpacity);

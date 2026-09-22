@@ -130,10 +130,12 @@ struct MetalRenderBackend::Impl
     id<MTLRenderPipelineState> windowPipeline = nil, capturePipeline = nil;
     id<MTLRenderPipelineState> meshPipelines[3] = {nil, nil, nil};
     id<MTLComputePipelineState> layerPipeline = nil, ordinaryLayerPipeline = nil, ordinaryInPlacePipeline = nil;
+    id<MTLComputePipelineState> dualSourceLayerPipeline = nil;
     id<MTLComputeCommandEncoder> ordinaryEncoder = nil;
     id<MTLTexture> ordinaryBoundSource = nil, ordinaryBoundTarget = nil;
     id<MTLBuffer> alphaTables = nil;
     id<MTLTexture> ordinaryDummy = nil, ordinarySnapshot = nil, ordinarySourceSnapshot = nil;
+    id<MTLTexture> dualSourceSnapshot1 = nil, dualSourceSnapshot2 = nil;
     id<MTLTexture> destinationSnapshot = nil;
     dispatch_semaphore_t inFlight = dispatch_semaphore_create(2);
     std::shared_ptr<std::atomic<bool>> gpuFailed = std::make_shared<std::atomic<bool>>(false);
@@ -467,8 +469,12 @@ struct MetalRenderBackend::Impl
         ordinaryOptions.fastMathEnabled = NO;
         id<MTLLibrary> ordinary = [device newLibraryWithSource:[NSString stringWithUTF8String:kMetalLayerShaders]
                                                       options:ordinaryOptions error:&error];
-        if (ordinary) ordinaryLayerPipeline = [device newComputePipelineStateWithFunction:
-                                               [ordinary newFunctionWithName:@"ordinaryLayer"] error:&error];
+        if (ordinary) {
+            ordinaryLayerPipeline = [device newComputePipelineStateWithFunction:
+                                     [ordinary newFunctionWithName:@"ordinaryLayer"] error:&error];
+            dualSourceLayerPipeline = [device newComputePipelineStateWithFunction:
+                                       [ordinary newFunctionWithName:@"dualSourceLayer"] error:&error];
+        }
         if(ordinaryLayerPipeline && device.readWriteTextureSupport == MTLReadWriteTextureTier2) {
             // These kernels read only their own destination pixel, into registers,
             // before overwriting it. Aliased sources still require region snapshots.
@@ -483,6 +489,9 @@ struct MetalRenderBackend::Impl
         }
         if (!ordinaryLayerPipeline) SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
             "GPU Layer initialization failed; software composition retained: %s", error.localizedDescription.UTF8String);
+        if (!dualSourceLayerPipeline) SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
+            "GPU Layer dual-source pipeline unavailable; SD transitions use software fallback: %s",
+            error.localizedDescription.UTF8String);
         return windowPipeline && capturePipeline && meshPipelines[0] && meshPipelines[1] &&
                meshPipelines[2] && layerPipeline;
     }
@@ -804,6 +813,84 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
         }
         [e dispatchThreads:MTLSizeMake(clip.Width(),clip.Height(),1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
         if(!inPlace) [e endEncoding];
+        p.transientBytes+=size_t(clip.Width())*clip.Height()*4;
+        if(p.transientBytes>=Impl::kSubmissionBudget) p.Submit();
+        return true;
+    }
+}
+bool MetalRenderBackend::OperateLayerRectDualSource(const TVPLayerOperation& operation,
+                                                    void* target,const TVPLayerRect& dst,
+                                                    void* source1,const TVPLayerRect& src1,
+                                                    void* source2,const TVPLayerRect& src2) {
+    @autoreleasepool {
+        auto& p=*impl_;
+        auto* t=p.Find(target); auto* s1=p.Find(source1); auto* s2=p.Find(source2);
+        if(!p.dualSourceLayerPipeline || !t || !s1 || !s2 ||
+           operation.kind!=TVPLayerOperationKind::ConstAlphaSD ||
+           t->bytesPerPixel!=4 || s1->bytesPerPixel!=4 || s2->bytesPerPixel!=4 ||
+           operation.opacity<0 || operation.opacity>255) return false;
+        const int w=dst.Width(),h=dst.Height();
+        if(w<=0 || h<=0 || src1.Width()!=w || src1.Height()!=h ||
+           src2.Width()!=w || src2.Height()!=h) return false;
+        auto validRect=[](const TVPLayerRect& r,const Impl::Resource* s) {
+            return r.left>=0 && r.top>=0 && r.right<=s->width && r.bottom<=s->height &&
+                   r.Width()>0 && r.Height()>0;
+        };
+        if(!validRect(src1,s1) || !validRect(src2,s2)) return false;
+        if((operation.flags & TVP_LAYER_DEST_ALPHA) && !p.alphaTables) return false;
+        TVPLayerRect clip={std::max(0,dst.left),std::max(0,dst.top),
+                           std::min(t->width,dst.right),std::min(t->height,dst.bottom)};
+        if(clip.Width()<=0 || clip.Height()<=0) return true;
+
+        id<MTLTexture> tex1=s1->texture,tex2=s2->texture;
+        TVPLayerRect actual1=src1,actual2=src2;
+        if(s1==t || s2==t) {
+            id<MTLBlitCommandEncoder> blit=p.Blit(); if(!blit) return false;
+            if(s1==t) {
+                if(!p.dualSourceSnapshot1 ||
+                   p.dualSourceSnapshot1.width!=NSUInteger(w) ||
+                   p.dualSourceSnapshot1.height!=NSUInteger(h))
+                    p.dualSourceSnapshot1=p.Texture(w,h);
+                tex1=p.dualSourceSnapshot1;
+                if(!tex1) { [blit endEncoding]; return false; }
+                [blit copyFromTexture:s1->texture sourceSlice:0 sourceLevel:0
+                      sourceOrigin:MTLOriginMake(src1.left,src1.top,0)
+                      sourceSize:MTLSizeMake(w,h,1) toTexture:tex1 destinationSlice:0
+                      destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+                actual1={0,0,w,h};
+            }
+            if(s2==t) {
+                if(!p.dualSourceSnapshot2 ||
+                   p.dualSourceSnapshot2.width!=NSUInteger(w) ||
+                   p.dualSourceSnapshot2.height!=NSUInteger(h))
+                    p.dualSourceSnapshot2=p.Texture(w,h);
+                tex2=p.dualSourceSnapshot2;
+                if(!tex2) { [blit endEncoding]; return false; }
+                [blit copyFromTexture:s2->texture sourceSlice:0 sourceLevel:0
+                      sourceOrigin:MTLOriginMake(src2.left,src2.top,0)
+                      sourceSize:MTLSizeMake(w,h,1) toTexture:tex2 destinationSlice:0
+                      destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+                actual2={0,0,w,h};
+            }
+            [blit endEncoding];
+        }
+        struct DualLayerParameters { simd_int4 destination,source1,source2,clip,operation; } params;
+        params.destination={dst.left,dst.top,dst.right,dst.bottom};
+        params.source1={actual1.left,actual1.top,actual1.right,actual1.bottom};
+        params.source2={actual2.left,actual2.top,actual2.right,actual2.bottom};
+        params.clip={clip.left,clip.top,clip.right,clip.bottom};
+        params.operation={static_cast<int>(operation.kind),operation.opacity,
+                          static_cast<int>(operation.flags),0};
+        id<MTLComputeCommandEncoder> e=p.Compute(); if(!e) return false;
+        [e setComputePipelineState:p.dualSourceLayerPipeline];
+        [e setBytes:&params length:sizeof(params) atIndex:0];
+        [e setBuffer:p.alphaTables offset:0 atIndex:1];
+        [e setTexture:tex1 atIndex:0];
+        [e setTexture:tex2 atIndex:1];
+        [e setTexture:t->texture atIndex:2];
+        [e dispatchThreads:MTLSizeMake(clip.Width(),clip.Height(),1)
+             threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+        [e endEncoding];
         p.transientBytes+=size_t(clip.Width())*clip.Height()*4;
         if(p.transientBytes>=Impl::kSubmissionBudget) p.Submit();
         return true;

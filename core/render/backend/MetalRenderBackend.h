@@ -25,6 +25,9 @@ public:
     bool ReadLayerTextureRegion(void*, const TVPLayerRect&, std::vector<uint8_t>&, int&) override;
     bool OperateLayerRect(const TVPLayerOperation&, void*, const TVPLayerRect&,
                           void*, const TVPLayerRect&, int) override;
+    bool OperateLayerRectDualSource(const TVPLayerOperation&, void*, const TVPLayerRect&,
+                                    void*, const TVPLayerRect&,
+                                    void*, const TVPLayerRect&) override;
     double GetGpuSubmissionTimeMilliseconds() const override;
     double GetPresentationWaitTimeMilliseconds() const override;
     void BeginFrame(int width, int height) override;

@@ -2691,6 +2691,8 @@ void iTVPRenderManager::RegisterRenderMethod(const char* name, iTVPRenderMethod*
         {"ConstColorAlphaBlend_d", K::FillBlend, TVP_LAYER_DEST_ALPHA, true},
         {"ConstColorAlphaBlend_a", K::FillBlend, TVP_LAYER_DEST_PREMULTIPLIED, true},
         {"RemoveConstOpacity", K::RemoveConstOpacity, 0, true},
+        {"ConstAlphaBlend_SD", K::ConstAlphaSD, 0, true},
+        {"ConstAlphaBlend_SD_d", K::ConstAlphaSD, TVP_LAYER_DEST_ALPHA, true},
         {"AlphaBlend", K::Alpha, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
         {"AlphaBlend_HDA", K::Alpha, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
         {"AlphaBlend_d", K::Alpha, TVP_LAYER_DEST_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
