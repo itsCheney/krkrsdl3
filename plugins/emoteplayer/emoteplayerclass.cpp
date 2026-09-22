@@ -310,14 +310,8 @@ void D3DAdaptor::captureCanvas(iTJSDispatch2* targetLayer)
     krkrsdl3::iTVPRenderBackend* renderer = krkrsdl3::TVPGetRenderBackend();
     if (!renderer)
         return;
-    int pitch = 0;
-    uint8_t* pixels = renderer->LockTarget(_target, pitch);
-    if (!pixels || pitch <= 0)
-    {
-        renderer->UnlockTarget(_target);
-        return;
-    }
 
+    krkrsdl3::TVPRecordEmoteCaptureCall();
     const tjs_int layerWidth = ths->GetWidth();
     const tjs_int layerHeight = ths->GetHeight();
     const tjs_int copyWidth = std::min(_width, layerWidth);
@@ -325,11 +319,31 @@ void D3DAdaptor::captureCanvas(iTJSDispatch2* targetLayer)
     const bool fullOverwrite =
         copyWidth == layerWidth && copyHeight == layerHeight &&
         _width == layerWidth && _height == layerHeight;
+    const uint64_t fullBytes =
+        fullOverwrite && _width > 0 && _height > 0 ? uint64_t(_width) * uint64_t(_height) * 4 : 0;
 
-    // captureCanvas overwrites the complete destination layer in the common
-    // D3DAdaptor path. Tell the Layer texture that the old GPU contents are
-    // disposable so Metal does not perform a full-surface Persistent readback
-    // immediately before memcpy replaces every pixel.
+    if (fullOverwrite)
+    {
+        void* destination = ths->GetMainImageGPUHandleForOverwrite();
+        if (destination && renderer->CopyTargetToLayerTexture(_target, destination))
+        {
+            ths->CommitMainImageGPUOverwrite();
+            krkrsdl3::TVPRecordEmoteCaptureGPUCopy(fullBytes);
+            ths->Update();
+            return;
+        }
+    }
+
+    int pitch = 0;
+    uint8_t* pixels = renderer->LockTarget(_target, pitch);
+    if (!pixels || pitch <= 0)
+    {
+        renderer->UnlockTarget(_target);
+        return;
+    }
+    krkrsdl3::TVPRecordEmoteCaptureCPUFallback(
+        _height > 0 ? uint64_t(pitch) * uint64_t(_height) : 0);
+
     tjs_uint8* buff = (tjs_uint8*)(fullOverwrite
         ? ths->GetMainImagePixelBufferForOverwrite()
         : ths->GetMainImagePixelBufferForWrite());
