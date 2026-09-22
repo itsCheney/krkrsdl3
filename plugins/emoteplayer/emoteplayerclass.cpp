@@ -3,6 +3,7 @@
 #include "tjsArray.h"
 #include "TVPStorage.h"
 #include "Platform.h"
+#include <SDL3/SDL.h>
 
 #include "tjsCommHead.h"
 #include "tjsNativeLayer.h"
