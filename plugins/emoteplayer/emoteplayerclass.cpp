@@ -312,6 +312,11 @@ void D3DAdaptor::captureCanvas(iTJSDispatch2* targetLayer)
         return;
     int pitch = 0;
     uint8_t* pixels = renderer->LockTarget(_target, pitch);
+    if (!pixels || pitch <= 0)
+    {
+        renderer->UnlockTarget(_target);
+        return;
+    }
 
     const tjs_int layerWidth = ths->GetWidth();
     const tjs_int layerHeight = ths->GetHeight();
@@ -329,17 +334,20 @@ void D3DAdaptor::captureCanvas(iTJSDispatch2* targetLayer)
         ? ths->GetMainImagePixelBufferForOverwrite()
         : ths->GetMainImagePixelBufferForWrite());
 
-    if (buff && pixels && copyWidth > 0 && copyHeight > 0)
+    if (buff && copyWidth > 0 && copyHeight > 0)
     {
         const tjs_int dstPitch = ths->GetMainImagePixelBufferPitch();
         const size_t rowBytes = (size_t)copyWidth * 4;
-        if (pitch == dstPitch && copyWidth == _width && copyWidth == layerWidth)
-            std::memcpy(buff, pixels, rowBytes * copyHeight);
-        else
-            for (tjs_int y = 0; y < copyHeight; ++y)
-                std::memcpy(buff + (size_t)y * dstPitch,
-                            pixels + (size_t)y * pitch,
-                            rowBytes);
+        if (dstPitch >= (tjs_int)rowBytes && pitch >= (tjs_int)rowBytes)
+        {
+            if (pitch == dstPitch && copyWidth == _width && copyWidth == layerWidth)
+                std::memcpy(buff, pixels, rowBytes * copyHeight);
+            else
+                for (tjs_int y = 0; y < copyHeight; ++y)
+                    std::memcpy(buff + (size_t)y * dstPitch,
+                                pixels + (size_t)y * pitch,
+                                rowBytes);
+        }
     }
 
     renderer->UnlockTarget(_target);
