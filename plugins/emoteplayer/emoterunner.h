@@ -95,6 +95,10 @@ namespace emoteplayer
         int _meshDivY = 8;
         std::vector<MeshVertex> _meshVertices;
         std::vector<uint16_t> _meshIndices;
+        // Per-node scratch storage survives frames. Surface matrices are rebuilt
+        // once per mesh update, while index topology is retained until division
+        // or mesh mode actually changes.
+        std::vector<glm::mat4> _surfaceMatrices;
     };
     // motion辅助类 - 管理按priority排序的nodeList并处理子motion展开
     class emotemotionref
