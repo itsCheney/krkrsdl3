@@ -102,6 +102,11 @@ kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
             }
             break;
         }
+        case 12:
+            // TVPRemoveConstOpacity: RGB is preserved exactly; alpha uses the
+            // software byte formula A * (255 - strength) >> 8.
+            result = int4(d.rgb, (d.a * (255 - opa)) >> 8);
+            break;
     }
     target.write(float4(result & int4(255)) / 255.0, uint2(xy));
 }

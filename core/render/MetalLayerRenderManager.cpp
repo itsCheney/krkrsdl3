@@ -324,7 +324,8 @@ public:
                 return Reject(TVPLayerGPURejectReason::InvalidGeometry);
             }
         } else if(op.kind!=TVPLayerOperationKind::Fill && op.kind!=TVPLayerOperationKind::FillColor &&
-                  op.kind!=TVPLayerOperationKind::FillMask && op.kind!=TVPLayerOperationKind::FillBlend) {
+                  op.kind!=TVPLayerOperationKind::FillMask && op.kind!=TVPLayerOperationKind::FillBlend &&
+                  op.kind!=TVPLayerOperationKind::RemoveConstOpacity) {
             return Reject(TVPLayerGPURejectReason::UnsupportedKind);
         }
         if(!session->tablesReady) {
