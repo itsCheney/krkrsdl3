@@ -69,31 +69,22 @@ inline void evalBezierSurface(const float controlPts[32], float u, float v,
     outY = ry;
 }
 
-// Evaluate the full surface chain (same logic as the old tess eval shader)
-// Start with UV (u,v), iterate surfaces from innermost to outermost,
-// applying bezier deformation and matrix transform at each level.
-// The outermost surface (index 0) includes projection and outputs clip space [-1,1].
-// Inner surfaces have model-only matrices and output pixel space (relative to parent);
-// their output is normalized back to UV [0,1] (with axis swap) for the next surface.
-inline void evaluateSurfaceChain(
+// The transform part of a surface chain is invariant across all vertices of one
+// node for a frame. Build it once, then reuse it while evaluating the UV grid.
+inline void buildSurfaceMatrices(
     const std::vector<emoteRender>& renderMethod,
-    float u, float v,
-    float& outClipX, float& outClipY)
+    std::vector<glm::mat4>& matrices)
 {
-    float lastX = 0;
-    float lastY = 0;
-    glm::vec4 trans = glm::vec4(1.0f);
-    int surfaceCount = (int)renderMethod.size();
+    const int surfaceCount = (int)renderMethod.size();
+    matrices.resize(surfaceCount);
     uint32_t currInheritMask = 0xFFFFFFF;
 
-    // Iterate in reverse: renderMethod[surfaceCount-1] is innermost (first in shader)
-    for (int i = surfaceCount - 1; i >= 0; i--)
+    for (int i = surfaceCount - 1; i >= 0; --i)
     {
-        // inheritMask
         currInheritMask &= renderMethod[i].currInheritMask;
         const auto& surface = renderMethod[i];
-        // Only ancestors inside the player obey the accumulated inheritance mask.
         const uint32_t mask = (i > 0 && i < surfaceCount - 1) ? currInheritMask : 0xFFFFFFFF;
+
         glm::mat4 model = glm::translate(glm::mat4(1.0f),
             glm::vec3(surface.currCoordx, surface.currCoordy, 0));
         if (mask & 0x10)
@@ -104,33 +95,43 @@ inline void evaluateSurfaceChain(
         if (mask & 0x80) shear[1][0] = surface.currSx;
         if (mask & 0x100) shear[0][1] = surface.currSy;
         model = shear * model;
-        // 非layout补充计算矩阵
-        if (renderMethod[i].type >= 1 && renderMethod[i].type <= 2)
+        if (surface.type >= 1 && surface.type <= 2)
         {
             model = glm::translate(
-                model, glm::vec3(-renderMethod[i].originX - renderMethod[i].currOx,
-                                 -renderMethod[i].originY - renderMethod[i].currOy, 0.0f));
-            model =
-                glm::scale(model, glm::vec3(renderMethod[i].width, renderMethod[i].height, 1.0f));
+                model, glm::vec3(-surface.originX - surface.currOx,
+                                 -surface.originY - surface.currOy, 0.0f));
+            model = glm::scale(model, glm::vec3(surface.width, surface.height, 1.0f));
         }
-        // 加入attach矩阵
-        model = renderMethod[i].attachMat * model;
+        matrices[i] = surface.attachMat * model;
+    }
+}
 
-        if (renderMethod[i].type == 3)
+inline void evaluateSurfaceChainPrepared(
+    const std::vector<emoteRender>& renderMethod,
+    const std::vector<glm::mat4>& matrices,
+    float u, float v,
+    float& outClipX, float& outClipY)
+{
+    float lastX = 0;
+    float lastY = 0;
+    glm::vec4 trans = glm::vec4(1.0f);
+    const int surfaceCount = (int)renderMethod.size();
+
+    for (int i = surfaceCount - 1; i >= 0; --i)
+    {
+        const auto& surface = renderMethod[i];
+        const glm::mat4& model = matrices[i];
+
+        if (surface.type == 3)
         {
-            // Layout层 直接计算
             trans = model * trans;
         }
         else
         {
-            // 获取 lastX,lastY
             if (i < surfaceCount - 1)
             {
-                // Inner surfaces have model-only matrices; output is in parent's pixel space.
-                // Normalize back to UV [0,1] (with axis swap: parent-Y→U, parent-X→V)
-                // for the next (outer) surface's Bezier input.
-                lastX = (trans.y + renderMethod[i].originY) / renderMethod[i].height; // Y → U
-                lastY = (trans.x + renderMethod[i].originX) / renderMethod[i].width;  // X → V
+                lastX = (trans.y + surface.originY) / surface.height;
+                lastY = (trans.x + surface.originX) / surface.width;
             }
             else
             {
@@ -138,25 +139,30 @@ inline void evaluateSurfaceChain(
                 lastY = v;
             }
 
-            // Evaluate bezier surface
             float bx, by;
-            if (renderMethod[i].type == 1)
-            {
-                evalBezierSurface(renderMethod[i].controlPts, lastX, lastY, bx, by);
-            }
+            if (surface.type == 1)
+                evalBezierSurface(surface.controlPts, lastX, lastY, bx, by);
             else
-            {
                 bx = lastY, by = lastX;
-            }
 
-            // Apply transformation matrix
             trans = model * glm::vec4(bx, by, 0.0f, 1.0f);
         }
     }
 
-    // Final Y flip (same as shader: gl_Position = lastPt * vec4(1, -1, 1, 1))
     outClipX = trans.x;
     outClipY = -trans.y;
+}
+
+// Compatibility helper for one-off evaluations. Mesh builders use the prepared
+// form so matrix construction is not repeated for every vertex.
+inline void evaluateSurfaceChain(
+    const std::vector<emoteRender>& renderMethod,
+    float u, float v,
+    float& outClipX, float& outClipY)
+{
+    std::vector<glm::mat4> matrices;
+    buildSurfaceMatrices(renderMethod, matrices);
+    evaluateSurfaceChainPrepared(renderMethod, matrices, u, v, outClipX, outClipY);
 }
 
 // Build subdivided mesh for a given icon node
@@ -164,98 +170,109 @@ inline void buildSubdivMesh(
     const std::vector<emoteRender>& renderMethod,
     int divX, int divY,
     std::vector<EmoteVertex>& outVerts,
-    std::vector<uint16_t>& outIndices)
+    std::vector<uint16_t>& outIndices,
+    std::vector<glm::mat4>* matrixScratch = nullptr,
+    bool rebuildIndices = true)
 {
-    outVerts.clear();
-    outIndices.clear();
+    std::vector<glm::mat4> localMatrices;
+    auto& matrices = matrixScratch ? *matrixScratch : localMatrices;
+    buildSurfaceMatrices(renderMethod, matrices);
 
-    // Generate vertices
-    outVerts.reserve((divX + 1) * (divY + 1));
+    const size_t vertexCount = size_t(divX + 1) * size_t(divY + 1);
+    outVerts.resize(vertexCount);
+    size_t vertex = 0;
     for (int gy = 0; gy <= divY; gy++) {
         float v = (float)gy / (float)divY;
         for (int gx = 0; gx <= divX; gx++) {
             float u = (float)gx / (float)divX;
             float clipX, clipY;
-            evaluateSurfaceChain(renderMethod, u, v, clipX, clipY);
-            // tessCoord in old shader was (gl_TessCoord.y, gl_TessCoord.x) = (v, u)
-            outVerts.push_back({ clipX, clipY, v, u });
+            evaluateSurfaceChainPrepared(renderMethod, matrices, u, v, clipX, clipY);
+            outVerts[vertex++] = { clipX, clipY, v, u };
         }
     }
 
-    // Generate triangle indices (2 triangles per quad)
-    outIndices.reserve(divX * divY * 6);
+    if (!rebuildIndices)
+        return;
+
+    const size_t indexCount = size_t(divX) * size_t(divY) * 6;
+    outIndices.resize(indexCount);
+    size_t index = 0;
     for (int gy = 0; gy < divY; gy++) {
         for (int gx = 0; gx < divX; gx++) {
             uint16_t i0 = (uint16_t)(gy * (divX + 1) + gx);
             uint16_t i1 = (uint16_t)(gy * (divX + 1) + gx + 1);
             uint16_t i2 = (uint16_t)((gy + 1) * (divX + 1) + gx);
             uint16_t i3 = (uint16_t)((gy + 1) * (divX + 1) + gx + 1);
-            // Triangle 1: p0-p1-p2
-            outIndices.push_back(i0);
-            outIndices.push_back(i1);
-            outIndices.push_back(i2);
-            // Triangle 2: p1-p3-p2
-            outIndices.push_back(i1);
-            outIndices.push_back(i3);
-            outIndices.push_back(i2);
+            outIndices[index++] = i0;
+            outIndices[index++] = i1;
+            outIndices[index++] = i2;
+            outIndices[index++] = i1;
+            outIndices[index++] = i3;
+            outIndices[index++] = i2;
         }
     }
 }
 // Build simple rectangle mesh (two triangles)
 inline void buildRectMesh(const std::vector<emoteRender>& renderMethod,
                           std::vector<EmoteVertex>& outVerts,
-                          std::vector<uint16_t>& outIndices)
+                          std::vector<uint16_t>& outIndices,
+                          std::vector<glm::mat4>* matrixScratch = nullptr,
+                          bool rebuildIndices = true)
 {
-    outVerts.clear();
-    outIndices.clear();
-    float cornerUV[4][2] = {{0.0f, 0.0f}, {1.0f, 0.0f}, {0.0f, 1.0f}, {1.0f, 1.0f}};
+    std::vector<glm::mat4> localMatrices;
+    auto& matrices = matrixScratch ? *matrixScratch : localMatrices;
+    buildSurfaceMatrices(renderMethod, matrices);
 
-    outVerts.reserve(4);
+    static constexpr float cornerUV[4][2] = {
+        {0.0f, 0.0f}, {1.0f, 0.0f}, {0.0f, 1.0f}, {1.0f, 1.0f}
+    };
+    outVerts.resize(4);
     for (int i = 0; i < 4; i++)
     {
         float clipX, clipY;
-        evaluateSurfaceChain(renderMethod, cornerUV[i][0], cornerUV[i][1], clipX, clipY);
-        outVerts.push_back({clipX, clipY, cornerUV[i][1], cornerUV[i][0]});
+        evaluateSurfaceChainPrepared(renderMethod, matrices, cornerUV[i][0], cornerUV[i][1],
+                                     clipX, clipY);
+        outVerts[i] = {clipX, clipY, cornerUV[i][1], cornerUV[i][0]};
     }
 
-    outIndices.reserve(6);
-    outIndices.push_back(0);
-    outIndices.push_back(1);
-    outIndices.push_back(2);
-    outIndices.push_back(1);
-    outIndices.push_back(3);
-    outIndices.push_back(2);
+    if (rebuildIndices)
+        outIndices = {0, 1, 2, 1, 3, 2};
 }
 
 // Shapes use the same UV -> Bezier -> node/parent -> projection path as icons.
 inline void buildShapeMesh(const std::vector<emoteRender>& methods, int shapeType,
                            std::vector<EmoteVertex>& vertices,
-                           std::vector<uint16_t>& indices)
+                           std::vector<uint16_t>& indices,
+                           std::vector<glm::mat4>* matrixScratch = nullptr)
 {
     if (shapeType != 0 && shapeType != 1)
     {
         const bool deformed = std::any_of(methods.begin(), methods.end(),
             [](const emoteRender& m) { return m.type == 1; });
         if (deformed)
-            buildSubdivMesh(methods, 8, 8, vertices, indices);
+            buildSubdivMesh(methods, 8, 8, vertices, indices, matrixScratch);
         else
-            buildRectMesh(methods, vertices, indices);
+            buildRectMesh(methods, vertices, indices, matrixScratch);
         return;
     }
     // A circle (or a one-unit point marker) becomes an ellipse under affine transforms.
     // 64 segments keep the radial approximation error below 0.13%.
     constexpr int segments = 64;
+    std::vector<glm::mat4> localMatrices;
+    auto& matrices = matrixScratch ? *matrixScratch : localMatrices;
+    buildSurfaceMatrices(methods, matrices);
+
     vertices.clear();
     indices.clear();
     float x, y;
-    evaluateSurfaceChain(methods, 0.5f, 0.5f, x, y);
+    evaluateSurfaceChainPrepared(methods, matrices, 0.5f, 0.5f, x, y);
     vertices.push_back({x, y, 0.5f, 0.5f});
     for (int i = 0; i < segments; ++i)
     {
         const float angle = i * 6.28318530718f / segments;
         const float u = 0.5f + 0.5f * std::sin(angle);
         const float v = 0.5f + 0.5f * std::cos(angle);
-        evaluateSurfaceChain(methods, u, v, x, y);
+        evaluateSurfaceChainPrepared(methods, matrices, u, v, x, y);
         vertices.push_back({x, y, v, u});
         indices.insert(indices.end(), {0, uint16_t(i + 1), uint16_t((i + 1) % segments + 1)});
     }
