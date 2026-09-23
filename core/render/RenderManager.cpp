@@ -191,10 +191,13 @@ inline uint32_t SampleBilinear(const uint8_t* src, int srcW, int srcH, int srcPi
     const uint8_t* p01 = p00 + srcPitch;
     const uint8_t* p11 = p01 + 4;
 
-    uint8_t r = (uint8_t)(ifx * ify * p00[0] + fx * ify * p10[0] + ifx * fy * p01[0] + fx * fy * p11[0] + 0.5f);
-    uint8_t g = (uint8_t)(ifx * ify * p00[1] + fx * ify * p10[1] + ifx * fy * p01[1] + fx * fy * p11[1] + 0.5f);
-    uint8_t b = (uint8_t)(ifx * ify * p00[2] + fx * ify * p10[2] + ifx * fy * p01[2] + fx * fy * p11[2] + 0.5f);
-    uint8_t a = (uint8_t)(ifx * ify * p00[3] + fx * ify * p10[3] + ifx * fy * p01[3] + fx * fy * p11[3] + 0.5f);
+    // ARM clamps negative float-to-unsigned conversions to zero. Make the
+    // software path defined and consistent across platforms.
+    auto byte = [](float v) { return uint8_t(uint32_t(std::max(0.0f, v + 0.5f))); };
+    uint8_t r = byte(ifx * ify * p00[0] + fx * ify * p10[0] + ifx * fy * p01[0] + fx * fy * p11[0]);
+    uint8_t g = byte(ifx * ify * p00[1] + fx * ify * p10[1] + ifx * fy * p01[1] + fx * fy * p11[1]);
+    uint8_t b = byte(ifx * ify * p00[2] + fx * ify * p10[2] + ifx * fy * p01[2] + fx * fy * p11[2]);
+    uint8_t a = byte(ifx * ify * p00[3] + fx * ify * p10[3] + ifx * fy * p01[3] + fx * fy * p11[3]);
 
     return (uint32_t)a << 24 | (uint32_t)b << 16 | (uint32_t)g << 8 | r;
 }
@@ -965,34 +968,29 @@ public:
     virtual void Update(const void* pixel,
                         TVPTextureFormat::e format,
                         int pitch,
-                        const tTVPRect& rc)
+                        const tTVPRect& requested) override
     {
-        assert(rc.left == 0);
-        unsigned char* src = (unsigned char*)pixel;
-        tjs_uint8* dst = (tjs_uint8*)Bitmap->GetScanLine(rc.top);
-        int dstPitch = Bitmap->GetPitch();
-        int h = std::min(rc.get_height(), (int)Bitmap->GetHeight()) - rc.top;
-        int w = rc.get_width();
-        if (w == Bitmap->GetWidth() && pitch == dstPitch)
-            memcpy(dst, src, pitch * h);
-        else if (format == TVPTextureFormat::RGB)
+        if (requested.get_width() <= 0 || requested.get_height() <= 0) return;
+        tTVPRect rc(std::max(0, requested.left), std::max(0, requested.top),
+                    std::min(int(Width), requested.right), std::min(int(Height), requested.bottom));
+        if (rc.get_width() <= 0 || rc.get_height() <= 0) return;
+        const int sourceBPP = format == TVPTextureFormat::RGB ? 3 :
+                              format == TVPTextureFormat::Gray ? 1 : 4;
+        const int destinationBPP = Bitmap->Is32bit() ? 4 : 1;
+        if (!pixel || pitch <= 0 || size_t(pitch) < size_t(requested.get_width()) * sourceBPP ||
+            (sourceBPP != destinationBPP && !(sourceBPP == 3 && destinationBPP == 4)))
+            TVPThrowExceptionMessage(TJS_N("Invalid software Layer update"));
+        const auto* src = static_cast<const uint8_t*>(pixel) +
+                          size_t(rc.top - requested.top) * pitch +
+                          size_t(rc.left - requested.left) * sourceBPP;
+        for (int y = 0; y < rc.get_height(); ++y)
         {
-            for (int y = 0; y < h; ++y)
-            {
-                TVPConvert24BitTo32Bit((tjs_uint32*)dst, src, w);
-                dst += dstPitch;
-                src += pitch;
-            }
-        }
-        else
-        {
-            int linesize = std::min(pitch, dstPitch);
-            for (int y = 0; y < h; ++y)
-            {
-                memcpy(dst, src, linesize);
-                dst += dstPitch;
-                src += pitch;
-            }
+            auto* dst = static_cast<uint8_t*>(Bitmap->GetScanLine(rc.top + y)) + rc.left * destinationBPP;
+            if (sourceBPP == 3)
+                TVPConvert24BitTo32Bit(reinterpret_cast<tjs_uint32*>(dst), src, rc.get_width());
+            else
+                memcpy(dst, src, size_t(rc.get_width()) * destinationBPP);
+            src += pitch;
         }
         Bitmap->IsOpaque = false;
     }
@@ -1360,7 +1358,7 @@ public:
             return 1;
         return -1;
     }
-    virtual void SetParameterColor4B(int id, unsigned int v) { clr = v; }
+    virtual void SetParameterColor4B(int id, unsigned int v) { clr = v; iTVPRenderMethod::SetParameterColor4B(id, v); }
     virtual void SetParameterOpa(int id, int v) { opa = v; }
 
     virtual void DoRender(iTVPTexture2D* _tar,
@@ -1517,7 +1515,7 @@ public:
             tjs_int w = rctar.get_width(), h = rctar.get_height();
             assert(rcsrc.get_width() == -w && rcsrc.get_height() == h);
             tjs_int wbytes = w * pixelsize;
-            tjs_int srcright = rcsrc.right - 1;
+            tjs_int srcright = rcsrc.right; // half-open reversed rectangle
             if (pixelsize == 4)
             { // 32bpp
                 for (int y = 0; y < h; ++y)
@@ -1573,22 +1571,22 @@ public:
                      tjs_int h,
                      bool backwardCopy)
     {
-        // 32bpp
-        w *= sizeof(tjs_uint32);
+        const int pixelSize = dst->GetFormat() == TVPTextureFormat::Gray ? 1 : 4;
+        w *= pixelSize;
         if (backwardCopy)
         {
             for (tjs_int y = h - 1; y >= 0; --y)
             {
-                memmove(((tjs_uint32*)dst->GetScanLineForWrite(dy + y)) + dx,
-                        ((const tjs_uint32*)src->GetScanLineForRead(sy + y)) + sx, w);
+                memmove(static_cast<uint8_t*>(dst->GetScanLineForWrite(dy + y)) + dx * pixelSize,
+                        static_cast<const uint8_t*>(src->GetScanLineForRead(sy + y)) + sx * pixelSize, w);
             }
         }
         else
         {
             for (tjs_int y = 0; y < h; ++y)
             {
-                memmove(((tjs_uint32*)dst->GetScanLineForWrite(dy + y)) + dx,
-                        ((const tjs_uint32*)src->GetScanLineForRead(sy + y)) + sx, w);
+                memmove(static_cast<uint8_t*>(dst->GetScanLineForWrite(dy + y)) + dx * pixelSize,
+                        static_cast<const uint8_t*>(src->GetScanLineForRead(sy + y)) + sx * pixelSize, w);
             }
         }
     }

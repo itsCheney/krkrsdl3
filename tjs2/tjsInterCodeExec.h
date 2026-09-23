@@ -52,6 +52,11 @@ public:
 
     void Compact() { InternalCompact(); }
 
+    // Drain inactive register blocks while the VM/global object are still
+    // alive. Finalizers may execute functions during this operation: keep the
+    // allocator alive but disable pooling for the remainder of shutdown.
+    void BeginShutdown();
+
 } /* *TJSVariantArrayStack = NULL*/;
 //---------------------------------------------------------------------------
 } // namespace TJS

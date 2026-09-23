@@ -247,6 +247,7 @@ public:
 
     //----- close / modal
     void Close();
+    void RequestUserClose(); // native close-button path, including game confirmation/cancellation
     void OnCloseQueryCalled(bool b);
     void UpdateWindow(tTVPUpdateType type);
 

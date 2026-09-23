@@ -8,6 +8,7 @@
 
 #include "krmovie.h"
 
+#include "TVPSkippedMovies.h"
 #include "tjsNativeLayer.h"
 #include "tjsNativeWindow.h"
 
@@ -525,6 +526,21 @@ void tTJSNI_VideoOverlay::Play()
     // start playing
     if (VideoOverlay)
     {
+        if (TVPIsSkippedMovie(CachedPlayingFile))
+        {
+            TVPAddImportantLog(ttstr(TJS_N("(info) Video overlay skipped: ")) + CachedPlayingFile);
+            ClearWndProcMessages();
+            // Report the status sequence a completed playback produces, rather
+            // than declining to open the file: a script waiting on
+            // onStatusChanged (wm/waitmovie) would otherwise wait forever, and
+            // throwing from Open would surface as a script error. Open leaves
+            // the status at ssStop, so ssPlay must be entered first or the
+            // ssStop below is dropped as an unchanged value.
+            SetStatus(ssPlay);
+            SetStatusAsync(ssStop);
+            return;
+        }
+
         VideoOverlay->Play();
         ClearWndProcMessages();
         if (Mode != vomMFEVR)

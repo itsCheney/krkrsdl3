@@ -1434,6 +1434,8 @@ void* TJS_realloc(void* buf, size_t len)
 
 void TJS_free(void* buf)
 {
+    // Match free(nullptr): a compacted/empty register pool has no allocation.
+    if (!buf) return;
     free((char*)buf - sizeof(size_t));
 }
 

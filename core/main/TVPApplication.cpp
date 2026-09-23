@@ -188,13 +188,15 @@ void tTVPApplication::OnExit()
     // while their event hooks, renderer and SDL devices are still alive.
     TVPInvalidateMovieSession();
     TVPFinalizeVideoOverlaySession();
-    TVPSystemUninit();
-    TVPUnloadPlugins();
-
     delete image_load_thread_;
     image_load_thread_ = NULL;
+    // KAG save callbacks can execute Scripts.execStorage (including ZIP/7z
+    // plugin formats). Run them before at-exit clears archive caches/factories.
+    if (TVPGetScriptEngine())
+        TVPDeliverCompactEvent(TVP_COMPACT_LEVEL_MAX);
+    TVPSystemUninit();
+    TVPUnloadPlugins();
     TVPResetEventState();
-    TVPDeliverCompactEvent(TVP_COMPACT_LEVEL_MAX);
     TVPResetGraphicSessionState();
 
     if (TVPSystemControl)

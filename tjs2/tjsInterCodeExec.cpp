@@ -570,6 +570,12 @@ tTJSVariantArrayStack::tTJSVariantArrayStack()
     CompactVariantArrayMagic = TJSCompactVariantArrayMagic;
 }
 //---------------------------------------------------------------------------
+void tTJSVariantArrayStack::BeginShutdown()
+{
+    OperationDisabledCount++;
+    InternalCompact();
+}
+//---------------------------------------------------------------------------
 tTJSVariantArrayStack::~tTJSVariantArrayStack()
 {
     OperationDisabledCount++;
@@ -641,7 +647,7 @@ void tTJSVariantArrayStack::InternalCompact(void)
             size_t offset = 0;
             if (Current != NULL && Arrays != NULL)
             {
-                offset = (size_t)Current - (size_t)Arrays;
+                offset = static_cast<size_t>(Current - Arrays);
                 availableoffset = true;
             }
 

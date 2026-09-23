@@ -1651,6 +1651,7 @@ void tTJSNI_AlphaMovie::open(tTJSString fileName)
         frameInfoList.push_back(_a);
     }
     m_BmpBits = new tTVPBaseTexture(_header.width, _header.height, 32);
+    m_BmpBits->Fill(tTVPRect(0,0,m_BmpBits->GetWidth(),m_BmpBits->GetHeight()),0);
     _frame = 0;
 }
 
@@ -1699,6 +1700,12 @@ tjs_int tTJSNI_AlphaMovie::showNextImage(tTJSVariant layer)
         if (_frame > frameInfoList.size())
             _frame = 1;
         AlphaMovieFrame& currentFrame = frameInfoList.at(_frame - 1);
+        // The script can select a canvas different from the file header. Keep
+        // the backing bitmap sized to that canvas before placing/clipping frames.
+        if(int(m_BmpBits->GetWidth())!=_screenWidth || int(m_BmpBits->GetHeight())!=_screenHeight) {
+            m_BmpBits->SetSize(_screenWidth, _screenHeight, false);
+            m_BmpBits->Fill(tTVPRect(0,0,m_BmpBits->GetWidth(),m_BmpBits->GetHeight()),0);
+        }
         m_BmpBits->Update(currentFrame.ptrData, currentFrame.frame_width * 4, _left, _top,
                           currentFrame.frame_width, currentFrame.frame_height);
         src->AssignMainImage(m_BmpBits);
