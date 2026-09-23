@@ -872,9 +872,24 @@ void EmotePlayer::draw(iTJSDispatch2* objthis)
         krkrsdl3::TVPRecordEmoteDraw(SDL_GetTicksNS() - drawStarted);
         if (!withD3DAdaptor)
         {
+            // The destination is overwritten in full. Keep the frame on the
+            // GPU when the Layer renderer can lend us its writable texture.
+            void* destination = ths->GetMainImageGPUHandleForOverwrite();
+            if (destination && renderer->CopyTargetToLayerTexture(target, destination))
+            {
+                ths->CommitMainImageGPUOverwrite();
+                krkrsdl3::TVPRecordEmoteLayerGPUCopy(
+                    static_cast<uint64_t>(_width) * static_cast<uint64_t>(_height) * 4);
+                ths->Update();
+                return;
+            }
             // 回读 CPU 像素并交给图层（GL 后端经 glReadPixels，软渲染后端零拷贝）
             int pitch = 0;
+            const Uint64 readbackStarted = SDL_GetTicksNS();
             uint8_t* pixels = renderer->LockTarget(target, pitch);
+            krkrsdl3::TVPRecordEmoteLayerCPUReadback(
+                pixels && pitch > 0 ? static_cast<uint64_t>(pitch) * static_cast<uint64_t>(_height) : 0,
+                SDL_GetTicksNS() - readbackStarted);
             // 紧接的 memcpy 覆盖整个图层（_width/_height 来自上面的 ResetDrawArea），
             // 图层原有像素不会被读取，因此无需为保留它们做一次 GPU 回读。
             tjs_uint8* buff = (tjs_uint8*)ths->GetMainImagePixelBufferForOverwrite();
@@ -911,6 +926,8 @@ void EmotePlayer::drawToTarget(krkrsdl3::iTVPRenderBackend* renderer,
     _limitArea = {(float)originX, (float)originY, (float)width, (float)height,
                   std::max(30.0f, emtEngine.getZMax() * 2), (float)viewW, (float)viewH};
     _targetTrans = transform;
+    krkrsdl3::TVPRecordEmotePlayerDraw(
+        reinterpret_cast<uintptr_t>(this), reinterpret_cast<uintptr_t>(target));
     prepareFrame();
     renderer->SetTarget(target);
     renderer->ClearTarget(selfClear);

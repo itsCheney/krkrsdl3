@@ -606,15 +606,23 @@ bool emotenoderef::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emo
     // 提前绘制好蒙版目标（不考虑复合蒙版的情况）
     if (renderMethod.at(0).hasStencil && maskTarget != 0)
     {
+        // Count source-node groups separately from clears. This is an identity
+        // hash for profiling, not a content-validity key for a future cache.
+        uint64_t group = 1469598103934665603ull;
+        for (auto* maskLayer : renderMethod.at(0).layerNode)
+            group = (group ^ reinterpret_cast<uintptr_t>(maskLayer)) * 1099511628211ull;
+        krkrsdl3::TVPRecordEmoteMaskGroup(group);
         renderer->SetTarget(maskTarget);
         renderer->ClearTarget(true);
+        krkrsdl3::TVPRecordEmoteMaskClear();
         bool hasDraw = false;
         for (auto maskLayer : renderMethod.at(0).layerNode)
         {
             if (maskLayer != nullptr && maskLayer->currOpa > 0)
             {
                 hasDraw = true;
-                maskLayer->draw(renderer, maskTarget, lim, nullptr);
+                if (maskLayer->draw(renderer, maskTarget, lim, nullptr))
+                    krkrsdl3::TVPRecordEmoteMaskDraw();
             }
         }
         // 排除异常蒙版

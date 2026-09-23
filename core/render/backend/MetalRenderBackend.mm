@@ -106,8 +106,12 @@ fragment float4 meshMain(Varying v [[stage_in]], constant Params& p [[buffer(0)]
 // alpha blending (which changes source alpha and signed >>8 rounding).
 kernel void layerMain(uint2 tid [[thread_position_in_grid]], constant Params& p [[buffer(0)]],
                       texture2d<float, access::read> src [[texture(0)]],
+#ifdef TVP_LAYER_RECT_IN_PLACE
+                      texture2d<float, access::read_write> out [[texture(2)]]) {
+#else
                       texture2d<float, access::read> dst [[texture(1)]],
                       texture2d<float, access::write> out [[texture(2)]]) {
+#endif
     int2 origin = max(int2(floor(p.rect.xy)), int2(0));
     int2 end = min(int2(ceil(p.rect.xy + p.rect.zw)), int2(out.get_width(), out.get_height()));
     int2 xy = origin + int2(tid);
@@ -116,7 +120,12 @@ kernel void layerMain(uint2 tid [[thread_position_in_grid]], constant Params& p 
     int2 sz = int2(src.get_width(), src.get_height());
     int2 sampleXY = clamp(int2(uv * float2(sz - 1) + 0.5), int2(0), sz - 1);
     int4 s = int4(round(src.read(uint2(sampleXY)) * 255.0));
-    int4 d = int4(round(dst.read(uint2(xy)) * 255.0));
+#ifdef TVP_LAYER_RECT_IN_PLACE
+    int4 d = int4(round(out.read(uint2(xy)) * 255.0));
+#else
+    int2 destinationXY = p.values.w != 0.0 ? xy : xy - origin;
+    int4 d = int4(round(dst.read(uint2(destinationXY)) * 255.0));
+#endif
     int4 c = s;
     int opa = p.flags.w;
     switch (p.flags.z) {
@@ -188,8 +197,11 @@ struct MetalRenderBackend::Impl
         int indexCount = 0;
     };
     std::unordered_map<uint32_t, DeformTopology> deformTopologies;
-    id<MTLComputePipelineState> layerPipeline = nil, ordinaryLayerPipeline = nil, ordinaryInPlacePipeline = nil;
+    id<MTLComputePipelineState> layerPipeline = nil, layerInPlacePipeline = nil;
+    id<MTLComputePipelineState> ordinaryLayerPipeline = nil, ordinaryInPlacePipeline = nil;
     id<MTLComputePipelineState> dualSourceLayerPipeline = nil;
+    id<MTLRenderCommandEncoder> activeMeshEncoder = nil;
+    id<MTLTexture> activeMeshTarget = nil;
     id<MTLComputeCommandEncoder> ordinaryEncoder = nil;
     id<MTLTexture> ordinaryBoundSource = nil, ordinaryBoundTarget = nil;
     id<MTLBuffer> alphaTables = nil;
@@ -417,12 +429,28 @@ struct MetalRenderBackend::Impl
         if(ordinaryEncoder) { [ordinaryEncoder endEncoding]; ordinaryEncoder=nil; }
         ordinaryBoundSource=nil; ordinaryBoundTarget=nil;
     }
-    id<MTLBlitCommandEncoder> Blit() { EndOrdinary(); return [Commands() blitCommandEncoder]; }
-    id<MTLComputeCommandEncoder> Compute() { EndOrdinary(); return [Commands() computeCommandEncoder]; }
+    void EndMesh() {
+        if (activeMeshEncoder) { [activeMeshEncoder endEncoding]; activeMeshEncoder = nil; }
+        activeMeshTarget = nil;
+    }
+    id<MTLBlitCommandEncoder> Blit() {
+        EndMesh(); EndOrdinary();
+        auto encoder = [Commands() blitCommandEncoder];
+        if (encoder) TVPRecordMetalBlitEncoder();
+        return encoder;
+    }
+    id<MTLComputeCommandEncoder> Compute() {
+        EndMesh(); EndOrdinary();
+        auto encoder = [Commands() computeCommandEncoder];
+        if (encoder) TVPRecordMetalComputeEncoder();
+        return encoder;
+    }
     id<MTLComputeCommandEncoder> OrdinaryCompute() {
+        EndMesh();
         if(!ordinaryEncoder) {
             // Serial dispatches provide write/read ordering for tracked textures.
             ordinaryEncoder=[Commands() computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+            if (ordinaryEncoder) TVPRecordMetalComputeEncoder();
             [ordinaryEncoder setComputePipelineState:ordinaryInPlacePipeline];
             [ordinaryEncoder setBuffer:alphaTables offset:0 atIndex:1];
         }
@@ -430,6 +458,7 @@ struct MetalRenderBackend::Impl
     }
     bool Submit(bool wait = false)
     {
+        EndMesh();
         EndOrdinary();
         if (commands) {
             lastSubmitted = commands;
@@ -468,6 +497,7 @@ struct MetalRenderBackend::Impl
     }
     id<MTLRenderCommandEncoder> Pass(id<MTLTexture> texture, bool clear)
     {
+        EndMesh();
         EndOrdinary();
         MTLRenderPassDescriptor* p = [MTLRenderPassDescriptor renderPassDescriptor];
         p.colorAttachments[0].texture = texture;
@@ -476,7 +506,16 @@ struct MetalRenderBackend::Impl
         p.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
         id<MTLRenderCommandEncoder> encoder = [Commands() renderCommandEncoderWithDescriptor:p];
         if (!encoder) throw std::runtime_error("Metal render encoder allocation failed");
+        TVPRecordMetalRenderEncoder();
         return encoder;
+    }
+    id<MTLRenderCommandEncoder> MeshPass(id<MTLTexture> texture)
+    {
+        EndOrdinary();
+        if (activeMeshEncoder && activeMeshTarget == texture) return activeMeshEncoder;
+        activeMeshEncoder = Pass(texture, false);
+        activeMeshTarget = texture;
+        return activeMeshEncoder;
     }
     void* Create(int w, int h, bool target)
     {
@@ -548,19 +587,23 @@ struct MetalRenderBackend::Impl
             std::memcpy(pixels.data() + y * pitch, static_cast<uint8_t*>(staging.contents) + y * rowBytes, pitch);
         return true;
     }
-    id<MTLTexture> Snapshot(Resource* r)
+    id<MTLTexture> SnapshotRegion(Resource* r, int x, int y, int width, int height)
     {
-        if (!destinationSnapshot || destinationSnapshot.width != static_cast<NSUInteger>(r->width) ||
-            destinationSnapshot.height != static_cast<NSUInteger>(r->height))
-            destinationSnapshot = Texture(r->width, r->height);
+        if (!destinationSnapshot || destinationSnapshot.width != static_cast<NSUInteger>(width) ||
+            destinationSnapshot.height != static_cast<NSUInteger>(height))
+            destinationSnapshot = Texture(width, height);
         if (!destinationSnapshot) throw std::runtime_error("Metal snapshot texture allocation failed");
         id<MTLBlitCommandEncoder> e = Blit();
         if (!e) throw std::runtime_error("Metal blit encoder allocation failed");
-        [e copyFromTexture:r->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-                sourceSize:MTLSizeMake(r->width, r->height, 1) toTexture:destinationSnapshot
+        [e copyFromTexture:r->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(x, y, 0)
+                sourceSize:MTLSizeMake(width, height, 1) toTexture:destinationSnapshot
                 destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
         [e endEncoding];
         return destinationSnapshot;
+    }
+    id<MTLTexture> Snapshot(Resource* r)
+    {
+        return SnapshotRegion(r, 0, 0, r->width, r->height);
     }
     void DrawWindows(id<MTLTexture> output, id<MTLRenderPipelineState> pipeline)
     {
@@ -679,6 +722,19 @@ struct MetalRenderBackend::Impl
         }
         layerPipeline = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"layerMain"] error:&error];
         if (!layerPipeline) SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Metal layer pipeline: %s", error.localizedDescription.UTF8String);
+        if (layerPipeline && device.readWriteTextureSupport == MTLReadWriteTextureTier2) {
+            std::string inPlaceSource("#define TVP_LAYER_RECT_IN_PLACE 1\n");
+            inPlaceSource += kShaders;
+            id<MTLLibrary> inPlace = [device newLibraryWithSource:[NSString stringWithUTF8String:inPlaceSource.c_str()]
+                                                      options:nil error:&error];
+            if (inPlace)
+                layerInPlacePipeline = [device newComputePipelineStateWithFunction:
+                                        [inPlace newFunctionWithName:@"layerMain"] error:&error];
+            if (!layerInPlacePipeline)
+                SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
+                            "Metal LayerDrawRect in-place pipeline unavailable: %s",
+                            error.localizedDescription.UTF8String);
+        }
         MTLCompileOptions* ordinaryOptions = [MTLCompileOptions new];
         ordinaryOptions.fastMathEnabled = NO;
         id<MTLLibrary> ordinary = [device newLibraryWithSource:[NSString stringWithUTF8String:kMetalLayerShaders]
@@ -849,7 +905,7 @@ void MetalRenderBackend::DrawMesh(const float* vertices, int vertexCount, const 
         uniforms.flags.y = p.mask != nullptr;
         uniforms.values = simd_make_float4(std::clamp(opacity, 0.0f, 1.0f), p.current->width, p.current->height, 0);
         int pipeline = (uniforms.flags.x == 1 || uniforms.flags.x == 4) ? 1 : uniforms.flags.x == 21 ? 2 : 0;
-        id<MTLRenderCommandEncoder> e = p.Pass(p.current->texture, false);
+        id<MTLRenderCommandEncoder> e = p.MeshPass(p.current->texture);
         [e setRenderPipelineState:p.meshPipelines[pipeline]];
         [e setVertexBuffer:upload.buffer offset:upload.offset atIndex:0];
         [e setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
@@ -857,7 +913,6 @@ void MetalRenderBackend::DrawMesh(const float* vertices, int vertexCount, const 
         [e setFragmentTexture:p.mask ? (p.mask == p.current ? snapshot : p.mask->texture) : source atIndex:1];
         [e drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:indexCount indexType:MTLIndexTypeUInt16
                      indexBuffer:upload.buffer indexBufferOffset:upload.offset + indexOffset];
-        [e endEncoding];
         p.transientBytes += uploadBytes;
         if (p.transientBytes >= Impl::kSubmissionBudget || ++p.transientOps >= Impl::kSubmissionOpBudget)
             p.Submit();
@@ -899,7 +954,7 @@ bool MetalRenderBackend::DrawDeformedMesh(int divX, int divY,
         const int pipeline = (uniforms.flags.x == 1 || uniforms.flags.x == 4) ? 1 :
                              uniforms.flags.x == 21 ? 2 : 0;
         const uint32_t count = static_cast<uint32_t>(surfaceCount);
-        id<MTLRenderCommandEncoder> e = p.Pass(p.current->texture, false);
+        id<MTLRenderCommandEncoder> e = p.MeshPass(p.current->texture);
         [e setRenderPipelineState:p.deformPipelines[pipeline]];
         [e setVertexBuffer:topology->uv offset:0 atIndex:0];
         [e setVertexBuffer:surfaceUpload.buffer offset:surfaceUpload.offset atIndex:1];
@@ -913,9 +968,8 @@ bool MetalRenderBackend::DrawDeformedMesh(int divX, int divY,
                         indexType:MTLIndexTypeUInt16
                       indexBuffer:topology->indices
                 indexBufferOffset:0];
-        [e endEncoding];
-
         p.transientBytes += surfaceBytes;
+        TVPRecordMetalSurfaceUpload(static_cast<uint64_t>(surfaceBytes));
         if (p.transientBytes >= Impl::kSubmissionBudget || ++p.transientOps >= Impl::kSubmissionOpBudget)
             p.Submit();
         TVPRecordEmoteGPUDeform(static_cast<uint64_t>(topology->vertexCount));
@@ -951,16 +1005,29 @@ void MetalRenderBackend::LayerDrawRect(void* h, float x, float y, float w, float
         float right = std::min(static_cast<float>(p.current->width), std::ceil(x + w));
         float bottom = std::min(static_cast<float>(p.current->height), std::ceil(y + height));
         if (l >= right || t >= bottom) return;
-        id<MTLTexture> dst = p.Snapshot(p.current);
+        // A source alias may sample another destination pixel. Preserve the
+        // pre-operation source in that case; the usual D3D Emote source is a
+        // separate texture and can use Tier-2 per-pixel read/write directly.
+        const bool sourceAliasesTarget = r == p.current;
+        const bool inPlace = p.layerInPlacePipeline && !sourceAliasesTarget;
+        const int clipX = static_cast<int>(l), clipY = static_cast<int>(t);
+        const int clipWidth = static_cast<int>(right - l);
+        const int clipHeight = static_cast<int>(bottom - t);
+        id<MTLTexture> dst = inPlace ? nil :
+            (sourceAliasesTarget ? p.Snapshot(p.current) :
+             p.SnapshotRegion(p.current, clipX, clipY, clipWidth, clipHeight));
+        if (dst) TVPRecordMetalLayerRectSnapshot(
+            static_cast<uint64_t>(dst.width) * static_cast<uint64_t>(dst.height) * 4);
         Params uniforms = p.layerParams;
         uniforms.rect = simd_make_float4(x, y, w, height);
         uniforms.uv = simd_make_float4(u0, v0, u1, v1);
+        uniforms.values.w = sourceAliasesTarget ? 1.0f : 0.0f;
         id<MTLComputeCommandEncoder> e = p.Compute();
         if (!e) throw std::runtime_error("Metal compute encoder allocation failed");
-        [e setComputePipelineState:p.layerPipeline];
+        [e setComputePipelineState:inPlace ? p.layerInPlacePipeline : p.layerPipeline];
         [e setBytes:&uniforms length:sizeof(uniforms) atIndex:0];
-        [e setTexture:r == p.current ? dst : r->texture atIndex:0];
-        [e setTexture:dst atIndex:1];
+        [e setTexture:sourceAliasesTarget ? dst : r->texture atIndex:0];
+        if (!inPlace) [e setTexture:dst atIndex:1];
         [e setTexture:p.current->texture atIndex:2];
         [e dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(right - l), static_cast<NSUInteger>(bottom - t), 1)
              threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];

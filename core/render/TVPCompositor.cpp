@@ -63,12 +63,18 @@ std::atomic<uint64_t> profileEmoteDistinctPlayerDraws{0}, profileEmoteRepeatedPl
 std::atomic<uint64_t> profileEmoteDistinctTargets{0};
 std::atomic<uint64_t> profileEmoteMaxDrawsPerStep{0}, profileEmoteMaxPlayersPerStep{0};
 std::atomic<uint64_t> profileEmoteMaxDrawsPerPlayerStep{0};
+std::atomic<uint64_t> profileEmoteMaskClears{0}, profileEmoteMaskDraws{0};
+std::atomic<uint64_t> profileEmoteUniqueMaskGroups{0};
+std::atomic<uint64_t> profileEmoteLayerGPUCopies{0}, profileEmoteLayerGPUCopyBytes{0};
+std::atomic<uint64_t> profileEmoteLayerCPUReadbacks{0}, profileEmoteLayerCPUReadbackBytes{0};
+std::atomic<uint64_t> profileEmoteLayerCPUReadbackTimeNS{0};
 
 struct EmoteStepAccumulator {
     bool active = false;
     uint64_t draws = 0;
     std::vector<std::pair<uintptr_t, uint32_t>> players;
     std::vector<uintptr_t> targets;
+    std::vector<uint64_t> maskGroups;
 };
 thread_local EmoteStepAccumulator emoteStepDetail;
 
@@ -94,6 +100,10 @@ std::atomic<uint64_t> profileMeshBufferAllocations{0}, profileMeshBufferBytes{0}
 std::atomic<uint64_t> profileMeshBufferAllocationTimeNS{0};
 std::atomic<uint64_t> profileMetalSubmits{0}, profileMetalSyncWaits{0};
 std::atomic<uint64_t> profileMetalSyncWaitTimeNS{0}, profileMetalQueueWaitTimeNS{0};
+std::atomic<uint64_t> profileMetalRenderEncoders{0}, profileMetalComputeEncoders{0};
+std::atomic<uint64_t> profileMetalBlitEncoders{0};
+std::atomic<uint64_t> profileMetalLayerRectSnapshots{0}, profileMetalLayerRectSnapshotBytes{0};
+std::atomic<uint64_t> profileMetalSurfaceUploadBytes{0};
 std::atomic<uint64_t> profileMetalRingBytes{0}, profileMetalRingSuballocs{0};
 std::atomic<uint64_t> profileMetalRingSuballocTimeNS{0}, profileMetalRingWraps{0};
 std::atomic<uint64_t> profileMetalRingStallTimeNS{0}, profileMetalRingHighWaterBytes{0};
@@ -190,6 +200,7 @@ void TVPBeginRuntimeStep() {
     emoteStepDetail.draws = 0;
     emoteStepDetail.players.clear();
     emoteStepDetail.targets.clear();
+    emoteStepDetail.maskGroups.clear();
 }
 void TVPRecordEmotePlayerDraw(uintptr_t playerIdentity, uintptr_t targetIdentity) {
     if (!emoteStepDetail.active) return;
@@ -204,8 +215,31 @@ void TVPRecordEmotePlayerDraw(uintptr_t playerIdentity, uintptr_t targetIdentity
         emoteStepDetail.targets.end())
         emoteStepDetail.targets.push_back(targetIdentity);
 }
+void TVPRecordEmoteMaskGroup(uint64_t identityHash) {
+    if (!emoteStepDetail.active) return;
+    if (std::find(emoteStepDetail.maskGroups.begin(), emoteStepDetail.maskGroups.end(), identityHash) ==
+        emoteStepDetail.maskGroups.end())
+        emoteStepDetail.maskGroups.push_back(identityHash);
+}
+void TVPRecordEmoteMaskClear() {
+    profileEmoteMaskClears.fetch_add(1, std::memory_order_relaxed);
+}
+void TVPRecordEmoteMaskDraw() {
+    profileEmoteMaskDraws.fetch_add(1, std::memory_order_relaxed);
+}
+void TVPRecordEmoteLayerGPUCopy(uint64_t bytes) {
+    profileEmoteLayerGPUCopies.fetch_add(1, std::memory_order_relaxed);
+    profileEmoteLayerGPUCopyBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+void TVPRecordEmoteLayerCPUReadback(uint64_t bytes, uint64_t ns) {
+    profileEmoteLayerCPUReadbacks.fetch_add(1, std::memory_order_relaxed);
+    profileEmoteLayerCPUReadbackBytes.fetch_add(bytes, std::memory_order_relaxed);
+    profileEmoteLayerCPUReadbackTimeNS.fetch_add(ns, std::memory_order_relaxed);
+}
 void TVPEndRuntimeStep() {
     if (!emoteStepDetail.active) return;
+    profileEmoteUniqueMaskGroups.fetch_add(emoteStepDetail.maskGroups.size(),
+                                           std::memory_order_relaxed);
     if (emoteStepDetail.draws > 0) {
         profileEmoteRenderSteps.fetch_add(1,std::memory_order_relaxed);
         profileEmotePlayerDraws.fetch_add(emoteStepDetail.draws,std::memory_order_relaxed);
@@ -256,6 +290,22 @@ void TVPRecordMeshDraw(uint64_t vertices,uint64_t indices,uint64_t cpuTimeNS,
     profileMeshBufferAllocationTimeNS.fetch_add(bufferAllocationTimeNS,std::memory_order_relaxed);
 }
 void TVPRecordMetalSubmit() { profileMetalSubmits.fetch_add(1,std::memory_order_relaxed); }
+void TVPRecordMetalRenderEncoder() {
+    profileMetalRenderEncoders.fetch_add(1, std::memory_order_relaxed);
+}
+void TVPRecordMetalComputeEncoder() {
+    profileMetalComputeEncoders.fetch_add(1, std::memory_order_relaxed);
+}
+void TVPRecordMetalBlitEncoder() {
+    profileMetalBlitEncoders.fetch_add(1, std::memory_order_relaxed);
+}
+void TVPRecordMetalLayerRectSnapshot(uint64_t bytes) {
+    profileMetalLayerRectSnapshots.fetch_add(1, std::memory_order_relaxed);
+    profileMetalLayerRectSnapshotBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+void TVPRecordMetalSurfaceUpload(uint64_t bytes) {
+    profileMetalSurfaceUploadBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
 void TVPRecordMetalSyncWait(uint64_t ns) {
     profileMetalSyncWaits.fetch_add(1,std::memory_order_relaxed);
     profileMetalSyncWaitTimeNS.fetch_add(ns,std::memory_order_relaxed);
@@ -313,6 +363,14 @@ TVPRuntimeProfileStats TVPGetRuntimeProfileStats() {
     s.emoteMaxDrawsPerStep=profileEmoteMaxDrawsPerStep.load(std::memory_order_relaxed);
     s.emoteMaxPlayersPerStep=profileEmoteMaxPlayersPerStep.load(std::memory_order_relaxed);
     s.emoteMaxDrawsPerPlayerStep=profileEmoteMaxDrawsPerPlayerStep.load(std::memory_order_relaxed);
+    s.emoteMaskClears=profileEmoteMaskClears.load(std::memory_order_relaxed);
+    s.emoteMaskDraws=profileEmoteMaskDraws.load(std::memory_order_relaxed);
+    s.emoteUniqueMaskGroups=profileEmoteUniqueMaskGroups.load(std::memory_order_relaxed);
+    s.emoteLayerGPUCopies=profileEmoteLayerGPUCopies.load(std::memory_order_relaxed);
+    s.emoteLayerGPUCopyBytes=profileEmoteLayerGPUCopyBytes.load(std::memory_order_relaxed);
+    s.emoteLayerCPUReadbacks=profileEmoteLayerCPUReadbacks.load(std::memory_order_relaxed);
+    s.emoteLayerCPUReadbackBytes=profileEmoteLayerCPUReadbackBytes.load(std::memory_order_relaxed);
+    s.emoteLayerCPUReadbackTimeNS=profileEmoteLayerCPUReadbackTimeNS.load(std::memory_order_relaxed);
     s.meshDrawCalls=profileMeshDrawCalls.load(std::memory_order_relaxed);
     s.meshVertices=profileMeshVertices.load(std::memory_order_relaxed);
     s.meshIndices=profileMeshIndices.load(std::memory_order_relaxed);
@@ -325,6 +383,12 @@ TVPRuntimeProfileStats TVPGetRuntimeProfileStats() {
     s.metalSyncWaits=profileMetalSyncWaits.load(std::memory_order_relaxed);
     s.metalSyncWaitTimeNS=profileMetalSyncWaitTimeNS.load(std::memory_order_relaxed);
     s.metalQueueWaitTimeNS=profileMetalQueueWaitTimeNS.load(std::memory_order_relaxed);
+    s.metalRenderEncoders=profileMetalRenderEncoders.load(std::memory_order_relaxed);
+    s.metalComputeEncoders=profileMetalComputeEncoders.load(std::memory_order_relaxed);
+    s.metalBlitEncoders=profileMetalBlitEncoders.load(std::memory_order_relaxed);
+    s.metalLayerRectSnapshots=profileMetalLayerRectSnapshots.load(std::memory_order_relaxed);
+    s.metalLayerRectSnapshotBytes=profileMetalLayerRectSnapshotBytes.load(std::memory_order_relaxed);
+    s.metalSurfaceUploadBytes=profileMetalSurfaceUploadBytes.load(std::memory_order_relaxed);
     s.metalRingBytes=profileMetalRingBytes.load(std::memory_order_relaxed);
     s.metalRingSuballocs=profileMetalRingSuballocs.load(std::memory_order_relaxed);
     s.metalRingSuballocTimeNS=profileMetalRingSuballocTimeNS.load(std::memory_order_relaxed);
@@ -368,6 +432,14 @@ void TVPResetRuntimeProfileStats() {
     profileEmoteMaxDrawsPerStep.store(0,std::memory_order_relaxed);
     profileEmoteMaxPlayersPerStep.store(0,std::memory_order_relaxed);
     profileEmoteMaxDrawsPerPlayerStep.store(0,std::memory_order_relaxed);
+    profileEmoteMaskClears.store(0,std::memory_order_relaxed);
+    profileEmoteMaskDraws.store(0,std::memory_order_relaxed);
+    profileEmoteUniqueMaskGroups.store(0,std::memory_order_relaxed);
+    profileEmoteLayerGPUCopies.store(0,std::memory_order_relaxed);
+    profileEmoteLayerGPUCopyBytes.store(0,std::memory_order_relaxed);
+    profileEmoteLayerCPUReadbacks.store(0,std::memory_order_relaxed);
+    profileEmoteLayerCPUReadbackBytes.store(0,std::memory_order_relaxed);
+    profileEmoteLayerCPUReadbackTimeNS.store(0,std::memory_order_relaxed);
     emoteStepDetail = {};
     emotePrepareDetail = {};
     profileMeshDrawCalls.store(0,std::memory_order_relaxed);
@@ -382,6 +454,12 @@ void TVPResetRuntimeProfileStats() {
     profileMetalSyncWaits.store(0,std::memory_order_relaxed);
     profileMetalSyncWaitTimeNS.store(0,std::memory_order_relaxed);
     profileMetalQueueWaitTimeNS.store(0,std::memory_order_relaxed);
+    profileMetalRenderEncoders.store(0,std::memory_order_relaxed);
+    profileMetalComputeEncoders.store(0,std::memory_order_relaxed);
+    profileMetalBlitEncoders.store(0,std::memory_order_relaxed);
+    profileMetalLayerRectSnapshots.store(0,std::memory_order_relaxed);
+    profileMetalLayerRectSnapshotBytes.store(0,std::memory_order_relaxed);
+    profileMetalSurfaceUploadBytes.store(0,std::memory_order_relaxed);
     profileMetalRingBytes.store(0,std::memory_order_relaxed);
     profileMetalRingSuballocs.store(0,std::memory_order_relaxed);
     profileMetalRingSuballocTimeNS.store(0,std::memory_order_relaxed);

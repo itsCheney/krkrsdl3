@@ -305,6 +305,22 @@ struct TVPRuntimeProfileStats {
     uint64_t metalSyncWaitTimeNS = 0;
     uint64_t metalQueueWaitTimeNS = 0;
 
+    // Command-generation costs, accumulated for the current game session.
+    uint64_t metalRenderEncoders = 0;
+    uint64_t metalComputeEncoders = 0;
+    uint64_t metalBlitEncoders = 0;
+    uint64_t metalLayerRectSnapshots = 0;
+    uint64_t metalLayerRectSnapshotBytes = 0;
+    uint64_t metalSurfaceUploadBytes = 0;
+    uint64_t emoteMaskClears = 0;
+    uint64_t emoteMaskDraws = 0;
+    uint64_t emoteUniqueMaskGroups = 0;
+    uint64_t emoteLayerGPUCopies = 0;
+    uint64_t emoteLayerGPUCopyBytes = 0;
+    uint64_t emoteLayerCPUReadbacks = 0;
+    uint64_t emoteLayerCPUReadbackBytes = 0;
+    uint64_t emoteLayerCPUReadbackTimeNS = 0;
+
     // Persistent transient-upload arena statistics.
     uint64_t metalRingBytes = 0;
     uint64_t metalRingSuballocs = 0;
@@ -334,6 +350,11 @@ void TVPRecordEmoteGPUDeform(uint64_t vertices);
 // its identity and render target when an actual render request is made.
 void TVPBeginRuntimeStep();
 void TVPRecordEmotePlayerDraw(uintptr_t playerIdentity, uintptr_t targetIdentity);
+void TVPRecordEmoteMaskGroup(uint64_t identityHash);
+void TVPRecordEmoteMaskClear();
+void TVPRecordEmoteMaskDraw();
+void TVPRecordEmoteLayerGPUCopy(uint64_t bytes);
+void TVPRecordEmoteLayerCPUReadback(uint64_t bytes, uint64_t nanoseconds);
 void TVPEndRuntimeStep();
 
 void TVPCommitEmotePrepareDetail(uint64_t transformTimeNS,
@@ -344,6 +365,11 @@ void TVPRecordMeshDraw(uint64_t vertices, uint64_t indices, uint64_t cpuTimeNS,
                        uint64_t validationTimeNS, uint64_t bufferAllocations,
                        uint64_t bufferBytes, uint64_t bufferAllocationTimeNS);
 void TVPRecordMetalSubmit();
+void TVPRecordMetalRenderEncoder();
+void TVPRecordMetalComputeEncoder();
+void TVPRecordMetalBlitEncoder();
+void TVPRecordMetalLayerRectSnapshot(uint64_t bytes);
+void TVPRecordMetalSurfaceUpload(uint64_t bytes);
 void TVPRecordMetalSyncWait(uint64_t nanoseconds);
 void TVPRecordMetalQueueWait(uint64_t nanoseconds);
 void TVPRecordMetalRingSuballoc(uint64_t bytes, uint64_t highWaterBytes,
