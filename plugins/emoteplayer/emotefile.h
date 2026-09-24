@@ -419,6 +419,9 @@ public:
     void setFun(tTJSVariantClosure decryptClo);
     bool load(const ttstr& filePath);
     tTJSVariant root();
+    // Materialize only this variable's frameList, preserving PSB fields and
+    // returning fresh mutable script objects on each call.
+    tTJSVariant readVariableFrameList(const ttstr& name);
     tTJSVariant readAllObjs(const ttstr& key, tjs_uint32 _objOffset);
     uint32_t readListInfo(std::vector<uint32_t>* target);
     void refreshListInfo(std::vector<uint32_t>* target1, std::vector<uint32_t>* target2);

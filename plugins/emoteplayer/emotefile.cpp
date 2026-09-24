@@ -1852,6 +1852,39 @@ tTJSVariant emotefile::root()
 {
     return readAllObjs("root", _header.offsetEntries);
 }
+tTJSVariant emotefile::readVariableFrameList(const ttstr& name)
+{
+    // Walk PSB offsets instead of constructing the entire animation/source
+    // object tree just to read one metadata array. Keep the existing decoder
+    // for returned values so unknown frame fields and script types survive.
+    if (!filePtr) return tTJSVariant();
+    std::map<std::string, uint32_t> properties;
+    if (!parseObject(properties, _header.offsetEntries)) return tTJSVariant();
+    auto metadata = properties.find("metadata");
+    if (metadata == properties.end()) return tTJSVariant();
+    const uint32_t metadataOffset = metadata->second;
+    properties.clear();
+    if (!parseObject(properties, metadataOffset)) return tTJSVariant();
+    auto variables = properties.find("variableList");
+    if (variables == properties.end()) return tTJSVariant();
+    std::vector<uint32_t> entries;
+    if (!parseList(entries, variables->second)) return tTJSVariant();
+    for (auto offset : entries)
+    {
+        properties.clear();
+        if (!parseObject(properties, offset)) continue;
+        auto label = properties.find("label");
+        if (label == properties.end()) continue;
+        const tTJSVariant value = readAllObjs("label", label->second);
+        if (value.Type() != tvtString || ttstr(value) != name) continue;
+        auto frames = properties.find("frameList");
+        // Dictionary.PropGet returns void for a missing member. The original
+        // script-tree lookup therefore stops at the first matching label too.
+        return frames != properties.end()
+            ? readAllObjs("frameList", frames->second) : tTJSVariant();
+    }
+    return tTJSVariant();
+}
 tTJSVariant emotefile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
 {
     filePtr->SetPosition(_objOffset);
@@ -1950,15 +1983,14 @@ tTJSVariant emotefile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
             PSB::parsePSBArray(&tmp, typeByte - static_cast<tjs_int8>(PSB::PSBObjType::ArrayN1) + 1,
                                filePtr);
             iTJSDispatch2* array = TJSCreateArrayObject();
+            tTJSVariant result(array, array);
+            array->Release();
+            tjs_int index = 0;
             for (auto i : tmp)
             {
                 tTJSVariant tmp(static_cast<tjs_int32>(i));
-                tTJSVariant* args[] = {&tmp};
-                static tjs_uint addHint = 0;
-                array->FuncCall(0, TJS_N("add"), &addHint, nullptr, 1, args, array);
+                array->PropSetByNum(TJS_MEMBERENSURE | TJS_IGNOREPROP, index++, &tmp, array);
             }
-            tTJSVariant result(array, array);
-            array->Release();
             return result;
         }
         case PSB::PSBObjType::StringN1:
@@ -2006,15 +2038,16 @@ tTJSVariant emotefile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
             tjs_uint32 _tmpOffset = this->readListInfo(&_objsOffset);
 
             iTJSDispatch2* array = TJSCreateArrayObject();
+            tTJSVariant result(array, array);
+            array->Release();
+            tjs_int index = 0;
             for (auto _offset : _objsOffset)
             {
                 tTJSVariant obj = readAllObjs(ttstr(), _tmpOffset + _offset);
-                tTJSVariant* args[] = {&obj};
-                static tjs_uint addHint = 0;
-                array->FuncCall(0, TJS_N("add"), &addHint, nullptr, 1, args, array);
+                // These are fresh array slots. Set them directly rather than
+                // dispatching a script-visible add method for every PSB item.
+                array->PropSetByNum(TJS_MEMBERENSURE | TJS_IGNOREPROP, index++, &obj, array);
             }
-            tTJSVariant result(array, array);
-            array->Release();
             return result;
         }
         case PSB::PSBObjType::Objects:
@@ -2033,14 +2066,14 @@ tTJSVariant emotefile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
             }
 
             iTJSDispatch2* dsp = TJSCreateDictionaryObject();
+            tTJSVariant result(dsp, dsp);
+            dsp->Release();
             for (tjs_int i = 0; i < _objsNamesIdx.size(); i++)
             {
                 ttstr keyName = namesCache.at(_objsNamesIdx.at(i));
                 tTJSVariant obj = readAllObjs(keyName, _tmpOffset + _objsOffset.at(i));
                 dsp->PropSet(TJS_MEMBERENSURE, keyName.c_str(), nullptr, &obj, dsp);
             }
-            tTJSVariant result(dsp, dsp);
-            dsp->Release();
             return result;
         }
         default:

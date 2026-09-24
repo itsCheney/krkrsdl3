@@ -16,9 +16,8 @@ namespace drawdevice
 {
 
 // emoteplayer::ResourceManager 与 EmotePlayer 的包装（避免头文件耦合）。
-// ResourceManager 全局共享以支持不同 emote 文件之间互相引用 source/motion；
-// PlayerImpl 记录本播放器实际 load 过的文件，析构时逐个释放引用计数，
-// 引用归零的 file 会从 ResourceManager 的 source/motion 索引中移除，避免下次同名冲突。
+// 普通实例独立持有 ResourceManager；clone 显式共享 manager 和播放器状态。
+// 一个 manager 中的文件可互相引用 source/motion，最后一个持有者释放时统一卸载。
 class PlayerImpl
 {
 public:
@@ -52,7 +51,7 @@ D3DEmotePlayer::D3DEmotePlayer(iTJSDispatch2* d3dlayer)
     Layer = ncbInstanceAdaptor<D3DLayer>::GetNativeInstance(d3dlayer);
     if (Layer)
         Device = Layer->Device;
-    // 每实例独立动画状态机；资源缓存/跨文件索引由共享 ResourceManager 管理
+    // 每实例独立动画状态机和资源缓存；同一实例内支持跨文件索引。
     Impl = new PlayerImpl();
 }
 
@@ -82,7 +81,7 @@ tjs_error D3DEmotePlayer::load(tTJSVariant* result,
     for (int i = 0; i < numparams; i++)
     {
         tmpname = *param[i];
-        objthis->Impl->RM->load(tmpname);
+        objthis->Impl->RM->ensureLoaded(tmpname);
     }
     try
     {

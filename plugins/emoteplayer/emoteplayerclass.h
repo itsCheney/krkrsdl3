@@ -4,6 +4,7 @@
 #include "tjsNative.h"
 
 #include <map>
+#include <cstdint>
 #include <vector>
 #include "emotefile.h"
 #include "emoterunner.h"
@@ -51,6 +52,19 @@ private:
 };
 
 class EmotePlayer;
+// Process-local diagnostics only: no paths, retained resource copies or cache policy.
+struct EmoteResourceDiagnostics
+{
+    std::uint64_t managerId = 0;
+    std::uint64_t loads = 0;
+    std::uint64_t hits = 0;
+    std::uint64_t misses = 0;
+    std::uint64_t failures = 0;
+    std::uint64_t unloads = 0;
+    std::uint64_t unloadAlls = 0;
+    std::uint64_t clearCacheCalls = 0;
+};
+
 class ResourceManager
 {
 public:
@@ -67,6 +81,8 @@ public:
             delete this;
     }
     tTJSVariant load(tTJSString path);
+    // Native players consume the parsed file, not a fresh script object tree.
+    void ensureLoaded(tTJSString path);
     void unload(tTJSString path);
     void unloadAll();
     void clearCache();
@@ -79,6 +95,9 @@ public:
     std::map<ttstr, emotefile*> cacheData;
 
 private:
+    tTJSVariant loadInternal(tTJSString path, bool materializeRoot);
+    void unloadAllInternal(const char* diagnosticAction);
+    EmoteResourceDiagnostics _diagnostics;
     tjs_int RefCount = 1;
     inline static tjs_int _decryptkey = 0;
     inline static tTJSVariantClosure _decryptClo = NULL;

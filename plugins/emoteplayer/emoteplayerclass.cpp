@@ -3,13 +3,18 @@
 #include "tjsArray.h"
 #include "TVPStorage.h"
 #include "Platform.h"
+#include "Random.h"
+#include "md5.h"
 #include <SDL3/SDL.h>
 
 #include "tjsCommHead.h"
 #include "tjsNativeLayer.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdint>
+#include <memory>
 
 namespace emoteplayer
 {
@@ -17,12 +22,75 @@ namespace emoteplayer
 iTJSDispatch2* ResourceManager::_kagWindow = nullptr;
 static SeparateLayerAdaptor* _motionWorkLayer = nullptr;
 
+static std::uint64_t nextEmoteManagerId()
+{
+    static std::atomic<std::uint64_t> next{0};
+    return next.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+static std::uint64_t emoteResourceId(const ttstr& placedPath)
+{
+    // Salted fingerprints correlate the same canonical resource across managers
+    // during one process run, without recording a path or retaining a path table.
+    // They are diagnostic identifiers, not an integrity/security primitive.
+    static const std::array<md5_byte_t, 16> salt = [] {
+        std::array<md5_byte_t, 16> value{};
+        TVPGetRandomBits128(value.data());
+        return value;
+    }();
+    md5_state_t state;
+    md5_init(&state);
+    md5_append(&state, salt.data(), static_cast<int>(salt.size()));
+    md5_append(&state, reinterpret_cast<const md5_byte_t*>(placedPath.c_str()),
+               placedPath.length() * sizeof(tjs_char));
+    md5_byte_t digest[16];
+    md5_finish(&state, digest);
+    std::uint64_t id = 0;
+    for (int i = 0; i < 8; ++i) id = (id << 8) | digest[i];
+    return id;
+}
+
+static void recordEmoteCacheEvent(const char* action, const EmoteResourceDiagnostics& diagnostic,
+                                 std::size_t entries, std::uint64_t resourceId = 0)
+{
+    static thread_local Uint64 lastReportAt = 0;
+    static thread_local Uint64 suppressed = 0;
+    const Uint64 now = SDL_GetTicksNS();
+    if (lastReportAt && now - lastReportAt < 1000000000ULL) {
+        ++suppressed;
+        return;
+    }
+    try {
+        TVPConsoleLog("emote.resourceCache action=%s managerId=%llu resourceId=%016llx "
+                      "entries=%llu loads=%llu cacheHits=%llu cacheMisses=%llu failures=%llu "
+                      "unloads=%llu unloadAlls=%llu clearCacheCalls=%llu suppressed=%llu",
+                      action, static_cast<unsigned long long>(diagnostic.managerId),
+                      static_cast<unsigned long long>(resourceId),
+                      static_cast<unsigned long long>(entries),
+                      static_cast<unsigned long long>(diagnostic.loads),
+                      static_cast<unsigned long long>(diagnostic.hits),
+                      static_cast<unsigned long long>(diagnostic.misses),
+                      static_cast<unsigned long long>(diagnostic.failures),
+                      static_cast<unsigned long long>(diagnostic.unloads),
+                      static_cast<unsigned long long>(diagnostic.unloadAlls),
+                      static_cast<unsigned long long>(diagnostic.clearCacheCalls),
+                      static_cast<unsigned long long>(suppressed));
+    } catch (...) {
+        // Logging must never change resource lifetime or load behavior.
+    }
+    lastReportAt = now;
+    suppressed = 0;
+}
+
 // Keep long scene/resource stalls identifiable without logging every animation
 // update. Durations include any blocking work; no asset paths or script values
 // are written to the log. Resource loads and play calls each log at most once/s.
 static void recordSlowEmoteOperation(bool resourceLoad, Uint64 started,
                                      Uint64 fileLoadNS = 0, Uint64 rootNS = 0,
-                                     bool cacheHit = false)
+                                     bool cacheHit = false,
+                                     const EmoteResourceDiagnostics* diagnostic = nullptr,
+                                     std::uint64_t resourceId = 0, std::size_t entries = 0,
+                                     bool rootRequested = true)
 {
     const Uint64 finished = SDL_GetTicksNS();
     const Uint64 wallNS = finished - started;
@@ -41,13 +109,27 @@ static void recordSlowEmoteOperation(bool resourceLoad, Uint64 started,
     }
     try {
         TVPConsoleLog("emote.slowOperation operation=%s wallMS=%.3f fileLoadMS=%.3f "
-                      "rootMS=%.3f cacheHit=%d suppressed=%llu suppressedPeakWallMS=%.3f",
+                      "rootMS=%.3f cacheHit=%d suppressed=%llu suppressedPeakWallMS=%.3f "
+                      "rootRequested=%d managerId=%llu resourceId=%016llx entries=%llu "
+                      "loads=%llu cacheHits=%llu cacheMisses=%llu failures=%llu "
+                      "unloads=%llu unloadAlls=%llu clearCacheCalls=%llu",
                       resourceLoad ? "resourceLoad" : "play",
                       static_cast<double>(wallNS) / 1000000.0,
                       static_cast<double>(fileLoadNS) / 1000000.0,
                       static_cast<double>(rootNS) / 1000000.0, cacheHit ? 1 : 0,
                       static_cast<unsigned long long>(state.suppressed),
-                      static_cast<double>(state.suppressedPeakNS) / 1000000.0);
+                      static_cast<double>(state.suppressedPeakNS) / 1000000.0,
+                      resourceLoad && rootRequested ? 1 : 0,
+                      static_cast<unsigned long long>(diagnostic ? diagnostic->managerId : 0),
+                      static_cast<unsigned long long>(resourceId),
+                      static_cast<unsigned long long>(entries),
+                      static_cast<unsigned long long>(diagnostic ? diagnostic->loads : 0),
+                      static_cast<unsigned long long>(diagnostic ? diagnostic->hits : 0),
+                      static_cast<unsigned long long>(diagnostic ? diagnostic->misses : 0),
+                      static_cast<unsigned long long>(diagnostic ? diagnostic->failures : 0),
+                      static_cast<unsigned long long>(diagnostic ? diagnostic->unloads : 0),
+                      static_cast<unsigned long long>(diagnostic ? diagnostic->unloadAlls : 0),
+                      static_cast<unsigned long long>(diagnostic ? diagnostic->clearCacheCalls : 0));
     } catch (...) {
         // Diagnostics must not make an otherwise successful operation fail.
     }
@@ -81,6 +163,8 @@ static emotemotionref* findMotionRefRecursive(emotemotionref* motion, const char
 
 ResourceManager::ResourceManager(iTJSDispatch2* kagWindow, tjs_int cacheSize)
 {
+    _diagnostics.managerId = nextEmoteManagerId();
+    recordEmoteCacheEvent("create", _diagnostics, 0);
     // window info
     tjs_int sWidth = 1280, sHeight = 720;
     if (kagWindow != nullptr)
@@ -93,7 +177,7 @@ ResourceManager::ResourceManager(iTJSDispatch2* kagWindow, tjs_int cacheSize)
         _kagWindow = kagWindow;
     }
     // 放这里来吧，省得init时啥也没有
-    if (_motionWorkLayer == nullptr)
+    if (_motionWorkLayer == nullptr && kagWindow != nullptr)
     {
         // kag.poolLayer作为父类
         tTJSVariant baseLayer;
@@ -119,9 +203,17 @@ ResourceManager::ResourceManager(iTJSDispatch2* kagWindow, tjs_int cacheSize)
 }
 ResourceManager::~ResourceManager()
 {
-    unloadAll();
+    unloadAllInternal("destroy");
 }
 tTJSVariant ResourceManager::load(tTJSString path)
+{
+    return loadInternal(path, true);
+}
+void ResourceManager::ensureLoaded(tTJSString path)
+{
+    loadInternal(path, false);
+}
+tTJSVariant ResourceManager::loadInternal(tTJSString path, bool materializeRoot)
 {
     const Uint64 started = SDL_GetTicksNS();
     ttstr trimPath;
@@ -129,28 +221,45 @@ tTJSVariant ResourceManager::load(tTJSString path)
         trimPath = path.SubString(9, path.length() - 9);
     else
         trimPath = path;
-    auto rst = cacheData.find(TVPGetPlacedPath(trimPath));
-    if (rst != cacheData.end())
-    {
-        // A cached file still materializes the root TJS object tree.
-        const Uint64 rootStarted = SDL_GetTicksNS();
-        auto root = rst->second->root();
-        recordSlowEmoteOperation(true, started, 0, SDL_GetTicksNS() - rootStarted, true);
+    const ttstr placedPath = TVPGetPlacedPath(trimPath);
+    const std::uint64_t resourceId = emoteResourceId(placedPath);
+    ++_diagnostics.loads;
+    auto rst = cacheData.find(placedPath);
+    const bool cacheHit = rst != cacheData.end();
+    if (cacheHit) ++_diagnostics.hits;
+    else ++_diagnostics.misses;
+    Uint64 fileLoadNS = 0;
+    Uint64 rootNS = 0;
+    try {
+        emotefile* file = cacheHit ? rst->second : nullptr;
+        if (!file) {
+            auto pending = std::make_unique<emotefile>();
+            pending->setSeed(_decryptkey);
+            pending->setFun(_decryptClo);
+            const Uint64 fileLoadStarted = SDL_GetTicksNS();
+            const bool loaded = pending->load(trimPath);
+            fileLoadNS = SDL_GetTicksNS() - fileLoadStarted;
+            if (!loaded)
+                TVPThrowExceptionMessage(TJS_N("Unable to load Emote resource"));
+            auto inserted = cacheData.emplace(placedPath, pending.get());
+            file = inserted.first->second;
+            if (inserted.second) pending.release();
+        }
+        tTJSVariant root;
+        if (materializeRoot) {
+            // Script callers retain the contract of a fresh, mutable root tree.
+            const Uint64 rootStarted = SDL_GetTicksNS();
+            root = file->root();
+            rootNS = SDL_GetTicksNS() - rootStarted;
+        }
+        recordSlowEmoteOperation(true, started, fileLoadNS, rootNS, cacheHit,
+                                 &_diagnostics, resourceId, cacheData.size(), materializeRoot);
         return root;
+    } catch (...) {
+        ++_diagnostics.failures;
+        recordEmoteCacheEvent("loadFailed", _diagnostics, cacheData.size(), resourceId);
+        throw;
     }
-    emotefile* file = new emotefile();
-    file->setSeed(_decryptkey);
-    file->setFun(_decryptClo);
-    const Uint64 fileLoadStarted = SDL_GetTicksNS();
-    file->load(trimPath);
-    const Uint64 fileLoadNS = SDL_GetTicksNS() - fileLoadStarted;
-
-    // motionKey是唯一可区分的表示符，我们用其作为标志
-    cacheData.insert(std::pair<ttstr, emotefile*>(TVPGetPlacedPath(trimPath), file));
-    const Uint64 rootStarted = SDL_GetTicksNS();
-    auto root = file->root();
-    recordSlowEmoteOperation(true, started, fileLoadNS, SDL_GetTicksNS() - rootStarted);
-    return root;
 }
 void ResourceManager::unload(tTJSString path)
 {
@@ -159,26 +268,39 @@ void ResourceManager::unload(tTJSString path)
         trimPath = path.SubString(9, path.length() - 9);
     else
         trimPath = path;
-    auto it = cacheData.find(TVPGetPlacedPath(trimPath));
+    const ttstr placedPath = TVPGetPlacedPath(trimPath);
+    auto it = cacheData.find(placedPath);
     if (it != cacheData.end())
     {
         if (it->second != nullptr)
             delete it->second;
         cacheData.erase(it);
+        ++_diagnostics.unloads;
     }
+    recordEmoteCacheEvent("unload", _diagnostics, cacheData.size(), emoteResourceId(placedPath));
 }
 void ResourceManager::unloadAll()
 {
+    unloadAllInternal("unloadAll");
+}
+void ResourceManager::unloadAllInternal(const char* diagnosticAction)
+{
+    ++_diagnostics.unloadAlls;
+    _diagnostics.unloads += cacheData.size();
     for (auto item : cacheData)
     {
         if (item.second != nullptr)
             delete item.second;
     }
     cacheData.clear();
+    recordEmoteCacheEvent(diagnosticAction, _diagnostics, 0);
 }
 void ResourceManager::clearCache()
 {
-    
+    // There is no separate unused-resource cache; loaded files remain live until
+    // unload/unloadAll. Preserve that contract instead of invalidating players.
+    ++_diagnostics.clearCacheCalls;
+    recordEmoteCacheEvent("clearCache", _diagnostics, cacheData.size());
 }
 emotefile* ResourceManager::GetPlayerByName(const tTJSString& name)
 {
@@ -1230,42 +1352,7 @@ tTJSVariant EmotePlayer::getVariableFrameList(tTJSString name)
 {
     if (emtEngine._mainfile != nullptr)
     {
-        iTJSDispatch2* root = emtEngine._mainfile->root().AsObject();
-        tTJSVariant itm;
-        if (TJS_FAILED(root->PropGet(0, TJS_N("metadata"), NULL, &itm, root)))
-        {
-            TVPConsoleLog("emotefile donot contain metadata");
-            return tTJSVariant();
-        }
-        root->Release();
-        root = itm.AsObject();
-        if (TJS_FAILED(root->PropGet(0, TJS_N("variableList"), NULL, &itm, root)))
-        {
-            TVPConsoleLog("emotefile donot contain variableList");
-            return tTJSVariant();
-        }
-        root->Release();
-        root = itm.AsObjectThis();
-
-        tTJSVariant retNeed;
-        for (tjs_uint32 i = 0; i < emtEngine._mainfile->_metadata->_varList.size(); i++)
-        {
-            tTJSVariant varItem;
-            if (TJS_FAILED(root->PropGetByNum(TJS_MEMBERMUSTEXIST, i, &varItem, root)))
-                break;
-            iTJSDispatch2* rev = varItem.AsObjectThisNoAddRef();
-            tTJSVariant labelname;
-            if (TJS_FAILED(rev->PropGet(0, TJS_N("label"), NULL, &labelname, rev)))
-                continue;
-            if (labelname.Type() != tvtString || ttstr(labelname) != name)
-                continue;
-            if (TJS_FAILED(rev->PropGet(0, TJS_N("frameList"), NULL, &retNeed, rev)))
-                continue;
-            break;
-        }
-
-        root->Release();
-        return retNeed;
+        return emtEngine._mainfile->readVariableFrameList(name);
     }
     else
     {
