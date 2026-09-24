@@ -88,7 +88,11 @@ tjs_int tTJSNI_Bitmap::GetMaskPixel(tjs_int x, tjs_int y) const
     if (!Bitmap)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
 
-    return (Bitmap->GetPoint(x, y) & 0xff000000) >> 24;
+    if (x < 0 || y < 0 || x >= (tjs_int)Bitmap->GetWidth() ||
+        y >= (tjs_int)Bitmap->GetHeight())
+        TVPThrowExceptionMessage(TVPOutOfRectangle);
+
+    return Bitmap->GetTexture()->GetPointAlpha(x, y);
 }
 //----------------------------------------------------------------------
 void tTJSNI_Bitmap::SetMaskPixel(tjs_int x, tjs_int y, tjs_int mask)

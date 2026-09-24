@@ -509,11 +509,11 @@ struct MetalRenderBackend::Impl
         TVPRecordMetalRenderEncoder();
         return encoder;
     }
-    id<MTLRenderCommandEncoder> MeshPass(id<MTLTexture> texture)
+    id<MTLRenderCommandEncoder> MeshPass(id<MTLTexture> texture, bool clear = false)
     {
         EndOrdinary();
-        if (activeMeshEncoder && activeMeshTarget == texture) return activeMeshEncoder;
-        activeMeshEncoder = Pass(texture, false);
+        if (!clear && activeMeshEncoder && activeMeshTarget == texture) return activeMeshEncoder;
+        activeMeshEncoder = Pass(texture, clear);
         activeMeshTarget = texture;
         return activeMeshEncoder;
     }
@@ -849,7 +849,13 @@ void* MetalRenderBackend::GetTargetTexture(void* h)
 }
 void MetalRenderBackend::ClearTarget(bool clear)
 {
-    @autoreleasepool { if (clear && impl_->current) [impl_->Pass(impl_->current->texture, true) endEncoding]; }
+    @autoreleasepool {
+        // Keep the clear and following mesh draws in the same render pass. In
+        // particular, Emote masks otherwise store a cleared full-size texture
+        // only to load it again immediately for their geometry. Blits, compute,
+        // drawing to another target and submission still close it via EndMesh.
+        if (clear && impl_->current) impl_->MeshPass(impl_->current->texture, true);
+    }
 }
 uint8_t* MetalRenderBackend::LockTarget(void* h, int& pitch)
 {

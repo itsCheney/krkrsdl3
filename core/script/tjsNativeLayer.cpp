@@ -2910,7 +2910,11 @@ tjs_int tTJSNI_BaseLayer::GetMaskPixel(tjs_int x, tjs_int y) const
     if (!MainImage)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
 
-    return (MainImage->GetPoint(x, y) & 0xff000000) >> 24;
+    if (x < 0 || y < 0 || x >= (tjs_int)MainImage->GetWidth() ||
+        y >= (tjs_int)MainImage->GetHeight())
+        TVPThrowExceptionMessage(TVPOutOfRectangle);
+
+    return MainImage->GetTexture()->GetPointAlpha(x, y);
 }
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::SetMaskPixel(tjs_int x, tjs_int y, tjs_int mask)
@@ -3245,20 +3249,19 @@ bool tTJSNI_BaseLayer::_HitTestNoVisibleCheck(tjs_int x, tjs_int y)
                 if (HitThreshold <= 0)
                     return true;
 
-                tjs_uint32 cl;
+                tjs_uint32 alpha;
                 if (MainImage->GetBPP() == 32)
                 {
-                    // Read the current render texture, not the stale bitmap side.
-                    // GPU Layer textures satisfy this as a 1x1 region readback;
-                    // software textures remain a direct memory read.
-                    cl = MainImage->GetTexture()->GetPoint(px, py);
+                    // RGB-only drawing leaves cached hit-test alpha valid.
+                    // Uncached alpha still reads the current render texture.
+                    alpha = MainImage->GetTexture()->GetPointAlpha(px, py);
                 }
                 else
                 {
                     // 8bpp 掩码纹理：固定软件驻留，GetPoint 零成本
-                    cl = MainImage->GetPoint(px, py);
+                    alpha = MainImage->GetPoint(px, py) >> 24;
                 }
-                if ((tjs_int)(cl >> 24) < HitThreshold)
+                if ((tjs_int)alpha < HitThreshold)
                     return false;
                 else
                     return true;

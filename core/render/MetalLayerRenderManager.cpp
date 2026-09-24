@@ -53,17 +53,23 @@ class LayerTexture final : public iTVPTexture2D {
         int x = -1, y = -1;
         uint32_t value = 0;
         bool valid = false;
+        bool alphaValid = false;
     };
     static constexpr size_t kPointCacheSize = 32;
     PointCacheEntry pointCache[kPointCacheSize];
     size_t pointCacheNext = 0;
-    void InvalidatePointCache() {
-        for(auto& entry:pointCache) entry.valid=false;
-        pointCacheNext=0;
+    void InvalidatePointCache(const tTVPRect* written=nullptr,bool preserveAlpha=false) {
+        for(auto& entry:pointCache) {
+            if(written && (entry.x<written->left || entry.x>=written->right ||
+                           entry.y<written->top || entry.y>=written->bottom)) continue;
+            entry.valid=false;
+            if(!preserveAlpha) entry.alphaValid=false;
+        }
+        if(!written && !preserveAlpha) pointCacheNext=0;
     }
-    bool FindPointCache(int x,int y,uint32_t& value) {
+    bool FindPointCache(int x,int y,uint32_t& value,bool alphaOnly) {
         for(const auto& entry:pointCache) {
-            if(entry.valid && entry.x==x && entry.y==y) {
+            if((alphaOnly ? entry.alphaValid : entry.valid) && entry.x==x && entry.y==y) {
                 value=entry.value;
                 ++session->stats.pointCacheHits;
                 return true;
@@ -73,17 +79,24 @@ class LayerTexture final : public iTVPTexture2D {
         return false;
     }
     void StorePointCache(int x,int y,uint32_t value) {
+        // Refresh alpha-only entries in place, avoiding duplicate coordinates
+        // whose old alpha could otherwise survive a later RGB query.
+        for(auto& entry:pointCache) {
+            if(entry.x==x && entry.y==y) {
+                entry.value=value; entry.valid=entry.alphaValid=true; return;
+            }
+        }
         auto& entry=pointCache[pointCacheNext++ % kPointCacheSize];
-        entry.x=x; entry.y=y; entry.value=value; entry.valid=true;
+        entry.x=x; entry.y=y; entry.value=value; entry.valid=entry.alphaValid=true;
     }
     size_t Bytes() const { return size_t(GetPitch())*Height; }
     // Writers report what they touched so an upload carries only those rows.
     // Callers that cannot describe their writes report the whole surface.
     void MarkDirty(const tTVPRect& requested) {
-        InvalidatePointCache();
         tTVPRect r(std::max(0,requested.left),std::max(0,requested.top),
                    std::min(int(Width),requested.right),std::min(int(Height),requested.bottom));
         if(r.get_width()<=0 || r.get_height()<=0) return;
+        InvalidatePointCache(&r);
         if(!dirty) { damage=r; dirty=true; return; }
         damage.left=std::min(damage.left,r.left); damage.top=std::min(damage.top,r.top);
         damage.right=std::max(damage.right,r.right); damage.bottom=std::max(damage.bottom,r.bottom);
@@ -156,6 +169,13 @@ public:
     void MarkCPUModified(const tTVPRect& written) override { Read(TVPLayerReadbackSource::Fallback); MarkDirty(written); }
     void InvalidateCPUCache() override {
         InvalidatePointCache();
+        DiscardCPUCache();
+    }
+    void InvalidateCPUCacheRegion(const tTVPRect& written,bool preserveAlpha=false) {
+        InvalidatePointCache(&written,preserveAlpha);
+        DiscardCPUCache();
+    }
+    void DiscardCPUCache() {
         // The GPU now owns these pixels, so no pre-lease CPU damage survives.
         dirty=false; leaseHadDamage=false;
         if(valid) { valid=false; session->stats.cpuCacheBytes-=Bytes(); }
@@ -208,6 +228,9 @@ public:
             const auto* source=pixels.data()+size_t(damage.top)*GetPitch()+size_t(damage.left)*bpp;
             if(!session->backend->UpdateLayerTexture(handle,source,GetPitch(),Rect(damage)))
                 throw std::runtime_error("GPU Layer upload failed");
+            // A caller may query then modify an outstanding CPU write pointer.
+            // Samples taken while dirty cannot outlive uploading that damage.
+            InvalidatePointCache(&damage);
             session->stats.uploadedBytes+=size_t(damage.get_width())*bpp*damage.get_height();
             dirty=false; leaseHadDamage=false;
         }
@@ -256,18 +279,23 @@ public:
         }
         if(!session->backend->UpdateLayerTexture(handle,source,pitch,Rect(r)))
             throw std::runtime_error("GPU Layer update failed");
-        session->stats.uploadedBytes+=size_t(bytes)*r.get_height(); InvalidateCPUCache();
+        session->stats.uploadedBytes+=size_t(bytes)*r.get_height(); InvalidateCPUCacheRegion(r);
     }
-    uint32_t GetPoint(int x,int y) override {
+    uint32_t ReadPoint(int x,int y,bool alphaOnly) {
         if(x<0 || y<0 || x>=Width || y>=Height) return 0;
         const int bpp=format==TVPTextureFormat::Gray ? 1 : 4;
         if(valid) {
             const auto* p=pixels.data()+size_t(y)*GetPitch()+size_t(x)*bpp;
-            if(format==TVPTextureFormat::Gray) return *p;
-            uint32_t v; std::memcpy(&v,p,4); return v;
+            uint32_t v=0;
+            if(format==TVPTextureFormat::Gray) v=*p;
+            else std::memcpy(&v,p,4);
+            // Keep queried pixels when a later GPU operation discards the full
+            // CPU mirror but leaves this pixel (or its alpha) unchanged.
+            StorePointCache(x,y,v);
+            return v;
         }
         uint32_t cached=0;
-        if(FindPointCache(x,y,cached)) return cached;
+        if(FindPointCache(x,y,cached,alphaOnly)) return cached;
         if(handle && session->backend) {
             std::vector<uint8_t> sample; int pitch=0;
             const TVPLayerRect region{x,y,x+1,y+1};
@@ -289,6 +317,8 @@ public:
         if(format==TVPTextureFormat::Gray) return p[x];
         uint32_t v; std::memcpy(&v,p+x*4,4); return v;
     }
+    uint32_t GetPoint(int x,int y) override { return ReadPoint(x,y,false); }
+    uint32_t GetPointAlpha(int x,int y) override { return ReadPoint(x,y,true)>>24; }
     void SetPoint(int x,int y,uint32_t color) override {
         if(x<0 || y<0 || x>=Width || y>=Height) return;
         tTVPRect r(x,y,x+1,y+1); Update(&color,format,format==TVPTextureFormat::Gray?1:4,r);
@@ -405,7 +435,7 @@ public:
                     source1->GetTextureHandle(),Rect(src1),
                     source2->GetTextureHandle(),Rect(src2)))
                 return Reject(TVPLayerGPURejectReason::BackendFailure);
-            t->InvalidateCPUCache(); ++session->stats.gpuOperations; return true;
+            t->InvalidateCPUCacheRegion(dst); ++session->stats.gpuOperations; return true;
         }
         if(!method->DescribeGpuOperation(op)) return RejectMethod(TVPLayerGPURejectReason::UnsupportedMethod,method);
         if(stretch<0 || stretch>2) return Reject(TVPLayerGPURejectReason::UnsupportedStretch);
@@ -444,7 +474,17 @@ public:
         void* sh=source?source->GetTextureHandle():nullptr;
         if(!session->backend->OperateLayerRect(op,t->GetTextureHandle(),Rect(dst),sh,Rect(src),stretch==0?0:1))
             return Reject(TVPLayerGPURejectReason::BackendFailure);
-        t->InvalidateCPUCache(); ++session->stats.gpuOperations; return true;
+        // Only plain HDA blending preserves destination alpha. The _d/_a
+        // formulas can change it even if HOLD_ALPHA is also set.
+        const bool plainHDA=(op.flags&TVP_LAYER_HOLD_ALPHA) &&
+            !(op.flags&(TVP_LAYER_DEST_ALPHA|TVP_LAYER_DEST_PREMULTIPLIED));
+        const bool preservesAlpha=op.kind==TVPLayerOperationKind::CopyColor ||
+            op.kind==TVPLayerOperationKind::FillColor ||
+            (plainHDA && (op.kind==TVPLayerOperationKind::Alpha ||
+                          op.kind==TVPLayerOperationKind::ConstAlpha ||
+                          op.kind==TVPLayerOperationKind::ColorMap ||
+                          op.kind==TVPLayerOperationKind::FillBlend));
+        t->InvalidateCPUCacheRegion(dst,preservesAlpha); ++session->stats.gpuOperations; return true;
     }
     void OperateRect(iTVPRenderMethod* method,iTVPTexture2D* target,iTVPTexture2D* reference,const tTVPRect& dst,const tRenderTexRectArray& inputs) override {
         if(GPU(method,target,reference,dst,inputs)) return;

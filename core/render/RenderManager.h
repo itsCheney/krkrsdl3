@@ -60,6 +60,9 @@ public:
                         int pitch,
                         const tTVPRect& rc) = 0;
     virtual uint32_t GetPoint(int x, int y) = 0;
+    // Alpha-only readers need not invalidate their cache after RGB-only writes.
+    // Backends may cache alpha separately, but must return the current value.
+    virtual uint32_t GetPointAlpha(int x, int y) { return GetPoint(x, y) >> 24; }
     virtual void SetPoint(int x, int y, uint32_t clr) = 0;
     virtual bool IsStatic() = 0; // aka. is readonly
     virtual bool IsOpaque() = 0;

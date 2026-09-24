@@ -17,6 +17,44 @@ namespace emoteplayer
 iTJSDispatch2* ResourceManager::_kagWindow = nullptr;
 static SeparateLayerAdaptor* _motionWorkLayer = nullptr;
 
+// Keep long scene/resource stalls identifiable without logging every animation
+// update. Durations include any blocking work; no asset paths or script values
+// are written to the log. Resource loads and play calls each log at most once/s.
+static void recordSlowEmoteOperation(bool resourceLoad, Uint64 started,
+                                     Uint64 fileLoadNS = 0, Uint64 rootNS = 0,
+                                     bool cacheHit = false)
+{
+    const Uint64 finished = SDL_GetTicksNS();
+    const Uint64 wallNS = finished - started;
+    if (wallNS < 50000000ULL) return;
+    struct ReportState {
+        Uint64 lastReportAt = 0;
+        Uint64 suppressed = 0;
+        Uint64 suppressedPeakNS = 0;
+    };
+    static thread_local ReportState states[2];
+    auto &state = states[resourceLoad ? 0 : 1];
+    if (state.lastReportAt && finished - state.lastReportAt < 1000000000ULL) {
+        ++state.suppressed;
+        state.suppressedPeakNS = std::max(state.suppressedPeakNS, wallNS);
+        return;
+    }
+    try {
+        TVPConsoleLog("emote.slowOperation operation=%s wallMS=%.3f fileLoadMS=%.3f "
+                      "rootMS=%.3f cacheHit=%d suppressed=%llu suppressedPeakWallMS=%.3f",
+                      resourceLoad ? "resourceLoad" : "play",
+                      static_cast<double>(wallNS) / 1000000.0,
+                      static_cast<double>(fileLoadNS) / 1000000.0,
+                      static_cast<double>(rootNS) / 1000000.0, cacheHit ? 1 : 0,
+                      static_cast<unsigned long long>(state.suppressed),
+                      static_cast<double>(state.suppressedPeakNS) / 1000000.0);
+    } catch (...) {
+        // Diagnostics must not make an otherwise successful operation fail.
+    }
+    state.lastReportAt = finished;
+    state.suppressed = state.suppressedPeakNS = 0;
+}
+
 static const emoterect* findShapeAreaRecursive(const emotemotionref* motion, const char* name)
 {
     if (!motion) return nullptr;
@@ -85,6 +123,7 @@ ResourceManager::~ResourceManager()
 }
 tTJSVariant ResourceManager::load(tTJSString path)
 {
+    const Uint64 started = SDL_GetTicksNS();
     ttstr trimPath;
     if (path.StartsWith(TJS_N("lzfs://./")))
         trimPath = path.SubString(9, path.length() - 9);
@@ -93,16 +132,25 @@ tTJSVariant ResourceManager::load(tTJSString path)
     auto rst = cacheData.find(TVPGetPlacedPath(trimPath));
     if (rst != cacheData.end())
     {
-        return rst->second->root();
+        // A cached file still materializes the root TJS object tree.
+        const Uint64 rootStarted = SDL_GetTicksNS();
+        auto root = rst->second->root();
+        recordSlowEmoteOperation(true, started, 0, SDL_GetTicksNS() - rootStarted, true);
+        return root;
     }
     emotefile* file = new emotefile();
     file->setSeed(_decryptkey);
     file->setFun(_decryptClo);
+    const Uint64 fileLoadStarted = SDL_GetTicksNS();
     file->load(trimPath);
+    const Uint64 fileLoadNS = SDL_GetTicksNS() - fileLoadStarted;
 
     // motionKey是唯一可区分的表示符，我们用其作为标志
     cacheData.insert(std::pair<ttstr, emotefile*>(TVPGetPlacedPath(trimPath), file));
-    return file->root();
+    const Uint64 rootStarted = SDL_GetTicksNS();
+    auto root = file->root();
+    recordSlowEmoteOperation(true, started, fileLoadNS, SDL_GetTicksNS() - rootStarted);
+    return root;
 }
 void ResourceManager::unload(tTJSString path)
 {
@@ -598,6 +646,7 @@ void EmotePlayer::unserialize(tTJSVariant data)
 }
 void EmotePlayer::play(tTJSString name, int flag)
 {
+    const Uint64 started = SDL_GetTicksNS();
     if (emtEngine._mainfile != nullptr && !isMotion) // motionKey的启动模式
     {
         // motion
@@ -678,6 +727,7 @@ void EmotePlayer::play(tTJSString name, int flag)
         _allplaying = true;
         isSelfClear = false;
     }
+    recordSlowEmoteOperation(false, started);
 }
 void EmotePlayer::initPhysics(tTJSVariant metadata)
 {
