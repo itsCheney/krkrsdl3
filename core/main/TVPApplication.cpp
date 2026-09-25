@@ -26,6 +26,7 @@
 #include "TVPCompositor.h"
 #include "KRMovieOverlay.h"
 #include "tjsNativeVideoOverlay.h"
+#include "emoteplayer/emoteresourcecache.h"
 
 #include "TVPStorage.h"
 #include "TVPColor.h"
@@ -35,6 +36,16 @@
 tTVPApplication* Application = NULL;
 static tTJSCriticalSection _NoMemCallBackCS;
 static void* _reservedMem = malloc(1024 * 1024 * 4); // 4M reserved mem
+
+struct tTVPClearEmoteResourceCacheCallback : public tTVPCompactEventCallbackIntf
+{
+    void OnCompact(tjs_int level) override
+    {
+        if (level >= TVP_COMPACT_LEVEL_MINIMIZE)
+            emoteplayer::ClearSharedEmoteResourceCache();
+    }
+};
+static tTVPClearEmoteResourceCacheCallback TVPClearEmoteResourceCacheCallback;
 
 ttstr TVPGetErrorDialogTitle()
 {
@@ -84,10 +95,14 @@ tTVPApplication::tTVPApplication()
 tTVPApplication::~tTVPApplication()
 {
     delete image_load_thread_;
+    // Also cover partially initialized sessions that never reach OnExit.
+    emoteplayer::ClearSharedEmoteResourceCache();
 }
 
 bool tTVPApplication::StartApplication()
 {
+    emoteplayer::ClearSharedEmoteResourceCache();
+    TVPAddCompactEventHook(&TVPClearEmoteResourceCacheCallback, true);
     TVPTerminated = false;
     TVPTerminateOnWindowClose = true;
     TVPTerminateOnNoWindowStartup = true;
@@ -209,6 +224,8 @@ void tTVPApplication::OnExit()
     krkrsdl3::TVPClearAllTexture();
     iTVPTexture2D::RecycleProcess();
     TVPProjectDirSelected = false;
+    // Save callbacks and script finalizers may load resources during shutdown.
+    emoteplayer::ClearSharedEmoteResourceCache();
 }
 
 void tTVPApplication::LoadImageRequest(class iTJSDispatch2* owner,

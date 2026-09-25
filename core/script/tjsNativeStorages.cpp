@@ -5,6 +5,7 @@
 #include "TVPMsg.h"
 #include "Platform.h"
 #include "TextStream.h"
+#include "emoteplayer/emoteresourcecache.h"
 
 //---------------------------------------------------------------------------
 // tTJSNC_Storages
@@ -150,6 +151,7 @@ TJS_END_NATIVE_STATIC_METHOD_DECL(/*func. name*/ chopStorageExt)
 //----------------------------------------------------------------------
 TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ clearArchiveCache)
 {
+    emoteplayer::ClearSharedEmoteResourceCache();
     TVPClearArchiveCache();
     return TJS_S_OK;
 }

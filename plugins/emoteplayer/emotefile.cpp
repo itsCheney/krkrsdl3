@@ -1,6 +1,8 @@
 #include "emotefile.h"
+#include "emoteresourcecache.h"
 
 #include "TVPStorage.h"
+#include "XP3Archive.h"
 #include "UtilStreams.h"
 #include "Platform.h"
 #include "tjsArray.h"
@@ -12,6 +14,8 @@
 
 #include <sstream>
 #include <algorithm>
+#include <limits>
+#include <stdexcept>
 
 struct EMoteCTX
 {
@@ -299,6 +303,86 @@ using namespace PSB;
 
 namespace emoteplayer
 {
+// Only decoded CPU data is shared. Runtime variables, motion references, script
+// objects, decoded icon pixels and GPU textures remain owned by each emotefile.
+struct EmoteDecodedResource
+{
+    std::vector<uint8_t> bytes;
+    PSB::PSBHeader header{};
+    std::vector<uint32_t> stringsOffset, namesData, charset, nameIndexes;
+    std::vector<std::string> namesCache;
+    std::vector<uint32_t> chunkOffsets, chunkLengths, extraChunkOffsets, extraChunkLengths;
+
+    size_t ByteCost() const
+    {
+        size_t cost = sizeof(*this) + bytes.capacity() + namesCache.capacity() * sizeof(std::string);
+        for (const auto* table : {&stringsOffset, &namesData, &charset, &nameIndexes,
+                                  &chunkOffsets, &chunkLengths, &extraChunkOffsets, &extraChunkLengths})
+            cost += table->capacity() * sizeof(uint32_t);
+        for (const auto& name : namesCache) cost += name.capacity() + 1;
+        return cost;
+    }
+};
+
+class EmoteReadOnlyStream final : public tTJSBinaryStream
+{
+    std::shared_ptr<const EmoteDecodedResource> resource;
+    size_t position = 0;
+public:
+    explicit EmoteReadOnlyStream(std::shared_ptr<const EmoteDecodedResource> value)
+        : resource(std::move(value)) {}
+    tjs_uint64 Seek(tjs_int64 offset, tjs_int whence) override
+    {
+        tjs_int64 base = 0;
+        if (whence == TJS_BS_SEEK_CUR) base = static_cast<tjs_int64>(position);
+        else if (whence == TJS_BS_SEEK_END) base = static_cast<tjs_int64>(resource->bytes.size());
+        else if (whence != TJS_BS_SEEK_SET) return position;
+        // Like tTVPMemoryStream, a failed seek leaves the cursor unchanged.
+        if (offset < -base || offset > static_cast<tjs_int64>(resource->bytes.size()) - base)
+            return position;
+        position = static_cast<size_t>(base + offset);
+        return position;
+    }
+    tjs_uint Read(void* buffer, tjs_uint requested) override
+    {
+        const auto count = static_cast<tjs_uint>(std::min<size_t>(requested, resource->bytes.size() - position));
+        if (count) std::memcpy(buffer, resource->bytes.data() + position, count);
+        position += count;
+        return count;
+    }
+    tjs_uint Write(const void*, tjs_uint) override { throw std::runtime_error("Emote resource is read-only"); }
+    void SetEndOfStorage() override { throw std::runtime_error("Emote resource is read-only"); }
+    bool Flush() override { return true; }
+    tjs_uint64 GetSize() override { return resource->bytes.size(); }
+};
+
+using EmoteDecodedCache = EmoteResourceCache<std::pair<std::string, tjs_int>, EmoteDecodedResource>;
+static EmoteDecodedCache& SharedEmoteCache()
+{
+    // Explicit session/compact hooks release retention. Avoid static teardown
+    // ordering dependencies on the application's shutdown callbacks.
+    static auto* cache = new EmoteDecodedCache(64 * 1024 * 1024);
+    return *cache;
+}
+void ClearSharedEmoteResourceCache()
+{
+    SharedEmoteCache().Clear();
+}
+void InvalidateSharedEmoteResource(const std::string& canonicalPath)
+{
+    SharedEmoteCache().EraseIf([&](const auto& key) {
+        return key.first == canonicalPath ||
+            (key.first.size() > canonicalPath.size() &&
+             key.first.compare(0, canonicalPath.size(), canonicalPath) == 0 &&
+             key.first[canonicalPath.size()] == TVPArchiveDelimiter);
+    });
+}
+EmoteSharedResourceCacheStats GetSharedEmoteResourceCacheStats()
+{
+    const auto stats = SharedEmoteCache().GetStats();
+    return {stats.hits, stats.misses, stats.evictions, stats.retainedBytes, stats.entries, stats.generation};
+}
+
 #pragma region Base
 
 emoteframe::emoteframe(emotefile* filePtr, uint32_t startOffset) : _filePtr(filePtr)
@@ -1606,10 +1690,81 @@ void emotefile::setFun(tTJSVariantClosure decryptClo)
 {
     _decryptClo = decryptClo;
 }
+void emotefile::LoadDecodedResource(std::shared_ptr<const EmoteDecodedResource> resource)
+{
+    auto stream = std::make_unique<EmoteReadOnlyStream>(resource);
+    _header = resource->header;
+    stringsOffset = resource->stringsOffset;
+    namesData = resource->namesData;
+    charset = resource->charset;
+    nameIndexes = resource->nameIndexes;
+    namesCache = resource->namesCache;
+    chunkOffsets = resource->chunkOffsets;
+    chunkLengths = resource->chunkLengths;
+    extraChunkOffsets = resource->extraChunkOffsets;
+    extraChunkLengths = resource->extraChunkLengths;
+    delete filePtr;
+    filePtr = stream.release();
+}
+std::shared_ptr<const EmoteDecodedResource> emotefile::SnapshotDecodedResource()
+{
+    const auto size = filePtr->GetSize();
+    const auto budget = SharedEmoteCache().BudgetBytes();
+    if (size > budget || size > std::numeric_limits<tjs_uint>::max()) return {};
+    auto resource = std::make_shared<EmoteDecodedResource>();
+    resource->header = _header;
+    resource->stringsOffset = stringsOffset;
+    resource->namesData = namesData;
+    resource->charset = charset;
+    resource->nameIndexes = nameIndexes;
+    resource->namesCache = namesCache;
+    resource->chunkOffsets = chunkOffsets;
+    resource->chunkLengths = chunkLengths;
+    resource->extraChunkOffsets = extraChunkOffsets;
+    resource->extraChunkLengths = extraChunkLengths;
+    if (resource->ByteCost() > budget - size) return {};
+    resource->bytes.resize(static_cast<size_t>(size));
+    const auto position = filePtr->GetPosition();
+    filePtr->SetPosition(0);
+    try {
+        filePtr->ReadBuffer(resource->bytes.data(), static_cast<tjs_uint>(size));
+    } catch (...) {
+        filePtr->SetPosition(position);
+        throw;
+    }
+    filePtr->SetPosition(position);
+    return resource;
+}
 bool emotefile::load(const ttstr& filePath)
 {
-    if (filePtr != NULL)
-        delete filePtr;
+    _sharedCacheHit = false;
+    _archiveFilterBypass = TVPHasXP3ArchiveFilters();
+    ClearAniTree();
+    delete filePtr;
+    filePtr = nullptr;
+    stringsOffset.clear(); namesData.clear(); charset.clear(); nameIndexes.clear(); namesCache.clear();
+    chunkOffsets.clear(); chunkLengths.clear(); extraChunkOffsets.clear(); extraChunkLengths.clear();
+    _header = {};
+    isKrkr = true; isMotion = false; colorType = 0; isMirror = false;
+    _screenSize = {}; _stereovisionProfile = {}; _zMax = _syncTime = 0;
+
+    // A script decrypt callback can depend on mutable state or have side
+    // effects. Always execute that path. Loose files can be changed by an open
+    // writer without another cache invalidation; only read-only archive members
+    // with deterministic seed decoding are eligible for cross-manager sharing.
+    const auto canonicalPath = TVPGetPlacedPath(filePath).AsStdString();
+    const bool cacheable = _decryptClo.Object == nullptr && !_archiveFilterBypass &&
+        canonicalPath.find(TVPArchiveDelimiter) != std::string::npos;
+    const auto key = std::make_pair(canonicalPath, _seed);
+    const auto generation = SharedEmoteCache().Generation();
+    if (cacheable) {
+        if (auto resource = SharedEmoteCache().Find(key)) {
+            LoadDecodedResource(std::move(resource));
+            _sharedCacheHit = true;
+            // Never share player variables, selection state or icon textures.
+            return GenerateAniTree();
+        }
+    }
     filePtr = TVPCreateStream(filePath);
     if (!filePtr)
         return false;
@@ -1632,6 +1787,9 @@ bool emotefile::load(const ttstr& filePath)
         if (TJS_strcasecmp(sign, "MDF") == 0)
         {
             // uncompress data
+            // The signature probe consumed five bytes for LZ4 detection. MDF
+            // stores its size after the four-byte magic, followed by data at 8.
+            filePtr->SetPosition(4);
             uLongf uncompressedSize = filePtr->ReadI32LE();
             tjs_uint8* _uncompress_buffer = new tjs_uint8[uncompressedSize];
             // compress data
@@ -1846,7 +2004,23 @@ bool emotefile::load(const ttstr& filePath)
             filePtr->ReadI8LE() - static_cast<tjs_int8>(PSB::PSBObjType::ArrayN1) + 1, filePtr);
     }
 
-    return GenerateAniTree();
+    const bool loaded = GenerateAniTree();
+    if (loaded && cacheable) {
+        try {
+            if (auto resource = SnapshotDecodedResource()) {
+                auto stream = std::make_unique<EmoteReadOnlyStream>(resource);
+                // Clearing storage caches during a reentrant load must prevent
+                // publication of the old contents after that invalidation.
+                SharedEmoteCache().Insert(key, resource, resource->ByteCost(), generation);
+                delete filePtr;
+                filePtr = stream.release();
+            }
+        } catch (const std::bad_alloc&) {
+            // Retention is optional; an otherwise successful load remains usable
+            // when the device cannot afford the shared snapshot allocation.
+        }
+    }
+    return loaded;
 }
 tTJSVariant emotefile::root()
 {
@@ -2555,6 +2729,7 @@ bool emotefile::ClearAniTree()
 {
     if (_metadata != nullptr)
         delete _metadata;
+    _metadata = nullptr;
     for (auto obj : _objects)
     {
         if (obj.second != nullptr)
@@ -2565,6 +2740,8 @@ bool emotefile::ClearAniTree()
         if (src.second != nullptr)
             delete src.second;
     }
+    _objects.clear();
+    _source.clear();
     return true;
 }
 void emotefile::updateZMax(float zMax)

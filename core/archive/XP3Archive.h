@@ -55,6 +55,9 @@ typedef tjs_int (*tTVPXP3ArchiveContentFilter)(const ttstr& filepath,
 //---------------------------------------------------------------------------
 void TVPSetXP3ArchiveExtractionFilter(tTVPXP3ArchiveExtractionFilter filter);
 void TVPSetXP3ArchiveContentFilter(tTVPXP3ArchiveContentFilter filter);
+// Filters may run script or depend on per-open context. Resource-level caches
+// must not bypass them merely because the canonical path is unchanged.
+bool TVPHasXP3ArchiveFilters();
 //---------------------------------------------------------------------------
 
 //---------------------------------------------------------------------------

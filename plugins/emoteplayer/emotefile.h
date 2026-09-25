@@ -4,6 +4,7 @@
 #include <array>
 #include <string>
 #include <random>
+#include <memory>
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -28,6 +29,7 @@ struct emoteVar // 变量
 };
 
 class emotefile;
+struct EmoteDecodedResource;
 class emoteframe
 {
 public:
@@ -418,6 +420,8 @@ public:
     void setSeed(tjs_int seed);
     void setFun(tTJSVariantClosure decryptClo);
     bool load(const ttstr& filePath);
+    bool WasSharedCacheHit() const { return _sharedCacheHit; }
+    bool BypassedSharedCacheForArchiveFilter() const { return _archiveFilterBypass; }
     tTJSVariant root();
     // Materialize only this variable's frameList, preserving PSB fields and
     // returning fresh mutable script objects on each call.
@@ -473,6 +477,10 @@ public:
     void setVariable(const std::string& name, tjs_real value);
 
 private:
+    void LoadDecodedResource(std::shared_ptr<const EmoteDecodedResource> resource);
+    std::shared_ptr<const EmoteDecodedResource> SnapshotDecodedResource();
+    bool _sharedCacheHit = false;
+    bool _archiveFilterBypass = false;
     tTJSBinaryStream* filePtr = nullptr;
     tjs_int _seed = 0;
     tTJSVariantClosure _decryptClo = NULL;

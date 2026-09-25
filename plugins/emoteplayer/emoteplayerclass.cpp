@@ -1,5 +1,6 @@
 #include "ncbind/ncbind.hpp"
 #include "emoteplayerclass.h"
+#include "emoteresourcecache.h"
 #include "tjsArray.h"
 #include "TVPStorage.h"
 #include "Platform.h"
@@ -61,9 +62,12 @@ static void recordEmoteCacheEvent(const char* action, const EmoteResourceDiagnos
         return;
     }
     try {
+        const auto shared = GetSharedEmoteResourceCacheStats();
         TVPConsoleLog("emote.resourceCache action=%s managerId=%llu resourceId=%016llx "
                       "entries=%llu loads=%llu cacheHits=%llu cacheMisses=%llu failures=%llu "
-                      "unloads=%llu unloadAlls=%llu clearCacheCalls=%llu suppressed=%llu",
+                      "unloads=%llu unloadAlls=%llu clearCacheCalls=%llu suppressed=%llu "
+                      "sharedHits=%llu sharedMisses=%llu sharedBytes=%llu "
+                      "sharedEntries=%llu sharedEvictions=%llu",
                       action, static_cast<unsigned long long>(diagnostic.managerId),
                       static_cast<unsigned long long>(resourceId),
                       static_cast<unsigned long long>(entries),
@@ -74,7 +78,12 @@ static void recordEmoteCacheEvent(const char* action, const EmoteResourceDiagnos
                       static_cast<unsigned long long>(diagnostic.unloads),
                       static_cast<unsigned long long>(diagnostic.unloadAlls),
                       static_cast<unsigned long long>(diagnostic.clearCacheCalls),
-                      static_cast<unsigned long long>(suppressed));
+                      static_cast<unsigned long long>(suppressed),
+                      static_cast<unsigned long long>(shared.hits),
+                      static_cast<unsigned long long>(shared.misses),
+                      static_cast<unsigned long long>(shared.retainedBytes),
+                      static_cast<unsigned long long>(shared.entries),
+                      static_cast<unsigned long long>(shared.evictions));
     } catch (...) {
         // Logging must never change resource lifetime or load behavior.
     }
@@ -90,7 +99,8 @@ static void recordSlowEmoteOperation(bool resourceLoad, Uint64 started,
                                      bool cacheHit = false,
                                      const EmoteResourceDiagnostics* diagnostic = nullptr,
                                      std::uint64_t resourceId = 0, std::size_t entries = 0,
-                                     bool rootRequested = true)
+                                     bool rootRequested = true, bool sharedCacheHit = false,
+                                     bool customDecrypt = false, bool archiveFilter = false)
 {
     const Uint64 finished = SDL_GetTicksNS();
     const Uint64 wallNS = finished - started;
@@ -108,11 +118,14 @@ static void recordSlowEmoteOperation(bool resourceLoad, Uint64 started,
         return;
     }
     try {
+        const auto shared = GetSharedEmoteResourceCacheStats();
         TVPConsoleLog("emote.slowOperation operation=%s wallMS=%.3f fileLoadMS=%.3f "
                       "rootMS=%.3f cacheHit=%d suppressed=%llu suppressedPeakWallMS=%.3f "
                       "rootRequested=%d managerId=%llu resourceId=%016llx entries=%llu "
                       "loads=%llu cacheHits=%llu cacheMisses=%llu failures=%llu "
-                      "unloads=%llu unloadAlls=%llu clearCacheCalls=%llu",
+                      "unloads=%llu unloadAlls=%llu clearCacheCalls=%llu "
+                      "sharedCacheHit=%d customDecrypt=%d archiveFilter=%d sharedHits=%llu sharedMisses=%llu "
+                      "sharedBytes=%llu sharedEntries=%llu sharedEvictions=%llu",
                       resourceLoad ? "resourceLoad" : "play",
                       static_cast<double>(wallNS) / 1000000.0,
                       static_cast<double>(fileLoadNS) / 1000000.0,
@@ -129,7 +142,15 @@ static void recordSlowEmoteOperation(bool resourceLoad, Uint64 started,
                       static_cast<unsigned long long>(diagnostic ? diagnostic->failures : 0),
                       static_cast<unsigned long long>(diagnostic ? diagnostic->unloads : 0),
                       static_cast<unsigned long long>(diagnostic ? diagnostic->unloadAlls : 0),
-                      static_cast<unsigned long long>(diagnostic ? diagnostic->clearCacheCalls : 0));
+                      static_cast<unsigned long long>(diagnostic ? diagnostic->clearCacheCalls : 0),
+                      resourceLoad && !cacheHit && sharedCacheHit ? 1 : 0,
+                      resourceLoad && !cacheHit && customDecrypt ? 1 : 0,
+                      resourceLoad && !cacheHit && archiveFilter ? 1 : 0,
+                      static_cast<unsigned long long>(shared.hits),
+                      static_cast<unsigned long long>(shared.misses),
+                      static_cast<unsigned long long>(shared.retainedBytes),
+                      static_cast<unsigned long long>(shared.entries),
+                      static_cast<unsigned long long>(shared.evictions));
     } catch (...) {
         // Diagnostics must not make an otherwise successful operation fail.
     }
@@ -226,6 +247,7 @@ tTJSVariant ResourceManager::loadInternal(tTJSString path, bool materializeRoot)
     ++_diagnostics.loads;
     auto rst = cacheData.find(placedPath);
     const bool cacheHit = rst != cacheData.end();
+    const bool customDecrypt = !cacheHit && _decryptClo.Object != nullptr;
     if (cacheHit) ++_diagnostics.hits;
     else ++_diagnostics.misses;
     Uint64 fileLoadNS = 0;
@@ -253,7 +275,9 @@ tTJSVariant ResourceManager::loadInternal(tTJSString path, bool materializeRoot)
             rootNS = SDL_GetTicksNS() - rootStarted;
         }
         recordSlowEmoteOperation(true, started, fileLoadNS, rootNS, cacheHit,
-                                 &_diagnostics, resourceId, cacheData.size(), materializeRoot);
+                                 &_diagnostics, resourceId, cacheData.size(), materializeRoot,
+                                 !cacheHit && file->WasSharedCacheHit(), customDecrypt,
+                                 !cacheHit && file->BypassedSharedCacheForArchiveFilter());
         return root;
     } catch (...) {
         ++_diagnostics.failures;
@@ -297,8 +321,8 @@ void ResourceManager::unloadAllInternal(const char* diagnosticAction)
 }
 void ResourceManager::clearCache()
 {
-    // There is no separate unused-resource cache; loaded files remain live until
-    // unload/unloadAll. Preserve that contract instead of invalidating players.
+    // Drop reusable decoded data while preserving files used by active players.
+    ClearSharedEmoteResourceCache();
     ++_diagnostics.clearCacheCalls;
     recordEmoteCacheEvent("clearCache", _diagnostics, cacheData.size());
 }
@@ -313,11 +337,15 @@ emotefile* ResourceManager::GetPlayerByName(const tTJSString& name)
 }
 void ResourceManager::setEmotePSBDecryptSeed(tjs_int decryptkey)
 {
+    if (_decryptkey == decryptkey) return;
     _decryptkey = decryptkey;
+    ClearSharedEmoteResourceCache();
 }
 void ResourceManager::setEmotePSBDecryptFunc(tTJSVariant funclosure)
 {
     _decryptClo = funclosure.AsObjectClosure();
+    // Reinstalling the same closure can accompany a change in its script state.
+    ClearSharedEmoteResourceCache();
 }
 
 SeparateLayerAdaptor::SeparateLayerAdaptor(iTJSDispatch2* targetLayer)

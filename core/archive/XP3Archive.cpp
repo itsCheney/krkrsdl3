@@ -19,6 +19,7 @@
 #include "UtilStreams.h"
 #include "TVPArchive.h"
 #include "PlatformMutex.h"
+#include "emoteplayer/emoteresourcecache.h"
 
 #include <zlib.h>
 
@@ -29,12 +30,19 @@ static tTVPXP3ArchiveExtractionFilter TVPXP3ArchiveExtractionFilter = nullptr;
 void TVPSetXP3ArchiveExtractionFilter(tTVPXP3ArchiveExtractionFilter filter)
 {
     TVPXP3ArchiveExtractionFilter = filter;
+    // Reinstalling a callback can also change the decoder state it captures.
+    emoteplayer::ClearSharedEmoteResourceCache();
 }
 
 static tTVPXP3ArchiveContentFilter TVPXP3ArchiveContentFilter = nullptr;
 void TVPSetXP3ArchiveContentFilter(tTVPXP3ArchiveContentFilter filter)
 {
     TVPXP3ArchiveContentFilter = filter;
+    emoteplayer::ClearSharedEmoteResourceCache();
+}
+bool TVPHasXP3ArchiveFilters()
+{
+    return TVPXP3ArchiveExtractionFilter || TVPXP3ArchiveContentFilter;
 }
 //---------------------------------------------------------------------------
 

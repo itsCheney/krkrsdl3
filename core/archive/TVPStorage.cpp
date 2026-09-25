@@ -21,6 +21,7 @@
 #include "Random.h"
 #include "XP3Archive.h"
 #include "PlatformMutex.h"
+#include "emoteplayer/emoteresourcecache.h"
 
 #define TVP_DEFAULT_ARCHIVE_CACHE_NUM 64
 #define TVP_DEFAULT_AUTOPATH_CACHE_NUM 256
@@ -1046,6 +1047,11 @@ static tTJSBinaryStream* _TVPCreateStream(const ttstr& _name, tjs_uint32 flags)
         TVPThrowExceptionMessage(TVPCannotOpenStorage, _name);
     }
 
+    // Resolve aliases before invalidating so saved files do not flush unrelated
+    // animation resources retained by the session cache.
+    if (access != TJS_BS_READ)
+        emoteplayer::InvalidateSharedEmoteResource(name.AsStdString());
+
     // does name contain > ?
     const tjs_char* sharp_pos = TJS_strchr(name.c_str(), TVPArchiveDelimiter);
     if (sharp_pos)
@@ -1138,6 +1144,7 @@ tTJSBinaryStream* TVPCreateStream(const ttstr& _name, tjs_uint32 flags)
 void TVPClearStorageCaches()
 {
     // clear all storage related caches
+    emoteplayer::ClearSharedEmoteResourceCache();
     TVPClearAutoPathCache();
 }
 //---------------------------------------------------------------------------
