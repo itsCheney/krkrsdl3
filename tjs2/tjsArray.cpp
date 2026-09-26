@@ -223,6 +223,7 @@ public:
 tjs_uint32 tTJSArrayClass::ClassID = (tjs_uint32)-1;
 tTJSArrayClass::tTJSArrayClass() : tTJSNativeClass(TJS_N("Array"))
 {
+    UseDirectMemberCopy = true;
     // class constructor
 
     TJS_BEGIN_NATIVE_MEMBERS(/* TJS class name */ Array)

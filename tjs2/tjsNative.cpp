@@ -391,6 +391,12 @@ tjs_error tTJSNativeClass::FuncCall(tjs_uint32 flag,
     // even if "nativeptr" is null
     objthis->NativeInstanceSupport(TJS_NIS_REGISTER, _ClassID, &nativeptr);
 
+    if (UseDirectMemberCopy)
+    {
+        CopyNativeClassMembersTo(objthis);
+        return TJS_S_OK;
+    }
+
     // register members to "objthis"
 
     // a class to receive member callback from class

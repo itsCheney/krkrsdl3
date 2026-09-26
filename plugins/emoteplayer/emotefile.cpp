@@ -2159,11 +2159,20 @@ tTJSVariant emotefile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
             iTJSDispatch2* array = TJSCreateArrayObject();
             tTJSVariant result(array, array);
             array->Release();
+            tTJSArrayNI* arrayInstance = nullptr;
+            if (TJS_SUCCEEDED(array->NativeInstanceSupport(TJS_NIS_GETINSTANCE, TJSGetArrayClassID(),
+                    reinterpret_cast<iTJSNativeInstance**>(&arrayInstance))) && arrayInstance)
+                arrayInstance->Items.reserve(std::max(arrayInstance->Items.size(), tmp.size()));
             tjs_int index = 0;
             for (auto i : tmp)
             {
                 tTJSVariant tmp(static_cast<tjs_int32>(i));
-                array->PropSetByNum(TJS_MEMBERENSURE | TJS_IGNOREPROP, index++, &tmp, array);
+                if (arrayInstance && arrayInstance->Items.size() == static_cast<size_t>(index) &&
+                    array->IsValid(0, nullptr, nullptr, array) == TJS_S_TRUE)
+                    static_cast<tTJSArrayObject*>(array)->Add(arrayInstance, tmp);
+                else
+                    array->PropSetByNum(TJS_MEMBERENSURE | TJS_IGNOREPROP, index, &tmp, array);
+                ++index;
             }
             return result;
         }
@@ -2214,13 +2223,23 @@ tTJSVariant emotefile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
             iTJSDispatch2* array = TJSCreateArrayObject();
             tTJSVariant result(array, array);
             array->Release();
+            tTJSArrayNI* arrayInstance = nullptr;
+            if (TJS_SUCCEEDED(array->NativeInstanceSupport(TJS_NIS_GETINSTANCE, TJSGetArrayClassID(),
+                    reinterpret_cast<iTJSNativeInstance**>(&arrayInstance))) && arrayInstance)
+                arrayInstance->Items.reserve(std::max(arrayInstance->Items.size(), _objsOffset.size()));
             tjs_int index = 0;
             for (auto _offset : _objsOffset)
             {
                 tTJSVariant obj = readAllObjs(ttstr(), _tmpOffset + _offset);
-                // These are fresh array slots. Set them directly rather than
-                // dispatching a script-visible add method for every PSB item.
-                array->PropSetByNum(TJS_MEMBERENSURE | TJS_IGNOREPROP, index++, &obj, array);
+                // Append fresh slots through the same primitive as Array.add.
+                // A customized constructor may prefill or invalidate the array;
+                // retain the prior indexed-write behavior in those cases.
+                if (arrayInstance && arrayInstance->Items.size() == static_cast<size_t>(index) &&
+                    array->IsValid(0, nullptr, nullptr, array) == TJS_S_TRUE)
+                    static_cast<tTJSArrayObject*>(array)->Add(arrayInstance, obj);
+                else
+                    array->PropSetByNum(TJS_MEMBERENSURE | TJS_IGNOREPROP, index, &obj, array);
+                ++index;
             }
             return result;
         }

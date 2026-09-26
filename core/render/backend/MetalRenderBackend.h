@@ -7,6 +7,43 @@ struct SDL_Window;
 
 namespace krkrsdl3
 {
+// Diagnostic metadata only: GPU durations belong to the whole command buffer.
+// A buffer containing multiple kinds of work must never be presented as the
+// duration of one of its stages, or divided according to draw/encoder counts.
+namespace metal_diagnostics
+{
+struct Workload
+{
+    enum Stage : uint32_t { Mesh = 1, Layer = 2, Blit = 4, Window = 8, OtherRender = 16 };
+    uint32_t stages = 0;
+    uint32_t renderEncoders = 0, computeEncoders = 0, blitEncoders = 0;
+    uint32_t meshDraws = 0, deformDraws = 0, maskedDraws = 0, clears = 0;
+    uint32_t layerDispatches = 0, windowDraws = 0;
+    const char* Bucket() const
+    {
+        switch (stages) {
+            case 0: return "empty";
+            case Mesh: return "mesh_or_clear";
+            case Layer: return "layer_compute";
+            case Blit: return "blit";
+            case Window: return "window_render";
+            case OtherRender: return "other_render";
+            default: return "mixed";
+        }
+    }
+};
+struct Sampler
+{
+    uint64_t nextSampleNS = 0;
+    bool ShouldSample(bool enabled, uint64_t nowNS)
+    {
+        if (!enabled || nowNS < nextSampleNS) return false;
+        nextSampleNS = nowNS + 1000000000ULL;
+        return true;
+    }
+};
+}
+
 // Native Metal compositor and offscreen renderer. All calls run on the SDL main thread.
 class MetalRenderBackend final : public iTVPRenderBackend
 {

@@ -213,6 +213,15 @@ struct MetalRenderBackend::Impl
     dispatch_semaphore_t inFlight = dispatch_semaphore_create(3);
     std::shared_ptr<std::atomic<bool>> gpuFailed = std::make_shared<std::atomic<bool>>(false);
     std::shared_ptr<std::atomic<double>> gpuTimeMS = std::make_shared<std::atomic<double>>(-1.0);
+    metal_diagnostics::Sampler diagnosticSampler;
+    metal_diagnostics::Workload diagnosticWorkload;
+    bool diagnosticSampled = false, diagnosticCapabilityLogged = false;
+    uint64_t commandSerial = 0, lastSubmittedSerial = 0, renderFrameSerial = 0;
+    uint64_t diagnosticFirstRenderFrame = 0;
+    enum WaitKind { QueueWait, ReadbackWait, DrawableWait };
+    uint64_t lastDiagnosticWaitNS[3] = {0, 0, 0}, suppressedDiagnosticWaits[3] = {0, 0, 0};
+    uint64_t lastSyncWaitNS = 0;
+    double diagnosticQueueWaitMS = 0;
     std::unordered_map<void*, std::unique_ptr<Resource>> resources;
     std::vector<WindowDraw> windows;
     Resource* current = nullptr;
@@ -328,6 +337,27 @@ struct MetalRenderBackend::Impl
         auto it = resources.find(handle);
         return it == resources.end() ? nullptr : it->second.get();
     }
+    void ReportSlowWait(WaitKind kind, uint64_t wallNS, int readWidth = 0,
+                        int readHeight = 0, const char* region = "none")
+    {
+        if (wallNS < 8000000ULL || !SDL_GetHintBoolean("MIKAGE_METAL_DIAGNOSTICS", false)) return;
+        const Uint64 now = SDL_GetTicksNS();
+        if (lastDiagnosticWaitNS[kind] && now - lastDiagnosticWaitNS[kind] < 1000000000ULL) {
+            ++suppressedDiagnosticWaits[kind];
+            return;
+        }
+        SDL_Log("metal.cpuWait operation=%s wallMS=%.3f gpuSyncWaitMS=%.3f "
+                "readbackRegion=%s width=%d height=%d lastSubmittedID=%llu renderFrame=%llu "
+                "finishedAtMS=%.3f suppressed=%llu",
+                kind == ReadbackWait ? "readback" : kind == QueueWait ? "inFlightQueue" : "nextDrawable",
+                double(wallNS) / 1000000.0, kind == ReadbackWait ? double(lastSyncWaitNS) / 1000000.0 : 0.0,
+                region, readWidth, readHeight,
+                static_cast<unsigned long long>(lastSubmittedSerial),
+                static_cast<unsigned long long>(renderFrameSerial), double(now) / 1000000.0,
+                static_cast<unsigned long long>(suppressedDiagnosticWaits[kind]));
+        lastDiagnosticWaitNS[kind] = now;
+        suppressedDiagnosticWaits[kind] = 0;
+    }
     id<MTLCommandBuffer> Commands()
     {
         if (gpuFailed->load(std::memory_order_relaxed))
@@ -339,10 +369,23 @@ struct MetalRenderBackend::Impl
             pendingQueueWaitMS += static_cast<double>(queueWaitNS) / 1000000.0;
             queueWaitAccumNS += queueWaitNS;
             TVPRecordMetalQueueWait(queueWaitNS);
+            ReportSlowWait(QueueWait, queueWaitNS);
             commands = [queue commandBuffer];
             if (!commands) {
                 dispatch_semaphore_signal(inFlight);
                 throw std::runtime_error("Metal command buffer allocation failed");
+            }
+            ++commandSerial;
+            diagnosticWorkload = {};
+            diagnosticSampled = diagnosticSampler.ShouldSample(
+                SDL_GetHintBoolean("MIKAGE_METAL_DIAGNOSTICS", false), SDL_GetTicksNS());
+            diagnosticQueueWaitMS = double(queueWaitNS) / 1000000.0;
+            diagnosticFirstRenderFrame = renderFrameSerial;
+            if (diagnosticSampled && !diagnosticCapabilityLogged) {
+                SDL_Log("metal.gpuTiming mode=command_buffer_completion sampleIntervalMS=1000 "
+                        "perStageTimestamps=not_collected mixedStageTiming=unattributed "
+                        "extraSubmissions=0 extraWaits=0");
+                diagnosticCapabilityLogged = true;
             }
             // Capture shared completion state, never this (the callback can
             // outlive the C++ resource wrappers).
@@ -436,13 +479,25 @@ struct MetalRenderBackend::Impl
     id<MTLBlitCommandEncoder> Blit() {
         EndMesh(); EndOrdinary();
         auto encoder = [Commands() blitCommandEncoder];
-        if (encoder) TVPRecordMetalBlitEncoder();
+        if (encoder) {
+            TVPRecordMetalBlitEncoder();
+            if (diagnosticSampled) {
+                diagnosticWorkload.stages |= metal_diagnostics::Workload::Blit;
+                ++diagnosticWorkload.blitEncoders;
+            }
+        }
         return encoder;
     }
     id<MTLComputeCommandEncoder> Compute() {
         EndMesh(); EndOrdinary();
         auto encoder = [Commands() computeCommandEncoder];
-        if (encoder) TVPRecordMetalComputeEncoder();
+        if (encoder) {
+            TVPRecordMetalComputeEncoder();
+            if (diagnosticSampled) {
+                diagnosticWorkload.stages |= metal_diagnostics::Workload::Layer;
+                ++diagnosticWorkload.computeEncoders;
+            }
+        }
         return encoder;
     }
     id<MTLComputeCommandEncoder> OrdinaryCompute() {
@@ -450,7 +505,13 @@ struct MetalRenderBackend::Impl
         if(!ordinaryEncoder) {
             // Serial dispatches provide write/read ordering for tracked textures.
             ordinaryEncoder=[Commands() computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
-            if (ordinaryEncoder) TVPRecordMetalComputeEncoder();
+            if (ordinaryEncoder) {
+                TVPRecordMetalComputeEncoder();
+                if (diagnosticSampled) {
+                    diagnosticWorkload.stages |= metal_diagnostics::Workload::Layer;
+                    ++diagnosticWorkload.computeEncoders;
+                }
+            }
             [ordinaryEncoder setComputePipelineState:ordinaryInPlacePipeline];
             [ordinaryEncoder setBuffer:alphaTables offset:0 atIndex:1];
         }
@@ -462,6 +523,7 @@ struct MetalRenderBackend::Impl
         EndOrdinary();
         if (commands) {
             lastSubmitted = commands;
+            lastSubmittedSerial = commandSerial;
             if (currentRingPage >= 0) {
                 auto& page = ringPages[static_cast<size_t>(currentRingPage)];
                 page.owner = commands;
@@ -471,16 +533,46 @@ struct MetalRenderBackend::Impl
             if (!stagingPending.empty())
                 stagingInFlight.emplace_back(commands, std::move(stagingPending));
             stagingPending.clear();
+            if (diagnosticSampled) {
+                // Immutable values captured before commit; callbacks never
+                // access Impl or split mixed work into invented stage times.
+                const auto workload = diagnosticWorkload;
+                const auto serial = commandSerial;
+                const auto cpuQueueWaitMS = diagnosticQueueWaitMS;
+                const auto firstRenderFrame = diagnosticFirstRenderFrame;
+                const auto lastRenderFrame = renderFrameSerial;
+                const double submittedAtMS = double(SDL_GetTicksNS()) / 1000000.0;
+                [commands addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+                    if (!SDL_GetHintBoolean("MIKAGE_METAL_DIAGNOSTICS", false)) return;
+                    const bool available = buffer.status == MTLCommandBufferStatusCompleted &&
+                        buffer.GPUStartTime > 0 && buffer.GPUEndTime >= buffer.GPUStartTime;
+                    const double gpuMS = available ? (buffer.GPUEndTime - buffer.GPUStartTime) * 1000.0 : -1.0;
+                    SDL_Log("metal.gpuCommandBuffer id=%llu bucket=%s gpuMS=%.3f timingAvailable=%d "
+                            "stageMask=%u renderEncoders=%u computeEncoders=%u blitEncoders=%u "
+                            "meshDraws=%u deformDraws=%u maskedDraws=%u clears=%u "
+                            "layerDispatches=%u windowDraws=%u cpuQueueWaitMS=%.3f "
+                            "firstRenderFrame=%llu lastRenderFrame=%llu submittedAtMS=%.3f completedAtMS=%.3f",
+                            static_cast<unsigned long long>(serial), workload.Bucket(), gpuMS, available ? 1 : 0,
+                            workload.stages, workload.renderEncoders, workload.computeEncoders, workload.blitEncoders,
+                            workload.meshDraws, workload.deformDraws, workload.maskedDraws, workload.clears,
+                            workload.layerDispatches, workload.windowDraws, cpuQueueWaitMS,
+                            static_cast<unsigned long long>(firstRenderFrame),
+                            static_cast<unsigned long long>(lastRenderFrame), submittedAtMS,
+                            double(SDL_GetTicksNS()) / 1000000.0);
+                }];
+            }
             [commands commit];
             TVPRecordMetalSubmit();
             commands = nil;
+            diagnosticSampled = false;
             transientBytes = 0;
             transientOps = 0;
         }
         if (wait && lastSubmitted) {
             const Uint64 waitStarted = SDL_GetTicksNS();
             [lastSubmitted waitUntilCompleted];
-            TVPRecordMetalSyncWait(SDL_GetTicksNS() - waitStarted);
+            lastSyncWaitNS = SDL_GetTicksNS() - waitStarted;
+            TVPRecordMetalSyncWait(lastSyncWaitNS);
             DrainStaging();
             return lastSubmitted.status == MTLCommandBufferStatusCompleted;
         }
@@ -495,7 +587,8 @@ struct MetalRenderBackend::Impl
         d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
         return [device newTextureWithDescriptor:d];
     }
-    id<MTLRenderCommandEncoder> Pass(id<MTLTexture> texture, bool clear)
+    id<MTLRenderCommandEncoder> Pass(id<MTLTexture> texture, bool clear,
+        metal_diagnostics::Workload::Stage stage = metal_diagnostics::Workload::OtherRender)
     {
         EndMesh();
         EndOrdinary();
@@ -507,13 +600,18 @@ struct MetalRenderBackend::Impl
         id<MTLRenderCommandEncoder> encoder = [Commands() renderCommandEncoderWithDescriptor:p];
         if (!encoder) throw std::runtime_error("Metal render encoder allocation failed");
         TVPRecordMetalRenderEncoder();
+        if (diagnosticSampled) {
+            diagnosticWorkload.stages |= stage;
+            ++diagnosticWorkload.renderEncoders;
+            if (clear) ++diagnosticWorkload.clears;
+        }
         return encoder;
     }
     id<MTLRenderCommandEncoder> MeshPass(id<MTLTexture> texture, bool clear = false)
     {
         EndOrdinary();
         if (!clear && activeMeshEncoder && activeMeshTarget == texture) return activeMeshEncoder;
-        activeMeshEncoder = Pass(texture, clear);
+        activeMeshEncoder = Pass(texture, clear, metal_diagnostics::Workload::Mesh);
         activeMeshTarget = texture;
         return activeMeshEncoder;
     }
@@ -563,6 +661,7 @@ struct MetalRenderBackend::Impl
     }
     bool Read(id<MTLTexture> texture, std::vector<uint8_t>& pixels, int& pitch, const TVPLayerRect* region = nullptr)
     {
+        const Uint64 readStarted = SDL_GetTicksNS();
         pitch = 0;
         const int x=region ? region->left : 0, y=region ? region->top : 0;
         const int regionWidth=region ? region->Width() : int(texture.width);
@@ -585,6 +684,8 @@ struct MetalRenderBackend::Impl
         pitch = static_cast<int>(w * bpp);
         for (size_t y = 0; y < h; ++y)
             std::memcpy(pixels.data() + y * pitch, static_cast<uint8_t*>(staging.contents) + y * rowBytes, pitch);
+        ReportSlowWait(ReadbackWait, SDL_GetTicksNS() - readStarted, regionWidth, regionHeight,
+                       !region ? "full" : regionWidth == 1 && regionHeight == 1 ? "point" : "region");
         return true;
     }
     id<MTLTexture> SnapshotRegion(Resource* r, int x, int y, int width, int height)
@@ -607,7 +708,8 @@ struct MetalRenderBackend::Impl
     }
     void DrawWindows(id<MTLTexture> output, id<MTLRenderPipelineState> pipeline)
     {
-        id<MTLRenderCommandEncoder> e = Pass(output, true);
+        id<MTLRenderCommandEncoder> e = Pass(output, true, pipeline == windowPipeline ?
+            metal_diagnostics::Workload::Window : metal_diagnostics::Workload::OtherRender);
         [e setRenderPipelineState:pipeline];
         for (const auto& draw : windows) {
             float l = draw.x / width * 2 - 1, t = draw.y / height * 2 - 1;
@@ -617,6 +719,7 @@ struct MetalRenderBackend::Impl
             [e setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
             [e setFragmentTexture:draw.texture atIndex:0];
             [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+            if (diagnosticSampled) ++diagnosticWorkload.windowDraws;
         }
         [e endEncoding];
     }
@@ -796,6 +899,7 @@ double MetalRenderBackend::GetPresentationWaitTimeMilliseconds() const
 }
 void MetalRenderBackend::BeginFrame(int w, int h)
 {
+    ++impl_->renderFrameSerial;
     impl_->width = w; impl_->height = h;
     impl_->windows.clear();
 }
@@ -809,7 +913,9 @@ void MetalRenderBackend::EndFrame()
                 p.layer.drawableSize = CGSizeMake(p.width, p.height);
             const Uint64 waitStarted = SDL_GetTicksNS();
             id<CAMetalDrawable> drawable = [p.layer nextDrawable];
-            drawableWaitMS = static_cast<double>(SDL_GetTicksNS() - waitStarted) / 1000000.0;
+            const Uint64 drawableWaitNS = SDL_GetTicksNS() - waitStarted;
+            drawableWaitMS = static_cast<double>(drawableWaitNS) / 1000000.0;
+            p.ReportSlowWait(Impl::DrawableWait, drawableWaitNS);
             if (drawable) {
                 p.DrawWindows(drawable.texture, p.windowPipeline);
                 [p.Commands() presentDrawable:drawable];
@@ -919,6 +1025,10 @@ void MetalRenderBackend::DrawMesh(const float* vertices, int vertexCount, const 
         [e setFragmentTexture:p.mask ? (p.mask == p.current ? snapshot : p.mask->texture) : source atIndex:1];
         [e drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:indexCount indexType:MTLIndexTypeUInt16
                      indexBuffer:upload.buffer indexBufferOffset:upload.offset + indexOffset];
+        if (p.diagnosticSampled) {
+            ++p.diagnosticWorkload.meshDraws;
+            if (p.mask) ++p.diagnosticWorkload.maskedDraws;
+        }
         p.transientBytes += uploadBytes;
         if (p.transientBytes >= Impl::kSubmissionBudget || ++p.transientOps >= Impl::kSubmissionOpBudget)
             p.Submit();
@@ -974,6 +1084,10 @@ bool MetalRenderBackend::DrawDeformedMesh(int divX, int divY,
                         indexType:MTLIndexTypeUInt16
                       indexBuffer:topology->indices
                 indexBufferOffset:0];
+        if (p.diagnosticSampled) {
+            ++p.diagnosticWorkload.deformDraws;
+            if (p.mask) ++p.diagnosticWorkload.maskedDraws;
+        }
         p.transientBytes += surfaceBytes;
         TVPRecordMetalSurfaceUpload(static_cast<uint64_t>(surfaceBytes));
         if (p.transientBytes >= Impl::kSubmissionBudget || ++p.transientOps >= Impl::kSubmissionOpBudget)
@@ -1037,6 +1151,7 @@ void MetalRenderBackend::LayerDrawRect(void* h, float x, float y, float w, float
         [e setTexture:p.current->texture atIndex:2];
         [e dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(right - l), static_cast<NSUInteger>(bottom - t), 1)
              threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        if (p.diagnosticSampled) ++p.diagnosticWorkload.layerDispatches;
         [e endEncoding];
     }
 }
@@ -1196,6 +1311,7 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
             [e setTexture:sourceTexture atIndex:0]; [e setTexture:snapshot ? snapshot : sourceTexture atIndex:1]; [e setTexture:t->texture atIndex:2];
         }
         [e dispatchThreads:MTLSizeMake(clip.Width(),clip.Height(),1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+        if (p.diagnosticSampled) ++p.diagnosticWorkload.layerDispatches;
         if(!inPlace) [e endEncoding];
         // Compute dispatch over existing GPU textures; no host-visible bytes.
         if(++p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
@@ -1278,6 +1394,7 @@ bool MetalRenderBackend::OperateLayerRectDualSource(const TVPLayerOperation& ope
         [e setTexture:t->texture atIndex:2];
         [e dispatchThreads:MTLSizeMake(clip.Width(),clip.Height(),1)
              threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+        if (p.diagnosticSampled) ++p.diagnosticWorkload.layerDispatches;
         [e endEncoding];
         // Compute dispatch over existing GPU textures; no host-visible bytes.
         if(++p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();

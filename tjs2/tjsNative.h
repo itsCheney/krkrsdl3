@@ -202,6 +202,9 @@ public:
 protected:
     tjs_int32 _ClassID;
     ttstr ClassName;
+    // Opt in only for built-in classes whose instance initialization uses the
+    // standard custom-object enumeration. Other native classes retain it.
+    bool UseDirectMemberCopy = false;
     void Finalize(void);
 
     virtual iTJSNativeInstance* CreateNativeInstance() { return NULL; }
