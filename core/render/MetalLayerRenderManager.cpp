@@ -5,6 +5,8 @@
 #include "TVPCompositor.h"
 #include "gl/tvpgl.h"
 #include "Platform.h"
+#include "PointReadTrace.h"
+#include "tjsDebug.h"
 #include <algorithm>
 #include <cstring>
 #include <memory>
@@ -20,6 +22,7 @@ extern unsigned char TVPNegativeMulTable[65536];
 
 namespace {
 using krkrsdl3::iTVPRenderBackend;
+namespace point_trace = krkrsdl3::point_trace;
 class LayerTexture;
 std::string fallbackReason;
 struct Session {
@@ -49,34 +52,100 @@ class LayerTexture final : public iTVPTexture2D {
     // this rather than drop writes the lease did not make.
     bool leaseHadDamage = false;
     tTVPRect leaseDamage;
+    const uint64_t textureID = point_trace::NextTextureID();
+    uint64_t contentVersion = 0;
+    struct InvalidationInfo {
+        point_trace::Invalidation reason = point_trace::Invalidation::Unknown;
+        const char* writer = "initial";
+        uint64_t version = 0;
+    };
+    InvalidationInfo lastWrite;
+    tTVPRect lastWriteRect{0,0,0,0};
     struct PointCacheEntry {
         int x = -1, y = -1;
         uint32_t value = 0;
         bool valid = false;
         bool alphaValid = false;
+        InvalidationInfo colorInvalidation, alphaInvalidation;
     };
     static constexpr size_t kPointCacheSize = 32;
     PointCacheEntry pointCache[kPointCacheSize];
     size_t pointCacheNext = 0;
-    void InvalidatePointCache(const tTVPRect* written=nullptr,bool preserveAlpha=false) {
+    void InvalidatePointCache(const tTVPRect* written=nullptr,bool preserveAlpha=false,
+                             point_trace::Invalidation reason=point_trace::Invalidation::Explicit,
+                             const char* writer="external") {
+        lastWrite = {reason, point_trace::CurrentWriter() ? point_trace::CurrentWriter() : writer,
+                     ++contentVersion};
+        lastWriteRect = written ? *written : tTVPRect(0,0,Width,Height);
         for(auto& entry:pointCache) {
             if(written && (entry.x<written->left || entry.x>=written->right ||
                            entry.y<written->top || entry.y>=written->bottom)) continue;
+            // Preserve the FIRST write that invalidated this sample. Later
+            // unrelated writes are reported separately as lastWrite, not blamed
+            // for the cache miss that they did not cause.
+            if(entry.valid) entry.colorInvalidation=lastWrite;
             entry.valid=false;
-            if(!preserveAlpha) entry.alphaValid=false;
+            if(!preserveAlpha) {
+                if(entry.alphaValid) entry.alphaInvalidation=lastWrite;
+                entry.alphaValid=false;
+            }
         }
         if(!written && !preserveAlpha) pointCacheNext=0;
     }
-    bool FindPointCache(int x,int y,uint32_t& value,bool alphaOnly) {
+    bool FindPointCache(int x,int y,uint32_t& value,bool alphaOnly,point_trace::Query& trace) {
         for(const auto& entry:pointCache) {
             if((alphaOnly ? entry.alphaValid : entry.valid) && entry.x==x && entry.y==y) {
                 value=entry.value;
                 ++session->stats.pointCacheHits;
                 return true;
             }
+            if(entry.x==x && entry.y==y) {
+                const auto& invalidation=alphaOnly ? entry.alphaInvalidation : entry.colorInvalidation;
+                trace.missReason="invalidated";
+                trace.invalidation=invalidation.reason;
+                trace.writer=invalidation.writer;
+                trace.invalidatedVersion=invalidation.version;
+            }
         }
         ++session->stats.pointCacheMisses;
         return false;
+    }
+    void ReportPointRead(const point_trace::Query& trace) {
+        if(!trace.reported || !point_trace::Enabled()) return;
+        try {
+            TVPConsoleLog("metal.pointRead pointQueryID=%llu source=%s trigger=%s parentTrigger=%s "
+                          "owner=%llx textureID=%llu version=%llu x=%d y=%d width=%d height=%d alphaOnly=%d "
+                          "miss=%s invalidation=%s writer=%s invalidatedVersion=%llu "
+                          "lastWrite=%s lastWriter=%s lastRect=%d,%d,%d,%d "
+                          "lastSubmittedID=%llu renderFrame=%llu wallMS=%.3f gpuSyncWaitMS=%.3f",
+                          static_cast<unsigned long long>(trace.queryID), point_trace::Name(trace.origin.source),
+                          point_trace::Name(trace.origin.trigger), point_trace::Name(trace.origin.parentTrigger),
+                          static_cast<unsigned long long>(trace.origin.owner),
+                          static_cast<unsigned long long>(trace.textureID), static_cast<unsigned long long>(trace.version),
+                          trace.x,trace.y,trace.width,trace.height,trace.alphaOnly?1:0,trace.missReason,
+                          point_trace::Name(trace.invalidation),trace.writer,
+                          static_cast<unsigned long long>(trace.invalidatedVersion),
+                          point_trace::Name(trace.lastInvalidation),trace.lastWriter,
+                          trace.lastWriteLeft,trace.lastWriteTop,trace.lastWriteRight,trace.lastWriteBottom,
+                          static_cast<unsigned long long>(trace.lastSubmittedID),
+                          static_cast<unsigned long long>(trace.renderFrame),
+                          double(trace.wallNS)/1000000.0,double(trace.gpuWaitNS)/1000000.0);
+            // Capture synchronously while the initiating TJS frames are alive.
+            // The host owns tracer lifetime at safe VM boundaries. Bytecode can
+            // omit source maps, so even a nonempty trace is not an exact-line guarantee.
+            std::string stack=TJSGetStackTraceString(4,TJS_N(" | ")).AsStdString();
+            const bool available=!stack.empty();
+            if(stack.size()>512) {
+                size_t cut=512;
+                while(cut && (static_cast<unsigned char>(stack[cut])&0xc0)==0x80) --cut;
+                stack.resize(cut);
+            }
+            for(char& c:stack) if(static_cast<unsigned char>(c)<32 || c=='"') c=' ';
+            TVPConsoleLog("metal.pointCaller pointQueryID=%llu traceState=%s positions=unverified trace=\"%s\"",
+                          static_cast<unsigned long long>(trace.queryID),available?"captured":"unavailable",stack.c_str());
+        } catch(...) {
+            // Diagnostic allocation or unavailable VM trace must not affect reads.
+        }
     }
     void StorePointCache(int x,int y,uint32_t value) {
         // Refresh alpha-only entries in place, avoiding duplicate coordinates
@@ -96,7 +165,7 @@ class LayerTexture final : public iTVPTexture2D {
         tTVPRect r(std::max(0,requested.left),std::max(0,requested.top),
                    std::min(int(Width),requested.right),std::min(int(Height),requested.bottom));
         if(r.get_width()<=0 || r.get_height()<=0) return;
-        InvalidatePointCache(&r);
+        InvalidatePointCache(&r,false,point_trace::Invalidation::CPUWrite,"cpu.write");
         if(!dirty) { damage=r; dirty=true; return; }
         damage.left=std::min(damage.left,r.left); damage.top=std::min(damage.top,r.top);
         damage.right=std::max(damage.right,r.right); damage.bottom=std::max(damage.bottom,r.bottom);
@@ -171,8 +240,10 @@ public:
         InvalidatePointCache();
         DiscardCPUCache();
     }
-    void InvalidateCPUCacheRegion(const tTVPRect& written,bool preserveAlpha=false) {
-        InvalidatePointCache(&written,preserveAlpha);
+    void InvalidateCPUCacheRegion(const tTVPRect& written,bool preserveAlpha=false,
+                                 point_trace::Invalidation reason=point_trace::Invalidation::GPUOperation,
+                                 const char* writer="layer.gpuRect") {
+        InvalidatePointCache(&written,preserveAlpha,reason,writer);
         DiscardCPUCache();
     }
     void DiscardCPUCache() {
@@ -230,7 +301,7 @@ public:
                 throw std::runtime_error("GPU Layer upload failed");
             // A caller may query then modify an outstanding CPU write pointer.
             // Samples taken while dirty cannot outlive uploading that damage.
-            InvalidatePointCache(&damage);
+            InvalidatePointCache(&damage,false,point_trace::Invalidation::CPUUpload,"cpu.upload");
             session->stats.uploadedBytes+=size_t(damage.get_width())*bpp*damage.get_height();
             dirty=false; leaseHadDamage=false;
         }
@@ -246,7 +317,7 @@ public:
         // Called only after a successful full-surface GPU copy. Old CPU damage
         // and cached pixels are obsolete and must never upload over the copy.
         if(pinned || locks || writeLeased) return;
-        InvalidatePointCache();
+        InvalidatePointCache(nullptr,false,point_trace::Invalidation::GPUOverwrite,"gpu.overwrite");
         dirty=false; leaseHadDamage=false;
         if(valid) {
             valid=false;
@@ -279,7 +350,8 @@ public:
         }
         if(!session->backend->UpdateLayerTexture(handle,source,pitch,Rect(r)))
             throw std::runtime_error("GPU Layer update failed");
-        session->stats.uploadedBytes+=size_t(bytes)*r.get_height(); InvalidateCPUCacheRegion(r);
+        session->stats.uploadedBytes+=size_t(bytes)*r.get_height();
+        InvalidateCPUCacheRegion(r,false,point_trace::Invalidation::GPUUpdate,"texture.update");
     }
     uint32_t ReadPoint(int x,int y,bool alphaOnly) {
         if(x<0 || y<0 || x>=Width || y>=Height) return 0;
@@ -295,11 +367,21 @@ public:
             return v;
         }
         uint32_t cached=0;
-        if(FindPointCache(x,y,cached,alphaOnly)) return cached;
+        point_trace::Query trace;
+        if(FindPointCache(x,y,cached,alphaOnly,trace)) return cached;
+        trace.textureID=textureID; trace.version=contentVersion;
+        trace.x=x; trace.y=y; trace.width=Width; trace.height=Height; trace.alphaOnly=alphaOnly;
+        trace.lastInvalidation=lastWrite.reason; trace.lastWriter=lastWrite.writer;
+        trace.lastWriteLeft=lastWriteRect.left; trace.lastWriteTop=lastWriteRect.top;
+        trace.lastWriteRight=lastWriteRect.right; trace.lastWriteBottom=lastWriteRect.bottom;
+        point_trace::QueryScope queryScope(trace);
         if(handle && session->backend) {
             std::vector<uint8_t> sample; int pitch=0;
             const TVPLayerRect region{x,y,x+1,y+1};
-            if(session->backend->ReadLayerTextureRegion(handle,region,sample,pitch) &&
+            const bool read=session->backend->ReadLayerTextureRegion(handle,region,sample,pitch);
+            ReportPointRead(trace);
+            trace.reported=false;
+            if(read &&
                pitch>=bpp && sample.size()>=size_t(bpp)) {
                 session->stats.readbackBytes+=bpp;
                 const int index=static_cast<int>(TVPLayerReadbackSource::Point);
@@ -314,6 +396,7 @@ public:
         }
         // Preserve correctness for unsupported/failed region readback paths.
         auto* p=static_cast<const uint8_t*>(GetScanLineForRead(y));
+        ReportPointRead(trace);
         if(format==TVPTextureFormat::Gray) return p[x];
         uint32_t v; std::memcpy(&v,p+x*4,4); return v;
     }
@@ -435,7 +518,8 @@ public:
                     source1->GetTextureHandle(),Rect(src1),
                     source2->GetTextureHandle(),Rect(src2)))
                 return Reject(TVPLayerGPURejectReason::BackendFailure);
-            t->InvalidateCPUCacheRegion(dst); ++session->stats.gpuOperations; return true;
+            t->InvalidateCPUCacheRegion(dst,false,point_trace::Invalidation::GPUOperation,"layer.gpuDualSource");
+            ++session->stats.gpuOperations; return true;
         }
         if(!method->DescribeGpuOperation(op)) return RejectMethod(TVPLayerGPURejectReason::UnsupportedMethod,method);
         if(stretch<0 || stretch>2) return Reject(TVPLayerGPURejectReason::UnsupportedStretch);

@@ -1,5 +1,6 @@
 #include "tjsNativeBitmap.h"
 #include "RenderManager.h"
+#include "PointReadTrace.h"
 
 #include "TVPMsg.h"
 #include "TVPEvent.h"
@@ -63,6 +64,7 @@ void tTJSNI_Bitmap::Invalidate()
 //----------------------------------------------------------------------
 tjs_uint32 tTJSNI_Bitmap::GetPixel(tjs_int x, tjs_int y) const
 {
+    krkrsdl3::point_trace::OriginScope trace(krkrsdl3::point_trace::Source::BitmapColor, this);
     if (Loading)
         TVPThrowExceptionMessage(TVPCurrentlyAsyncLoadBitmap);
     if (!Bitmap)
@@ -83,6 +85,7 @@ void tTJSNI_Bitmap::SetPixel(tjs_int x, tjs_int y, tjs_uint32 color)
 //----------------------------------------------------------------------
 tjs_int tTJSNI_Bitmap::GetMaskPixel(tjs_int x, tjs_int y) const
 {
+    krkrsdl3::point_trace::OriginScope trace(krkrsdl3::point_trace::Source::BitmapMask, this);
     if (Loading)
         TVPThrowExceptionMessage(TVPCurrentlyAsyncLoadBitmap);
     if (!Bitmap)

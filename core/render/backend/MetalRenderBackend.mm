@@ -1,5 +1,6 @@
 #include "MetalRenderBackend.h"
 #include "MetalLayerShaders.h"
+#include "PointReadTrace.h"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -346,15 +347,32 @@ struct MetalRenderBackend::Impl
             ++suppressedDiagnosticWaits[kind];
             return;
         }
+        uint64_t pointQueryID = 0;
+        if (kind == ReadbackWait) {
+            // The query belongs to the caller's current stack. Mark only the
+            // readbacks admitted by this existing limiter, so caller details
+            // and stack capture share the same diagnostic budget. Never retain
+            // this pointer in a GPU completion handler or across render calls.
+            if (auto* query = point_trace::CurrentQuery()) {
+                pointQueryID = query->queryID;
+                query->lastSubmittedID = lastSubmittedSerial;
+                query->renderFrame = renderFrameSerial;
+                query->wallNS = wallNS;
+                query->gpuWaitNS = lastSyncWaitNS;
+                query->finishedNS = now;
+                query->reported = true;
+            }
+        }
         SDL_Log("metal.cpuWait operation=%s wallMS=%.3f gpuSyncWaitMS=%.3f "
                 "readbackRegion=%s width=%d height=%d lastSubmittedID=%llu renderFrame=%llu "
-                "finishedAtMS=%.3f suppressed=%llu",
+                "finishedAtMS=%.3f suppressed=%llu pointQueryID=%llu",
                 kind == ReadbackWait ? "readback" : kind == QueueWait ? "inFlightQueue" : "nextDrawable",
                 double(wallNS) / 1000000.0, kind == ReadbackWait ? double(lastSyncWaitNS) / 1000000.0 : 0.0,
                 region, readWidth, readHeight,
                 static_cast<unsigned long long>(lastSubmittedSerial),
                 static_cast<unsigned long long>(renderFrameSerial), double(now) / 1000000.0,
-                static_cast<unsigned long long>(suppressedDiagnosticWaits[kind]));
+                static_cast<unsigned long long>(suppressedDiagnosticWaits[kind]),
+                static_cast<unsigned long long>(pointQueryID));
         lastDiagnosticWaitNS[kind] = now;
         suppressedDiagnosticWaits[kind] = 0;
     }

@@ -12,6 +12,7 @@
 #include "tjsCommHead.h"
 
 #include "LayerManager.h"
+#include "PointReadTrace.h"
 #include "TVPMsg.h"
 #include "LayerBitmap.h"
 #include "TVPStorage.h"
@@ -404,6 +405,7 @@ tTJSNI_BaseLayer* tTVPLayerManager::GetMostFrontChildAt(tjs_int x,
 //---------------------------------------------------------------------------
 void tTVPLayerManager::PrimaryClick(tjs_int x, tjs_int y)
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::Click);
     tTJSNI_BaseLayer* l = GetMostFrontChildAt(x, y);
     if (l && CaptureOwner == l)
     {
@@ -414,6 +416,7 @@ void tTVPLayerManager::PrimaryClick(tjs_int x, tjs_int y)
 //---------------------------------------------------------------------------
 void tTVPLayerManager::PrimaryDoubleClick(tjs_int x, tjs_int y)
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::DoubleClick);
     tTJSNI_BaseLayer* l = GetMostFrontChildAt(x, y);
     if (l /*&& CaptureOwner == l*/)
     {
@@ -424,6 +427,7 @@ void tTVPLayerManager::PrimaryDoubleClick(tjs_int x, tjs_int y)
 //---------------------------------------------------------------------------
 void tTVPLayerManager::PrimaryMouseDown(tjs_int x, tjs_int y, tTVPMouseButton mb, tjs_uint32 flags)
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerDown);
     PrimaryMouseMove(x, y, flags);
     tTJSNI_BaseLayer* l = CaptureOwner ? CaptureOwner : GetMostFrontChildAt(x, y);
     if (l)
@@ -455,6 +459,7 @@ void tTVPLayerManager::PrimaryMouseDown(tjs_int x, tjs_int y, tTVPMouseButton mb
 //---------------------------------------------------------------------------
 void tTVPLayerManager::PrimaryMouseUp(tjs_int x, tjs_int y, tTVPMouseButton mb, tjs_uint32 flags)
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerUp);
     tTJSNI_BaseLayer* l;
 
     if (CaptureOwner)
@@ -479,6 +484,7 @@ void tTVPLayerManager::PrimaryMouseUp(tjs_int x, tjs_int y, tTVPMouseButton mb, 
 //---------------------------------------------------------------------------
 void tTVPLayerManager::PrimaryMouseMove(tjs_int x, tjs_int y, tjs_uint32 flags)
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerMove);
     bool poschanged = (LastMouseMoveX != x || LastMouseMoveY != y);
     LastMouseMoveX = x;
     LastMouseMoveY = y;
@@ -585,6 +591,7 @@ void tTVPLayerManager::PrimaryMouseMove(tjs_int x, tjs_int y, tjs_uint32 flags)
 void tTVPLayerManager::PrimaryTouchDown(
     tjs_real x, tjs_real y, tjs_real cx, tjs_real cy, tjs_uint32 id)
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerDown);
     tjs_int ix = (tjs_int)x, iy = (tjs_int)y;
     ReleaseTouchCapture(id);
     tTJSNI_BaseLayer* l = GetMostFrontChildAt(ix, iy);
@@ -603,6 +610,7 @@ void tTVPLayerManager::PrimaryTouchDown(
 void tTVPLayerManager::PrimaryTouchUp(
     tjs_real x, tjs_real y, tjs_real cx, tjs_real cy, tjs_uint32 id)
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerUp);
     tjs_int ix = (tjs_int)x, iy = (tjs_int)y;
     tTJSNI_BaseLayer* l = GetTouchCapture(id) ? GetTouchCapture(id) : GetMostFrontChildAt(ix, iy);
     if (l)
@@ -616,6 +624,7 @@ void tTVPLayerManager::PrimaryTouchUp(
 void tTVPLayerManager::PrimaryTouchMove(
     tjs_real x, tjs_real y, tjs_real cx, tjs_real cy, tjs_uint32 id)
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerMove);
     tjs_int ix = (tjs_int)x, iy = (tjs_int)y;
     tTJSNI_BaseLayer* l = GetTouchCapture(id) ? GetTouchCapture(id) : GetMostFrontChildAt(ix, iy);
     if (l)
@@ -659,6 +668,7 @@ void tTVPLayerManager::ForceMouseLeave()
 //---------------------------------------------------------------------------
 void tTVPLayerManager::ForceMouseRecheck()
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::InputRecheck);
     PrimaryMouseMove(LastMouseMoveX, LastMouseMoveY, 0);
 }
 //---------------------------------------------------------------------------
@@ -1172,6 +1182,7 @@ void tTVPLayerManager::PrimaryKeyPress(tjs_uint16 key)
 //---------------------------------------------------------------------------
 void tTVPLayerManager::PrimaryMouseWheel(tjs_uint32 shift, tjs_int delta, tjs_int x, tjs_int y)
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::Wheel);
     if (FocusedLayer)
         FocusedLayer->FireMouseWheel(shift, delta, x, y);
 }
@@ -1223,6 +1234,7 @@ void tTVPLayerManager::RequestInvalidation(const tTVPRect& r)
 //---------------------------------------------------------------------------
 void tTVPLayerManager::RecheckInputState()
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::InputRecheck, false);
     // To re-check current layer under current mouse position
     // and update hint, cursor type and process layer enter/leave.
     // This can be reasonably slow, about 1 sec interval.

@@ -1,6 +1,7 @@
 #include "ncbind/ncbind.hpp"
 #include "emoteplayerclass.h"
 #include "emoteresourcecache.h"
+#include "PointReadTrace.h"
 #include "tjsArray.h"
 #include "TVPStorage.h"
 #include "Platform.h"
@@ -533,7 +534,10 @@ void D3DAdaptor::captureCanvas(iTJSDispatch2* targetLayer)
         void* destination = ths->GetMainImageGPUHandleForOverwrite();
         if (destination && renderer->CopyTargetToLayerTexture(_target, destination))
         {
-            ths->CommitMainImageGPUOverwrite();
+            {
+                krkrsdl3::point_trace::WriterScope write("emote.captureCanvas");
+                ths->CommitMainImageGPUOverwrite();
+            }
             krkrsdl3::TVPRecordEmoteCaptureGPUCopy(fullBytes);
             ths->Update();
             return;
@@ -1077,7 +1081,10 @@ void EmotePlayer::draw(iTJSDispatch2* objthis)
             void* destination = ths->GetMainImageGPUHandleForOverwrite();
             if (destination && renderer->CopyTargetToLayerTexture(target, destination))
             {
-                ths->CommitMainImageGPUOverwrite();
+                {
+                    krkrsdl3::point_trace::WriterScope write("emote.drawToLayer");
+                    ths->CommitMainImageGPUOverwrite();
+                }
                 krkrsdl3::TVPRecordEmoteLayerGPUCopy(
                     static_cast<uint64_t>(_width) * static_cast<uint64_t>(_height) * 4);
                 ths->Update();

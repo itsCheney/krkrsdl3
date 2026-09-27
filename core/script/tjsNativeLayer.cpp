@@ -13,6 +13,7 @@
 #include "tvpinputdefs.h"
 #include "tjsDictionary.h"
 #include "RenderManager.h"
+#include "PointReadTrace.h"
 #include "FontRasterizer.h"
 #include "LayerManager.h"
 #include "TVPFont.h"
@@ -2880,6 +2881,7 @@ void tTJSNI_BaseLayer::LoadProvinceImage(const ttstr& name)
 //---------------------------------------------------------------------------
 tjs_uint32 tTJSNI_BaseLayer::GetMainPixel(tjs_int x, tjs_int y) const
 {
+    krkrsdl3::point_trace::OriginScope trace(krkrsdl3::point_trace::Source::LayerColor, this);
     if (!MainImage)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
 
@@ -2907,6 +2909,7 @@ void tTJSNI_BaseLayer::SetMainPixel(tjs_int x, tjs_int y, tjs_uint32 color)
 //---------------------------------------------------------------------------
 tjs_int tTJSNI_BaseLayer::GetMaskPixel(tjs_int x, tjs_int y) const
 {
+    krkrsdl3::point_trace::OriginScope trace(krkrsdl3::point_trace::Source::LayerMask, this);
     if (!MainImage)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
 
@@ -3234,6 +3237,7 @@ void tTJSNI_BaseLayer::SetImeMode(tTVPImeMode mode)
 //---------------------------------------------------------------------------
 bool tTJSNI_BaseLayer::_HitTestNoVisibleCheck(tjs_int x, tjs_int y)
 {
+    krkrsdl3::point_trace::OriginScope trace(krkrsdl3::point_trace::Source::LayerHitTest, this);
     // do hit test.
     // this function does not check layer's visiblity
 
@@ -8238,6 +8242,7 @@ TJS_END_NATIVE_METHOD_DECL(/*func. name*/ setProvincePixel)
 //----------------------------------------------------------------------
 TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ getLayerAt) // not GetMostFrontChildAt
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::ScriptHitTest, false);
     TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Layer);
     if (numparams < 2)
         return TJS_E_BADPARAMCOUNT;
