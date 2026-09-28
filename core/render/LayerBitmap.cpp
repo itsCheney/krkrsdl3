@@ -16,6 +16,8 @@
 #include "TVPMsg.h"
 #include "PlatformThread.h"
 #include "RenderManager.h"
+#include "TVPCompositor.h"
+#include <memory>
 #include "TVPSystem.h"
 #include "TVPStorage.h"
 #include "TVPFont.h"
@@ -2313,6 +2315,35 @@ bool tTVPNativeBaseBitmap::AssignTexture(iTVPTexture2D* tex)
     // font information are not copyed
     FontChanged = true; // informs internal font information is invalidated
 
+    return true;
+}
+bool tTVPNativeBaseBitmap::CopyFromGPUTarget(krkrsdl3::iTVPRenderBackend* renderer,
+                                          void* source)
+{
+    if (!renderer || !source || !Bitmap || !renderer->SupportsLayerOperations() ||
+        Bitmap->GetFormat() != TVPTextureFormat::RGBA || Bitmap->IsCPUResident())
+        return false;
+
+    // Do not sever sharing until the copy succeeds: a rejected copy must leave
+    // both this image and any snapshots unchanged for the CPU fallback.
+    auto release = [](iTVPTexture2D* texture) { if (texture) texture->Release(); };
+    std::unique_ptr<iTVPTexture2D, decltype(release)> replacement(nullptr, release);
+    iTVPTexture2D* destination = Bitmap;
+    if (!Bitmap->IsIndependent() || Bitmap->IsStatic())
+    {
+        replacement.reset(GetRenderManager()->CreateTexture2D(
+            nullptr, 0, Bitmap->GetWidth(), Bitmap->GetHeight(), Bitmap->GetFormat()));
+        destination = replacement.get();
+    }
+    // Exclusive pinned/leased images decline GPU writes so raw CPU pointers
+    // remain authoritative. A shared snapshot retains its own old texture.
+    void* handle = destination ? destination->GetTextureHandleForOverwrite() : nullptr;
+    if (!handle || !renderer->CopyTargetToLayerTexture(source, handle))
+        return false;
+
+    destination->CommitGPUOverwrite();
+    if (replacement)
+        AssignTexture(destination);
     return true;
 }
 //---------------------------------------------------------------------------

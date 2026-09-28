@@ -9,6 +9,8 @@
 #include "ObjectList.h"
 #include "tjsNative.h"
 
+namespace krkrsdl3 { class iTVPRenderBackend; }
+
 //---------------------------------------------------------------------------
 // global flags
 //---------------------------------------------------------------------------
@@ -492,6 +494,12 @@ public:
     // borrowed; commit only after the backend copy succeeds.
     void* GetMainImageGPUHandleForOverwrite();
     void CommitMainImageGPUOverwrite();
+    // Atomic shared-image replacement for a complete GPU frame. Size arguments
+    // describe the source target; a larger layer image requires a partial copy.
+    bool CopyMainImageFromGPUTarget(krkrsdl3::iTVPRenderBackend* renderer, void* source,
+                                    tjs_int width, tjs_int height);
+    // Copies the top-left source region, preserving image pixels outside it.
+    bool CopyMainImageFromCPU(const void* pixels, tjs_int pitch, tjs_int width, tjs_int height);
     // Closes the write lease opened by GetMainImagePixelBufferForWrite so a GPU
     // adapter can upload only `written` instead of the whole surface. Callers
     // that cannot describe their writes may skip this and pay a full upload.

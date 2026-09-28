@@ -458,6 +458,7 @@ class tTVPBasicDrawDevice : public iTVPDrawDevice
     // 呈现转化用：iTVPTexture2D（软渲染 DrawBuffer）→ compositor 一般贴图
     void* ScratchTexture = nullptr;
     tjs_int ScratchW = 0, ScratchH = 0;
+    void UpdatePointerPresentationHitTesting();
 
 public:
     tTVPBasicDrawDevice(); //!< コンストラクタ

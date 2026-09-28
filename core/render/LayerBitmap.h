@@ -174,6 +174,7 @@ public:
 // tTVPNativeBaseBitmap
 //---------------------------------------------------------------------------
 class iTVPTexture2D;
+namespace krkrsdl3 { class iTVPRenderBackend; }
 class tTVPComplexRect;
 class tTVPCharacterData;
 struct tTVPDrawTextData;
@@ -207,6 +208,9 @@ public:
     bool Assign(const tTVPNativeBaseBitmap& rhs);
     bool AssignBitmap(const tTVPNativeBaseBitmap& rhs); // assigns only bitmap
     bool AssignTexture(iTVPTexture2D* tex);
+    // Full RGBA surface copy. Shared/static images are replaced only after a
+    // successful copy, without first copying the pixels that will be discarded.
+    bool CopyFromGPUTarget(krkrsdl3::iTVPRenderBackend* renderer, void* source);
 
     /* scan line */
     const void* GetScanLine(tjs_uint l) const;

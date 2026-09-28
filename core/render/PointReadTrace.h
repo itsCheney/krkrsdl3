@@ -9,7 +9,7 @@ namespace krkrsdl3::point_trace
 {
 enum class Source { Unknown, LayerHitTest, LayerMask, LayerColor, BitmapMask, BitmapColor };
 enum class Trigger { Unknown, PointerMove, PointerDown, PointerUp, Click, DoubleClick, Wheel,
-                     InputRecheck, ScriptHitTest };
+                     InputRecheck, ScriptHitTest, CursorChange, HintChange };
 enum class Invalidation { Unknown, CPUWrite, CPUUpload, GPUUpdate, GPUOperation,
                           GPUOverwrite, Explicit };
 
@@ -33,6 +33,8 @@ inline const char* Name(Trigger trigger) {
         case Trigger::Wheel: return "wheel";
         case Trigger::InputRecheck: return "inputRecheck";
         case Trigger::ScriptHitTest: return "scriptHitTest";
+        case Trigger::CursorChange: return "cursorChange";
+        case Trigger::HintChange: return "hintChange";
         default: return "unknown";
     }
 }

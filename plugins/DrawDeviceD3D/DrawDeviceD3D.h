@@ -191,6 +191,7 @@ public:
     tjs_int GetOffsetY() const { return OffsetY; }
 
 private:
+    void UpdatePointerPresentationHitTesting();
     void EnsureBackend();
     void RenderFrame();
     void ComposeLayerManager(int index, void* target);

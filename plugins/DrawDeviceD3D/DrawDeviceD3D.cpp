@@ -8,6 +8,7 @@
 #include "TVPSystem.h"
 
 #include <algorithm>
+#include <typeinfo>
 
 
 //---------------------------------------------------------------------------
@@ -91,7 +92,11 @@ DrawDeviceD3D::~DrawDeviceD3D()
     for (auto& mi : Managers)
     {
         if (mi.Manager)
+        {
+            if (auto* manager = dynamic_cast<tTVPLayerManager*>(mi.Manager))
+                manager->SetPointerPresentationHitTestingEnabled(true);
             mi.Manager->Release();
+        }
     }
     Managers.clear();
 }
@@ -118,6 +123,25 @@ bool DrawDeviceD3D::IsSoftwareBackend() const
 void DrawDeviceD3D::SetWindowInterface(TVPWindow* window)
 {
     Window = window;
+    UpdatePointerPresentationHitTesting();
+}
+
+void DrawDeviceD3D::UpdatePointerPresentationHitTesting()
+{
+    // Native subclasses may override cursor/hint callbacks. Only the two
+    // built-in implementations are known to forward to TVPWindow's sinks.
+    const bool builtIn = typeid(*this) == typeid(DrawDeviceD3D) || typeid(*this) == typeid(D3D);
+    for (auto& mi : Managers)
+    {
+        if (auto* manager = dynamic_cast<tTVPLayerManager*>(mi.Manager))
+        {
+            const bool noPresentation = builtIn && Window &&
+                typeid(*Window) == typeid(TVPWindow) &&
+                manager->GetLayerTreeOwner() == static_cast<iTVPLayerTreeOwner*>(Window) &&
+                !Window->HasNativePointerPresentation();
+            manager->SetPointerPresentationHitTestingEnabled(!noPresentation);
+        }
+    }
 }
 
 void DrawDeviceD3D::AddLayerManager(iTVPLayerManager* manager)
@@ -128,6 +152,7 @@ void DrawDeviceD3D::AddLayerManager(iTVPLayerManager* manager)
     manager->AddRef();
     manager->SetDesiredLayerType(ltOpaque);
     Managers.push_back(info);
+    UpdatePointerPresentationHitTesting();
 }
 
 void DrawDeviceD3D::RemoveLayerManager(iTVPLayerManager* manager)
@@ -136,6 +161,8 @@ void DrawDeviceD3D::RemoveLayerManager(iTVPLayerManager* manager)
     {
         if (it->Manager == manager)
         {
+            if (auto* concrete = dynamic_cast<tTVPLayerManager*>(it->Manager))
+                concrete->SetPointerPresentationHitTestingEnabled(true);
             it->Manager->Release();
             Managers.erase(it);
             break;

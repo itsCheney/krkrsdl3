@@ -68,11 +68,13 @@ void tTVPLayerManager::Release()
 //---------------------------------------------------------------------------
 void tTVPLayerManager::RegisterSelfToWindow()
 {
+    PointerPresentationHitTestingEnabled = true;
     LayerTreeOwner->RegisterLayerManager(this);
 }
 //---------------------------------------------------------------------------
 void tTVPLayerManager::UnregisterSelfFromWindow()
 {
+    PointerPresentationHitTestingEnabled = true;
     LayerTreeOwner->UnregisterLayerManager(this);
 }
 
@@ -267,8 +269,10 @@ void tTVPLayerManager::QueryUpdateExcludeRect()
 //---------------------------------------------------------------------------
 void tTVPLayerManager::NotifyMouseCursorChange(tTJSNI_BaseLayer* layer, tjs_int cursor)
 {
-    if (InNotifyingHintOrCursorChange)
+    if (!PointerPresentationHitTestingEnabled || InNotifyingHintOrCursorChange)
         return;
+
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::CursorChange, false);
 
     InNotifyingHintOrCursorChange = true;
     try
@@ -317,8 +321,10 @@ void tTVPLayerManager::SetCursorPos(tjs_int x, tjs_int y)
 //---------------------------------------------------------------------------
 void tTVPLayerManager::NotifyHintChange(tTJSNI_BaseLayer* layer, const ttstr& hint)
 {
-    if (InNotifyingHintOrCursorChange)
+    if (!PointerPresentationHitTestingEnabled || InNotifyingHintOrCursorChange)
         return;
+
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::HintChange, false);
 
     InNotifyingHintOrCursorChange = true;
 
@@ -372,6 +378,7 @@ void tTVPLayerManager::NotifyWindowInvalidation()
 void tTVPLayerManager::SetLayerTreeOwner(class iTVPLayerTreeOwner* owner)
 {
     // sets LayerTreeOwner
+    PointerPresentationHitTestingEnabled = true;
     LayerTreeOwner = owner;
 }
 //---------------------------------------------------------------------------

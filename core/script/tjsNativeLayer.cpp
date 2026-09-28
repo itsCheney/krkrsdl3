@@ -22,6 +22,7 @@
 #include "tjsNativeBitmap.h"
 #include "tjsNativeFont.h"
 #include "tjsNativeRect.h"
+#include <cstring>
 
 //---------------------------------------------------------------------------
 // global flags
@@ -3010,6 +3011,53 @@ void tTJSNI_BaseLayer::CommitMainImageGPUOverwrite()
         return;
     texture->CommitGPUOverwrite();
     ImageModified = true;
+}
+//---------------------------------------------------------------------------
+bool tTJSNI_BaseLayer::CopyMainImageFromGPUTarget(krkrsdl3::iTVPRenderBackend* renderer,
+                                               void* source, tjs_int width, tjs_int height)
+{
+    if (!MainImage || width <= 0 || height <= 0 ||
+        MainImage->GetWidth() != static_cast<tjs_uint>(width) ||
+        MainImage->GetHeight() != static_cast<tjs_uint>(height))
+        return false;
+    if (!MainImage->CopyFromGPUTarget(renderer, source))
+        return false;
+    ImageModified = true;
+    return true;
+}
+//---------------------------------------------------------------------------
+bool tTJSNI_BaseLayer::CopyMainImageFromCPU(const void* pixels, tjs_int pitch,
+                                         tjs_int width, tjs_int height)
+{
+    if (!MainImage || !pixels || pitch <= 0 || width <= 0 || height <= 0 ||
+        MainImage->GetTexture()->GetFormat() != TVPTextureFormat::RGBA)
+        return false;
+    const tjs_int copyWidth = std::min(width, static_cast<tjs_int>(MainImage->GetWidth()));
+    const tjs_int copyHeight = std::min(height, static_cast<tjs_int>(MainImage->GetHeight()));
+    if (copyWidth <= 0 || copyHeight <= 0)
+        return false;
+    const size_t rowBytes = static_cast<size_t>(copyWidth) * 4;
+    // Validate the source before acquiring a destructive full-overwrite lease.
+    if (static_cast<size_t>(pitch) < rowBytes)
+        return false;
+    const bool fullOverwrite = copyWidth == static_cast<tjs_int>(MainImage->GetWidth()) &&
+                               copyHeight == static_cast<tjs_int>(MainImage->GetHeight());
+    // GetTextureForRender can change the destination pitch while severing sharing.
+    auto* texture = MainImage->GetTextureForRender(true, nullptr);
+    const tjs_int destinationPitch = texture->GetPitch();
+    if (destinationPitch <= 0 || static_cast<size_t>(destinationPitch) < rowBytes)
+        return false;
+    auto* destination = static_cast<uint8_t*>(fullOverwrite
+        ? texture->GetPersistentCPUDataForOverwrite() : texture->GetPersistentCPUData(true));
+    if (!destination)
+        return false;
+    for (tjs_int y = 0; y < copyHeight; ++y)
+        std::memcpy(destination + static_cast<size_t>(y) * destinationPitch,
+                    static_cast<const uint8_t*>(pixels) + static_cast<size_t>(y) * pitch, rowBytes);
+    const tTVPRect written(0, 0, copyWidth, copyHeight);
+    texture->ReleasePersistentCPUData(&written);
+    ImageModified = true;
+    return true;
 }
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::ReleaseMainImagePixelBufferForWrite(const tTVPRect& written)

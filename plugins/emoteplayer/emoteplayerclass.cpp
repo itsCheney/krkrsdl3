@@ -24,6 +24,20 @@ namespace emoteplayer
 iTJSDispatch2* ResourceManager::_kagWindow = nullptr;
 static SeparateLayerAdaptor* _motionWorkLayer = nullptr;
 
+// Keep the target unlocked even if destination allocation/copy throws.
+struct TargetReadLock
+{
+    krkrsdl3::iTVPRenderBackend* renderer;
+    void* target;
+    int pitch = 0;
+    uint8_t* pixels;
+    TargetReadLock(krkrsdl3::iTVPRenderBackend* backend, void* source)
+        : renderer(backend), target(source), pixels(renderer->LockTarget(target, pitch)) {}
+    ~TargetReadLock() { renderer->UnlockTarget(target); }
+    TargetReadLock(const TargetReadLock&) = delete;
+    TargetReadLock& operator=(const TargetReadLock&) = delete;
+};
+
 static std::uint64_t nextEmoteManagerId()
 {
     static std::atomic<std::uint64_t> next{0};
@@ -531,52 +545,30 @@ void D3DAdaptor::captureCanvas(iTJSDispatch2* targetLayer)
 
     if (fullOverwrite)
     {
-        void* destination = ths->GetMainImageGPUHandleForOverwrite();
-        if (destination && renderer->CopyTargetToLayerTexture(_target, destination))
+        bool copied;
         {
-            {
-                krkrsdl3::point_trace::WriterScope write("emote.captureCanvas");
-                ths->CommitMainImageGPUOverwrite();
-            }
+            krkrsdl3::point_trace::WriterScope write("emote.captureCanvas");
+            copied = ths->CopyMainImageFromGPUTarget(renderer, _target, _width, _height);
+        }
+        if (copied)
+        {
             krkrsdl3::TVPRecordEmoteCaptureGPUCopy(fullBytes);
             ths->Update();
             return;
         }
     }
 
-    int pitch = 0;
-    uint8_t* pixels = renderer->LockTarget(_target, pitch);
-    if (!pixels || pitch <= 0)
+    bool copied;
     {
-        renderer->UnlockTarget(_target);
-        return;
+        TargetReadLock read(renderer, _target);
+        if (!read.pixels || read.pitch <= 0)
+            return;
+        krkrsdl3::TVPRecordEmoteCaptureCPUFallback(
+            _height > 0 ? uint64_t(read.pitch) * uint64_t(_height) : 0);
+        copied = ths->CopyMainImageFromCPU(read.pixels, read.pitch, copyWidth, copyHeight);
     }
-    krkrsdl3::TVPRecordEmoteCaptureCPUFallback(
-        _height > 0 ? uint64_t(pitch) * uint64_t(_height) : 0);
-
-    tjs_uint8* buff = (tjs_uint8*)(fullOverwrite
-        ? ths->GetMainImagePixelBufferForOverwrite()
-        : ths->GetMainImagePixelBufferForWrite());
-
-    if (buff && copyWidth > 0 && copyHeight > 0)
-    {
-        const tjs_int dstPitch = ths->GetMainImagePixelBufferPitch();
-        const size_t rowBytes = (size_t)copyWidth * 4;
-        if (dstPitch >= (tjs_int)rowBytes && pitch >= (tjs_int)rowBytes)
-        {
-            if (pitch == dstPitch && copyWidth == _width && copyWidth == layerWidth)
-                std::memcpy(buff, pixels, rowBytes * copyHeight);
-            else
-                for (tjs_int y = 0; y < copyHeight; ++y)
-                    std::memcpy(buff + (size_t)y * dstPitch,
-                                pixels + (size_t)y * pitch,
-                                rowBytes);
-        }
-    }
-
-    renderer->UnlockTarget(_target);
-    ths->ReleaseMainImagePixelBufferForWrite(tTVPRect(0, 0, copyWidth, copyHeight));
-    ths->Update();
+    if (copied)
+        ths->Update();
 }
 void D3DAdaptor::unloadUnusedTextures()
 {
@@ -1078,34 +1070,31 @@ void EmotePlayer::draw(iTJSDispatch2* objthis)
         {
             // The destination is overwritten in full. Keep the frame on the
             // GPU when the Layer renderer can lend us its writable texture.
-            void* destination = ths->GetMainImageGPUHandleForOverwrite();
-            if (destination && renderer->CopyTargetToLayerTexture(target, destination))
+            bool copied;
             {
-                {
-                    krkrsdl3::point_trace::WriterScope write("emote.drawToLayer");
-                    ths->CommitMainImageGPUOverwrite();
-                }
+                krkrsdl3::point_trace::WriterScope write("emote.drawToLayer");
+                copied = ths->CopyMainImageFromGPUTarget(renderer, target, _width, _height);
+            }
+            if (copied)
+            {
                 krkrsdl3::TVPRecordEmoteLayerGPUCopy(
                     static_cast<uint64_t>(_width) * static_cast<uint64_t>(_height) * 4);
                 ths->Update();
                 return;
             }
             // 回读 CPU 像素并交给图层（GL 后端经 glReadPixels，软渲染后端零拷贝）
-            int pitch = 0;
-            const Uint64 readbackStarted = SDL_GetTicksNS();
-            uint8_t* pixels = renderer->LockTarget(target, pitch);
-            krkrsdl3::TVPRecordEmoteLayerCPUReadback(
-                pixels && pitch > 0 ? static_cast<uint64_t>(pitch) * static_cast<uint64_t>(_height) : 0,
-                SDL_GetTicksNS() - readbackStarted);
-            // 紧接的 memcpy 覆盖整个图层（_width/_height 来自上面的 ResetDrawArea），
-            // 图层原有像素不会被读取，因此无需为保留它们做一次 GPU 回读。
-            tjs_uint8* buff = (tjs_uint8*)ths->GetMainImagePixelBufferForOverwrite();
-            if (buff && pixels)
-                std::memcpy(buff, pixels, (size_t)_width * _height * 4);
-            renderer->UnlockTarget(target);
-            // 写入范围即上面这块，据此关闭写租约，GPU 后端只需上传该区域
-            ths->ReleaseMainImagePixelBufferForWrite(tTVPRect(0, 0, _width, _height));
-            ths->Update();
+            {
+                const Uint64 readbackStarted = SDL_GetTicksNS();
+                TargetReadLock read(renderer, target);
+                krkrsdl3::TVPRecordEmoteLayerCPUReadback(
+                    read.pixels && read.pitch > 0 ? static_cast<uint64_t>(read.pitch) * static_cast<uint64_t>(_height) : 0,
+                    SDL_GetTicksNS() - readbackStarted);
+                // The image may be larger than the layer rectangle. Preserve the
+                // uncovered pixels and honor both row pitches in that case.
+                copied = ths->CopyMainImageFromCPU(read.pixels, read.pitch, _width, _height);
+            }
+            if (copied)
+                ths->Update();
         }
     }
 }

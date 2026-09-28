@@ -286,6 +286,9 @@ class tTVPLayerManager : public iTVPLayerManager, public tTVPDrawable
     bool ReleaseCaptureCalled;
 
     bool InNotifyingHintOrCursorChange;
+    // Only built-in draw devices with no native cursor/hint presentation opt
+    // out. Keep foreign owners/devices and all real input hit tests unchanged.
+    bool PointerPresentationHitTestingEnabled = true;
     bool HoldAlpha = true;
 
 public:
@@ -349,6 +352,10 @@ public:
     void QueryUpdateExcludeRect();
 
 public:
+    void SetPointerPresentationHitTestingEnabled(bool enabled)
+    {
+        PointerPresentationHitTestingEnabled = enabled;
+    }
     void NotifyMouseCursorChange(tTJSNI_BaseLayer* layer, tjs_int cursor);
     void SetMouseCursor(tjs_int cursor);
 
