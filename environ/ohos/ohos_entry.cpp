@@ -5,9 +5,12 @@
 #include "TVPApplication.h"
 #include "RenderManager.h"
 #include "TVPWindow.h"
+#include "WindowManager.h"
 #include "Platform.h"
 #include "TVPSettings.h"
 #include "TVPCompositor.h"
+#include "TVPStorage.h"
+#include "TVPDebug.h"
 
 #include "backend/GLRenderBackend.h"
 
@@ -20,6 +23,11 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <string.h>
+#include <string>
+#include <vector>
+#include <cctype>
+#include <sys/stat.h>
 
 #undef LOG_DOMAIN
 #undef LOG_TAG
@@ -28,6 +36,8 @@
 
 static int winWidth = 1280, winHeight = 720;
 static bool g_running = false;
+static volatile bool g_stopRequested = false;
+static volatile bool g_paused = false;
 static bool g_surfaceReady = false;
 static EGLDisplay g_eglDisplay = EGL_NO_DISPLAY;
 static EGLSurface g_eglSurface = EGL_NO_SURFACE;
@@ -38,6 +48,8 @@ static napi_threadsafe_function g_titleCallback = nullptr;
 static napi_threadsafe_function g_fullscreenCallback = nullptr;
 static napi_threadsafe_function g_imeCallback = nullptr;
 static pthread_t g_renderThread = 0;
+static char g_saveDir[512] = {0};
+static char g_engineArgs[1024] = {0};
 
 NativeResourceManager* OHOS_GetResourceManager() { return g_resourceMgr; }
 
@@ -46,8 +58,12 @@ static void* RenderThreadProc(void* data)
 {
     const char* gamePath = (const char*)data;
 
-    // 等待 native window 就绪
-    while (!g_nativeWindow) { usleep(16000); }
+    // 等待 native window 就绪（可被 shutdown 中断）
+    while (!g_nativeWindow && !g_stopRequested) { usleep(16000); }
+    if (g_stopRequested) {
+        if (gamePath) free((void*)gamePath);
+        return nullptr;
+    }
 
     // 在本线程创建 EGL 上下文
     g_eglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
@@ -67,36 +83,99 @@ static void* RenderThreadProc(void* data)
     OH_LOG_INFO(LOG_APP, "EGL ready on render thread");
 
     // EGL 就绪后启动引擎（glGenTextures 等 GL 调用此时才有效）
+    std::vector<std::string> argStore;
+    argStore.push_back("./krkrsdl3");
     if (gamePath && gamePath[0]) {
-        const char* args[2] = {"./krkrsdl3", gamePath};
-        TVPParseArguments(2, (char**)args);
+        argStore.push_back(gamePath);
+    }
+    {
+        std::string extra(g_engineArgs);
+        size_t pos = 0;
+        while (pos < extra.size()) {
+            while (pos < extra.size() && isspace((unsigned char)extra[pos])) pos++;
+            const size_t start = pos;
+            while (pos < extra.size() && !isspace((unsigned char)extra[pos])) pos++;
+            if (pos > start) {
+                argStore.push_back(extra.substr(start, pos - start));
+            }
+        }
+    }
+    std::vector<char*> argVec;
+    for (size_t i = 0; i < argStore.size(); i++) {
+        argVec.push_back(const_cast<char*>(argStore[i].c_str()));
+    }
+    TVPParseArguments((int)argVec.size(), argVec.data());
+    eglSwapInterval(g_eglDisplay, TVPSettings.vsync ? 1 : 0);
+    OH_LOG_INFO(LOG_APP, "engine params: renderer=%{public}s vsync=%{public}d stretch=%{public}d",
+                TVPSettings.renderer.c_str(), TVPSettings.vsync,
+                krkrsdl3::TVPGetStretchMode() ? 1 : 0);
+    // 存档/日志重定向到应用沙箱（游戏目录只读）
+    if (g_saveDir[0]) {
+        std::string dir = std::string(g_saveDir) + "/savedata/";
+        mkdir(g_saveDir, 0755);
+        mkdir(dir.c_str(), 0755);
+        TVPNativeDataPath = ttstr(dir.c_str());
+        TVPDataPath = TVPNormalizeStorageName(TVPNativeDataPath);
+        TVPSetLogLocation(TVPNativeDataPath);
+        OH_LOG_INFO(LOG_APP, "savedata redirect: %{public}s", dir.c_str());
     }
     Application = new tTVPApplication;
     if (!::Application->StartApplication()) {
         OH_LOG_ERROR(LOG_APP, "StartApplication failed");
         g_running = false;
-        return nullptr;
+    } else {
+        g_running = true;
     }
-    g_running = true;
 
-    while (g_running) {
+    unsigned int statFrames = 0;
+    tjs_uint64 statStart = TVPGetRoughTickCount();
+    tjs_uint64 statRun = 0;
+    tjs_uint64 statRender = 0;
+    while (g_running && !g_stopRequested) {
+        if (g_paused) { usleep(16000); continue; }
+        const tjs_uint64 t0 = TVPGetRoughTickCount();
         if(!::Application->Run())
             break;
+        const tjs_uint64 t1 = TVPGetRoughTickCount();
         // 合成器完成渲染（清屏/绘制/呈现全部由当前渲染后端负责）
         krkrsdl3::TVPRenderOnce(winWidth, winHeight);
+        const tjs_uint64 t2 = TVPGetRoughTickCount();
+        statRun += (t1 - t0);
+        statRender += (t2 - t1);
+        statFrames++;
+        if (t2 - statStart >= 5000) {
+            TVPSprite* spr = krkrsdl3::KRKR_Get_Current_Sprite();
+            OH_LOG_INFO(LOG_APP,
+                        "perf: fps=%{public}.1f run=%{public}llu ms render=%{public}llu ms sprite=%{public}dx%{public}d (5s)",
+                        statFrames / 5.0,
+                        (unsigned long long)statRun,
+                        (unsigned long long)statRender,
+                        spr ? spr->width : 0,
+                        spr ? spr->height : 0);
+            statFrames = 0;
+            statRun = 0;
+            statRender = 0;
+            statStart = t2;
+        }
     }
-    
-    ::Application->OnExit();
-    delete Application;
-    Application = NULL;
+
+    if (::Application) {
+        ::Application->OnExit();
+        delete Application;
+        Application = NULL;
+    }
 
     eglMakeCurrent(g_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     eglDestroySurface(g_eglDisplay, g_eglSurface);
     eglDestroyContext(g_eglDisplay, g_eglContext);
     eglTerminate(g_eglDisplay);
+    g_eglDisplay = EGL_NO_DISPLAY;
+    g_eglSurface = EGL_NO_SURFACE;
+    g_eglContext = EGL_NO_CONTEXT;
+    g_surfaceReady = false;
     if(gamePath) free((void*)gamePath);
     TVPClearAllArguments();
-    exit(0);
+    OH_LOG_INFO(LOG_APP, "render thread exited");
     return nullptr;
 }
 
@@ -105,8 +184,17 @@ static napi_value NAPI_InitEngine(napi_env env, napi_callback_info info)
 {
     size_t argc = 1; napi_value argv[1];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    char arg0[256] = {0}; size_t len;
+    char arg0[512] = {0}; size_t len;
     napi_get_value_string_utf8(env, argv[0], arg0, sizeof(arg0), &len);
+
+    if (g_renderThread) {
+        OH_LOG_WARN(LOG_APP, "engine already running, ignore initEngine");
+        napi_value r; napi_get_boolean(env, false, &r); return r;
+    }
+    g_stopRequested = false;
+    g_paused = false;
+    g_running = false;
+    g_surfaceReady = false;
 
     // 游戏路径传给渲染线程（EGL 就绪后再 StartApplication）
     char* gamePath = strdup((const char*)arg0);
@@ -141,9 +229,69 @@ static napi_value NAPI_SetSurface(napi_env env, napi_callback_info info)
 
 static napi_value NAPI_Shutdown(napi_env env, napi_callback_info info)
 {
-    g_running = false;
+    g_stopRequested = true;
+    g_paused = false;
     if (g_renderThread) { pthread_join(g_renderThread, nullptr); g_renderThread = 0; }
     if (g_nativeWindow) { OH_NativeWindow_DestroyNativeWindow(g_nativeWindow); g_nativeWindow = nullptr; }
+    if (g_titleCallback) { napi_release_threadsafe_function(g_titleCallback, napi_tsfn_release); g_titleCallback = nullptr; }
+    if (g_fullscreenCallback) { napi_release_threadsafe_function(g_fullscreenCallback, napi_tsfn_release); g_fullscreenCallback = nullptr; }
+    if (g_imeCallback) { napi_release_threadsafe_function(g_imeCallback, napi_tsfn_release); g_imeCallback = nullptr; }
+    napi_value r; napi_get_undefined(env, &r); return r;
+}
+
+static napi_value NAPI_SetSaveDir(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    size_t len = 0;
+    napi_get_value_string_utf8(env, argv[0], g_saveDir, sizeof(g_saveDir), &len);
+    napi_value r; napi_get_undefined(env, &r); return r;
+}
+
+static napi_value NAPI_SetEngineArgs(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    size_t len = 0;
+    napi_get_value_string_utf8(env, argv[0], g_engineArgs, sizeof(g_engineArgs), &len);
+    napi_value r; napi_get_undefined(env, &r); return r;
+}
+
+static napi_value NAPI_Pause(napi_env env, napi_callback_info info)
+{
+    g_paused = true;
+    napi_value r; napi_get_undefined(env, &r); return r;
+}
+
+static napi_value NAPI_Resume(napi_env env, napi_callback_info info)
+{
+    g_paused = false;
+    napi_value r; napi_get_undefined(env, &r); return r;
+}
+
+static napi_value NAPI_SendKey(napi_env env, napi_callback_info info)
+{
+    size_t argc = 2; napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t vk = 0; bool down = false;
+    napi_get_value_int32(env, argv[0], &vk);
+    napi_get_value_bool(env, argv[1], &down);
+    if (down) krkrsdl3::KRKR_Trig_KeyDown(vk);
+    else krkrsdl3::KRKR_Trig_KeyUp(vk);
+    napi_value r; napi_get_undefined(env, &r); return r;
+}
+
+static napi_value NAPI_SendText(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    size_t len = 0;
+    napi_get_value_string_utf8(env, argv[0], nullptr, 0, &len);
+    std::vector<char> buffer(len + 1, 0);
+    if (len > 0) {
+        napi_get_value_string_utf8(env, argv[0], buffer.data(), buffer.size(), &len);
+    }
+    krkrsdl3::KRKR_Trig_TextInput(std::string(buffer.data(), len));
     napi_value r; napi_get_undefined(env, &r); return r;
 }
 
@@ -167,12 +315,17 @@ static napi_value NAPI_RegisterCallbacks(napi_env env, napi_callback_info info)
     size_t argc = 3; napi_value argv[3];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
 
+    if (g_titleCallback) { napi_release_threadsafe_function(g_titleCallback, napi_tsfn_release); g_titleCallback = nullptr; }
+    if (g_fullscreenCallback) { napi_release_threadsafe_function(g_fullscreenCallback, napi_tsfn_release); g_fullscreenCallback = nullptr; }
+    if (g_imeCallback) { napi_release_threadsafe_function(g_imeCallback, napi_tsfn_release); g_imeCallback = nullptr; }
+
     napi_value rn;
     napi_create_string_utf8(env, "T", NAPI_AUTO_LENGTH, &rn);
     napi_create_threadsafe_function(env, argv[0], nullptr, rn, 0, 1, nullptr, nullptr, nullptr,
         [](napi_env e, napi_value cb, void*, void* d) {
             napi_value a; napi_create_string_utf8(e, (const char*)d, NAPI_AUTO_LENGTH, &a);
             napi_call_function(e, nullptr, cb, 1, &a, nullptr);
+            free(d);
         }, &g_titleCallback);
 
     napi_create_string_utf8(env, "F", NAPI_AUTO_LENGTH, &rn);
@@ -214,7 +367,13 @@ static napi_value Init(napi_env env, napi_value exports)
         {"setResourceManager", nullptr, NAPI_SetResourceManager, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setSurface", nullptr, NAPI_SetSurface, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"shutdown", nullptr, NAPI_Shutdown, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setSaveDir", nullptr, NAPI_SetSaveDir, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setEngineArgs", nullptr, NAPI_SetEngineArgs, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"pause", nullptr, NAPI_Pause, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"resume", nullptr, NAPI_Resume, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sendMouseEvent", nullptr, NAPI_SendMouseEvent, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"sendKey", nullptr, NAPI_SendKey, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"sendText", nullptr, NAPI_SendText, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"registerCallbacks", nullptr, NAPI_RegisterCallbacks, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"updateWindowSize", nullptr, NAPI_UpdateWindowSize, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
@@ -225,7 +384,7 @@ EXTERN_C_END
 
 static napi_module demoModule = {
     .nm_version = 1, .nm_flags = 0, .nm_filename = nullptr,
-    .nm_register_func = Init, .nm_modname = "krkrsdl3_napi",
+    .nm_register_func = Init, .nm_modname = "krkrsdl3",
     .nm_priv = nullptr, .reserved = {0},
 };
 
@@ -236,7 +395,10 @@ extern "C" __attribute__((constructor)) void RegisterKrkrsdl3Module(void)
 
 // ─── 平台函数 ──────────────────────────────────────────────────
 void TVPSetWindowTitle(const char* t) {
-    if (g_titleCallback) napi_call_threadsafe_function(g_titleCallback, (void*)t, napi_tsfn_blocking);
+    if (g_titleCallback) {
+        char* d = strdup(t ? t : "");
+        napi_call_threadsafe_function(g_titleCallback, (void*)d, napi_tsfn_blocking);
+    }
 }
 std::string TVPGetWindowTitle() { return "krkrsdl3 OHOS"; }
 void TVPSetWindowFullscreen(bool full) {
@@ -265,6 +427,8 @@ int TVPDrawSceneOnce(int interval) {
     int remain = interval - (curTick - lastTick);
     if (remain <= 0)
     {
+        if (!::Application)
+            return interval;
         eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext);
         ::Application->Run();
         iTVPTexture2D::RecycleProcess();
