@@ -1,5 +1,6 @@
 #include "MetalRenderBackend.h"
 #include "MetalLayerShaders.h"
+#include "MetalStageDiagnostics.h"
 #include "PointReadTrace.h"
 
 #import <Foundation/Foundation.h>
@@ -145,6 +146,169 @@ kernel void layerMain(uint2 tid [[thread_position_in_grid]], constant Params& p 
 }
 )MSL";
 
+namespace stage_timing = metal_diagnostics::stage_timing;
+
+// One owner per sampled command buffer. Completion keeps this (and its Metal
+// resources) alive without retaining or touching the backend. Sampling attaches
+// to existing passes; it never ends an encoder or inserts a GPU command.
+struct StageCapture
+{
+    id<MTLDevice> device = nil;
+    id<MTLCounterSampleBuffer> samples = nil;
+    stage_timing::Plan plan;
+    stage_timing::ClockCalibration clock;
+    const char* status = "unsupported_os";
+
+    explicit StageCapture(id<MTLDevice> owner) : device(owner)
+    {
+        if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
+            status = "unsupported_stage_boundary";
+            if (![device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) return;
+            status = "timestamp_set_missing";
+            id<MTLCounterSet> timestampSet = nil;
+            for (id<MTLCounterSet> set in device.counterSets) {
+                if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) {
+                    timestampSet = set;
+                    break;
+                }
+            }
+            if (!timestampSet) return;
+            MTLCounterSampleBufferDescriptor* descriptor = [MTLCounterSampleBufferDescriptor new];
+            descriptor.label = @"Sampled frame stages";
+            descriptor.counterSet = timestampSet;
+            descriptor.storageMode = MTLStorageModeShared;
+            descriptor.sampleCount = stage_timing::MaxSamples;
+            NSError* error = nil;
+            samples = [device newCounterSampleBufferWithDescriptor:descriptor error:&error];
+            status = samples ? "stage_boundary" : "buffer_allocation_failed";
+            if (samples) [device sampleTimestamps:&clock.cpuBegin gpuTimestamp:&clock.gpuBegin];
+        }
+    }
+
+    id<MTLRenderCommandEncoder> Render(id<MTLCommandBuffer> commands,
+                                      MTLRenderPassDescriptor* descriptor,
+                                      stage_timing::RenderKind kind)
+    {
+        if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
+            if (samples) {
+                const auto first = plan.ReserveRender(kind);
+                if (first != stage_timing::NoSample) {
+                    auto attachment = descriptor.sampleBufferAttachments[0];
+                    attachment.sampleBuffer = samples;
+                    attachment.startOfVertexSampleIndex = first;
+                    attachment.endOfVertexSampleIndex = first + 1;
+                    attachment.startOfFragmentSampleIndex = first + 2;
+                    attachment.endOfFragmentSampleIndex = first + 3;
+                    auto encoder = [commands renderCommandEncoderWithDescriptor:descriptor];
+                    if (encoder) return encoder;
+                    plan.Rollback(first);
+                    attachment.sampleBuffer = nil;
+                    attachment.startOfVertexSampleIndex = MTLCounterDontSample;
+                    attachment.endOfVertexSampleIndex = MTLCounterDontSample;
+                    attachment.startOfFragmentSampleIndex = MTLCounterDontSample;
+                    attachment.endOfFragmentSampleIndex = MTLCounterDontSample;
+                }
+            }
+        }
+        return [commands renderCommandEncoderWithDescriptor:descriptor];
+    }
+
+    id<MTLComputeCommandEncoder> Compute(id<MTLCommandBuffer> commands, bool explicitSerial)
+    {
+        if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
+            if (samples) {
+                const auto first = plan.ReserveEncoder(stage_timing::Stage::LayerCompute);
+                if (first != stage_timing::NoSample) {
+                    MTLComputePassDescriptor* descriptor = [MTLComputePassDescriptor computePassDescriptor];
+                    descriptor.dispatchType = MTLDispatchTypeSerial;
+                    auto attachment = descriptor.sampleBufferAttachments[0];
+                    attachment.sampleBuffer = samples;
+                    attachment.startOfEncoderSampleIndex = first;
+                    attachment.endOfEncoderSampleIndex = first + 1;
+                    auto encoder = [commands computeCommandEncoderWithDescriptor:descriptor];
+                    if (encoder) return encoder;
+                    plan.Rollback(first);
+                }
+            }
+        }
+        return explicitSerial ? [commands computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial]
+                              : [commands computeCommandEncoder];
+    }
+
+    id<MTLBlitCommandEncoder> Blit(id<MTLCommandBuffer> commands)
+    {
+        if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
+            if (samples) {
+                const auto first = plan.ReserveEncoder(stage_timing::Stage::Blit);
+                if (first != stage_timing::NoSample) {
+                    MTLBlitPassDescriptor* descriptor = [MTLBlitPassDescriptor blitPassDescriptor];
+                    auto attachment = descriptor.sampleBufferAttachments[0];
+                    attachment.sampleBuffer = samples;
+                    attachment.startOfEncoderSampleIndex = first;
+                    attachment.endOfEncoderSampleIndex = first + 1;
+                    auto encoder = [commands blitCommandEncoderWithDescriptor:descriptor];
+                    if (encoder) return encoder;
+                    plan.Rollback(first);
+                }
+            }
+        }
+        return [commands blitCommandEncoder];
+    }
+
+    void Report(uint64_t serial, bool completed)
+    {
+        stage_timing::Summary summary;
+        const char* result = status;
+        if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
+            if (samples) {
+                result = "command_failed";
+                if (completed) {
+                    [device sampleTimestamps:&clock.cpuEnd gpuTimestamp:&clock.gpuEnd];
+                    // Shared counter storage resolves on the CPU after completion;
+                    // no blit encoder, wait, or additional submission is necessary.
+                    NSData* data = plan.sampleCount ? [samples resolveCounterRange:NSMakeRange(0, plan.sampleCount)] : nil;
+                    std::array<uint64_t, stage_timing::MaxSamples> timestamps{};
+                    const size_t count = std::min(size_t(plan.sampleCount),
+                                                  size_t(data.length / sizeof(MTLCounterResultTimestamp)));
+                    for (size_t i = 0; i < count; ++i) {
+                        MTLCounterResultTimestamp sample;
+                        std::memcpy(&sample, static_cast<const uint8_t*>(data.bytes) + i * sizeof(sample), sizeof(sample));
+                        timestamps[i] = sample.timestamp;
+                    }
+                    summary = stage_timing::Resolve(plan, timestamps.data(), count, clock, MTLCounterErrorValue);
+                    result = !plan.sampleCount ? "no_intervals" : !clock.Valid() ? "clock_invalid" :
+                        !data ? "resolve_failed" : !summary.valid ? "samples_invalid" :
+                        summary.invalid || plan.droppedPasses || plan.failedPasses ? "partial" : "complete";
+                }
+            }
+        }
+        // Missing/invalid stages use -1, never a misleading zero. Partial sums
+        // describe only their valid intervals; counts make missing coverage explicit.
+        const auto& s = summary.stages;
+        SDL_Log("metal.gpuStages id=%llu status=%s timingAvailable=%d calibrationValid=%d "
+                "validIntervals=%u invalidIntervals=%u droppedPasses=%u failedPasses=%u "
+                "meshVertexMS=%.3f meshVertexValid=%u meshVertexInvalid=%u "
+                "meshFragmentMS=%.3f meshFragmentValid=%u meshFragmentInvalid=%u "
+                "windowVertexMS=%.3f windowVertexValid=%u windowVertexInvalid=%u "
+                "windowFragmentMS=%.3f windowFragmentValid=%u windowFragmentInvalid=%u "
+                "otherVertexMS=%.3f otherVertexValid=%u otherVertexInvalid=%u "
+                "otherFragmentMS=%.3f otherFragmentValid=%u otherFragmentInvalid=%u "
+                "layerComputeMS=%.3f layerComputeValid=%u layerComputeInvalid=%u "
+                "blitMS=%.3f blitValid=%u blitInvalid=%u",
+                static_cast<unsigned long long>(serial), result, summary.valid ? 1 : 0,
+                summary.calibrationValid ? 1 : 0, summary.valid, summary.invalid,
+                plan.droppedPasses, plan.failedPasses,
+                s[0].Milliseconds(), s[0].valid, s[0].invalid,
+                s[1].Milliseconds(), s[1].valid, s[1].invalid,
+                s[2].Milliseconds(), s[2].valid, s[2].invalid,
+                s[3].Milliseconds(), s[3].valid, s[3].invalid,
+                s[4].Milliseconds(), s[4].valid, s[4].invalid,
+                s[5].Milliseconds(), s[5].valid, s[5].invalid,
+                s[6].Milliseconds(), s[6].valid, s[6].invalid,
+                s[7].Milliseconds(), s[7].valid, s[7].invalid);
+    }
+};
+
 struct Params
 {
     simd_float4 color = {0, 0, 0, 0};
@@ -216,6 +380,7 @@ struct MetalRenderBackend::Impl
     std::shared_ptr<std::atomic<double>> gpuTimeMS = std::make_shared<std::atomic<double>>(-1.0);
     metal_diagnostics::Sampler diagnosticSampler;
     metal_diagnostics::Workload diagnosticWorkload;
+    std::shared_ptr<StageCapture> diagnosticStages;
     bool diagnosticSampled = false, diagnosticCapabilityLogged = false;
     uint64_t commandSerial = 0, lastSubmittedSerial = 0, renderFrameSerial = 0;
     uint64_t diagnosticFirstRenderFrame = 0;
@@ -397,12 +562,14 @@ struct MetalRenderBackend::Impl
             diagnosticWorkload = {};
             diagnosticSampled = diagnosticSampler.ShouldSample(
                 SDL_GetHintBoolean("MIKAGE_METAL_DIAGNOSTICS", false), SDL_GetTicksNS());
+            diagnosticStages = diagnosticSampled ? std::make_shared<StageCapture>(device) : nullptr;
             diagnosticQueueWaitMS = double(queueWaitNS) / 1000000.0;
             diagnosticFirstRenderFrame = renderFrameSerial;
             if (diagnosticSampled && !diagnosticCapabilityLogged) {
                 SDL_Log("metal.gpuTiming mode=command_buffer_completion sampleIntervalMS=1000 "
-                        "perStageTimestamps=not_collected mixedStageTiming=unattributed "
-                        "extraSubmissions=0 extraWaits=0");
+                        "perStageTimestamps=%s mixedStageTiming=unattributed "
+                        "maxStageSamples=%u extraSubmissions=0 extraWaits=0",
+                        diagnosticStages->status, stage_timing::MaxSamples);
                 diagnosticCapabilityLogged = true;
             }
             // Capture shared completion state, never this (the callback can
@@ -496,7 +663,8 @@ struct MetalRenderBackend::Impl
     }
     id<MTLBlitCommandEncoder> Blit() {
         EndMesh(); EndOrdinary();
-        auto encoder = [Commands() blitCommandEncoder];
+        auto buffer = Commands();
+        auto encoder = diagnosticStages ? diagnosticStages->Blit(buffer) : [buffer blitCommandEncoder];
         if (encoder) {
             TVPRecordMetalBlitEncoder();
             if (diagnosticSampled) {
@@ -508,7 +676,8 @@ struct MetalRenderBackend::Impl
     }
     id<MTLComputeCommandEncoder> Compute() {
         EndMesh(); EndOrdinary();
-        auto encoder = [Commands() computeCommandEncoder];
+        auto buffer = Commands();
+        auto encoder = diagnosticStages ? diagnosticStages->Compute(buffer, false) : [buffer computeCommandEncoder];
         if (encoder) {
             TVPRecordMetalComputeEncoder();
             if (diagnosticSampled) {
@@ -522,7 +691,9 @@ struct MetalRenderBackend::Impl
         EndMesh();
         if(!ordinaryEncoder) {
             // Serial dispatches provide write/read ordering for tracked textures.
-            ordinaryEncoder=[Commands() computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+            auto buffer = Commands();
+            ordinaryEncoder = diagnosticStages ? diagnosticStages->Compute(buffer, true) :
+                [buffer computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
             if (ordinaryEncoder) {
                 TVPRecordMetalComputeEncoder();
                 if (diagnosticSampled) {
@@ -559,6 +730,7 @@ struct MetalRenderBackend::Impl
                 const auto cpuQueueWaitMS = diagnosticQueueWaitMS;
                 const auto firstRenderFrame = diagnosticFirstRenderFrame;
                 const auto lastRenderFrame = renderFrameSerial;
+                const auto stages = diagnosticStages;
                 const double submittedAtMS = double(SDL_GetTicksNS()) / 1000000.0;
                 [commands addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
                     if (!SDL_GetHintBoolean("MIKAGE_METAL_DIAGNOSTICS", false)) return;
@@ -577,11 +749,13 @@ struct MetalRenderBackend::Impl
                             static_cast<unsigned long long>(firstRenderFrame),
                             static_cast<unsigned long long>(lastRenderFrame), submittedAtMS,
                             double(SDL_GetTicksNS()) / 1000000.0);
+                    if (stages) stages->Report(serial, buffer.status == MTLCommandBufferStatusCompleted);
                 }];
             }
             [commands commit];
             TVPRecordMetalSubmit();
             commands = nil;
+            diagnosticStages.reset();
             diagnosticSampled = false;
             transientBytes = 0;
             transientOps = 0;
@@ -615,7 +789,11 @@ struct MetalRenderBackend::Impl
         p.colorAttachments[0].loadAction = clear ? MTLLoadActionClear : MTLLoadActionLoad;
         p.colorAttachments[0].storeAction = MTLStoreActionStore;
         p.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
-        id<MTLRenderCommandEncoder> encoder = [Commands() renderCommandEncoderWithDescriptor:p];
+        auto buffer = Commands();
+        const auto kind = stage == metal_diagnostics::Workload::Mesh ? stage_timing::RenderKind::Mesh :
+            stage == metal_diagnostics::Workload::Window ? stage_timing::RenderKind::Window : stage_timing::RenderKind::Other;
+        id<MTLRenderCommandEncoder> encoder = diagnosticStages ? diagnosticStages->Render(buffer, p, kind) :
+            [buffer renderCommandEncoderWithDescriptor:p];
         if (!encoder) throw std::runtime_error("Metal render encoder allocation failed");
         TVPRecordMetalRenderEncoder();
         if (diagnosticSampled) {
