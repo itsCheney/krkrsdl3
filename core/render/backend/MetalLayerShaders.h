@@ -164,4 +164,59 @@ kernel void dualSourceLayer(uint2 tid [[thread_position_in_grid]],
         : constAlphaSD(s1, s2, uint(p.operation.y));
     target.write(float4(layerUnpack(out)) / 255.0, uint2(xy));
 }
+
+// UnivTrans integer helpers are also compiled by the portable parity test.
+// Unlike ConstAlphaSD_d, the universal blend does NOT adjust weights > 127.
+uint univTransBlendARGB(uint s1, uint s2, uint opa) {
+    uint rb = s1 & 0x00ff00ffu;
+    uint out = (rb + ((((s2 & 0x00ff00ffu) - rb) * opa) >> 8)) & 0x00ff00ffu;
+    uint ga = (s1 & 0xff00ff00u) >> 8;
+    return out + (((ga + (((((s2 & 0xff00ff00u) >> 8) - ga) * opa) >> 8)) << 8) & 0xff00ff00u);
+}
+uint univTransPixel(uint s1, uint s2, int rule, int phase, int vague,
+                    uint flags, const device uchar* tables) {
+    int lower = phase - vague;
+    // The switch routines copy the ENTIRE source pixel, including alpha.
+    // For vague >= 512 the full-table routines blend even at weight 0/255.
+    if (vague < 512) {
+        if (rule >= phase) return s1;
+        if (rule < lower) return s2;
+    }
+    uint opa = rule < lower ? 255u : rule >= phase ? 0u :
+        uint(255 - ((rule - lower) * 255 / max(vague, 1)));
+    if ((flags & 2u) != 0u) {
+        uint a1 = s1 >> 24, a2 = s2 >> 24;
+        uint addr = ((a2 * opa) & 0xff00u) + ((a1 * (256u - opa)) >> 8);
+        // tvpgl's switch_d and full-table _d use different alpha formulas.
+        uint alpha = vague < 512 ? uint(tables[65536u + addr]) :
+            a1 + (((a2 - a1) * opa) >> 8);
+        return constAlphaSD(s1, s2, uint(tables[addr])) |
+               (alpha << 24);
+    }
+    if ((flags & 4u) != 0u) return univTransBlendARGB(s1, s2, opa);
+    return constAlphaSD(s1, s2, opa);
+}
+// End UnivTrans integer helpers.
+
+struct TripleLayerParameters {
+    int4 destination, source1, source2, rule, clip;
+    int4 operation; // kind, flags, phase, vague
+};
+kernel void univTransLayer(uint2 tid [[thread_position_in_grid]],
+                          constant TripleLayerParameters& p [[buffer(0)]],
+                          const device uchar* tables [[buffer(1)]],
+                          texture2d<float, access::read> source1 [[texture(0)]],
+                          texture2d<float, access::read> source2 [[texture(1)]],
+                          texture2d<float, access::read> rule [[texture(2)]],
+                          texture2d<float, access::write> target [[texture(3)]]) {
+    int2 xy = p.clip.xy + int2(tid);
+    if (any(xy >= p.clip.zw)) return;
+    int2 offset = xy - p.destination.xy;
+    uint s1 = layerPack(layerBytes(source1, p.source1.xy + offset));
+    uint s2 = layerPack(layerBytes(source2, p.source2.xy + offset));
+    int weight = layerBytes(rule, p.rule.xy + offset).r;
+    uint out = univTransPixel(s1, s2, weight, p.operation.z, p.operation.w,
+                              uint(p.operation.y), tables);
+    target.write(float4(layerUnpack(out)) / 255.0, uint2(xy));
+}
 )MSL";

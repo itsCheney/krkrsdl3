@@ -365,6 +365,7 @@ struct MetalRenderBackend::Impl
     id<MTLComputePipelineState> layerPipeline = nil, layerInPlacePipeline = nil;
     id<MTLComputePipelineState> ordinaryLayerPipeline = nil, ordinaryInPlacePipeline = nil;
     id<MTLComputePipelineState> dualSourceLayerPipeline = nil;
+    id<MTLComputePipelineState> univTransLayerPipeline = nil;
     id<MTLRenderCommandEncoder> activeMeshEncoder = nil;
     id<MTLTexture> activeMeshTarget = nil;
     id<MTLComputeCommandEncoder> ordinaryEncoder = nil;
@@ -372,6 +373,7 @@ struct MetalRenderBackend::Impl
     id<MTLBuffer> alphaTables = nil;
     id<MTLTexture> ordinaryDummy = nil, ordinarySnapshot = nil, ordinarySourceSnapshot = nil;
     id<MTLTexture> dualSourceSnapshot1 = nil, dualSourceSnapshot2 = nil;
+    id<MTLTexture> univSourceSnapshot1 = nil, univSourceSnapshot2 = nil;
     id<MTLTexture> destinationSnapshot = nil;
     // Depth 3 lets the CPU stay a frame ahead of the GPU. Depth 2 stalled
     // every frame that issued more than two command buffers.
@@ -1043,6 +1045,8 @@ struct MetalRenderBackend::Impl
                                      [ordinary newFunctionWithName:@"ordinaryLayer"] error:&error];
             dualSourceLayerPipeline = [device newComputePipelineStateWithFunction:
                                        [ordinary newFunctionWithName:@"dualSourceLayer"] error:&error];
+            univTransLayerPipeline = [device newComputePipelineStateWithFunction:
+                                      [ordinary newFunctionWithName:@"univTransLayer"] error:&error];
         }
         if(ordinaryLayerPipeline && device.readWriteTextureSupport == MTLReadWriteTextureTier2) {
             // These kernels read only their own destination pixel, into registers,
@@ -1060,6 +1064,9 @@ struct MetalRenderBackend::Impl
             "GPU Layer initialization failed; software composition retained: %s", error.localizedDescription.UTF8String);
         if (!dualSourceLayerPipeline) SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
             "GPU Layer dual-source pipeline unavailable; SD transitions use software fallback: %s",
+            error.localizedDescription.UTF8String);
+        if (!univTransLayerPipeline) SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
+            "GPU Layer UnivTrans pipeline unavailable; universal transitions use software fallback: %s",
             error.localizedDescription.UTF8String);
         return windowPipeline && capturePipeline && meshPipelines[0] && meshPipelines[1] &&
                meshPipelines[2] && deformPipelines[0] && deformPipelines[1] &&
@@ -1593,6 +1600,99 @@ bool MetalRenderBackend::OperateLayerRectDualSource(const TVPLayerOperation& ope
         if (p.diagnosticSampled) ++p.diagnosticWorkload.layerDispatches;
         [e endEncoding];
         // Compute dispatch over existing GPU textures; no host-visible bytes.
+        if(++p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
+        return true;
+    }
+}
+
+bool MetalRenderBackend::OperateLayerRectTripleSource(const TVPLayerOperation& operation,
+                                                      void* target,const TVPLayerRect& dst,
+                                                      void* source1,const TVPLayerRect& src1,
+                                                      void* source2,const TVPLayerRect& src2,
+                                                      void* rule,const TVPLayerRect& ruleRect) {
+    @autoreleasepool {
+        auto& p=*impl_;
+        auto* t=p.Find(target); auto* s1=p.Find(source1); auto* s2=p.Find(source2); auto* r=p.Find(rule);
+        if(!p.univTransLayerPipeline || !t || !s1 || !s2 || !r ||
+           operation.kind!=TVPLayerOperationKind::UnivTrans ||
+           t->bytesPerPixel!=4 || s1->bytesPerPixel!=4 || s2->bytesPerPixel!=4 || r->bytesPerPixel!=1 ||
+           (operation.flags & ~(TVP_LAYER_DEST_ALPHA | TVP_LAYER_DEST_PREMULTIPLIED)) ||
+           operation.flags==(TVP_LAYER_DEST_ALPHA | TVP_LAYER_DEST_PREMULTIPLIED)) return false;
+        // Preserve the software table's signed integer arithmetic domain.
+        // Normal transition parameters (including vague==0) fit comfortably.
+        if(operation.vague<0 || operation.vague>std::numeric_limits<int>::max()/255 ||
+           int64_t(operation.phase)-operation.vague<std::numeric_limits<int>::min()) return false;
+        const int w=dst.Width(),h=dst.Height();
+        if(w<=0 || h<=0) return false;
+        auto validRect=[w,h](const TVPLayerRect& rect,const Impl::Resource* source) {
+            return rect.Width()==w && rect.Height()==h && rect.left>=0 && rect.top>=0 &&
+                   rect.right<=source->width && rect.bottom<=source->height;
+        };
+        if(!validRect(src1,s1) || !validRect(src2,s2) || !validRect(ruleRect,r)) return false;
+        if((operation.flags & TVP_LAYER_DEST_ALPHA) && !p.alphaTables) return false;
+        TVPLayerRect clip={std::max(0,dst.left),std::max(0,dst.top),
+                           std::min(t->width,dst.right),std::min(t->height,dst.bottom)};
+        if(clip.Width()<=0 || clip.Height()<=0) return true;
+
+        // Snapshots use dedicated tracked resources. Blit and compute encoders
+        // stay in the same command buffer; serial encoder/queue ordering makes
+        // reuse safe across successive operations without any CPU wait.
+        id<MTLTexture> tex1=s1->texture,tex2=s2->texture;
+        TVPLayerRect actual1=src1,actual2=src2;
+        if(s1==t || s2==t) {
+            if(s1==t) {
+                if(!p.univSourceSnapshot1 || p.univSourceSnapshot1.width!=NSUInteger(w) ||
+                   p.univSourceSnapshot1.height!=NSUInteger(h))
+                    p.univSourceSnapshot1=p.Texture(w,h);
+                tex1=p.univSourceSnapshot1;
+                if(!tex1) return false;
+            }
+            if(s2==t) {
+                if(!p.univSourceSnapshot2 || p.univSourceSnapshot2.width!=NSUInteger(w) ||
+                   p.univSourceSnapshot2.height!=NSUInteger(h))
+                    p.univSourceSnapshot2=p.Texture(w,h);
+                tex2=p.univSourceSnapshot2;
+                if(!tex2) return false;
+            }
+            id<MTLBlitCommandEncoder> blit=p.Blit(); if(!blit) return false;
+            if(s1==t) {
+                [blit copyFromTexture:s1->texture sourceSlice:0 sourceLevel:0
+                      sourceOrigin:MTLOriginMake(src1.left,src1.top,0)
+                      sourceSize:MTLSizeMake(w,h,1) toTexture:tex1 destinationSlice:0
+                      destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+                actual1={0,0,w,h};
+            }
+            if(s2==t) {
+                [blit copyFromTexture:s2->texture sourceSlice:0 sourceLevel:0
+                      sourceOrigin:MTLOriginMake(src2.left,src2.top,0)
+                      sourceSize:MTLSizeMake(w,h,1) toTexture:tex2 destinationSlice:0
+                      destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+                actual2={0,0,w,h};
+            }
+            [blit endEncoding];
+        }
+        // Bind a valid dummy buffer for normal/_a, which do not read tables.
+        if(!p.alphaTables) p.alphaTables=[p.device newBufferWithLength:131072 options:MTLResourceStorageModeShared];
+        if(!p.alphaTables) return false;
+        struct TripleLayerParameters { simd_int4 destination,source1,source2,rule,clip,operation; } params;
+        params.destination={dst.left,dst.top,dst.right,dst.bottom};
+        params.source1={actual1.left,actual1.top,actual1.right,actual1.bottom};
+        params.source2={actual2.left,actual2.top,actual2.right,actual2.bottom};
+        params.rule={ruleRect.left,ruleRect.top,ruleRect.right,ruleRect.bottom};
+        params.clip={clip.left,clip.top,clip.right,clip.bottom};
+        params.operation={static_cast<int>(operation.kind),static_cast<int>(operation.flags),
+                          operation.phase,operation.vague};
+        id<MTLComputeCommandEncoder> e=p.Compute(); if(!e) return false;
+        [e setComputePipelineState:p.univTransLayerPipeline];
+        [e setBytes:&params length:sizeof(params) atIndex:0];
+        [e setBuffer:p.alphaTables offset:0 atIndex:1];
+        [e setTexture:tex1 atIndex:0]; [e setTexture:tex2 atIndex:1];
+        [e setTexture:r->texture atIndex:2]; [e setTexture:t->texture atIndex:3];
+        [e dispatchThreads:MTLSizeMake(clip.Width(),clip.Height(),1)
+             threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+        if(p.diagnosticSampled) ++p.diagnosticWorkload.layerDispatches;
+        [e endEncoding];
+        // Retain the existing submission budget; never submit/wait per transition.
         if(++p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
         return true;
     }

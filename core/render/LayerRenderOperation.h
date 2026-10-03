@@ -6,7 +6,7 @@ enum class TVPLayerOperationKind : uint32_t
 {
     Unsupported, Copy, CopyColor, CopyMask, CopyOpaque, Fill, FillColor,
     FillMask, Alpha, ConstAlpha, ColorMap, FillBlend, RemoveConstOpacity,
-    ConstAlphaSD
+    ConstAlphaSD, UnivTrans
 };
 enum TVPLayerOperationFlags : uint32_t
 {
@@ -21,6 +21,8 @@ struct TVPLayerOperation
     int opacity = 255;
     uint32_t color = 0;
     uint32_t flags = 0;
+    int phase = 0;
+    int vague = 0;
 };
 struct TVPLayerRect
 {

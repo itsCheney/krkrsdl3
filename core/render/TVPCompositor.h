@@ -200,6 +200,12 @@ public:
     virtual bool OperateLayerRectDualSource(const TVPLayerOperation&, void*, const TVPLayerRect&,
                                             void*, const TVPLayerRect&,
                                             void*, const TVPLayerRect&) { return false; }
+    // Universal transitions read two RGBA sources and an R8 rule map.
+    // Other backends may keep the existing software path.
+    virtual bool OperateLayerRectTripleSource(const TVPLayerOperation&, void*, const TVPLayerRect&,
+                                              void*, const TVPLayerRect&,
+                                              void*, const TVPLayerRect&,
+                                              void*, const TVPLayerRect&) { return false; }
 
     // Duration of the last completed GPU submission, excluding queue wait.
     // Negative means unsupported/not available; reading never waits for GPU.

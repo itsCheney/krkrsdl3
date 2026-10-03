@@ -483,6 +483,41 @@ public:
         auto* t=dynamic_cast<LayerTexture*>(target); TVPLayerOperation op;
         if(!session || !t || !t->Belongs(session)) return Reject(TVPLayerGPURejectReason::TargetUnavailable);
         if(t->IsCPUResident()) return Reject(TVPLayerGPURejectReason::TargetCPUResident);
+        if(inputs.size()==3) {
+            if(!method->DescribeGpuOperation(op) || op.kind!=TVPLayerOperationKind::UnivTrans)
+                return RejectMethod(TVPLayerGPURejectReason::MultipleInputs,method,inputs.size());
+            auto* source1=dynamic_cast<LayerTexture*>(inputs[0].first);
+            auto* source2=dynamic_cast<LayerTexture*>(inputs[1].first);
+            auto* rule=dynamic_cast<LayerTexture*>(inputs[2].first);
+            if(!source1 || !source2 || !rule || !source1->Belongs(session) ||
+               !source2->Belongs(session) || !rule->Belongs(session))
+                return Reject(TVPLayerGPURejectReason::SourceUnavailable);
+            if(t->GetFormat()!=TVPTextureFormat::RGBA ||
+               source1->GetFormat()!=TVPTextureFormat::RGBA || source2->GetFormat()!=TVPTextureFormat::RGBA ||
+               rule->GetFormat()!=TVPTextureFormat::Gray)
+                return Reject(TVPLayerGPURejectReason::SourceFormat);
+            const int w=dst.get_width(),h=dst.get_height();
+            if(w<=0 || h<=0) return Reject(TVPLayerGPURejectReason::InvalidGeometry);
+            for(size_t i=0;i<3;++i) {
+                const auto& r=inputs[i].second;
+                if(r.get_width()!=w || r.get_height()!=h || r.left<0 || r.top<0 ||
+                   r.right>int(inputs[i].first->GetWidth()) || r.bottom>int(inputs[i].first->GetHeight()))
+                    return Reject(TVPLayerGPURejectReason::InvalidGeometry);
+            }
+            if((op.flags & TVP_LAYER_DEST_ALPHA) && !session->tablesReady) {
+                if(!session->backend->SetLayerAlphaTables(TVPOpacityOnOpacityTable,TVPNegativeMulTable))
+                    return Reject(TVPLayerGPURejectReason::AlphaTables);
+                session->tablesReady=true;
+            }
+            if(!session->backend->OperateLayerRectTripleSource(
+                    op,t->GetTextureHandle(),Rect(dst),
+                    source1->GetTextureHandle(),Rect(inputs[0].second),
+                    source2->GetTextureHandle(),Rect(inputs[1].second),
+                    rule->GetTextureHandle(),Rect(inputs[2].second)))
+                return Reject(TVPLayerGPURejectReason::BackendFailure);
+            t->InvalidateCPUCacheRegion(dst,false,point_trace::Invalidation::GPUOperation,"layer.gpuUnivTrans");
+            ++session->stats.gpuOperations; return true;
+        }
         if(inputs.size()>1) {
             if(inputs.size()!=2 || !method->DescribeGpuOperation(op) ||
                op.kind!=TVPLayerOperationKind::ConstAlphaSD)
@@ -522,6 +557,8 @@ public:
             ++session->stats.gpuOperations; return true;
         }
         if(!method->DescribeGpuOperation(op)) return RejectMethod(TVPLayerGPURejectReason::UnsupportedMethod,method);
+        if(op.kind==TVPLayerOperationKind::UnivTrans || op.kind==TVPLayerOperationKind::ConstAlphaSD)
+            return RejectMethod(TVPLayerGPURejectReason::MultipleInputs,method,inputs.size());
         if(stretch<0 || stretch>2) return Reject(TVPLayerGPURejectReason::UnsupportedStretch);
         if(op.opacity<0 || op.opacity>255) return Reject(TVPLayerGPURejectReason::InvalidOpacity);
         LayerTexture* source=nullptr; tTVPRect src(0,0,1,1);

@@ -1762,7 +1762,7 @@ class tTVPRenderMethod_UnivTransBlt : public tTVPRenderMethod_Software
 {
 protected:
     tjs_int tpitch, spitch, dpitch, rpitch;
-    tjs_int phase, vague;
+    tjs_int phase = 0, vague = 0;
     tjs_uint32 BlendTable[256];
 
 public:
@@ -1806,10 +1806,12 @@ public:
         {
             case 0:
                 phase = v;
+                GpuOperation.phase = v;
                 FuncInitTable(BlendTable, phase, vague);
                 break;
             case 1:
                 vague = v;
+                GpuOperation.vague = v;
                 break;
             default:
                 break;
@@ -2693,6 +2695,9 @@ void iTVPRenderManager::RegisterRenderMethod(const char* name, iTVPRenderMethod*
         {"RemoveConstOpacity", K::RemoveConstOpacity, 0, true},
         {"ConstAlphaBlend_SD", K::ConstAlphaSD, 0, true},
         {"ConstAlphaBlend_SD_d", K::ConstAlphaSD, TVP_LAYER_DEST_ALPHA, true},
+        {"UnivTransBlend", K::UnivTrans, 0, false},
+        {"UnivTransBlend_d", K::UnivTrans, TVP_LAYER_DEST_ALPHA, false},
+        {"UnivTransBlend_a", K::UnivTrans, TVP_LAYER_DEST_PREMULTIPLIED, false},
         {"AlphaBlend", K::Alpha, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
         {"AlphaBlend_HDA", K::Alpha, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
         {"AlphaBlend_d", K::Alpha, TVP_LAYER_DEST_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},

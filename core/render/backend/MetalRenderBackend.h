@@ -66,6 +66,10 @@ public:
     bool OperateLayerRectDualSource(const TVPLayerOperation&, void*, const TVPLayerRect&,
                                     void*, const TVPLayerRect&,
                                     void*, const TVPLayerRect&) override;
+    bool OperateLayerRectTripleSource(const TVPLayerOperation&, void*, const TVPLayerRect&,
+                                      void*, const TVPLayerRect&,
+                                      void*, const TVPLayerRect&,
+                                      void*, const TVPLayerRect&) override;
     double GetGpuSubmissionTimeMilliseconds() const override;
     double GetPresentationWaitTimeMilliseconds() const override;
     void BeginFrame(int width, int height) override;
