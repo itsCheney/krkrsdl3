@@ -230,6 +230,17 @@ static void TVPDetectRender()
         else
             TVPAddImportantLog(ttstr(TJS_N("Invalid -vsync value '")) + str + TJS_N("', using 1"));
     }
+
+    // 画面比例：-stretch=0/1（默认 0=保持比例 letterbox；1=拉伸铺满窗口）
+    krkrsdl3::TVPSetStretchMode(false);
+    if (TVPGetCommandLine(TJS_N("-stretch"), &opt))
+    {
+        ttstr str(opt);
+        if (str == TJS_N("1"))
+            krkrsdl3::TVPSetStretchMode(true);
+        else if (str != TJS_N("0"))
+            TVPAddImportantLog(ttstr(TJS_N("Invalid -stretch value '")) + str + TJS_N("', using 0"));
+    }
 }
 
 bool TVPParseArguments(int argc, char* argv[])
