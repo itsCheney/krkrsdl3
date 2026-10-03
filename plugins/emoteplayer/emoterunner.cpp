@@ -1,6 +1,9 @@
 #include "emoterunner.h"
 
 #include <cstdint>
+#include <cstdlib>
+#include <iomanip>
+#include <locale>
 #include <SDL3/SDL.h>
 
 #include "Platform.h"
@@ -707,6 +710,24 @@ float emotemotionref::getTickByIdx(int32_t idx)
     if (idx >= currentMotion->parameter.size() || idx < 0)
         return -1.0f;
     float currVal = 0;
+    if (refTop->integratedAnimation())
+    {
+        double value = 0;
+        const auto& id = currentMotion->parameter.at(idx)->id;
+        if (refTop->getMotionParameter(currentMotion, id, value))
+        {
+            const bool metadataVariable = currentMotion->_filePtr->_metadata &&
+                currentMotion->_filePtr->_metadata->_varList.find(id) != currentMotion->_filePtr->_metadata->_varList.end();
+            if (currentMotion->_filePtr->isMotion && !metadataVariable)
+            {
+                if (currentMotion->lastTime < 0) return value;
+                const auto* parameter = currentMotion->parameter.at(idx);
+                const double span = parameter->rangeEnd + 1 - parameter->rangeBegin;
+                return span != 0 ? value * currentMotion->lastTime / span : 0;
+            }
+            return currentMotion->parameter.at(idx)->transToTick(value);
+        }
+    }
     // file系控制
     if (!currentMotion->_filePtr->getTickByName(currentMotion->parameter.at(idx)->id, currVal))
     {
@@ -921,7 +942,192 @@ bool EmoteHitFrame::contains(const char* label, float x, float y, bool local) co
            motion->contains(x, y, label);
 }
 
+emoteengine::emoteengine()
+{
+    const char* mode = SDL_GetHint("MIKAGE_EMOTE_ANIMATION_MODE");
+    if (!mode) mode = std::getenv("MIKAGE_EMOTE_ANIMATION_MODE");
+    _integratedAnimation = mode && std::strcmp(mode, "integrated") == 0;
+}
 emoteengine::~emoteengine() = default;
+
+void emoteengine::resetAnimationState()
+{
+    _animationFile = nullptr; _animation.reset({}, {}); _animationClock = 0;
+    _animationEyes.clear(); _animationEyeRefs.clear(); _varCache.clear();
+    _animationParameterLabels.clear();
+}
+void emoteengine::ensureAnimationState()
+{
+    if (!integratedAnimation() || _animationFile == _mainfile) return;
+    resetAnimationState();
+    if (!_mainfile || !_mainfile->_metadata) return;
+    auto* metadata = _mainfile->_metadata;
+    std::vector<animation::Timeline> timelines;
+    std::map<std::string, double> defaults;
+    for (auto* file : _attach) if (file && file->_metadata)
+        for (const auto& value : file->_metadata->_varList) defaults[value.first] = value.second;
+    for (const auto& value : metadata->_varList) defaults[value.first] = value.second;
+    for (auto* source : metadata->_timelineControl)
+    {
+        animation::Timeline timeline;
+        timeline.label = source->label; timeline.loopBegin = source->loopBegin;
+        timeline.loopEnd = source->loopEnd; timeline.lastTime = source->lastTime;
+        timeline.difference = source->diff != 0;
+        for (auto* variable : source->variableList)
+        {
+            bool selectorTarget = false;
+            for (auto* selector : metadata->_selectorControl)
+                for (const auto& option : selector->selectItem)
+                    if (option.label == variable->label) selectorTarget = true;
+            if (selectorTarget) continue; // Preserve the existing selector ownership rule.
+            animation::Track track; track.label = variable->label;
+            track.instant = std::find(metadata->_instantVariableList.begin(), metadata->_instantVariableList.end(), track.label) != metadata->_instantVariableList.end();
+            for (auto* frame : variable->frameList)
+                track.frames.push_back({frame->time, frame->value, frame->easing, frame->hasContent && frame->type != 0});
+            timeline.tracks.push_back(std::move(track));
+        }
+        timelines.push_back(std::move(timeline));
+    }
+    _animation.reset(std::move(timelines), defaults);
+    for (auto* eye : metadata->_eyeControl)
+    {
+        auto copy = *eye; copy.hasStart = copy.isBlinking = false;
+        copy.currWaitInterval = -1; copy.lastTick = copy.baseVal = 0;
+        _animationEyes.push_back(copy);
+    }
+    for (auto& eye : _animationEyes) _animationEyeRefs.push_back(&eye);
+    _animationFile = _mainfile;
+}
+void emoteengine::updateAnimationSelectors()
+{
+    if (!_mainfile || !_mainfile->_metadata) return;
+    for (auto* selector : _mainfile->_metadata->_selectorControl)
+    {
+        if (!_animation.hasVariable(selector->lable)) continue;
+        const double raw = _animation.variable(selector->lable);
+        const int selected = raw >= 0 && raw < selector->selectItem.size() ? static_cast<int>(raw) : -1;
+        for (std::size_t i = 0; i < selector->selectItem.size(); ++i)
+        {
+            const auto& option = selector->selectItem[i];
+            _animation.setVariable(option.label, static_cast<int>(i) == selected ? option.onValue : option.offValue);
+        }
+    }
+}
+void emoteengine::advanceAnimation(double milliseconds, double speedDivisor)
+{
+    ensureAnimationState();
+    if (_animationPaused) return;
+    const double dt = animation::millisecondsToFrames(milliseconds, speedDivisor);
+    _animationClock += dt; _animation.advance(dt); updateAnimationSelectors();
+    if (_mainfile && _mainfile->_metadata) updateEyeControl(_animationClock, true);
+}
+void emoteengine::setAnimationVariable(const std::string& name, double value, double time, double easing)
+{
+    ensureAnimationState(); _animation.setVariable(name, value, time, easing); updateAnimationSelectors();
+}
+bool emoteengine::getMotionParameter(emotemotion* motion, const std::string& id, double& value)
+{
+    ensureAnimationState();
+    if (motion && motion->_filePtr && _animationParameterLabels.find(motion) == _animationParameterLabels.end())
+    {
+        auto& labels = _animationParameterLabels[motion];
+        for (const auto& object : motion->_filePtr->_objects)
+            for (const auto& clip : object.second->motion) if (clip.second == motion)
+            {
+                for (auto* parameter : motion->parameter)
+                {
+                    std::string scoped(object.first.c_str()); scoped += '/'; scoped += parameter->id.c_str(); scoped.append(1, '\0');
+                    labels[parameter->id] = std::move(scoped);
+                }
+            }
+    }
+    const auto motionLabels = _animationParameterLabels.find(motion);
+    if (motionLabels != _animationParameterLabels.end())
+    {
+        const auto scoped = motionLabels->second.find(id);
+        if (scoped != motionLabels->second.end() && _animation.hasVariable(scoped->second))
+        { value = _animation.variable(scoped->second); return true; }
+    }
+    if (_animation.hasVariable(id)) { value = _animation.variable(id); return true; }
+    return false; // Existing per-resource defaults remain the read-only fallback.
+}
+void emoteengine::copyAnimationStateFrom(const emoteengine& source)
+{
+    if (!integratedAnimation() || !source.integratedAnimation()) return;
+    ensureAnimationState(); _animation = source._animation; _animationClock = source._animationClock;
+    _animationPaused = source._animationPaused; _animationEyes = source._animationEyes;
+    _animationEyeRefs.clear(); for (auto& eye : _animationEyes) _animationEyeRefs.push_back(&eye);
+}
+std::string emoteengine::serializeAnimationState() const
+{
+    const auto core = _animation.serialize();
+    std::ostringstream out; out.imbue(std::locale::classic()); out << std::setprecision(17);
+    out << "EMOTEENGINE1 " << _animationClock << ' ' << _animationPaused << ' ' << _animationEyes.size() << ' ' << core.size() << '\n';
+    out << core;
+    for (const auto& eye : _animationEyes)
+        out << eye.hasStart << ' ' << eye.isBlinking << ' ' << eye.currWaitInterval << ' ' << eye.lastTick << ' ' << eye.baseVal << '\n';
+    return out.str();
+}
+bool emoteengine::restoreAnimationState(const std::string& text)
+{
+    ensureAnimationState();
+    if (text.size() > 16 * 1024 * 1024) return false;
+    std::istringstream in(text); in.imbue(std::locale::classic());
+    std::string magic; double clock; bool paused; std::size_t eyes, size;
+    if (!(in >> magic >> clock >> paused >> eyes >> size) || magic != "EMOTEENGINE1" || !std::isfinite(clock) || clock < 0 || eyes != _animationEyes.size() || size > text.size()) return false;
+    if (in.get() != '\n') return false;
+    std::string core(size, '\0'); if (!in.read(core.data(), size)) return false;
+    auto candidate = _animation; if (!candidate.restore(core)) return false;
+    auto eyeStates = _animationEyes;
+    for (auto& eye : eyeStates)
+        if (!(in >> eye.hasStart >> eye.isBlinking >> eye.currWaitInterval >> eye.lastTick >> eye.baseVal) ||
+            !std::isfinite(eye.lastTick) || !std::isfinite(eye.baseVal) || eye.currWaitInterval < -1 || eye.lastTick < 0) return false;
+    in >> std::ws; if (!in.eof()) return false;
+    _animation = std::move(candidate); _animationClock = clock; _animationPaused = paused;
+    _animationEyes = std::move(eyeStates); _animationEyeRefs.clear();
+    for (auto& eye : _animationEyes) _animationEyeRefs.push_back(&eye);
+    updateAnimationSelectors(); return true;
+}
+void emoteengine::recordAnimationProgress(double milliseconds, double tick, bool mainPlaying)
+{
+    const bool diagnostics = SDL_GetHintBoolean("MIKAGE_METAL_DIAGNOSTICS", false);
+    if (!diagnostics) return;
+    ++_animationProgressVersion;
+    _animationTrace[(_animationProgressVersion - 1) % _animationTrace.size()] =
+        {milliseconds, integratedAnimation() ? _animationClock : tick, _animationProgressVersion, _animationDrawVersion, mainPlaying};
+    auto& trace = _animationTrace[(_animationProgressVersion - 1) % _animationTrace.size()];
+    if (integratedAnimation())
+    {
+        for (const auto& value : _animation.values())
+            if (trace.variableCount < trace.variableValues.size()) trace.variableValues[trace.variableCount++] = value.second;
+        for (const auto& state : _animation.states()) if (state.playing && trace.timelineCount < trace.timelineTimes.size())
+            trace.timelineTimes[trace.timelineCount++] = state.time;
+    }
+    else if (_mainfile && _mainfile->_metadata)
+    {
+        for (const auto& value : _mainfile->_metadata->_varList)
+            if (trace.variableCount < trace.variableValues.size()) trace.variableValues[trace.variableCount++] = value.second;
+        for (auto* timeline : currTimeline) if (trace.timelineCount < trace.timelineTimes.size())
+            trace.timelineTimes[trace.timelineCount++] = tick - currStartTick + timeline->loopBegin;
+    }
+    const auto now = SDL_GetTicks();
+    if (now - _animationLogAt < 1000) return;
+    _animationLogAt = now;
+    const auto& counts = _animation.counters();
+    TVPConsoleLog("emote.animation mode=%s player=%p inputMS=%.3f tick=%.3f mainPlaying=%d progressVersion=%llu drawVersion=%llu drawCalls=%llu repeatedDraws=%llu wraps=%llu crossings=%llu",
+        integratedAnimation() ? "integrated" : "legacy", static_cast<void*>(this), milliseconds,
+        integratedAnimation() ? _animationClock : tick, mainPlaying ? 1 : 0,
+        static_cast<unsigned long long>(_animationProgressVersion), static_cast<unsigned long long>(_animationDrawVersion),
+        static_cast<unsigned long long>(_animationDrawCalls), static_cast<unsigned long long>(_animationRepeatedDraws),
+        static_cast<unsigned long long>(counts.wraps), static_cast<unsigned long long>(counts.crossings));
+}
+void emoteengine::recordAnimationDraw()
+{
+    if (!SDL_GetHintBoolean("MIKAGE_METAL_DIAGNOSTICS", false)) return;
+    ++_animationDrawCalls;
+    if (_animationDrawVersion == _animationProgressVersion) ++_animationRepeatedDraws;
+    _animationDrawVersion = _animationProgressVersion;
+}
 
 void emoteengine::progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim)
 {
@@ -945,6 +1151,11 @@ void emoteengine::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emot
 }
 bool emoteengine::getTickByName(const std::string& name, tjs_real& retVal)
 {
+    if (integratedAnimation())
+    {
+        ensureAnimationState();
+        if (_animation.hasVariable(name)) { retVal = _animation.variable(name); return true; }
+    }
     auto it = _varCache.find(name);
     if (it != _varCache.end())
     {
@@ -1018,9 +1229,10 @@ emotemotion* emoteengine::findmotionByName(const std::string& name)
 }
 void emoteengine::updateEyeControl(float tick, bool isMain)
 {
+    if (integratedAnimation()) ensureAnimationState();
     std::default_random_engine dre;
     // 眼动控制
-    for (auto itm : _mainfile->_metadata->_eyeControl)
+    for (auto itm : integratedAnimation() ? _animationEyeRefs : _mainfile->_metadata->_eyeControl)
     {
         // 初始化tick
         if (!itm->hasStart)
@@ -1046,7 +1258,8 @@ void emoteengine::updateEyeControl(float tick, bool isMain)
                 auto varPos = _mainfile->_metadata->_varList.find(itm->label);
                 if (varPos != _mainfile->_metadata->_varList.end())
                 {
-                    varPos->second = itm->baseVal;
+                    if (integratedAnimation()) _animation.setVariable(itm->label, itm->baseVal);
+                    else varPos->second = itm->baseVal;
                 }
             }
             else
@@ -1069,7 +1282,8 @@ void emoteengine::updateEyeControl(float tick, bool isMain)
                 auto varPos = _mainfile->_metadata->_varList.find(itm->label);
                 if (varPos != _mainfile->_metadata->_varList.end())
                 {
-                    varPos->second = realVal;
+                    if (integratedAnimation()) _animation.setVariable(itm->label, realVal);
+                    else varPos->second = realVal;
                 }
             }
         }
@@ -1083,7 +1297,7 @@ void emoteengine::updateEyeControl(float tick, bool isMain)
                 auto varPos = _mainfile->_metadata->_varList.find(itm->label);
                 if (varPos != _mainfile->_metadata->_varList.end())
                 {
-                    itm->baseVal = varPos->second;
+                    itm->baseVal = integratedAnimation() ? _animation.variable(itm->label) : varPos->second;
                 }
             }
         }
@@ -1093,8 +1307,15 @@ void emoteengine::updateEyeControl(float tick, bool isMain)
         // nothing to do
     }
 }
-void emoteengine::startTimeline(float tick, const std::string& name, bool isMain)
+void emoteengine::startTimeline(float tick, const std::string& name, bool isMain, int flags)
 {
+    if (integratedAnimation())
+    {
+        ensureAnimationState();
+        std::string label(name.c_str()); label.append(1, '\0');
+        _animation.play(label, flags);
+        return;
+    }
     for (auto itm : _mainfile->_metadata->_timelineControl)
     {
         if (strcmp(itm->label.c_str(), name.c_str()) == 0)
@@ -1107,6 +1328,12 @@ void emoteengine::startTimeline(float tick, const std::string& name, bool isMain
 }
 void emoteengine::stopTimeline(const std::string& name, bool isMain)
 {
+    if (integratedAnimation())
+    {
+        ensureAnimationState();
+        std::string label(name.c_str()); if (!label.empty()) label.append(1, '\0');
+        _animation.stop(label); return;
+    }
     for (auto itm : _mainfile->_metadata->_timelineControl)
     {
         if (strcmp(itm->label.c_str(), name.c_str()) == 0)
@@ -1120,6 +1347,13 @@ void emoteengine::stopTimeline(const std::string& name, bool isMain)
 }
 bool emoteengine::checkTimline(const std::string& name, bool& result, bool isMain)
 {
+    if (integratedAnimation())
+    {
+        ensureAnimationState();
+        std::string label(name.c_str()); if (!label.empty()) label.append(1, '\0');
+        result = _animation.playing(label);
+        return label.empty() || _animation.definition(label) != nullptr;
+    }
     emotetimeline* matchT = nullptr;
     for (auto itm : _mainfile->_metadata->_timelineControl)
     {
@@ -1144,6 +1378,7 @@ bool emoteengine::checkTimline(const std::string& name, bool& result, bool isMai
 }
 void emoteengine::updateTimelineControl(float tick, bool isMain)
 {
+    if (integratedAnimation()) return; // advanced once by advanceAnimation(dt)
     if (currTimeline.size() < 1)
         return;
 
@@ -1243,6 +1478,7 @@ emoteVar* emoteengine::findVarByName(const std::string& name)
 }
 void emoteengine::setVariable(const std::string& name, tjs_real value)
 {
+    if (integratedAnimation()) { setAnimationVariable(name, value, 0, 0); return; }
     // 所有file
     std::vector<emotefile*> allFiles = _attach;
     allFiles.push_back(_mainfile);
@@ -1308,6 +1544,7 @@ void emoteengine::setVariable(const std::string& name, tjs_real value)
 }
 tjs_real emoteengine::getVariable(const std::string& name)
 {
+    if (integratedAnimation()) { ensureAnimationState(); return _animation.variable(name); }
     size_t pos = name.find('/');
     if (_mainfile->isMotion) // motion类
     {
