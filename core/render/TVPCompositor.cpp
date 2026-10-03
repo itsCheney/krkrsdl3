@@ -35,6 +35,22 @@ static iTVPRenderBackend*& GetCurrentBackendRef()
     return backend;
 }
 
+static bool& GetStretchModeRef()
+{
+    static bool stretch = false;
+    return stretch;
+}
+
+void TVPSetStretchMode(bool enable)
+{
+    GetStretchModeRef() = enable;
+}
+
+bool TVPGetStretchMode()
+{
+    return GetStretchModeRef();
+}
+
 void TVPRegisterRenderBackend(const TVPRenderBackendDesc& desc)
 {
     if (!desc.name)
@@ -173,13 +189,23 @@ void TVPRenderOnce(int winWidth, int winHeight)
 
     backend->BeginFrame(winWidth, winHeight);
 
+    const bool stretch = TVPGetStretchMode();
+
     // 绘制 currentSprite
     TVPSprite* retSpr = KRKR_Get_Current_Sprite();
     if (retSpr && retSpr->texture)
     {
-        TVPCalcLetterbox(retSpr, winWidth, winHeight);
-        backend->DrawWindowTexture(retSpr->texture, retSpr->xPos, retSpr->yPos,
-                                   retSpr->scale * retSpr->width, retSpr->scale * retSpr->height);
+        if (stretch)
+        {
+            backend->DrawWindowTexture(retSpr->texture, 0.0f, 0.0f,
+                                       (float)winWidth, (float)winHeight);
+        }
+        else
+        {
+            TVPCalcLetterbox(retSpr, winWidth, winHeight);
+            backend->DrawWindowTexture(retSpr->texture, retSpr->xPos, retSpr->yPos,
+                                       retSpr->scale * retSpr->width, retSpr->scale * retSpr->height);
+        }
     }
 
     // 绘制 overlay
@@ -192,9 +218,17 @@ void TVPRenderOnce(int winWidth, int winHeight)
         if (texture->isVisible && texture->type == 2 && texture->texture)
         {
             overlayDrawn++;
-            TVPCalcLetterbox(texture, winWidth, winHeight);
-            backend->DrawWindowTexture(texture->texture, texture->xPos, texture->yPos,
-                                       texture->scale * texture->width, texture->scale * texture->height);
+            if (stretch)
+            {
+                backend->DrawWindowTexture(texture->texture, 0.0f, 0.0f,
+                                           (float)winWidth, (float)winHeight);
+            }
+            else
+            {
+                TVPCalcLetterbox(texture, winWidth, winHeight);
+                backend->DrawWindowTexture(texture->texture, texture->xPos, texture->yPos,
+                                           texture->scale * texture->width, texture->scale * texture->height);
+            }
         }
     }
     TVPReportCompositorFrame((int)renderTexture.size(), overlayCandidates, overlayDrawn,
