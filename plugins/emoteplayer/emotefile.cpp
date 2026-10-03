@@ -1439,6 +1439,19 @@ emotemetadata::emotemetadata(emotefile* filePtr, uint32_t startOffset) : _filePt
         _eyebrowControl.push_back(tmp);
     }
 
+    // Optional controller metadata; absent in older PSB exports.
+    auto instant = _rootData.find("instantVariableList");
+    if (instant != _rootData.end())
+    {
+        std::vector<uint32_t> entries;
+        filePtr->parseList(entries, instant->second);
+        for (auto entry : entries)
+        {
+            std::string label;
+            if (filePtr->parseString(label, entry)) _instantVariableList.push_back(std::move(label));
+        }
+    }
+
     // bustControl
     _tmpList.clear();
     filePtr->parseList(_tmpList, _rootData["bustControl"]);

@@ -6,6 +6,7 @@
 #include <map>
 #include <cstdint>
 #include <vector>
+#include <cmath>
 #include "emotefile.h"
 #include "emoterunner.h"
 
@@ -166,8 +167,8 @@ class EmotePlayer
 public:
     enum EmotePlayerFlag
     {
-        TimelinePlayFlagParallel = 0,
-        TimelinePlayFlagDifference
+        TimelinePlayFlagParallel = 1,
+        TimelinePlayFlagDifference = 2
     };
 
     EmotePlayer(ResourceManager* resourceManager) : _resourceManager(resourceManager){};
@@ -183,7 +184,8 @@ public:
             delete this;
     }
 
-    property_marco(playing, bool, _playing);
+    bool get_playing() { return _playing; }
+    void set_playing(bool value) { _playing = value; emtEngine._animationPaused = !value; }
     property_marco(allplaying, bool, _allplaying);
     property_marco(animating, bool, _playing);
     property_marco(useD3D, bool, _useD3D);
@@ -204,7 +206,17 @@ public:
     property_marco(chara, tTJSString, _chara);
     void set_variableKeys() { throw "reject to set variableKeys"; };
     tTJSVariant get_variableKeys();
-    property_marco(tickCount, tjs_real, clockPassed);
+    tjs_real get_tickCount() { return clockPassed; }
+    void set_tickCount(tjs_real value)
+    {
+        if (emtEngine.integratedAnimation() && !std::isfinite(value)) return;
+        clockPassed = value;
+        if (emtEngine.integratedAnimation())
+        {
+            emtEngine.ensureAnimationState(); emtEngine._animation.seek(std::max(0.0, value));
+            emtEngine._animationClock = std::max(0.0, value);
+        }
+    }
     property_marco(speed, tjs_real, speedRatio);
     tTJSVariant get_outline() { return tTJSVariant(); }
     void set_outline(tTJSVariant v){/* TODO */};
@@ -223,7 +235,13 @@ public:
     void setScale(tjs_real scale);
     void setRotate(tjs_real rotate);
     void setColor(tjs_uint32 color);
-    void setVariable(tTJSString name, tjs_real value);
+    void setVariable(tTJSString name, tjs_real value, tjs_real time = 0, tjs_real easing = 0);
+    static tjs_error cb_setVariable(tTJSVariant* result, tjs_int count, tTJSVariant** args, EmotePlayer* self);
+    bool usesIntegratedAnimation() const { return emtEngine.integratedAnimation(); }
+    void inheritAnimationModeFrom(const EmotePlayer& source) { emtEngine.inheritAnimationMode(source.usesIntegratedAnimation()); }
+    bool get_queuing() { emtEngine.ensureAnimationState(); return emtEngine._animation.queuing(); }
+    void set_queuing(bool value) { emtEngine.ensureAnimationState(); emtEngine._animation.setQueuing(value); }
+    void copyAnimationStateFrom(const EmotePlayer& source);
     tjs_real getVariable(tTJSString name);
     void setOuterForce(tTJSString name, tjs_real ofx, tjs_real ofy);
     void setDrawAffineTranslateMatrix(
@@ -366,6 +384,8 @@ public:
     using EmotePlayer::setScale;
     using EmotePlayer::setTimelineBlendRatio;
     using EmotePlayer::setVariable;
+    static tjs_error cb_setVariable(tTJSVariant* result, tjs_int count, tTJSVariant** args, Player* self)
+    { return EmotePlayer::cb_setVariable(result, count, args, self); }
     using EmotePlayer::skip;
     using EmotePlayer::startWind;
     using EmotePlayer::stopTimeline;

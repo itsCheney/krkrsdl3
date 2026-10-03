@@ -4,9 +4,11 @@
 #include <unordered_map>
 #include <list>
 #include <memory>
+#include <array>
 
 #include "emotefile.h"
 #include "emotegeometry.h"
+#include "emoteanimation.h"
 
 namespace emoteplayer
 {
@@ -147,6 +149,7 @@ namespace emoteplayer
     class emoteengine
     {
     public:
+        emoteengine();
 	    // 主file/motion
         emotefile* _mainfile = nullptr;
         emotemotion* _mainmotion = nullptr;
@@ -170,7 +173,7 @@ namespace emoteplayer
         void updateEyeControl(float tick, bool isMain = false);
         std::vector<emotetimeline*> currTimeline;
         float currStartTick = -1.0f;
-        void startTimeline(float tick, const std::string& name, bool isMain = false);
+        void startTimeline(float tick, const std::string& name, bool isMain = false, int flags = 0);
         void stopTimeline(const std::string& name, bool isMain = false);
         bool checkTimline(const std::string& name, bool& result, bool isMain = false);
         void updateTimelineControl(float tick, bool isMain = false);
@@ -178,6 +181,42 @@ namespace emoteplayer
         void setVariable(const std::string& name, tjs_real value);
         tjs_real getVariable(const std::string& name);
         void updatePhysics(float tick);
+
+        bool integratedAnimation() const { return _integratedAnimation; }
+        void inheritAnimationMode(bool value) { _integratedAnimation = value; resetAnimationState(); }
+        void ensureAnimationState();
+        void resetAnimationState();
+        void advanceAnimation(double milliseconds, double speedDivisor);
+        void setAnimationVariable(const std::string& name, double value, double time, double easing);
+        void updateAnimationSelectors();
+        void recordAnimationProgress(double milliseconds, double tick, bool mainPlaying);
+        void recordAnimationDraw();
+        void copyAnimationStateFrom(const emoteengine& source);
+        std::string serializeAnimationState() const;
+        bool restoreAnimationState(const std::string& text);
+        bool getMotionParameter(emotemotion* motion, const std::string& id, double& value);
+        animation::Runtime _animation;
+        double _animationClock = 0;
+        bool _animationPaused = false;
+        // This pointer identifies a binding; the ResourceManager owns its lifetime.
+        emotefile* _animationFile = nullptr;
+        std::vector<eyeControl> _animationEyes;
+        std::vector<eyeControl*> _animationEyeRefs;
+        std::map<emotemotion*, std::map<std::string, std::string>> _animationParameterLabels;
+        struct AnimationTrace {
+            double inputMS = 0, tick = 0;
+            std::uint64_t progressVersion = 0, drawVersion = 0;
+            bool mainPlaying = false;
+            std::array<double, 8> variableValues{}, timelineTimes{};
+            std::uint8_t variableCount = 0, timelineCount = 0;
+        };
+        std::array<AnimationTrace, 128> _animationTrace{};
+        std::uint64_t _animationProgressVersion = 0, _animationDrawVersion = 0;
+        std::uint64_t _animationDrawCalls = 0, _animationRepeatedDraws = 0;
+        std::uint64_t _animationLogAt = 0;
+    private:
+        bool _integratedAnimation = false;
+    public:
 
         // Each draw owns its geometry, so shared players can render to multiple layers.
         std::shared_ptr<emotemotionref> _mainMotionRef;

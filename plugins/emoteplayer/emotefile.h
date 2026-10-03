@@ -349,6 +349,7 @@ public:
     double scale = 1.0;
 
     std::map<std::string, float> _varList;
+    std::vector<std::string> _instantVariableList;
     std::vector<emoteattrcomp*> _attrcomp;
     // std::vector<std::string> _mirrorControl;
     std::vector<emoteselect*> _selectorControl;
