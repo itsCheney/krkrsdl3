@@ -56,6 +56,7 @@ tTVPBasicDrawDevice::tTVPBasicDrawDevice()
     Window = NULL;
     Manager = NULL;
     DestRect.clear();
+    TVPAddImportantLog(ttstr("DrawDevice: BasicDrawDevice (software) created"));
 }
 //---------------------------------------------------------------------------
 tTVPBasicDrawDevice::~tTVPBasicDrawDevice()
@@ -587,6 +588,14 @@ void tTVPBasicDrawDevice::Show()
     }
     if (!ScratchTexture)
         return;
+
+    static tjs_int sLastLogW = 0, sLastLogH = 0;
+    if (w != sLastLogW || h != sLastLogH)
+    {
+        sLastLogW = w;
+        sLastLogH = h;
+        TVPAddImportantLog(ttstr("DrawDevice: draw buffer ") + ttstr(w) + TJS_N("x") + ttstr(h));
+    }
 
     void* pixels = tex->LockCPURead();
     if (pixels)

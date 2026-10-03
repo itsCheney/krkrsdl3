@@ -4,6 +4,7 @@
 #include "tjsCommHead.h"
 #include "Platform.h"
 #include "PlatformFile.h"
+#include "PlatformView.h"
 
 #include <hilog/log.h>
 #include <sys/time.h>
@@ -31,9 +32,9 @@ bool TVP_stat(const char* name, tTVP_stat& s)
     return true;
 }
 
-// ─── Screen — default 1280x720, updated by XComponent surface ───
-int tTVPScreen::GetWidth() { return 1280; }
-int tTVPScreen::GetHeight() { return 720; }
+// ─── Screen — 由 XComponent surface 尺寸驱动（winWidth/winHeight）───
+int tTVPScreen::GetWidth() { int w = 0, h = 0; TVPGetWindowSize(&w, &h); return w > 0 ? w : 1280; }
+int tTVPScreen::GetHeight() { int w = 0, h = 0; TVPGetWindowSize(&w, &h); return h > 0 ? h : 720; }
 int tTVPScreen::GetDesktopLeft() { return 0; }
 int tTVPScreen::GetDesktopTop() { return 0; }
 int tTVPScreen::GetDesktopWidth() { return GetWidth(); }

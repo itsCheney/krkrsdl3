@@ -234,6 +234,9 @@ struct TVPRenderBackendDesc
                                     // 由入口直接构造，此时可为 nullptr
 };
 void TVPRegisterRenderBackend(const TVPRenderBackendDesc& desc);
+// 画面比例：false=保持比例 letterbox（默认），true=拉伸铺满窗口
+void TVPSetStretchMode(bool enable);
+bool TVPGetStretchMode();
 // 探测通过的可用后端名列表
 std::vector<std::string> TVPListRenderBackends();
 bool TVPRenderBackendAvailable(const std::string& name);
