@@ -133,13 +133,18 @@ bool tTVPThreadEvent::WaitFor(int timeout)
 {
     pthread_mutex_lock(&EVT_IMPL->mutex);
     bool result = true;
-    if (timeout) {
+    if (timeout > 0) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec += timeout / 1000;
-        ts.tv_nsec += (timeout % 1000) * 1000000;
+        ts.tv_nsec += (long long)(timeout % 1000) * 1000000LL;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec += ts.tv_nsec / 1000000000L;
+            ts.tv_nsec %= 1000000000L;
+        }
         result = pthread_cond_timedwait(&EVT_IMPL->cond, &EVT_IMPL->mutex, &ts) == 0;
     } else {
+        // timeout == 0 或 INFINITE(-1)：无限等待（与 SDL 后端语义一致）
         pthread_cond_wait(&EVT_IMPL->cond, &EVT_IMPL->mutex);
     }
     pthread_mutex_unlock(&EVT_IMPL->mutex);

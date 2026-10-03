@@ -6,6 +6,7 @@
 #include "TVPWindow.h"
 #include "tjsNativeLayer.h"
 #include "TVPSystem.h"
+#include "TVPDebug.h"
 
 #include <algorithm>
 
@@ -65,6 +66,7 @@ DrawDeviceD3D::DrawDeviceD3D(tjs_int w, tjs_int h) : Width(w), Height(h)
     ScreenW = w;
     ScreenH = h;
     EnsureBackend();
+    TVPAddImportantLog(ttstr("DrawDevice: DrawDeviceD3D created (") + ttstr(w) + TJS_N("x") + ttstr(h) + TJS_N(")"));
 
     // 注意：不切换全局渲染管理器——Layer 树保持完全软渲染
     // （tjsNativeLayer 无 GPU 路径），以保证与渲染基准一致；

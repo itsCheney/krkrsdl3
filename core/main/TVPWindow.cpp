@@ -78,6 +78,7 @@ TVPWindow::TVPWindow()
     int w = LayerWidth, h = LayerHeight;
     if (w <= 0 || h <= 0)
         TVPGetWindowSize(&w, &h);
+    TVPAddImportantLog(ttstr("Window: sprite init ") + ttstr(w) + TJS_N("x") + ttstr(h));
     pSprite = new TVPSprite;
     pSprite->width = w;
     pSprite->height = h;
@@ -562,6 +563,7 @@ void TVPWindow::SetPaintBoxSize(tjs_int w, tjs_int h)
 {
     LayerWidth = w;
     LayerHeight = h;
+    TVPAddImportantLog(ttstr("Window: setPaintBoxSize ") + ttstr(w) + TJS_N("x") + ttstr(h));
     RecalcPaintBox();
 }
 //---------------------------------------------------------------------------
