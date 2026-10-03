@@ -609,14 +609,33 @@ public:
     }
     void OperateRect(iTVPRenderMethod* method,iTVPTexture2D* target,iTVPTexture2D* reference,const tTVPRect& dst,const tRenderTexRectArray& inputs) override {
         if(GPU(method,target,reference,dst,inputs)) return;
+        tTVPRect fallbackDst=dst;
+        TVPLayerOperation op;
+        const bool univTrans=target && inputs.size()==3 && method->DescribeGpuOperation(op) &&
+                             op.kind==TVPLayerOperationKind::UnivTrans;
+        if(univTrans) {
+            // The software three-source primitive expects pre-clipped rectangles.
+            // Preserve the GPU path's source/rule offsets when a CPU target or
+            // an unavailable pipeline forces fallback. Empty clips need no views
+            // (and therefore no GPU readback or dirty CPU cache).
+            fallbackDst=tTVPRect(std::max(0,dst.left),std::max(0,dst.top),
+                                std::min(int(target->GetWidth()),dst.right),
+                                std::min(int(target->GetHeight()),dst.bottom));
+            if(fallbackDst.get_width()<=0 || fallbackDst.get_height()<=0) return;
+        }
         CPUViews views; std::vector<std::pair<iTVPTexture2D*,tTVPRect>> textures;
         auto* targetView=views.Get(target,TVPLayerFallbackReadbackRole::Target);
         auto* referenceView=views.Get(reference,TVPLayerFallbackReadbackRole::Reference);
-        for(size_t i=0;i<inputs.size();++i)
-            textures.emplace_back(views.Get(inputs[i].first,TVPLayerFallbackReadbackRole::Source),inputs[i].second);
-        Software()->OperateRect(method,targetView,referenceView,dst,tRenderTexRectArray(textures.data(),textures.size()));
-        // The software manager clips its writes to dst, so the upload can too.
-        if(target) target->MarkCPUModified(dst);
+        for(size_t i=0;i<inputs.size();++i) {
+            auto src=inputs[i].second;
+            if(univTrans) {
+                src.left+=fallbackDst.left-dst.left; src.top+=fallbackDst.top-dst.top;
+                src.right-=dst.right-fallbackDst.right; src.bottom-=dst.bottom-fallbackDst.bottom;
+            }
+            textures.emplace_back(views.Get(inputs[i].first,TVPLayerFallbackReadbackRole::Source),src);
+        }
+        Software()->OperateRect(method,targetView,referenceView,fallbackDst,tRenderTexRectArray(textures.data(),textures.size()));
+        if(target) target->MarkCPUModified(fallbackDst);
         if(session) ++session->stats.cpuFallbacks;
     }
     void OperateTriangles(iTVPRenderMethod* method,int count,iTVPTexture2D* target,iTVPTexture2D* reference,const tTVPRect& clip,const tTVPPointD* points,const tRenderTexQuadArray& inputs) override {
