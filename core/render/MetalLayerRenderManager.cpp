@@ -6,8 +6,10 @@
 #include "gl/tvpgl.h"
 #include "Platform.h"
 #include "PointReadTrace.h"
+#include "LayerTriangleTrace.h"
 #include "tjsDebug.h"
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <set>
@@ -23,6 +25,52 @@ extern unsigned char TVPNegativeMulTable[65536];
 namespace {
 using krkrsdl3::iTVPRenderBackend;
 namespace point_trace = krkrsdl3::point_trace;
+namespace triangle_trace = krkrsdl3::layer_triangle_trace;
+using TriangleClock = std::chrono::steady_clock;
+uint64_t ElapsedNS(TriangleClock::time_point start,TriangleClock::time_point end) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(end-start).count();
+}
+// At most 32 distinct short keys per interval; summaries show the top eight.
+// Overflow is billed to otherCalls rather than dropping calls or growing maps.
+struct TriangleHistogram {
+    std::unordered_map<std::string,uint64_t> counts;
+    uint64_t otherCalls = 0;
+    void Add(std::string key) {
+        if(key.size()>40) {
+            size_t cut=39;
+            while(cut && (static_cast<unsigned char>(key[cut])&0xc0)==0x80) --cut;
+            key.resize(cut); key+='~';
+        }
+        auto it=counts.find(key);
+        if(it!=counts.end()) ++it->second;
+        else if(counts.size()<32) counts.emplace(std::move(key),1);
+        else ++otherCalls;
+    }
+    std::string Summary() const {
+        std::vector<std::pair<std::string,uint64_t>> ordered(counts.begin(),counts.end());
+        std::sort(ordered.begin(),ordered.end(),[](const auto& a,const auto& b) {
+            return a.second!=b.second ? a.second>b.second : a.first<b.first;
+        });
+        std::string out;
+        uint64_t omitted=otherCalls;
+        for(size_t i=0;i<ordered.size();++i) {
+            if(i>=8) { omitted+=ordered[i].second; continue; }
+            if(!out.empty()) out+=',';
+            out+=ordered[i].first+":"+std::to_string(ordered[i].second);
+        }
+        if(omitted) {
+            if(!out.empty()) out+=',';
+            out+="otherCalls:"+std::to_string(omitted);
+        }
+        return out;
+    }
+};
+struct TriangleInterval {
+    TriangleClock::time_point started = TriangleClock::now();
+    TVPLayerTriangleFallbackStats stats;
+    TriangleHistogram methods, targetSizes, stretchModes;
+    uint64_t sources[static_cast<int>(triangle_trace::Source::Count)] = {};
+};
 class LayerTexture;
 std::string fallbackReason;
 struct Session {
@@ -31,6 +79,7 @@ struct Session {
     std::set<LayerTexture*> textures;
     std::unordered_map<std::string,uint64_t> multipleInputMethods;
     std::unordered_map<std::string,uint64_t> unsupportedMethods;
+    TriangleInterval triangles;
     bool tablesReady = false;
     explicit Session(iTVPRenderBackend* b) : backend(b) {}
 };
@@ -640,13 +689,63 @@ public:
     }
     void OperateTriangles(iTVPRenderMethod* method,int count,iTVPTexture2D* target,iTVPTexture2D* reference,const tTVPRect& clip,const tTVPPointD* points,const tRenderTexQuadArray& inputs) override {
         Reject(TVPLayerGPURejectReason::Triangles);
-        CPUViews views; std::vector<std::pair<iTVPTexture2D*,const tTVPPointD*>> textures;
-        auto* targetView=views.Get(target,TVPLayerFallbackReadbackRole::Target);
-        auto* referenceView=views.Get(reference,TVPLayerFallbackReadbackRole::Reference);
-        for(size_t i=0;i<inputs.size();++i)
-            textures.emplace_back(views.Get(inputs[i].first,TVPLayerFallbackReadbackRole::Source),inputs[i].second);
-        Software()->OperateTriangles(method,count,targetView,referenceView,clip,points,tRenderTexQuadArray(textures.data(),textures.size()));
-        if(target) target->MarkCPUModified(); if(session) ++session->stats.cpuFallbacks;
+        const bool profile=session && triangle_trace::Enabled();
+        const auto start=profile ? TriangleClock::now() : TriangleClock::time_point{};
+        uint64_t beforeBytes[static_cast<int>(TVPLayerFallbackReadbackRole::Count)] = {};
+        if(profile) std::copy(std::begin(session->stats.fallbackReadbackBytesByRole),
+                              std::end(session->stats.fallbackReadbackBytesByRole),beforeBytes);
+        uint64_t softwareNS=0;
+        {
+            CPUViews views; std::vector<std::pair<iTVPTexture2D*,const tTVPPointD*>> textures;
+            auto* targetView=views.Get(target,TVPLayerFallbackReadbackRole::Target);
+            auto* referenceView=views.Get(reference,TVPLayerFallbackReadbackRole::Reference);
+            for(size_t i=0;i<inputs.size();++i)
+                textures.emplace_back(views.Get(inputs[i].first,TVPLayerFallbackReadbackRole::Source),inputs[i].second);
+            const auto softwareStart=profile ? TriangleClock::now() : TriangleClock::time_point{};
+            Software()->OperateTriangles(method,count,targetView,referenceView,clip,points,tRenderTexQuadArray(textures.data(),textures.size()));
+            if(profile) softwareNS=ElapsedNS(softwareStart,TriangleClock::now());
+            if(target) target->MarkCPUModified(); if(session) ++session->stats.cpuFallbacks;
+        }
+        if(profile) {
+            auto& interval=session->triangles;
+            auto& stats=interval.stats;
+            const uint64_t cpuNS=ElapsedNS(start,TriangleClock::now());
+            ++stats.calls;
+            stats.triangleCount+=std::max(0,count);
+            stats.cpuTimeNS+=cpuNS; stats.maxCpuTimeNS=std::max(stats.maxCpuTimeNS,cpuNS);
+            stats.softwareTimeNS+=softwareNS; stats.maxSoftwareTimeNS=std::max(stats.maxSoftwareTimeNS,softwareNS);
+            auto bytes=[&](TVPLayerFallbackReadbackRole role) {
+                const int index=static_cast<int>(role);
+                return session->stats.fallbackReadbackBytesByRole[index]-beforeBytes[index];
+            };
+            stats.targetReadbackBytes+=bytes(TVPLayerFallbackReadbackRole::Target);
+            stats.sourceReadbackBytes+=bytes(TVPLayerFallbackReadbackRole::Source);
+            stats.referenceReadbackBytes+=bytes(TVPLayerFallbackReadbackRole::Reference);
+            stats.count2Calls+=count==2;
+            stats.singleInputCalls+=inputs.size()==1;
+            stats.referenceCalls+=reference!=nullptr;
+            bool alias=false;
+            for(size_t i=0;i<inputs.size();++i) alias|=target && inputs[i].first==target;
+            stats.sourceTargetAliasCalls+=alias;
+            ++interval.sources[static_cast<int>(triangle_trace::source)];
+            if(target) {
+                const int64_t w=target->GetWidth(),h=target->GetHeight();
+                const uint64_t area=uint64_t(w)*h;
+                const uint64_t visible=uint64_t(std::max<int64_t>(0,std::min<int64_t>(w,clip.right)-std::max<int64_t>(0,clip.left)))*
+                                       std::max<int64_t>(0,std::min<int64_t>(h,clip.bottom)-std::max<int64_t>(0,clip.top));
+                stats.clipPixels+=visible; stats.maxClipPixels=std::max(stats.maxClipPixels,visible);
+                stats.maxTargetPixels=std::max(stats.maxTargetPixels,area);
+                stats.fullSurfaceCalls+=area && visible==area;
+                stats.target1920x1080Calls+=w==1920 && h==1080;
+            }
+            try {
+                interval.methods.Add(method && !method->GetName().empty() ? method->GetName() : "<unnamed>");
+                interval.targetSizes.Add(target ? std::to_string(target->GetWidth())+"x"+std::to_string(target->GetHeight()) : "none");
+                interval.stretchModes.Add(std::to_string(stretch));
+            } catch(...) {
+                // Diagnostic allocation must not change rendering behavior.
+            }
+        }
     }
     void OperatePerspective(iTVPRenderMethod* method,int count,iTVPTexture2D* target,iTVPTexture2D* reference,const tTVPRect& clip,const tTVPPointD* points,const tRenderTexQuadArray& inputs) override {
         Reject(TVPLayerGPURejectReason::Perspective);
@@ -692,6 +791,32 @@ void TVPUnbindMetalLayerRenderManager() {
 }
 bool TVPMetalLayerCompositionActive() { return bool(Manager().session); }
 TVPLayerRenderStats TVPGetMetalLayerRenderStats() { return Manager().session?Manager().session->stats:TVPLayerRenderStats{}; }
+
+void TVPSetMetalLayerTriangleDiagnostics(bool enabled) {
+    if(triangle_trace::Enabled()==enabled) return;
+    triangle_trace::enabled.store(enabled,std::memory_order_relaxed);
+    if(Manager().session) Manager().session->triangles=TriangleInterval{};
+}
+TVPLayerTriangleProfile TVPTakeMetalLayerTriangleProfile() {
+    auto& manager=Manager();
+    if(!manager.session || !triangle_trace::Enabled()) return {};
+    auto& interval=manager.session->triangles;
+    const auto sampled=TriangleClock::now();
+    TVPLayerTriangleProfile profile;
+    profile.stats=interval.stats;
+    profile.stats.intervalNS=ElapsedNS(interval.started,sampled);
+    profile.methods=interval.methods.Summary();
+    profile.targetSizes=interval.targetSizes.Summary();
+    profile.stretchModes=interval.stretchModes.Summary();
+    for(int i=0;i<static_cast<int>(triangle_trace::Source::Count);++i) {
+        if(!interval.sources[i]) continue;
+        if(!profile.sources.empty()) profile.sources+=',';
+        profile.sources+=std::string(triangle_trace::Name(static_cast<triangle_trace::Source>(i)))+":"+std::to_string(interval.sources[i]);
+    }
+    interval=TriangleInterval{};
+    interval.started=sampled;
+    return profile;
+}
 
 static std::string FormatMethodSummary(const std::unordered_map<std::string,uint64_t>& methods) {
     std::vector<std::pair<std::string,uint64_t>> ordered(methods.begin(),methods.end());

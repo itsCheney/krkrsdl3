@@ -2678,7 +2678,9 @@ void iTVPRenderManager::RegisterRenderMethod(const char* name, iTVPRenderMethod*
     tjs_uint32 hash = tTJSHashFunc<tjs_char*>::Make(name);
     assert(method && AllMethods.find(hash) == AllMethods.end());
     AllMethods[hash] = method;
-    method->SetName(name);
+    // Aliases share the same method object. Keep its first/canonical name for
+    // diagnostic attribution instead of relabeling AlphaBlend as its HDA alias.
+    if (method->GetName().empty()) method->SetName(name);
     // Canonical software methods live for the process. Semantic metadata is
     // attached to those same objects, so static pointers/parameter IDs remain
     // valid across software and GPU sessions (including registered aliases).

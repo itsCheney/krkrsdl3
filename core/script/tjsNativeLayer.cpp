@@ -14,6 +14,7 @@
 #include "tjsDictionary.h"
 #include "RenderManager.h"
 #include "PointReadTrace.h"
+#include "LayerTriangleTrace.h"
 #include "FontRasterizer.h"
 #include "LayerManager.h"
 #include "TVPFont.h"
@@ -4924,6 +4925,8 @@ void tTJSNI_BaseLayer::AffineCopy(const t2DAffineMatrix& matrix,
                                   tTVPBBStretchType type,
                                   bool clear)
 {
+    krkrsdl3::layer_triangle_trace::SourceScope triangleSource(
+        krkrsdl3::layer_triangle_trace::Source::AffineCopy);
     // affine copy
     tTVPRect updaterect;
     bool updated;
@@ -4972,6 +4975,8 @@ void tTJSNI_BaseLayer::AffineCopy(const tTVPPointD* points,
                                   tTVPBBStretchType type,
                                   bool clear)
 {
+    krkrsdl3::layer_triangle_trace::SourceScope triangleSource(
+        krkrsdl3::layer_triangle_trace::Source::AffineCopy);
     // affine copy
     tTVPRect updaterect;
     bool updated;
@@ -5352,6 +5357,8 @@ void tTJSNI_BaseLayer::AffinePile(const t2DAffineMatrix& matrix,
                                   tjs_int opacity,
                                   tTVPBBStretchType type)
 {
+    krkrsdl3::layer_triangle_trace::SourceScope triangleSource(
+        krkrsdl3::layer_triangle_trace::Source::AffinePile);
     // obsoleted (use OperateAffine)
 
     // affine pile
@@ -5405,6 +5412,8 @@ void tTJSNI_BaseLayer::AffinePile(const tTVPPointD* points,
                                   tjs_int opacity,
                                   tTVPBBStretchType type)
 {
+    krkrsdl3::layer_triangle_trace::SourceScope triangleSource(
+        krkrsdl3::layer_triangle_trace::Source::AffinePile);
     // obsoleted (use OperateAffine)
 
     // affine pile
@@ -5458,6 +5467,8 @@ void tTJSNI_BaseLayer::AffineBlend(const t2DAffineMatrix& matrix,
                                    tjs_int opacity,
                                    tTVPBBStretchType type)
 {
+    krkrsdl3::layer_triangle_trace::SourceScope triangleSource(
+        krkrsdl3::layer_triangle_trace::Source::AffineBlend);
     // obsoleted (use OperateAffine)
 
     // affine blend
@@ -5512,6 +5523,8 @@ void tTJSNI_BaseLayer::AffineBlend(const tTVPPointD* points,
                                    tjs_int opacity,
                                    tTVPBBStretchType type)
 {
+    krkrsdl3::layer_triangle_trace::SourceScope triangleSource(
+        krkrsdl3::layer_triangle_trace::Source::AffineBlend);
     // obsoleted (use OperateAffine)
 
     // affine blend
@@ -5567,6 +5580,8 @@ void tTJSNI_BaseLayer::OperateAffine(const t2DAffineMatrix& matrix,
                                      tjs_int opacity,
                                      tTVPBBStretchType type)
 {
+    krkrsdl3::layer_triangle_trace::SourceScope triangleSource(
+        krkrsdl3::layer_triangle_trace::Source::OperateAffine);
     // affine operation
     tTVPRect updaterect;
     bool updated;
@@ -5606,6 +5621,8 @@ void tTJSNI_BaseLayer::OperateAffine(const tTVPPointD* points,
                                      tjs_int opacity,
                                      tTVPBBStretchType type)
 {
+    krkrsdl3::layer_triangle_trace::SourceScope triangleSource(
+        krkrsdl3::layer_triangle_trace::Source::OperateAffine);
     // affine operation
     tTVPRect updaterect;
     bool updated;
