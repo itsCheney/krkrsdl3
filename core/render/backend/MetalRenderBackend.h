@@ -63,6 +63,8 @@ public:
     bool ReadLayerTextureRegion(void*, const TVPLayerRect&, std::vector<uint8_t>&, int&) override;
     bool OperateLayerRect(const TVPLayerOperation&, void*, const TVPLayerRect&,
                           void*, const TVPLayerRect&, int) override;
+    bool OperateLayerAffine(const TVPLayerOperation&, void*, const TVPLayerAffineCopy&,
+                            void*, int) override;
     bool OperateLayerRectDualSource(const TVPLayerOperation&, void*, const TVPLayerRect&,
                                     void*, const TVPLayerRect&,
                                     void*, const TVPLayerRect&) override;

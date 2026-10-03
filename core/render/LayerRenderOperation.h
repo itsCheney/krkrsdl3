@@ -30,6 +30,12 @@ struct TVPLayerRect
     int Width() const { return right - left; }
     int Height() const { return bottom - top; }
 };
+// Prepared software-compatible affine inverse map. Coordinates are relative
+// to clip/sourceCrop; no render-method pointers cross the backend boundary.
+struct TVPLayerAffineCopy {
+    TVPLayerRect clip, sourceCrop;
+    double inverse[6] = {}; // source x/y = a*x + b*y + c, destination centers
+};
 enum class TVPLayerTextureFormat { RGBA8, R8 };
 // Why a GPU->CPU readback happened. Readbacks are synchronous and dominate
 // main-thread time, so attribution matters more than the total: the same byte
@@ -61,8 +67,8 @@ enum class TVPLayerFallbackReadbackRole
     Count
 };
 // Why an operation could not stay on the Metal Layer path. Rect operations
-// record one reason before entering software; triangle/perspective calls are
-// tracked explicitly because they do not attempt the rect GPU path.
+// record one reason before entering software; unsupported triangle/perspective
+// calls are tracked explicitly after their specialized GPU path is considered.
 enum class TVPLayerGPURejectReason
 {
     TargetUnavailable = 0,

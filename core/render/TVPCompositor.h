@@ -195,6 +195,8 @@ public:
     virtual bool ReadLayerTextureRegion(void*, const TVPLayerRect&, std::vector<uint8_t>&, int&) { return false; }
     virtual bool OperateLayerRect(const TVPLayerOperation&, void*, const TVPLayerRect&,
                                   void*, const TVPLayerRect&, int) { return false; }
+    virtual bool OperateLayerAffine(const TVPLayerOperation&, void*, const TVPLayerAffineCopy&,
+                                    void*, int) { return false; }
     // Two-source ordinary Layer operation. Kept separate from OperateLayerRect
     // so existing backends do not need to change their single-source ABI.
     virtual bool OperateLayerRectDualSource(const TVPLayerOperation&, void*, const TVPLayerRect&,

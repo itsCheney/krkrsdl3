@@ -40,6 +40,61 @@ int4 layerSample(texture2d<float, access::read> texture, constant LayerParameter
                    (1-factor.x)*factor.y*c01 + factor.x*factor.y*c11;
     return int4(max(value + 0.5, float4(0))) & int4(255);
 }
+// Two-float arithmetic preserves the host double inverse map at half-pixel
+// boundaries without requiring unsupported Metal double precision.
+struct AffinePair { float high, low; };
+AffinePair affineAdd(AffinePair a, AffinePair b) {
+    float s=a.high+b.high, v=s-a.high;
+    float e=(a.high-(s-v))+(b.high-v)+a.low+b.low;
+    float h=s+e;
+    return {h,e-(h-s)};
+}
+AffinePair affineMultiply(float high,float low,float coordinate) {
+    float h=high*coordinate;
+    return {h,fma(high,coordinate,-h)+low*coordinate};
+}
+float affineCoordinate(float ah,float al,float bh,float bl,float ch,float cl,float x,float y) {
+    AffinePair sum=affineAdd(affineMultiply(ah,al,x),affineMultiply(bh,bl,y));
+    sum=affineAdd(sum,{ch,cl});
+    return sum.high+sum.low;
+}
+int affineBilinearByte(float x,float y,int a,int b,int c,int d) {
+    float v=(1-x)*(1-y)*float(a)+x*(1-y)*float(b)+(1-x)*y*float(c)+x*y*float(d);
+    return int(max(v+0.5f,0.0f)) & 255;
+}
+struct AffineParameters {
+    int4 clip,crop;
+    float4 high[2],low[2];
+    int4 sampling;
+};
+kernel void affineCopyLayer(uint2 tid [[thread_position_in_grid]],
+                            constant AffineParameters& p [[buffer(0)]],
+                            texture2d<float,access::read> source [[texture(0)]],
+                            texture2d<float,access::write> target [[texture(1)]]) {
+    int2 xy=p.clip.xy+int2(tid);
+    if(any(xy>=p.clip.zw)) return;
+    float x=float(tid.x)+0.5, y=float(tid.y)+0.5;
+    float2 point;
+    point.x=affineCoordinate(p.high[0].x,p.low[0].x,p.high[0].y,p.low[0].y,p.high[0].z,p.low[0].z,x,y);
+    point.y=affineCoordinate(p.high[1].x,p.low[1].x,p.high[1].y,p.low[1].y,p.high[1].z,p.low[1].z,x,y);
+    int2 size=p.crop.zw-p.crop.xy;
+    int4 result=int4(0);
+    if(all(point>=float2(0.5)) && all(point<float2(size)-0.5)) {
+        if(p.sampling.x==0) result=layerBytes(source,p.crop.xy+clamp(int2(point+0.5),int2(0),size-1));
+        else {
+            int2 a=clamp(int2(point),int2(0),max(size-2,int2(0)));
+            int2 b=min(a+1,size-1);
+            float2 f=select(point-float2(a),float2(0),size==int2(1));
+            int4 c00=layerBytes(source,p.crop.xy+a);
+            int4 c10=layerBytes(source,p.crop.xy+int2(b.x,a.y));
+            int4 c01=layerBytes(source,p.crop.xy+int2(a.x,b.y));
+            int4 c11=layerBytes(source,p.crop.xy+b);
+            for(int c=0;c<4;++c) result[c]=affineBilinearByte(f.x,f.y,c00[c],c10[c],c01[c],c11[c]);
+        }
+    }
+    // Software Copy replaces the full clip, including transparent warp border.
+    target.write(float4(result)/255.0,uint2(xy));
+}
 kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
                           constant LayerParameters& p [[buffer(0)]],
                           const device uchar* tables [[buffer(1)]],

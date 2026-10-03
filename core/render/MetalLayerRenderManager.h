@@ -15,6 +15,8 @@ std::string TVPGetMetalLayerUnsupportedMethodSummary();
 struct TVPLayerTriangleFallbackStats {
     uint64_t intervalNS = 0;
     uint64_t calls = 0, triangleCount = 0;
+    // Successful Copy affine calls and dispatched pixels, separate from fallback.
+    uint64_t gpuCalls = 0, gpuPixels = 0;
     // Clip intersected with the target, not triangle-covered/rasterized pixels.
     uint64_t clipPixels = 0, maxClipPixels = 0, maxTargetPixels = 0;
     uint64_t fullSurfaceCalls = 0, target1920x1080Calls = 0;

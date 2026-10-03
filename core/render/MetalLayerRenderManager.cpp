@@ -7,6 +7,7 @@
 #include "Platform.h"
 #include "PointReadTrace.h"
 #include "LayerTriangleTrace.h"
+#include "LayerAffineGeometry.h"
 #include "tjsDebug.h"
 #include <algorithm>
 #include <chrono>
@@ -687,7 +688,55 @@ public:
         if(target) target->MarkCPUModified(fallbackDst);
         if(session) ++session->stats.cpuFallbacks;
     }
+    bool GPUAffineCopy(iTVPRenderMethod* method,int count,iTVPTexture2D* target,
+                       const tTVPRect& clip,const tTVPPointD* points,const tRenderTexQuadArray& inputs) {
+        auto* t=dynamic_cast<LayerTexture*>(target);
+        if(!session || !t || !t->Belongs(session) || t->IsCPUResident() ||
+           count!=2 || inputs.size()!=1 || stretch<0 || stretch>2) return false;
+        auto* s=dynamic_cast<LayerTexture*>(inputs[0].first);
+        TVPLayerOperation op;
+        if(!method || !method->DescribeGpuOperation(op) || op.kind!=TVPLayerOperationKind::Copy || op.flags ||
+           !s || !s->Belongs(session) || t->GetFormat()!=TVPTextureFormat::RGBA ||
+           s->GetFormat()!=TVPTextureFormat::RGBA) return false;
+        TVPLayerAffineCopy affine;
+        // The software warp uses clip-relative coordinates. Require a clip
+        // already inside the target; LayerBitmap clamps it before dispatch.
+        if(clip.left<0 || clip.top<0 || clip.right>int(t->GetWidth()) || clip.bottom>int(t->GetHeight())) return false;
+        if(!layer_affine::Prepare(points,inputs[0].second,s->GetWidth(),s->GetHeight(),Rect(clip),affine)) return false;
+        const auto* srcpt=inputs[0].second;
+        const auto close=[](double a,double b) { return std::abs(a-b)<0.001; };
+        const bool rectangle=close(points[0].y,points[1].y) && close(points[1].x,points[5].x) &&
+                             close(points[0].x,points[2].x) && close(points[2].y,points[5].y);
+        tTVPRect affected=clip;
+        if(rectangle) {
+            tTVPRect dst(points[0].x,points[0].y,points[5].x,points[5].y);
+            tTVPRect src(srcpt[0].x,srcpt[0].y,srcpt[5].x,srcpt[5].y);
+            // Mirrored axis-aligned quads use the old fixed-point scanline
+            // rasterizer. Keep that distinct behavior in software for now.
+            if(dst.get_width()<=0 || dst.get_height()<=0) return false;
+            if(!TVPIntersectRect(&affected,clip,dst)) affected=tTVPRect(0,0,0,0);
+            if(affected.get_width()>0 && affected.get_height()>0) {
+                const int dw=dst.get_width(),dh=dst.get_height(),sw=src.get_width(),sh=src.get_height();
+                if(affected.left!=dst.left) src.left+=(float)sw/dw*(affected.left-dst.left);
+                if(affected.top!=dst.top) src.top+=(float)sh/dh*(affected.top-dst.top);
+                if(affected.right!=dst.right) src.right-=(float)sw/dw*(dst.right-affected.right);
+                if(affected.bottom!=dst.bottom) src.bottom-=(float)sh/dh*(dst.bottom-affected.bottom);
+                if(src.get_width()<=0 || src.get_height()<=0) return false;
+                if(!session->backend->OperateLayerRect(op,t->GetTextureHandle(),Rect(affected),s->GetTextureHandle(),Rect(src),stretch==0?0:1)) return false;
+            }
+        } else if(clip.get_width()>0 && clip.get_height()>0) {
+            if(!session->backend->OperateLayerAffine(op,t->GetTextureHandle(),affine,s->GetTextureHandle(),stretch==0?0:1)) return false;
+        } else affected=tTVPRect(0,0,0,0);
+        t->InvalidateCPUCacheRegion(affected);
+        ++session->stats.gpuOperations;
+        if(triangle_trace::Enabled()) {
+            ++session->triangles.stats.gpuCalls;
+            session->triangles.stats.gpuPixels+=uint64_t(affected.get_width())*affected.get_height();
+        }
+        return true;
+    }
     void OperateTriangles(iTVPRenderMethod* method,int count,iTVPTexture2D* target,iTVPTexture2D* reference,const tTVPRect& clip,const tTVPPointD* points,const tRenderTexQuadArray& inputs) override {
+        if(GPUAffineCopy(method,count,target,clip,points,inputs)) return;
         Reject(TVPLayerGPURejectReason::Triangles);
         const bool profile=session && triangle_trace::Enabled();
         const auto start=profile ? TriangleClock::now() : TriangleClock::time_point{};

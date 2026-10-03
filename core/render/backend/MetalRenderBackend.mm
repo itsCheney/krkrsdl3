@@ -365,7 +365,7 @@ struct MetalRenderBackend::Impl
     id<MTLComputePipelineState> layerPipeline = nil, layerInPlacePipeline = nil;
     id<MTLComputePipelineState> ordinaryLayerPipeline = nil, ordinaryInPlacePipeline = nil;
     id<MTLComputePipelineState> dualSourceLayerPipeline = nil;
-    id<MTLComputePipelineState> univTransLayerPipeline = nil;
+    id<MTLComputePipelineState> univTransLayerPipeline = nil, affineCopyPipeline = nil;
     id<MTLRenderCommandEncoder> activeMeshEncoder = nil;
     id<MTLTexture> activeMeshTarget = nil;
     id<MTLComputeCommandEncoder> ordinaryEncoder = nil;
@@ -1045,6 +1045,8 @@ struct MetalRenderBackend::Impl
                                      [ordinary newFunctionWithName:@"ordinaryLayer"] error:&error];
             dualSourceLayerPipeline = [device newComputePipelineStateWithFunction:
                                        [ordinary newFunctionWithName:@"dualSourceLayer"] error:&error];
+            affineCopyPipeline = [device newComputePipelineStateWithFunction:
+                                  [ordinary newFunctionWithName:@"affineCopyLayer"] error:&error];
             univTransLayerPipeline = [device newComputePipelineStateWithFunction:
                                       [ordinary newFunctionWithName:@"univTransLayer"] error:&error];
         }
@@ -1062,6 +1064,8 @@ struct MetalRenderBackend::Impl
         }
         if (!ordinaryLayerPipeline) SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
             "GPU Layer initialization failed; software composition retained: %s", error.localizedDescription.UTF8String);
+        if (!affineCopyPipeline) SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
+            "GPU Layer affine Copy unavailable; software fallback retained: %s", error.localizedDescription.UTF8String);
         if (!dualSourceLayerPipeline) SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
             "GPU Layer dual-source pipeline unavailable; SD transitions use software fallback: %s",
             error.localizedDescription.UTF8String);
@@ -1517,6 +1521,52 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
         if (p.diagnosticSampled) ++p.diagnosticWorkload.layerDispatches;
         if(!inPlace) [e endEncoding];
         // Compute dispatch over existing GPU textures; no host-visible bytes.
+        if(++p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
+        return true;
+    }
+}
+bool MetalRenderBackend::OperateLayerAffine(const TVPLayerOperation& operation,void* target,
+                                           const TVPLayerAffineCopy& affine,void* source,int sampling) {
+    @autoreleasepool {
+        auto& p=*impl_; auto* t=p.Find(target); auto* s=p.Find(source);
+        const auto& clip=affine.clip; const auto& crop=affine.sourceCrop;
+        if(!p.affineCopyPipeline || !t || !s || t->bytesPerPixel!=4 || s->bytesPerPixel!=4 ||
+           operation.kind!=TVPLayerOperationKind::Copy || operation.flags || sampling<0 || sampling>1 ||
+           clip.left<0 || clip.top<0 || clip.right>t->width || clip.bottom>t->height ||
+           crop.left<0 || crop.top<0 || crop.right>s->width || crop.bottom>s->height ||
+           crop.Width()<=0 || crop.Height()<=0) return false;
+        for(double value:affine.inverse) if(!std::isfinite(value) || std::abs(value)>1000000) return false;
+        if(clip.Width()<=0 || clip.Height()<=0) return true;
+        struct AffineParameters { simd_int4 clip,crop; simd_float4 high[2],low[2]; simd_int4 sampling; } params{};
+        params.clip={clip.left,clip.top,clip.right,clip.bottom};
+        params.crop={crop.left,crop.top,crop.right,crop.bottom};
+        for(int i=0;i<6;++i) {
+            params.high[i/3][i%3]=float(affine.inverse[i]);
+            params.low[i/3][i%3]=float(affine.inverse[i]-double(params.high[i/3][i%3]));
+        }
+        params.sampling.x=sampling;
+        id<MTLTexture> sourceTexture=s->texture;
+        // Copy ignores reference/destination alpha. Only source-target aliases
+        // need a snapshot, taken on the GPU before any destination writes.
+        if(s==t) {
+            if(!p.ordinarySourceSnapshot || p.ordinarySourceSnapshot.width!=NSUInteger(crop.Width()) ||
+               p.ordinarySourceSnapshot.height!=NSUInteger(crop.Height()))
+                p.ordinarySourceSnapshot=p.Texture(crop.Width(),crop.Height());
+            sourceTexture=p.ordinarySourceSnapshot; if(!sourceTexture) return false;
+            auto blit=p.Blit(); if(!blit) return false;
+            [blit copyFromTexture:s->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(crop.left,crop.top,0)
+                  sourceSize:MTLSizeMake(crop.Width(),crop.Height(),1) toTexture:sourceTexture destinationSlice:0
+                  destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+            [blit endEncoding];
+            params.crop={0,0,crop.Width(),crop.Height()};
+        }
+        auto e=p.Compute(); if(!e) return false;
+        [e setComputePipelineState:p.affineCopyPipeline];
+        [e setBytes:&params length:sizeof(params) atIndex:0];
+        [e setTexture:sourceTexture atIndex:0]; [e setTexture:t->texture atIndex:1];
+        [e dispatchThreads:MTLSizeMake(clip.Width(),clip.Height(),1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+        if(p.diagnosticSampled) ++p.diagnosticWorkload.layerDispatches;
+        [e endEncoding];
         if(++p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
         return true;
     }
