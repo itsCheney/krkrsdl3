@@ -1161,6 +1161,11 @@ void MetalRenderBackend::EndFrame()
             if (drawable) {
                 p.DrawWindows(drawable.texture, p.windowPipeline);
                 if (presentation) {
+#if TARGET_OS_SIMULATOR
+                    // The simulator SDK omits presentedTime/handlers. Never
+                    // treat command completion as proof of actual display.
+                    presentation->failed.store(true, std::memory_order_release);
+#else
                     auto lastPresented = p.lastLayerPresentation;
                     [drawable addPresentedHandler:^(id<MTLDrawable> displayed) {
                         const double time = displayed.presentedTime;
@@ -1174,6 +1179,7 @@ void MetalRenderBackend::EndFrame()
                         } else
                             presentation->failed.store(true, std::memory_order_release);
                     }];
+#endif
                     [p.Commands() addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
                         if (buffer.status != MTLCommandBufferStatusCompleted)
                             presentation->failed.store(true, std::memory_order_release);
