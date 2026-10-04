@@ -398,14 +398,13 @@ void ClearSharedEmoteResourceCache(const char* reason)
 }
 void TrimSharedEmoteResourceCache(const char* reason)
 {
-    const auto budget = SharedEmoteCache().BudgetBytes();
-    const auto keep = budget / 4;
+    const auto keep = SharedEmoteCache().BudgetBytes() / 4;
     const auto removed = SharedEmoteCache().TrimTo(keep);
     if (removed)
         TVPConsoleLog("emote.resourceCache action=trim reason=%s removed=%llu retainedBytes=%llu",
                       reason ? reason : "unspecified",
                       static_cast<unsigned long long>(removed),
-                      static_cast<unsigned long long>(keep));
+                      static_cast<unsigned long long>(SharedEmoteCache().GetStats().retainedBytes));
 }
 void InvalidateSharedEmoteResource(const std::string& canonicalPath)
 {
