@@ -303,6 +303,30 @@ using namespace PSB;
 
 namespace emoteplayer
 {
+// Reads a NUL-terminated string with block reads; the original decoders issued
+// one virtual stream call per byte. Returns whether the terminator was found.
+// The trailing NUL is part of the result, matching the original byte loop.
+static bool ReadNulTerminatedBlock(tTJSBinaryStream* stream, std::string& out)
+{
+    out.clear();
+    tjs_uint8 buffer[256];
+    for (;;)
+    {
+        const tjs_uint64 position = stream->GetPosition();
+        const tjs_uint64 size = stream->GetSize();
+        const tjs_uint64 remaining = size > position ? size - position : 0;
+        const tjs_uint want =
+            static_cast<tjs_uint>(remaining < sizeof(buffer) ? remaining : sizeof(buffer));
+        const tjs_uint got = want ? stream->Read(buffer, want) : 0;
+        if (got == 0) return false;
+        for (tjs_uint i = 0; i < got; ++i)
+        {
+            out.append(1, static_cast<char>(buffer[i]));
+            if (buffer[i] == '\0') return true;
+        }
+        if (got < want) return false;
+    }
+}
 // Only decoded CPU data is shared. Runtime variables, motion references, script
 // objects, decoded icon pixels and GPU textures remain owned by each emotefile.
 struct EmoteDecodedResource
@@ -1756,6 +1780,8 @@ bool emotefile::load(const ttstr& filePath)
     delete filePtr;
     filePtr = nullptr;
     stringsOffset.clear(); namesData.clear(); charset.clear(); nameIndexes.clear(); namesCache.clear();
+    namesCacheTJS.clear(); stringsCacheTJS.clear();
+    _tjsNameTableReady = _tjsStringTableReady = false;
     chunkOffsets.clear(); chunkLengths.clear(); extraChunkOffsets.clear(); extraChunkLengths.clear();
     _header = {};
     isKrkr = true; isMotion = false; colorType = 0; isMirror = false;
@@ -2037,7 +2063,38 @@ bool emotefile::load(const ttstr& filePath)
 }
 tTJSVariant emotefile::root()
 {
+    // Whole-tree materialization reads the shared string table once instead of
+    // once per occurrence. Targeted queries keep the original minimal read set.
+    struct FullTreeScope
+    {
+        bool& flag;
+        explicit FullTreeScope(bool& target) : flag(target) { flag = true; }
+        ~FullTreeScope() { flag = false; }
+    } fullTreeScope(_fullTreeMaterialization);
     return readAllObjs("root", _header.offsetEntries);
+}
+void emotefile::EnsureTJSNameTable()
+{
+    // A copy of the decoded table, not a reference: the per-occurrence ttstr
+    // built from it must match the per-byte path byte for byte.
+    if (_tjsNameTableReady) return;
+    namesCacheTJS = namesCache;
+    _tjsNameTableReady = true;
+}
+void emotefile::EnsureTJSStringTable()
+{
+    if (_tjsStringTableReady) return;
+    stringsCacheTJS.reserve(stringsOffset.size());
+    for (const auto offset : stringsOffset)
+    {
+        filePtr->SetPosition(_header.offsetStringsData + offset);
+        std::string str;
+        const bool terminated = ReadNulTerminatedBlock(filePtr, str);
+        // The decoder treats a stream that ends before the terminator as an
+        // empty string; preserve that instead of exposing the partial bytes.
+        stringsCacheTJS.emplace_back(terminated ? str : std::string());
+    }
+    _tjsStringTableReady = true;
 }
 tTJSVariant emotefile::readVariableFrameList(const ttstr& name)
 {
@@ -2197,6 +2254,13 @@ tTJSVariant emotefile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
             tjs_int32 idx = 0;
             filePtr->ReadBuffer(&idx,
                                 typeByte - static_cast<tjs_int8>(PSB::PSBObjType::StringN1) + 1);
+            if (_fullTreeMaterialization)
+            {
+                EnsureTJSStringTable();
+                if (idx >= 0 && static_cast<size_t>(idx) < stringsCacheTJS.size())
+                    return tTJSVariant(stringsCacheTJS[idx]);
+                return tTJSVariant();
+            }
             filePtr->SetPosition(_header.offsetStringsData + stringsOffset[idx]);
             std::string str;
             tjs_uint8 val8 = 0;
@@ -2274,9 +2338,10 @@ tTJSVariant emotefile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
             iTJSDispatch2* dsp = TJSCreateDictionaryObject();
             tTJSVariant result(dsp, dsp);
             dsp->Release();
+            EnsureTJSNameTable();
             for (tjs_int i = 0; i < _objsNamesIdx.size(); i++)
             {
-                ttstr keyName = namesCache.at(_objsNamesIdx.at(i));
+                const ttstr keyName = namesCacheTJS.at(_objsNamesIdx.at(i));
                 tTJSVariant obj = readAllObjs(keyName, _tmpOffset + _objsOffset.at(i));
                 dsp->PropSet(TJS_MEMBERENSURE, keyName.c_str(), nullptr, &obj, dsp);
             }
@@ -2553,21 +2618,9 @@ bool emotefile::parseString(std::string& output, uint32_t _objOffset)
             filePtr->ReadBuffer(&idx,
                                 typeByte - static_cast<tjs_int8>(PSB::PSBObjType::StringN1) + 1);
             filePtr->SetPosition(_header.offsetStringsData + stringsOffset[idx]);
-            std::string str;
-            tjs_uint8 val8 = 0;
-            while (true)
-            {
-                if (filePtr->Read(&val8, 1) == 0)
-                    break;
-
-                if (val8 == '\0')
-                {
-                    str.append(1, val8);
-                    break;
-                }
-                str.append(1, val8);
-            }
-            output = str;
+            // A truncated tail keeps the partial bytes here, unlike the script
+            // decoder which reports it as empty.
+            ReadNulTerminatedBlock(filePtr, output);
             return true;
         }
         default:

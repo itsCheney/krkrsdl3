@@ -480,8 +480,20 @@ public:
 private:
     void LoadDecodedResource(std::shared_ptr<const EmoteDecodedResource> resource);
     std::shared_ptr<const EmoteDecodedResource> SnapshotDecodedResource();
+    // Decoded name/string tables, read once per file instead of once per
+    // occurrence during whole-tree materialization. Entries stay in the VM's
+    // character encoding so each use converts exactly as the per-byte path did;
+    // the string table is only built for full-tree reads, so targeted metadata
+    // queries keep their minimal read set.
+    void EnsureTJSNameTable();
+    void EnsureTJSStringTable();
     bool _sharedCacheHit = false;
     bool _archiveFilterBypass = false;
+    bool _fullTreeMaterialization = false;
+    bool _tjsNameTableReady = false;
+    bool _tjsStringTableReady = false;
+    std::vector<std::string> namesCacheTJS;
+    std::vector<std::string> stringsCacheTJS;
     tTJSBinaryStream* filePtr = nullptr;
     tjs_int _seed = 0;
     tTJSVariantClosure _decryptClo = NULL;
