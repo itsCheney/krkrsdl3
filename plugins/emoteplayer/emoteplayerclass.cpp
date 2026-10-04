@@ -4,6 +4,7 @@
 #include "emoteperformance.h"
 #include "emotegeometrybounds.h"
 #include "PointReadTrace.h"
+#include "RenderManager.h"
 #include "tjsArray.h"
 #include "TVPStorage.h"
 #include "Platform.h"

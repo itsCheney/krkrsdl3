@@ -328,6 +328,7 @@ public:
     void ProcessPendingAlphaInput();
     bool IsAsyncAlphaQuery() const { return AlphaDispatching && AlphaQuery; }
     bool GetPinnedAlpha(tTJSNI_BaseLayer*, tjs_uint32& alpha) const;
+    bool GetPinnedHitType(tTJSNI_BaseLayer*, tjs_int& hitType) const;
     bool GetPinnedLayerPoint(tTJSNI_BaseLayer*, tjs_int& x,tjs_int& y,bool& inside) const;
     // Missing nodes were not part of this displayed input frame. They cannot
     // join traversal after a script callback and trigger an unplanned read.

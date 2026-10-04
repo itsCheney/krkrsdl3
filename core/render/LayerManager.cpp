@@ -37,8 +37,9 @@ struct tTVPLayerManager::AlphaPointerFrame {
         std::shared_ptr<iTJSDispatch2> owner;
         int x=0,y=0,width=0,height=0,px=0,py=0;
         uint64_t textureID=0;
+        tjs_int hitType=0;
         bool inside=false, async=false, mask=false, sourceBound=false;
-        uint8_t alpha=0;
+        tjs_uint32 alpha=0; // 256 means outside MainImage, independently of threshold.
         std::shared_ptr<krkrsdl3::AsyncAlphaTile> tile;
         std::shared_ptr<krkrsdl3::AsyncAlphaTileSnapshot> snapshot;
         // No CPU full-image copy. Keeping the original GPU texture intrusive
@@ -96,15 +97,16 @@ std::shared_ptr<tTVPLayerManager::AlphaPointerFrame> tTVPLayerManager::PrepareAl
         point.x=x; point.y=y; layer->FromPrimaryCoordinates(point.x,point.y);
         point.width=layer->GetRect().get_width(); point.height=layer->GetRect().get_height();
         point.inside=point.x>=0 && point.y>=0 && point.x<point.width && point.y<point.height;
-        point.mask=layer->GetHitType()==htMask;
+        point.hitType=tjs_int(layer->GetHitType()); point.mask=point.hitType==htMask;
         auto* image=layer->GetMainImage();
-        if(point.inside && point.mask && layer->GetHitThreshold()<=0) point.alpha=255;
-        if(point.inside && point.mask && layer->GetHitThreshold()>0 && image) {
+        if(point.inside && point.mask && image) {
             auto* texture=image->GetTexture();
             point.px=point.x-layer->GetImageLeft(); point.py=point.y-layer->GetImageTop();
             uint64_t version=0;
             texture->GetContentKey(point.textureID,version);
-            if(point.px>=0 && point.py>=0 && point.px<int(image->GetWidth()) && point.py<int(image->GetHeight())) {
+            if(point.px<0 || point.py<0 || point.px>=int(image->GetWidth()) || point.py>=int(image->GetHeight()))
+                point.alpha=256;
+            else if(layer->GetHitThreshold()>0) {
                 point.async=TVPRequestEmoteAsyncAlpha(texture,point.px,point.py,point.tile);
                 if(!point.async) point.alpha=image->GetBPP()==32 ? texture->GetPointAlpha(point.px,point.py) :
                     image->GetPoint(point.px,point.py)>>24;
@@ -150,11 +152,12 @@ void tTVPLayerManager::CaptureAlphaForPresentation(tTJSNI_BaseLayer* layer) {
         point.width=layer->GetRect().get_width(); point.height=layer->GetRect().get_height();
         point.inside=layer->GetNodeVisible() && point.x>=0 && point.y>=0 &&
             point.x<point.width && point.y<point.height;
-        point.mask=layer->GetHitType()==htMask;
+        point.hitType=tjs_int(layer->GetHitType()); point.mask=point.hitType==htMask;
         point.alpha=0; point.async=false; point.tile.reset(); point.snapshot.reset(); point.sourceTexture.reset();
         auto* image=layer->GetMainImage();
         point.px=point.x-layer->GetImageLeft(); point.py=point.y-layer->GetImageTop();
-        if(point.inside && point.mask && layer->GetHitThreshold()<=0) point.alpha=255;
+        if(point.inside && point.mask && image && (point.px<0 || point.py<0 ||
+           point.px>=int(image->GetWidth()) || point.py>=int(image->GetHeight()))) point.alpha=256;
         if(point.inside && point.mask && layer->GetHitThreshold()>0 && image &&
            point.px>=0 && point.py>=0 && point.px<int(image->GetWidth()) && point.py<int(image->GetHeight())) {
             uint64_t version=0; image->GetTexture()->GetContentKey(point.textureID,version);
@@ -271,6 +274,12 @@ bool tTVPLayerManager::GetPinnedAlpha(tTJSNI_BaseLayer* layer,tjs_uint32& alpha)
     if(it==ActiveAlphaInput->points.end() || !it->second.mask ||
        (it->second.async && !it->second.snapshot)) return false;
     alpha=it->second.alpha; return true;
+}
+bool tTVPLayerManager::GetPinnedHitType(tTJSNI_BaseLayer* layer,tjs_int& hitType) const {
+    if(!IsAsyncAlphaQuery() || !ActiveAlphaInput) return false;
+    auto it=ActiveAlphaInput->points.find(layer);
+    if(it==ActiveAlphaInput->points.end()) return false;
+    hitType=it->second.hitType; return true;
 }
 bool tTVPLayerManager::GetPinnedLayerPoint(tTJSNI_BaseLayer* layer,tjs_int& x,tjs_int& y,bool& inside) const {
     if(!IsAsyncAlphaQuery() || !ActiveAlphaInput) return false;

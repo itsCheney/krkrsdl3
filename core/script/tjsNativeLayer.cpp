@@ -3301,14 +3301,16 @@ bool tTJSNI_BaseLayer::_HitTestNoVisibleCheck(tjs_int x, tjs_int y)
     // do hit test.
     // this function does not check layer's visiblity
 
-    if (HitType == htMask)
+    tjs_int frameHitType=HitType;
+    if(Manager && Manager->IsAsyncAlphaQuery()) Manager->GetPinnedHitType(this,frameHitType);
+    if (frameHitType == htMask)
     {
         // The input preflight has already fixed one displayed alpha frame for
         // every candidate. Never re-read the GPU after script callbacks begin.
         if(Manager && Manager->IsAsyncAlphaQuery()) {
             tjs_uint32 pinnedAlpha=0;
             if(Manager->GetPinnedAlpha(this,pinnedAlpha))
-                return HitThreshold<=0 || tjs_int(pinnedAlpha)>=HitThreshold;
+                return pinnedAlpha<=255 && (HitThreshold<=0 || tjs_int(pinnedAlpha)>=HitThreshold);
         }
         // use mask
         if (MainImage)
@@ -3356,7 +3358,7 @@ bool tTJSNI_BaseLayer::_HitTestNoVisibleCheck(tjs_int x, tjs_int y)
             return false;
         }
     }
-    else if (HitType == htProvince)
+    else if (frameHitType == htProvince)
     {
         // use province
 
