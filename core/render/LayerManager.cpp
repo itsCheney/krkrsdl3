@@ -156,7 +156,10 @@ void tTVPLayerManager::CaptureAlphaForPresentation(tTJSNI_BaseLayer* layer) {
         point.hitType=tjs_int(layer->GetHitType()); point.mask=point.hitType==htMask;
         point.alpha=0; point.async=false; point.tile.reset(); point.snapshot.reset(); point.sourceTexture.reset();
         auto* image=layer->GetMainImage();
-        point.px=point.x-layer->GetImageLeft(); point.py=point.y-layer->GetImageTop();
+        // GetImageLeft/Top throw "Not drawable layer type" without a MainImage;
+        // image-less candidates keep alpha 0 and no pixel coordinate.
+        point.px=0; point.py=0;
+        if(image) { point.px=point.x-layer->GetImageLeft(); point.py=point.y-layer->GetImageTop(); }
         if(point.inside && point.mask && image && (point.px<0 || point.py<0 ||
            point.px>=int(image->GetWidth()) || point.py>=int(image->GetHeight()))) point.alpha=256;
         if(point.inside && point.mask && layer->GetHitThreshold()>0 && image &&
