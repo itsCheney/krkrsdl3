@@ -2347,6 +2347,23 @@ bool tTVPNativeBaseBitmap::CopyFromGPUTarget(krkrsdl3::iTVPRenderBackend* render
     return true;
 }
 //---------------------------------------------------------------------------
+bool tTVPNativeBaseBitmap::CopyFromGPUTargetRegion(krkrsdl3::iTVPRenderBackend* renderer,
+                                                void* source, const tTVPRect& region)
+{
+    if (!renderer || !source || !Bitmap || !renderer->SupportsLayerOperations() ||
+        Bitmap->GetFormat() != TVPTextureFormat::RGBA || Bitmap->IsCPUResident() ||
+        !Bitmap->IsIndependent() || Bitmap->IsStatic() ||
+        region.left < 0 || region.top < 0 || region.right > Bitmap->GetWidth() ||
+        region.bottom > Bitmap->GetHeight() || region.get_width() <= 0 || region.get_height() <= 0)
+        return false;
+    void* handle = Bitmap->GetTextureHandleForRegionWrite();
+    const TVPLayerRect rect{region.left,region.top,region.right,region.bottom};
+    if (!handle || !renderer->CopyTargetToLayerTextureRegion(source,handle,rect))
+        return false;
+    Bitmap->CommitGPURegionWrite(region);
+    return true;
+}
+//---------------------------------------------------------------------------
 const void* tTVPNativeBaseBitmap::GetScanLine(tjs_uint l) const
 {
     return Bitmap->GetScanLineForRead(l);

@@ -14,9 +14,17 @@
 #include "drawable.h"
 #include "tvpinputdefs.h"
 #include "LayerBitmap.h"
+#include <deque>
+#include <functional>
+#include <memory>
+#include <unordered_map>
+#include <unordered_set>
 
 /*[*/
 class tTJSNI_BaseLayer;
+// Render/main-thread pump; GPU callbacks only publish bytes and never run TJS.
+void TVPProcessPendingLayerPointerEvents();
+bool TVPHasPendingLayerPointerBackpressure();
 //---------------------------------------------------------------------------
 // abstract class of Layer Manager
 //---------------------------------------------------------------------------
@@ -290,9 +298,43 @@ class tTVPLayerManager : public iTVPLayerManager, public tTVPDrawable
     // out. Keep foreign owners/devices and all real input hit tests unchanged.
     bool PointerPresentationHitTestingEnabled = true;
     bool HoldAlpha = true;
+    struct AlphaPointerFrame;
+    friend bool TVPHasPendingLayerPointerBackpressure();
+    std::deque<std::shared_ptr<AlphaPointerFrame>> PendingAlphaInput;
+    std::shared_ptr<AlphaPointerFrame> ActiveAlphaInput;
+    bool AlphaDispatching = false, AlphaQuery = false;
+    uint64_t NextAlphaPointerChain = 1;
+    std::unordered_map<uint64_t,uint64_t> AlphaPointerChains;
+    std::unordered_set<uint64_t> CanceledAlphaPointerChains;
+    class AlphaPointerScope {
+        tTVPLayerManager& manager;
+        bool entered = false, deferred = false;
+    public:
+        AlphaPointerScope(tTVPLayerManager&, tjs_int x, tjs_int y, std::function<void()> dispatch,
+                          uint64_t pointerID=0, bool startsChain=false, bool endsChain=false);
+        ~AlphaPointerScope();
+        bool Deferred() const { return deferred; }
+    };
+    std::shared_ptr<AlphaPointerFrame> PrepareAlphaPointer(tjs_int x,tjs_int y,std::function<void()>);
+    bool ResolveAlphaPointer(const std::shared_ptr<AlphaPointerFrame>&);
+    void BindAlphaPresentation();
+    void FinishAlphaPresentation();
+    void CancelAlphaPointerChain(uint64_t chain);
+    void FromPinnedPrimaryCoordinates(tTJSNI_BaseLayer*, tjs_int& x,tjs_int& y);
+    void FromPinnedPrimaryCoordinates(tTJSNI_BaseLayer*, tjs_real& x,tjs_real& y);
 
 public:
     tTVPLayerManager(class iTVPLayerTreeOwner* owner);
+    void ProcessPendingAlphaInput();
+    bool IsAsyncAlphaQuery() const { return AlphaDispatching && AlphaQuery; }
+    bool GetPinnedAlpha(tTJSNI_BaseLayer*, tjs_uint32& alpha) const;
+    bool GetPinnedLayerPoint(tTJSNI_BaseLayer*, tjs_int& x,tjs_int& y,bool& inside) const;
+    // Missing nodes were not part of this displayed input frame. They cannot
+    // join traversal after a script callback and trigger an unplanned read.
+    bool HasPinnedLayer(tTJSNI_BaseLayer*) const;
+    // Called at actual MainImage source use while completing a window frame.
+    void CaptureAlphaForPresentation(tTJSNI_BaseLayer*);
+    bool SetAsyncAlphaQuery(bool enabled) { bool prior=AlphaQuery; AlphaQuery=enabled; return prior; }
 
 private:
     virtual ~tTVPLayerManager();

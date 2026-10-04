@@ -42,6 +42,7 @@ std::atomic<uint64_t> emoteCaptureCPUFallbacks{0};
 std::atomic<uint64_t> emoteCaptureCPUBytes{0};
 std::atomic<uint64_t> emoteCaptureGPUCopies{0};
 std::atomic<uint64_t> emoteCaptureGPUBytes{0};
+std::atomic<uint64_t> emoteCaptureSkipped{0}, emoteCaptureRegionPixels{0}, emoteCaptureFullPixels{0};
 
 std::atomic<uint64_t> profileEmoteProgressCalls{0}, profileEmoteProgressTimeNS{0};
 std::atomic<uint64_t> profileEmotePrepareCalls{0}, profileEmotePrepareTimeNS{0};
@@ -129,6 +130,13 @@ void TVPRecordEmoteCaptureGPUCopy(uint64_t bytes) {
     emoteCaptureGPUCopies.fetch_add(1, std::memory_order_relaxed);
     emoteCaptureGPUBytes.fetch_add(bytes, std::memory_order_relaxed);
 }
+void TVPRecordEmoteCaptureSkip() {
+    emoteCaptureSkipped.fetch_add(1, std::memory_order_relaxed);
+}
+void TVPRecordEmoteCaptureRegion(uint64_t pixels, uint64_t fullPixels) {
+    emoteCaptureRegionPixels.fetch_add(pixels, std::memory_order_relaxed);
+    emoteCaptureFullPixels.fetch_add(fullPixels, std::memory_order_relaxed);
+}
 TVPEmoteCaptureStats TVPGetEmoteCaptureStats() {
     TVPEmoteCaptureStats stats;
     stats.calls=emoteCaptureCalls.load(std::memory_order_relaxed);
@@ -136,6 +144,9 @@ TVPEmoteCaptureStats TVPGetEmoteCaptureStats() {
     stats.cpuBytes=emoteCaptureCPUBytes.load(std::memory_order_relaxed);
     stats.gpuCopies=emoteCaptureGPUCopies.load(std::memory_order_relaxed);
     stats.gpuBytes=emoteCaptureGPUBytes.load(std::memory_order_relaxed);
+    stats.skipped=emoteCaptureSkipped.load(std::memory_order_relaxed);
+    stats.regionPixels=emoteCaptureRegionPixels.load(std::memory_order_relaxed);
+    stats.fullPixels=emoteCaptureFullPixels.load(std::memory_order_relaxed);
     return stats;
 }
 void TVPResetEmoteCaptureStats() {
@@ -144,6 +155,9 @@ void TVPResetEmoteCaptureStats() {
     emoteCaptureCPUBytes.store(0, std::memory_order_relaxed);
     emoteCaptureGPUCopies.store(0, std::memory_order_relaxed);
     emoteCaptureGPUBytes.store(0, std::memory_order_relaxed);
+    emoteCaptureSkipped.store(0, std::memory_order_relaxed);
+    emoteCaptureRegionPixels.store(0, std::memory_order_relaxed);
+    emoteCaptureFullPixels.store(0, std::memory_order_relaxed);
 }
 
 void TVPRecordEmoteProgress(uint64_t ns) {

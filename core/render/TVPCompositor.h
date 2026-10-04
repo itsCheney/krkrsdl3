@@ -6,6 +6,7 @@
 
 #include "PlatformView.h"
 #include "LayerRenderOperation.h"
+#include "AsyncLayerReadback.h"
 
 //---------------------------------------------------------------------------
 // TVPCompositor
@@ -191,8 +192,18 @@ public:
     // Fast full-surface copy from an offscreen render target into a Layer texture.
     // Backends that cannot guarantee identical RGBA8 dimensions return false.
     virtual bool CopyTargetToLayerTexture(void*, void*) { return false; }
+    // Same-size RGBA targets; preserve destination pixels outside region.
+    virtual bool CopyTargetToLayerTextureRegion(void*, void*, const TVPLayerRect&) { return false; }
     virtual bool ReadLayerTexture(void*, std::vector<uint8_t>&, int&) { return false; }
     virtual bool ReadLayerTextureRegion(void*, const TVPLayerRect&, std::vector<uint8_t>&, int&) { return false; }
+    // Last synchronous texture read only; querying this never blocks. Zero is
+    // also the default for unsupported backends, not an estimated wall time.
+    virtual uint64_t GetLastReadbackWaitNanoseconds() const { return 0; }
+    virtual std::shared_ptr<AsyncLayerPresentation> GetCurrentLayerPresentation() const { return {}; }
+    virtual uint64_t GetLastLayerPresentationSerial() const { return 0; }
+    // Encodes into normal frame work; never submits or waits for the GPU.
+    virtual bool RequestLayerTextureRegionRead(void*, const TVPLayerRect&,
+                                               const std::shared_ptr<AsyncLayerReadback>&) { return false; }
     virtual bool OperateLayerRect(const TVPLayerOperation&, void*, const TVPLayerRect&,
                                   void*, const TVPLayerRect&, int) { return false; }
     virtual bool OperateLayerAffine(const TVPLayerOperation&, void*, const TVPLayerAffineCopy&,
@@ -255,10 +266,15 @@ struct TVPEmoteCaptureStats {
     uint64_t cpuBytes = 0;
     uint64_t gpuCopies = 0;
     uint64_t gpuBytes = 0;
+    uint64_t skipped = 0;
+    uint64_t regionPixels = 0;
+    uint64_t fullPixels = 0;
 };
 void TVPRecordEmoteCaptureCall();
 void TVPRecordEmoteCaptureCPUFallback(uint64_t bytes);
 void TVPRecordEmoteCaptureGPUCopy(uint64_t bytes);
+void TVPRecordEmoteCaptureSkip();
+void TVPRecordEmoteCaptureRegion(uint64_t pixels, uint64_t fullPixels);
 TVPEmoteCaptureStats TVPGetEmoteCaptureStats();
 void TVPResetEmoteCaptureStats();
 

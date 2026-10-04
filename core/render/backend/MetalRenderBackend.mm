@@ -385,10 +385,28 @@ struct MetalRenderBackend::Impl
     std::shared_ptr<StageCapture> diagnosticStages;
     bool diagnosticSampled = false, diagnosticCapabilityLogged = false;
     uint64_t commandSerial = 0, lastSubmittedSerial = 0, renderFrameSerial = 0;
+    uint64_t layerPresentationSerial = 0;
+    std::shared_ptr<AsyncLayerPresentation> layerPresentation;
+    std::shared_ptr<std::atomic<uint64_t>> lastLayerPresentation = std::make_shared<std::atomic<uint64_t>>(0);
+    struct AsyncReadBudget {
+        std::atomic<size_t> bytes{0}, requests{0};
+    };
+    std::shared_ptr<AsyncReadBudget> asyncReadBudget = std::make_shared<AsyncReadBudget>();
+    struct AsyncReadLease {
+        std::shared_ptr<AsyncReadBudget> budget;
+        size_t bytes;
+        AsyncReadLease(std::shared_ptr<AsyncReadBudget> value, size_t size)
+            : budget(std::move(value)), bytes(size) {}
+        ~AsyncReadLease() {
+            budget->bytes.fetch_sub(bytes, std::memory_order_relaxed);
+            budget->requests.fetch_sub(1, std::memory_order_relaxed);
+        }
+    };
     uint64_t diagnosticFirstRenderFrame = 0;
     enum WaitKind { QueueWait, ReadbackWait, DrawableWait };
     uint64_t lastDiagnosticWaitNS[3] = {0, 0, 0}, suppressedDiagnosticWaits[3] = {0, 0, 0};
     uint64_t lastSyncWaitNS = 0;
+    uint64_t lastReadbackWaitNS = 0;
     double diagnosticQueueWaitMS = 0;
     std::unordered_map<void*, std::unique_ptr<Resource>> resources;
     std::vector<WindowDraw> windows;
@@ -877,7 +895,9 @@ struct MetalRenderBackend::Impl
                 sourceSize:MTLSizeMake(w, h, 1) toBuffer:staging destinationOffset:0
                 destinationBytesPerRow:rowBytes destinationBytesPerImage:rowBytes * h];
         [e endEncoding];
-        if (!Submit(true)) return false;
+        const bool success = Submit(true);
+        lastReadbackWaitNS = lastSyncWaitNS;
+        if (!success) return false;
         pixels.resize(w * h * bpp);
         pitch = static_cast<int>(w * bpp);
         for (size_t y = 0; y < h; ++y)
@@ -1110,10 +1130,25 @@ void MetalRenderBackend::BeginFrame(int w, int h)
     impl_->width = w; impl_->height = h;
     impl_->windows.clear();
 }
+std::shared_ptr<AsyncLayerPresentation> MetalRenderBackend::GetCurrentLayerPresentation() const
+{
+    auto& p = *impl_;
+    // Ordinary Layer composition can precede BeginFrame. Its source reads and
+    // the following window presentation belong to one shared immutable ticket.
+    if (!p.layerPresentation)
+        p.layerPresentation = std::make_shared<AsyncLayerPresentation>(++p.layerPresentationSerial);
+    return p.layerPresentation;
+}
+uint64_t MetalRenderBackend::GetLastLayerPresentationSerial() const
+{
+    return impl_->lastLayerPresentation->load(std::memory_order_acquire);
+}
 void MetalRenderBackend::EndFrame()
 {
     @autoreleasepool {
         auto& p = *impl_;
+        auto presentation = p.layerPresentation;
+        bool scheduledPresentation = false;
         double drawableWaitMS = 0;
         if (p.width > 0 && p.height > 0 && !(SDL_GetWindowFlags(p.window) & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED))) {
             if (p.layer.drawableSize.width != p.width || p.layer.drawableSize.height != p.height)
@@ -1125,9 +1160,32 @@ void MetalRenderBackend::EndFrame()
             p.ReportSlowWait(Impl::DrawableWait, drawableWaitNS);
             if (drawable) {
                 p.DrawWindows(drawable.texture, p.windowPipeline);
+                if (presentation) {
+                    auto lastPresented = p.lastLayerPresentation;
+                    [drawable addPresentedHandler:^(id<MTLDrawable> displayed) {
+                        const double time = displayed.presentedTime;
+                        presentation->presentedTime.store(time, std::memory_order_relaxed);
+                        if (time > 0) {
+                            uint64_t previous = lastPresented->load(std::memory_order_relaxed);
+                            while (previous < presentation->frameSerial &&
+                                   !lastPresented->compare_exchange_weak(previous, presentation->frameSerial,
+                                       std::memory_order_release, std::memory_order_relaxed)) {}
+                            presentation->presented.store(true, std::memory_order_release);
+                        } else
+                            presentation->failed.store(true, std::memory_order_release);
+                    }];
+                    [p.Commands() addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+                        if (buffer.status != MTLCommandBufferStatusCompleted)
+                            presentation->failed.store(true, std::memory_order_release);
+                    }];
+                }
                 [p.Commands() presentDrawable:drawable];
+                scheduledPresentation = true;
             }
         }
+        if (presentation && !scheduledPresentation)
+            presentation->failed.store(true, std::memory_order_release);
+        p.layerPresentation.reset();
         p.Submit(); // Offscreen work must still complete when no drawable is available.
         p.lastPresentationWaitMS = p.pendingQueueWaitMS + drawableWaitMS;
         p.pendingQueueWaitMS = 0;
@@ -1455,10 +1513,108 @@ bool MetalRenderBackend::CopyTargetToLayerTexture(void* sourceHandle, void* dest
     }
 }
 bool MetalRenderBackend::ReadLayerTexture(void* handle,std::vector<uint8_t>& pixels,int& pitch) {
-    @autoreleasepool { auto* r=impl_->Find(handle); return r && impl_->Read(r->texture,pixels,pitch); }
+    @autoreleasepool { impl_->lastReadbackWaitNS=0; auto* r=impl_->Find(handle); return r && impl_->Read(r->texture,pixels,pitch); }
 }
 bool MetalRenderBackend::ReadLayerTextureRegion(void* handle,const TVPLayerRect& region,std::vector<uint8_t>& pixels,int& pitch) {
-    @autoreleasepool { auto* r=impl_->Find(handle); return r && impl_->Read(r->texture,pixels,pitch,&region); }
+    @autoreleasepool { impl_->lastReadbackWaitNS=0; auto* r=impl_->Find(handle); return r && impl_->Read(r->texture,pixels,pitch,&region); }
+}
+uint64_t MetalRenderBackend::GetLastReadbackWaitNanoseconds() const { return impl_->lastReadbackWaitNS; }
+bool MetalRenderBackend::CopyTargetToLayerTextureRegion(void* sourceHandle, void* destinationHandle,
+                                                       const TVPLayerRect& region)
+{
+    @autoreleasepool {
+        auto& p = *impl_;
+        auto* source = p.Find(sourceHandle);
+        auto* destination = p.Find(destinationHandle);
+        if (!source || !destination || source == destination || !source->target || !destination->target ||
+            source->bytesPerPixel != 4 || destination->bytesPerPixel != 4 ||
+            source->width != destination->width || source->height != destination->height ||
+            region.left < 0 || region.top < 0 || region.right > source->width || region.bottom > source->height ||
+            region.Width() < 0 || region.Height() < 0) return false;
+        if (!region.Width() || !region.Height()) return true;
+        id<MTLBlitCommandEncoder> encoder = p.Blit();
+        if (!encoder) return false;
+        [encoder copyFromTexture:source->texture sourceSlice:0 sourceLevel:0
+             sourceOrigin:MTLOriginMake(region.left, region.top, 0)
+             sourceSize:MTLSizeMake(region.Width(), region.Height(), 1)
+             toTexture:destination->texture destinationSlice:0 destinationLevel:0
+             destinationOrigin:MTLOriginMake(region.left, region.top, 0)];
+        [encoder endEncoding];
+        if (++p.transientOps >= Impl::kSubmissionOpBudget) p.Submit();
+        return true;
+    }
+}
+bool MetalRenderBackend::RequestLayerTextureRegionRead(void* handle, const TVPLayerRect& region,
+                                                      const std::shared_ptr<AsyncLayerReadback>& request)
+{
+    @autoreleasepool {
+        auto& p = *impl_;
+        auto* resource = p.Find(handle);
+        if (!request || request->allocationLease || !resource || resource->bytesPerPixel != 4 ||
+            region.Width() <= 0 || region.Height() <= 0 || region.left < 0 || region.top < 0 ||
+            region.right > resource->width || region.bottom > resource->height) return false;
+        const size_t rowBytes = (size_t(region.Width()) * 4 + 255) & ~size_t(255);
+        const size_t bytes = rowBytes * size_t(region.Height());
+        constexpr size_t maxBytes = 2 * 1024 * 1024, maxRequests = 64;
+        if (bytes > maxBytes) return false;
+        auto budget = p.asyncReadBudget;
+        const size_t previousRequests = budget->requests.fetch_add(1, std::memory_order_relaxed);
+        const size_t previousBytes = budget->bytes.fetch_add(bytes, std::memory_order_relaxed);
+        if (previousRequests >= maxRequests || previousBytes > maxBytes - bytes) {
+            budget->bytes.fetch_sub(bytes, std::memory_order_relaxed);
+            budget->requests.fetch_sub(1, std::memory_order_relaxed);
+            return false;
+        }
+        std::shared_ptr<Impl::AsyncReadLease> lease;
+        try { lease = std::make_shared<Impl::AsyncReadLease>(budget, bytes); }
+        catch (...) {
+            budget->bytes.fetch_sub(bytes, std::memory_order_relaxed);
+            budget->requests.fetch_sub(1, std::memory_order_relaxed);
+            return false;
+        }
+        // Not acquired from the normal staging pool: GPU completion alone does
+        // not imply that this completion callback has copied the bytes yet.
+        __block id<MTLBuffer> staging = [p.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        if (!staging) return false;
+        id<MTLBlitCommandEncoder> encoder = p.Blit();
+        if (!encoder) return false;
+        request->region = region;
+        if (!request->presentation) request->presentation = GetCurrentLayerPresentation();
+        request->allocationLease = lease;
+        [encoder copyFromTexture:resource->texture sourceSlice:0 sourceLevel:0
+             sourceOrigin:MTLOriginMake(region.left, region.top, 0)
+             sourceSize:MTLSizeMake(region.Width(), region.Height(), 1)
+             toBuffer:staging destinationOffset:0 destinationBytesPerRow:rowBytes destinationBytesPerImage:bytes];
+        [encoder endEncoding];
+        [p.Commands() addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+            if (buffer.status == MTLCommandBufferStatusCompleted &&
+                !request->canceled.load(std::memory_order_acquire)) {
+                const int pitch = region.Width() * 4;
+                try {
+                    request->rgba.resize(size_t(pitch) * region.Height());
+                    for (int y = 0; y < region.Height(); ++y)
+                        std::memcpy(request->rgba.data() + size_t(y) * pitch,
+                                    static_cast<const uint8_t*>(staging.contents) + size_t(y) * rowBytes,
+                                    size_t(pitch));
+                    request->pitch = pitch;
+                } catch (...) {
+                    request->failed.store(true, std::memory_order_relaxed);
+                }
+            } else if (buffer.status != MTLCommandBufferStatusCompleted) {
+                request->failed.store(true, std::memory_order_relaxed);
+                if (request->presentation) request->presentation->failed.store(true, std::memory_order_release);
+            }
+            // A completed command buffer may retain its handler object. Drop
+            // the handler's strong staging reference after CPU copying, before
+            // publishing completion; its bytes can never outlive the lease.
+            staging = nil;
+            request->completed.store(true, std::memory_order_release);
+        }];
+        // No Submit(), queue wait or waitUntilCompleted is introduced here.
+        // The ordinary frame flush owns submission and presentation cadence.
+        ++p.transientOps;
+        return true;
+    }
 }
 bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,void* target,const TVPLayerRect& dst,
                                          void* source,const TVPLayerRect& src,int sampling) {

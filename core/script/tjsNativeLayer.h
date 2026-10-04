@@ -498,6 +498,8 @@ public:
     // describe the source target; a larger layer image requires a partial copy.
     bool CopyMainImageFromGPUTarget(krkrsdl3::iTVPRenderBackend* renderer, void* source,
                                     tjs_int width, tjs_int height);
+    bool CopyMainImageFromGPUTargetRegion(krkrsdl3::iTVPRenderBackend* renderer, void* source,
+                                        tjs_int width, tjs_int height, const tTVPRect& region);
     // Copies the top-left source region, preserving image pixels outside it.
     bool CopyMainImageFromCPU(const void* pixels, tjs_int pitch, tjs_int width, tjs_int height);
     // Closes the write lease opened by GetMainImagePixelBufferForWrite so a GPU

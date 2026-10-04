@@ -59,8 +59,14 @@ public:
     void DestroyLayerTexture(void*) override;
     bool UpdateLayerTexture(void*, const uint8_t*, int, const TVPLayerRect&) override;
     bool CopyTargetToLayerTexture(void*, void*) override;
+    bool CopyTargetToLayerTextureRegion(void*, void*, const TVPLayerRect&) override;
     bool ReadLayerTexture(void*, std::vector<uint8_t>&, int&) override;
     bool ReadLayerTextureRegion(void*, const TVPLayerRect&, std::vector<uint8_t>&, int&) override;
+    uint64_t GetLastReadbackWaitNanoseconds() const override;
+    std::shared_ptr<AsyncLayerPresentation> GetCurrentLayerPresentation() const override;
+    uint64_t GetLastLayerPresentationSerial() const override;
+    bool RequestLayerTextureRegionRead(void*, const TVPLayerRect&,
+                                      const std::shared_ptr<AsyncLayerReadback>&) override;
     bool OperateLayerRect(const TVPLayerOperation&, void*, const TVPLayerRect&,
                           void*, const TVPLayerRect&, int) override;
     bool OperateLayerAffine(const TVPLayerOperation&, void*, const TVPLayerAffineCopy&,

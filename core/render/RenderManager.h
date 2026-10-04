@@ -85,6 +85,11 @@ public:
     // CPU state; CommitGPUOverwrite is called only after the backend copy succeeds.
     virtual void* GetTextureHandleForOverwrite() { return nullptr; }
     virtual void CommitGPUOverwrite() {}
+    // Stable resource identity plus a monotonically increasing content version.
+    virtual bool GetContentKey(uint64_t& identity, uint64_t& version) const { return false; }
+    // Preserve pixels outside the destination ROI; reject outstanding CPU leases.
+    virtual void* GetTextureHandleForRegionWrite() { return nullptr; }
+    virtual void CommitGPURegionWrite(const tTVPRect& written) {}
     // 显式回读（带缓存）：返回 CPU 像素；软件实现零拷贝返回真实缓冲
     virtual void* LockCPURead() { return const_cast<void*>(GetPixelData()); }
     virtual void UnlockCPU() {}

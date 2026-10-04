@@ -17,6 +17,7 @@
 #include "LayerTriangleTrace.h"
 #include "FontRasterizer.h"
 #include "LayerManager.h"
+#include "MetalLayerRenderManager.h"
 #include "TVPFont.h"
 #include "Platform.h"
 
@@ -3027,6 +3028,16 @@ bool tTJSNI_BaseLayer::CopyMainImageFromGPUTarget(krkrsdl3::iTVPRenderBackend* r
     return true;
 }
 //---------------------------------------------------------------------------
+bool tTJSNI_BaseLayer::CopyMainImageFromGPUTargetRegion(krkrsdl3::iTVPRenderBackend* renderer,
+                                                     void* source,tjs_int width,tjs_int height,
+                                                     const tTVPRect& region)
+{
+    if(!MainImage || width<=0 || height<=0 || width!=tjs_int(MainImage->GetWidth()) ||
+       height!=tjs_int(MainImage->GetHeight()) || !MainImage->CopyFromGPUTargetRegion(renderer,source,region))
+        return false;
+    ImageModified=true;
+    return true;
+}
 bool tTJSNI_BaseLayer::CopyMainImageFromCPU(const void* pixels, tjs_int pitch,
                                          tjs_int width, tjs_int height)
 {
@@ -3292,6 +3303,13 @@ bool tTJSNI_BaseLayer::_HitTestNoVisibleCheck(tjs_int x, tjs_int y)
 
     if (HitType == htMask)
     {
+        // The input preflight has already fixed one displayed alpha frame for
+        // every candidate. Never re-read the GPU after script callbacks begin.
+        if(Manager && Manager->IsAsyncAlphaQuery()) {
+            tjs_uint32 pinnedAlpha=0;
+            if(Manager->GetPinnedAlpha(this,pinnedAlpha))
+                return HitThreshold<=0 || tjs_int(pinnedAlpha)>=HitThreshold;
+        }
         // use mask
         if (MainImage)
         {
@@ -3384,7 +3402,12 @@ bool tTJSNI_BaseLayer::HitTestNoVisibleCheck(tjs_int x, tjs_int y)
             param[1] = y;
             param[2] = true;
             static ttstr eventname(TJS_N("onHitTest"));
-            TVPPostEvent(Owner, Owner, eventname, 0, TVP_EPT_IMMEDIATE, 3, param);
+            // Explicit script HitTest/getMaskPixel calls inside onHitTest keep
+            // their immediate semantics rather than borrowing this UI frame.
+            const bool priorQuery=Manager ? Manager->SetAsyncAlphaQuery(false) : false;
+            try { TVPPostEvent(Owner, Owner, eventname, 0, TVP_EPT_IMMEDIATE, 3, param); }
+            catch(...) { if(Manager) Manager->SetAsyncAlphaQuery(priorQuery); throw; }
+            if(Manager) Manager->SetAsyncAlphaQuery(priorQuery);
 
             res = OnHitTest_Work;
         }
@@ -3407,8 +3430,13 @@ bool tTJSNI_BaseLayer::GetMostFrontChildAt(
         return false; // cannot hit invisible layer
 
     // convert coordinates ( the point is given by parent's coordinates )
-    x -= Rect.left;
-    y -= Rect.top;
+    if(Manager && Manager->IsAsyncAlphaQuery()) {
+        bool inside=false;
+        if(!Manager->GetPinnedLayerPoint(this,x,y,inside) || !inside) return false;
+    } else {
+        x -= Rect.left;
+        y -= Rect.top;
+    }
 
     // rectangle test
     if (x < 0 || y < 0 || x >= Rect.get_width() || y >= Rect.get_height())
@@ -6549,6 +6577,8 @@ void tTJSNI_BaseLayer::BltImage(iTVPBaseBitmap* dest,
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::DrawSelf(tTVPDrawable* target, tTVPRect& pr, tTVPRect& cr)
 {
+    if(Manager) Manager->CaptureAlphaForPresentation(this);
+    if(MainImage) TVPEncodeEmoteAsyncAlphaForPresentation(MainImage->GetTexture());
     if (!MainImage)
     {
         if (DisplayType == ltOpaque)
@@ -6613,6 +6643,8 @@ void tTJSNI_BaseLayer::CopySelfForRect(iTVPBaseBitmap* dest,
                                        tjs_int desty,
                                        const tTVPRect& srcrect)
 {
+    if(Manager) Manager->CaptureAlphaForPresentation(this);
+    if(MainImage) TVPEncodeEmoteAsyncAlphaForPresentation(MainImage->GetTexture());
     // copy self image to the target
     tTVPRect cr = srcrect;
     cr.add_offsets(-ImageLeft, -ImageTop);
@@ -6646,6 +6678,8 @@ void tTJSNI_BaseLayer::CopySelf(iTVPBaseBitmap* dest,
                                 tjs_int desty,
                                 const tTVPRect& r)
 {
+    if(Manager) Manager->CaptureAlphaForPresentation(this);
+    if(MainImage) TVPEncodeEmoteAsyncAlphaForPresentation(MainImage->GetTexture());
     const tTVPRect& uer = UpdateExcludeRect;
     if (uer.is_empty())
     {

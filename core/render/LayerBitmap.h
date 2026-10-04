@@ -211,6 +211,10 @@ public:
     // Full RGBA surface copy. Shared/static images are replaced only after a
     // successful copy, without first copying the pixels that will be discarded.
     bool CopyFromGPUTarget(krkrsdl3::iTVPRenderBackend* renderer, void* source);
+    // A partial copy preserves uncovered pixels. Shared/static destinations
+    // decline it so callers retain the cheaper full-overwrite COW transaction.
+    bool CopyFromGPUTargetRegion(krkrsdl3::iTVPRenderBackend* renderer, void* source,
+                                const tTVPRect& region);
 
     /* scan line */
     const void* GetScanLine(tjs_uint l) const;

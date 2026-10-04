@@ -9,6 +9,7 @@
 #include "emotefile.h"
 #include "emotegeometry.h"
 #include "emoteanimation.h"
+#include "emoteperformance.h"
 
 namespace emoteplayer
 {
@@ -105,6 +106,27 @@ namespace emoteplayer
         // once per mesh update, while index topology is retained until division
         // or mesh mode actually changes.
         std::vector<glm::mat4> _surfaceMatrices;
+        // Prepared geometry belongs to this node instance. The comparison key
+        // includes the complete inherited chain; equal local poses alone do not
+        // permit reusing geometry after a parent or viewport transform changes.
+        std::vector<emoteRender> _geometryMethods;
+        // Selected-frame scalars are cached separately from inherited geometry.
+        // Values (not just frame pointers) are compared so explicit resource
+        // edits invalidate the cache, and viewport sentinel resolution is local.
+        std::array<double, 101> _localPoseInputs{};
+        bool _localPoseValid = false;
+        emotelimit _geometryLimit;
+        emoterect _shapeArea;
+        std::uint64_t _geometryRevision = 0;
+        bool _geometryValid = false, _geometryGPUCapable = false;
+        bool _geometryDrawable = false, _geometryIcon = false, _geometryShape = false;
+        bool _geometryRemoved = false, _geometryHasColor = false;
+        int _geometryDivision = 0, _geometryBlend = 0;
+        std::int64_t _geometryColor = 0;
+        emoteicon* _geometrySource = nullptr;
+        void* _geometryTexture = nullptr;
+        emotemotion* _geometryMotion = nullptr;
+        std::string _geometryFrameSource;
     };
     // motion辅助类 - 管理按priority排序的nodeList并处理子motion展开
     class emotemotionref
@@ -123,6 +145,12 @@ namespace emoteplayer
         bool contains(float x, float y, const char* label = nullptr) const;
         // 根据emotenode*查找对应的emotenoderef
         emotenoderef* getNodeRef(emotenode* node);
+        // Available after progress; the list is expanded and sorted only when
+        // its membership/order/Z changes, and is shared by draw and bounds scans.
+        const std::vector<emotenoderef*>& drawNodes() const { return _drawNodes; }
+        void collectDrawNodes();
+        void recordShape(const emoterect& area);
+        std::uint64_t poseRevision() const { return _poseRevision; }
 
         emotemotion* currentMotion = nullptr;
         emoteengine* refTop = nullptr;
@@ -132,6 +160,7 @@ namespace emoteplayer
 
         // 核心: 按priority排序的ref列表，平行于currentMotion->nodeList
         std::vector<emotenoderef> _nodeCache;
+        std::unordered_map<emotenode*, size_t> _nodeIndex;
         // 子motion引用缓存(progress阶段创建，draw阶段使用)
         std::vector<emotemotionref*> _subMotionRefs;
         // Sub-motion refs retained across frames, keyed by the emotemotion they
@@ -144,6 +173,13 @@ namespace emoteplayer
 
         // shape节点区域(用于 getLayerGetter/getLayerMotion 的shape返回和contains检测)
         std::vector<emoterect> shapeNodeAreas;
+        size_t _shapeCount = 0;
+        bool _poseChanged = false;
+        std::uint64_t _poseRevision = 0;
+        std::vector<emotemotionref*> _previousSubMotions;
+        std::vector<std::uint64_t> _previousSubRevisions;
+        std::vector<emotenoderef*> _drawNodes, _drawInput, _drawScratch, _drawStack;
+        std::vector<float> _drawZ;
     };
     // 核心模拟引擎
     class emoteengine
@@ -162,6 +198,12 @@ namespace emoteplayer
         // progress/draw接口(替代_mainMotionRef)
         void progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim);
         void draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget);
+        // A monotonic prepared-content generation, independent of diagnostics
+        // and clock-call counters. Never resets during the engine lifetime.
+        std::uint64_t poseRevision() const { return _poseRevision; }
+        bool nodeCachingEnabled() const { return _nodeCachingEnabled; }
+        bool localPoseCachingEnabled() const { return _localPoseCachingEnabled; }
+        bool contentTrackingEnabled() const { return _contentTrackingEnabled; }
         // 查找数值
         bool getTickByName(const std::string& name, tjs_real& retVal);
 
@@ -216,6 +258,10 @@ namespace emoteplayer
         std::uint64_t _animationLogAt = 0;
     private:
         bool _integratedAnimation = false;
+        bool _nodeCachingEnabled = false;
+        bool _localPoseCachingEnabled = false;
+        bool _contentTrackingEnabled = false;
+        std::uint64_t _poseRevision = 0, _preparedMotionRevision = 0;
     public:
 
         // Each draw owns its geometry, so shared players can render to multiple layers.

@@ -8,6 +8,8 @@
 #include "PointReadTrace.h"
 #include "LayerTriangleTrace.h"
 #include "LayerAffineGeometry.h"
+#include "AsyncAlphaTileCache.h"
+#include "../../plugins/emoteplayer/emoteperformance.h"
 #include "tjsDebug.h"
 #include <algorithm>
 #include <chrono>
@@ -104,6 +106,8 @@ class LayerTexture final : public iTVPTexture2D {
     tTVPRect leaseDamage;
     const uint64_t textureID = point_trace::NextTextureID();
     uint64_t contentVersion = 0;
+    bool emoteAlphaEligible = false;
+    krkrsdl3::AsyncAlphaTileCache alphaTiles;
     struct InvalidationInfo {
         point_trace::Invalidation reason = point_trace::Invalidation::Unknown;
         const char* writer = "initial";
@@ -248,6 +252,7 @@ public:
         session->textures.erase(this);
     }
     void Detach() {
+        alphaTiles.Cancel();
         try { Read(TVPLayerReadbackSource::Detach); }
         catch(const std::exception& error) {
             TVPConsoleLog("GPU Layer shutdown readback failed: %s",error.what());
@@ -259,6 +264,29 @@ public:
         if(!pinned) { pinned=true; ++session->stats.pinnedCPUTextures; }
     }
     bool Belongs(const std::shared_ptr<Session>& s) const { return session==s && handle; }
+    void MarkEmoteAlpha() { emoteAlphaEligible=true; }
+    bool HasEmoteAlpha() const { return format==TVPTextureFormat::RGBA && handle && session->backend && !pinned && !writeLeased; }
+    std::shared_ptr<krkrsdl3::AsyncAlphaTile> DemandAlpha(int x,int y) {
+        return alphaTiles.Demand(x,y,Width,Height);
+    }
+    void StopAlphaDemand() { alphaTiles.StopDemand(); }
+    void EncodeAlphaForPresentation(const std::shared_ptr<krkrsdl3::AsyncLayerPresentation>& frozen={}) {
+        if(!HasEmoteAlpha() || !emoteplayer::performanceEnabled("MIKAGE_EMOTE_ASYNC_ALPHA")) return;
+        // Upload CPU damage before recording the content key, then read exactly
+        // this MainImage version after the window's normal composition pass.
+        GetTextureHandle();
+        alphaTiles.EncodeDemanded(contentVersion,frozen ? frozen : session->backend->GetCurrentLayerPresentation(),
+            [&](const std::shared_ptr<krkrsdl3::AsyncLayerReadback>& read) {
+                const bool encoded=session->backend->RequestLayerTextureRegionRead(handle,read->region,read);
+                if(encoded) {
+                    auto& counters=emoteplayer::performanceCounters();
+                    counters.alphaRequests.fetch_add(1,std::memory_order_relaxed);
+                    counters.alphaReadBytes.fetch_add(uint64_t(read->region.Width())*read->region.Height()*4,
+                                                     std::memory_order_relaxed);
+                }
+                return encoded;
+            });
+    }
     // Used when building a borrowed software view for a CPU fallback, so the
     // readback is billed to the fallback rather than to ordinary pixel access.
     const void* ScanLineForFallback(TVPLayerFallbackReadbackRole role) {
@@ -357,6 +385,17 @@ public:
         }
         return handle;
     }
+    bool GetContentKey(uint64_t& identity,uint64_t& version) const override {
+        identity=textureID; version=contentVersion; return true;
+    }
+    void* GetTextureHandleForRegionWrite() override {
+        if(!session->backend || !handle || pinned || locks || writeLeased) return nullptr;
+        return GetTextureHandle();
+    }
+    void CommitGPURegionWrite(const tTVPRect& written) override {
+        if(pinned || locks || writeLeased) return;
+        InvalidateCPUCacheRegion(written,false,point_trace::Invalidation::GPUOverwrite,"gpu.regionOverwrite");
+    }
     void* GetTextureHandleForOverwrite() override {
         // A raw CPU address or active read/write lease can be observed outside
         // this call; replacing GPU contents behind it would violate that contract.
@@ -425,10 +464,27 @@ public:
         trace.lastWriteLeft=lastWriteRect.left; trace.lastWriteTop=lastWriteRect.top;
         trace.lastWriteRight=lastWriteRect.right; trace.lastWriteBottom=lastWriteRect.bottom;
         point_trace::QueryScope queryScope(trace);
+        const auto recordUIWait = [&] {
+            if(trace.origin.source!=point_trace::Source::LayerHitTest || !session->backend) return;
+            switch(trace.origin.trigger) {
+                case point_trace::Trigger::PointerMove: case point_trace::Trigger::PointerDown:
+                case point_trace::Trigger::PointerUp: case point_trace::Trigger::Click:
+                case point_trace::Trigger::DoubleClick: case point_trace::Trigger::Wheel:
+                case point_trace::Trigger::InputRecheck: break;
+                default: return; // Explicit script/cursor/hint queries are separate.
+            }
+            const auto wait=session->backend->GetLastReadbackWaitNanoseconds();
+            if(wait) {
+                auto& counters=emoteplayer::performanceCounters();
+                counters.uiSyncReads.fetch_add(1,std::memory_order_relaxed);
+                counters.uiSyncWaitNS.fetch_add(wait,std::memory_order_relaxed);
+            }
+        };
         if(handle && session->backend) {
             std::vector<uint8_t> sample; int pitch=0;
             const TVPLayerRect region{x,y,x+1,y+1};
             const bool read=session->backend->ReadLayerTextureRegion(handle,region,sample,pitch);
+            recordUIWait();
             ReportPointRead(trace);
             trace.reported=false;
             if(read &&
@@ -446,6 +502,7 @@ public:
         }
         // Preserve correctness for unsupported/failed region readback paths.
         auto* p=static_cast<const uint8_t*>(GetScanLineForRead(y));
+        recordUIWait();
         ReportPointRead(trace);
         if(format==TVPTextureFormat::Gray) return p[x];
         uint32_t v; std::memcpy(&v,p+x*4,4); return v;
@@ -891,3 +948,42 @@ std::string TVPGetMetalLayerUnsupportedMethodSummary() {
 }
 
 const char* TVPMetalLayerFallbackReason() { return fallbackReason.c_str(); }
+
+void TVPMarkEmoteAlphaTexture(iTVPTexture2D* texture) {
+    if(auto* metal=dynamic_cast<LayerTexture*>(texture)) metal->MarkEmoteAlpha();
+}
+bool TVPIsEmoteAsyncAlphaTexture(iTVPTexture2D* texture) {
+    auto* metal=dynamic_cast<LayerTexture*>(texture);
+    return metal && metal->HasEmoteAlpha() &&
+        emoteplayer::performanceEnabled("MIKAGE_EMOTE_ASYNC_ALPHA");
+}
+bool TVPRequestEmoteAsyncAlpha(iTVPTexture2D* texture,int x,int y,
+                             std::shared_ptr<krkrsdl3::AsyncAlphaTile>& tile) {
+    if(!TVPIsEmoteAsyncAlphaTexture(texture)) return false;
+    tile=static_cast<LayerTexture*>(texture)->DemandAlpha(x,y);
+    return true;
+}
+namespace { unsigned alphaPresentationDepth=0; }
+void TVPBeginEmoteAlphaPresentation() { ++alphaPresentationDepth; }
+void TVPEndEmoteAlphaPresentation() { if(alphaPresentationDepth) --alphaPresentationDepth; }
+void TVPEncodeEmoteAsyncAlphaForPresentation(iTVPTexture2D* texture) {
+    if(!alphaPresentationDepth) return;
+    if(auto* metal=dynamic_cast<LayerTexture*>(texture)) metal->EncodeAlphaForPresentation();
+}
+void TVPEncodeFrozenEmoteAsyncAlpha(iTVPTexture2D* texture,
+    const std::shared_ptr<krkrsdl3::AsyncLayerPresentation>& presentation) {
+    if(!presentation || presentation->failed.load(std::memory_order_acquire)) return;
+    if(auto* metal=dynamic_cast<LayerTexture*>(texture)) metal->EncodeAlphaForPresentation(presentation);
+}
+void TVPStopEmoteAsyncAlphaDemand(iTVPTexture2D* texture) {
+    if(auto* metal=dynamic_cast<LayerTexture*>(texture)) metal->StopAlphaDemand();
+}
+uint64_t TVPGetEmoteAlphaPresentationSerial() {
+    auto& session=Manager().session;
+    auto presentation=session && session->backend ? session->backend->GetCurrentLayerPresentation() : nullptr;
+    return presentation ? presentation->frameSerial : 0;
+}
+std::shared_ptr<krkrsdl3::AsyncLayerPresentation> TVPGetEmoteAlphaPresentation() {
+    auto& session=Manager().session;
+    return session && session->backend ? session->backend->GetCurrentLayerPresentation() : nullptr;
+}
