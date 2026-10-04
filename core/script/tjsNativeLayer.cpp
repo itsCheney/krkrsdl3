@@ -7937,7 +7937,10 @@ void tTJSNI_BaseLayer::DoDivisibleTransition(iTVPBaseBitmap* dest,
     data.DestTop = dy;
 
     // process
-    DivisibleTransHandler->Process(&data);
+    {
+        tTVPTransitionCPUOutputScope output(data);
+        DivisibleTransHandler->Process(&data);
+    }
 
     if (data.Dest == data.Src1)
     {
@@ -8056,7 +8059,10 @@ void tTJSNI_BaseLayer::tTransDrawable::DrawCompleted(const tTVPRect& destrect,
 
     try
     {
-        Owner->DivisibleTransHandler->Process(&data);
+        {
+            tTVPTransitionCPUOutputScope output(data);
+            Owner->DivisibleTransHandler->Process(&data);
+        }
         tTVPRect cr = cliprect;
 
         if (data.Dest == Owner->DestSLP)

@@ -332,6 +332,13 @@ public:
         if(!scopedWrites) return;
         MarkDirty(written); --scopedWrites; UnlockCPU();
     }
+    void* LockCPUWriteForOverwrite() override {
+        if(pinned || writeLeased || locks) return LockCPUWrite();
+        if(!valid) {
+            pixels.resize(Bytes()); valid=true; session->stats.cpuCacheBytes+=Bytes();
+        }
+        ++locks; ++scopedWrites; return pixels.data();
+    }
     void MarkCPUModified() override { Read(TVPLayerReadbackSource::Fallback); MarkDirtyAll(); }
     void MarkCPUModified(const tTVPRect& written) override { Read(TVPLayerReadbackSource::Fallback); MarkDirty(written); }
     void InvalidateCPUCache() override {
@@ -697,7 +704,7 @@ public:
         }
         if(!method->DescribeGpuOperation(op)) return RejectMethod(TVPLayerGPURejectReason::UnsupportedMethod,method);
         // ApplySelf copies the reference before converting, including after COW.
-        if(op.kind==TVPLayerOperationKind::AlphaToAdditiveAlpha && inputs.size()==0) {
+        if((op.kind==TVPLayerOperationKind::AlphaToAdditiveAlpha || op.kind==TVPLayerOperationKind::GrayScale) && inputs.size()==0) {
             if(!reference) return Reject(TVPLayerGPURejectReason::SourceUnavailable);
             tRenderTexRectArray::Element input(reference,dst);
             return GPU(method,target,nullptr,dst,tRenderTexRectArray(&input,1));
@@ -712,7 +719,7 @@ public:
             if(!source || !source->Belongs(session)) return Reject(TVPLayerGPURejectReason::SourceUnavailable);
             const bool newBlend=op.kind==TVPLayerOperationKind::AdditiveAlpha ||
                 op.kind==TVPLayerOperationKind::PsMul || op.kind==TVPLayerOperationKind::PsOverlay ||
-                op.kind==TVPLayerOperationKind::PsHardLight;
+                op.kind==TVPLayerOperationKind::PsHardLight || op.kind==TVPLayerOperationKind::MultiplyAlpha;
             // Offset self-blends are scanline-order dependent in software.
             // A GPU snapshot would change them; same-pixel aliases are safe.
             if(newBlend && source==t && (src.left!=dst.left || src.top!=dst.top ||
@@ -725,6 +732,11 @@ public:
             }
             int sw=src.get_width(),sh=src.get_height(),dw=dst.get_width(),dh=dst.get_height();
             if(sw==0 || sh==0 || dw<=0 || dh<=0) return Reject(TVPLayerGPURejectReason::InvalidGeometry);
+            if(op.kind==TVPLayerOperationKind::BoxBlur &&
+                (sw!=dw || sh!=dh || src.left<0 || src.top<0 || src.right>int(source->GetWidth()) ||
+                 src.bottom>int(source->GetHeight()) || dst.left<0 || dst.top<0 ||
+                 dst.right>int(t->GetWidth()) || dst.bottom>int(t->GetHeight())))
+                return Reject(TVPLayerGPURejectReason::InvalidGeometry);
             if(sw>0 && sh>0 && (sw!=dw || sh!=dh)) {
                 // Match the software manager's integer source adjustments before resize.
                 if(dst.left<0) { src.left+=float(sw)/dw*-dst.left; dst.left=0; }
@@ -738,7 +750,7 @@ public:
         } else if(op.kind!=TVPLayerOperationKind::Fill && op.kind!=TVPLayerOperationKind::FillColor &&
                   op.kind!=TVPLayerOperationKind::FillMask && op.kind!=TVPLayerOperationKind::FillBlend &&
                   op.kind!=TVPLayerOperationKind::RemoveConstOpacity &&
-                  op.kind!=TVPLayerOperationKind::AlphaToAdditiveAlpha) {
+                  op.kind!=TVPLayerOperationKind::AlphaToAdditiveAlpha && op.kind!=TVPLayerOperationKind::GrayScale) {
             return Reject(TVPLayerGPURejectReason::UnsupportedKind);
         }
         if(!session->tablesReady) {
@@ -755,7 +767,7 @@ public:
             !(op.flags&(TVP_LAYER_DEST_ALPHA|TVP_LAYER_DEST_PREMULTIPLIED));
         const bool preservesAlpha=op.kind==TVPLayerOperationKind::CopyColor ||
             op.kind==TVPLayerOperationKind::FillColor ||
-            (op.kind==TVPLayerOperationKind::AlphaToAdditiveAlpha && source==t) ||
+            ((op.kind==TVPLayerOperationKind::AlphaToAdditiveAlpha || op.kind==TVPLayerOperationKind::GrayScale) && source==t) ||
             (plainHDA && (op.kind==TVPLayerOperationKind::Alpha ||
                           op.kind==TVPLayerOperationKind::ConstAlpha ||
                           op.kind==TVPLayerOperationKind::ColorMap ||

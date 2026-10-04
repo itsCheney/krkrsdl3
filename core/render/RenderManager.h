@@ -102,6 +102,8 @@ public:
     // Native callers hold these only through one operation. Unlike script raw
     // pointers they neither pin the texture permanently nor end a raw lease.
     virtual void* LockCPUWrite() { return LockCPURead(); }
+    // Full-output native producers promise to replace every pixel before use.
+    virtual void* LockCPUWriteForOverwrite() { return LockCPUWrite(); }
     virtual void UnlockCPUWrite(const tTVPRect& written) {
         MarkCPUModified(written); UnlockCPU();
     }
@@ -146,12 +148,12 @@ public:
         if(write) texture->UnlockCPUWrite(written); else texture->UnlockCPU();
         texture->ReleaseCPUAccessRef(); texture=nullptr; pixels=nullptr;
     }
-    void Acquire(iTVPTexture2D* value,bool forWrite,const char* caller="native.layerPixels") {
+    void Acquire(iTVPTexture2D* value,bool forWrite,const char* caller="native.layerPixels",bool overwrite=false) {
         Reset(); if(!value) return;
         std::snprintf(origin,sizeof(origin),"%s",caller);
         krkrsdl3::layer_work::SourceScope scope(origin);
         value->AddCPUAccessRef();
-        try { pixels=forWrite ? value->LockCPUWrite() : value->LockCPURead(); }
+        try { pixels=forWrite ? (overwrite ? value->LockCPUWriteForOverwrite() : value->LockCPUWrite()) : value->LockCPURead(); }
         catch(...) { value->ReleaseCPUAccessRef(); throw; }
         texture=value; write=forWrite; written=tTVPRect(0,0,0,0);
     }

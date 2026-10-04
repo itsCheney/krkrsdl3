@@ -1,5 +1,6 @@
 #include "tjsCommHead.h"
 #include "RenderManager.h"
+#include <climits>
 
 #include "TVPMsg.h"
 #include "LayerBitmap.h"
@@ -1904,6 +1905,25 @@ public:
     }
 };
 
+class tTVPRenderMethod_ChannelMask : public tTVPRenderMethod_BaseBlt<tjs_uint32,52>
+{
+    bool multiply;
+public:
+    explicit tTVPRenderMethod_ChannelMask(bool value):multiply(value) {}
+    void PartialFill(iTVPTexture2D* dst,iTVPTexture2D* src,tjs_int sx,tjs_int sy,
+                     tjs_int dx,tjs_int dy,tjs_int w,tjs_int h) override {
+        for(int y=0;y<h;++y) {
+            auto* d=static_cast<tjs_uint32*>(dst->GetScanLineForWrite(dy+y))+dx;
+            auto* s=static_cast<const tjs_uint32*>(src->GetScanLineForRead(sy+y))+sx;
+            for(int x=0;x<w;++x) {
+                tjs_uint32 alpha=s[x]&255u;
+                if(multiply) { const auto product=(d[x]>>24)*(s[x]>>24); alpha=(product+(product>>7))>>8; }
+                d[x]=(d[x]&0xffffffu)|(alpha<<24);
+            }
+        }
+    }
+};
+
 template<int THREAD_FACTOR, void (*&FuncWithOpa)(tjs_uint32*, const tjs_uint32*, tjs_int, tjs_int)>
 class tTVPRenderMethod_BltWithOpa : public tTVPRenderMethod_BaseBlt<tjs_uint32, THREAD_FACTOR>
 {
@@ -2392,6 +2412,15 @@ class tTVPRenderMethod_DoBoxBlur : public tTVPRenderMethod_DirectCopy
     tTVPRect area;
 
 public:
+    bool DescribeGpuOperation(TVPLayerOperation& operation) const override
+    {
+        if(!iTVPRenderMethod::DescribeGpuOperation(operation)) return false;
+        const int64_t width=int64_t(area.right)-area.left+1;
+        const int64_t height=int64_t(area.bottom)-area.top+1;
+        if(width<=0 || height<=0 || width>INT_MAX || height>INT_MAX) return false;
+        operation.phase=int(width); operation.vague=int(height);
+        return true;
+    }
     virtual int EnumParameterID(const char* name)
     {
         if (!strcmp(name, "area_left"))
@@ -2717,6 +2746,11 @@ void iTVPRenderManager::RegisterRenderMethod(const char* name, iTVPRenderMethod*
         {"PsOverlayBlend", K::PsOverlay, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
         {"PsHardLightBlend", K::PsHardLight, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
         {"AlphaToAdditiveAlpha", K::AlphaToAdditiveAlpha, 0, false},
+        {"DoGrayScale", K::GrayScale, 0, false},
+        {"CopyBlueToAlpha", K::CopyBlueToAlpha, 0, false},
+        {"MultiplyAlpha", K::MultiplyAlpha, 0, false},
+        {"BoxBlur", K::BoxBlur, 0, false},
+        {"BoxBlurAlpha", K::BoxBlur, 0, false},
     };
     for (const auto& entry : entries)
         if (!strcmp(name, entry.name)) {
@@ -3063,6 +3097,11 @@ public:
         {
             static tTVPRenderMethod_DoGrayScale method;
             RegisterRenderMethod("DoGrayScale", &method);
+        }
+        {
+            static tTVPRenderMethod_ChannelMask copyBlue(false), multiplyAlpha(true);
+            RegisterRenderMethod("CopyBlueToAlpha",&copyBlue);
+            RegisterRenderMethod("MultiplyAlpha",&multiplyAlpha);
         }
         {
             static tTVPRenderMethod_DoBoxBlur<TDoBoxBlurLoop<tTVPARGB<tjs_uint16>>,

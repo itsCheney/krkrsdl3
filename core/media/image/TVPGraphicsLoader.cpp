@@ -783,10 +783,10 @@ tjs_uint64 TVPGetGraphicCacheTotalBytes()
     return TVPGraphicCacheTotalBytes;
 }
 //---------------------------------------------------------------------------
-static void TVPCheckGraphicCacheLimit()
+static void TVPTrimGraphicCache(tjs_uint64 limit)
 {
     std::lock_guard<std::recursive_mutex> lock(TVPGraphicCacheMutex);
-    while (TVPGraphicCacheTotalBytes > TVPGraphicCacheLimit)
+    while (TVPGraphicCacheTotalBytes > limit)
     {
         // chop last graphics
         tTVPGraphicCache::tIterator i;
@@ -803,6 +803,7 @@ static void TVPCheckGraphicCacheLimit()
         }
     }
 }
+static void TVPCheckGraphicCacheLimit() { TVPTrimGraphicCache(TVPGraphicCacheLimit); }
 //---------------------------------------------------------------------------
 void TVPClearGraphicCache()
 {
@@ -829,8 +830,13 @@ struct tTVPClearGraphicCacheCallback : public tTVPCompactEventCallbackIntf
     {
         if (level >= TVP_COMPACT_LEVEL_MINIMIZE)
         {
-            // clear the font cache on application minimize
-            TVPClearGraphicCache();
+            // Keep a small recent-image cache on ordinary minimize. Explicit
+            // maximum compaction and severe pressure still release everything.
+            if(level>=TVP_COMPACT_LEVEL_MAX) TVPClearGraphicCache();
+            else {
+                std::lock_guard<std::recursive_mutex> lock(TVPGraphicCacheMutex);
+                TVPTrimGraphicCache(std::min<tjs_uint64>(TVPGraphicCacheLimit/4,16u*1024u*1024u));
+            }
         }
     }
 } static TVPClearGraphicCacheCallback;
@@ -1181,21 +1187,6 @@ static tTVPBitmap* TVPInternalLoadBitmap(const ttstr& _name,
     return data.Dest;
 }
 //---------------------------------------------------------------------------
-static iTVPTexture2D* TVPInternalLoadTexture(const ttstr& _name,
-                                             std::vector<tTVPGraphicMetaInfoPair>** MetaInfo,
-                                             ttstr* provincename)
-{
-    ttstr name(_name), maskname;
-    TVPNormalizeGraphicNames(name, &maskname, provincename);
-    if (!maskname.IsEmpty())
-    {
-        // mask merge is not supported
-        return nullptr;
-    }
-    tTVPStreamHolder holder(name);
-    return NULL;
-}
-//---------------------------------------------------------------------------
 tTVPRegisterGraphicInfo* TVPGetGraphicLoadHandler(const ttstr& fileName)
 {
     ttstr name(fileName);
@@ -1288,6 +1279,7 @@ int TVPLoadGraphic(iTVPBaseBitmap* dest,
 {
     krkrsdl3::layer_work::SourceScope source("image.load");
     krkrsdl3::layer_work::StageScope stage(krkrsdl3::layer_work::Stage::ResourceLoad);
+    krkrsdl3::layer_work::StageScope image(krkrsdl3::layer_work::Stage::ImageLoad);
     std::lock_guard<std::recursive_mutex> lock(TVPGraphicCacheMutex);
     // loading with cache management
     ttstr nname = TVPNormalizeStorageName(name);
@@ -1307,6 +1299,7 @@ int TVPLoadGraphic(iTVPBaseBitmap* dest,
         tTVPGraphicImageHolder* ptr = TVPGraphicCache.FindAndTouchWithHash(searchdata, hash);
         if (ptr)
         {
+            krkrsdl3::layer_work::StageScope hit(krkrsdl3::layer_work::Stage::ImageCacheHit);
             // found in cache
             if (dest)
                 ptr->GetObjectNoAddRef()->AssignToTexture(dest);
@@ -1324,16 +1317,14 @@ int TVPLoadGraphic(iTVPBaseBitmap* dest,
     ttstr pn;
     std::vector<tTVPGraphicMetaInfoPair>* mi = nullptr;
     int ret = 0;
+    tTVPBitmap* bmp = nullptr;
     try
     {
-        tTVPBitmap* bmp = nullptr;
-        iTVPTexture2D* texture = nullptr;
-        if (mode == glmNormal && keyidx == TVP_clNone && !desw && !desh)
+        // The old texture loader only normalized/opened storage and returned
+        // nullptr. Decode once through the bitmap path instead of reopening
+        // every image and repeating mask/province lookup.
         {
-            texture = TVPInternalLoadTexture(nname, &mi, &pn);
-        }
-        if (!texture)
-        {
+            krkrsdl3::layer_work::StageScope decode(krkrsdl3::layer_work::Stage::ImageDecode);
             bmp = TVPInternalLoadBitmap(nname, keyidx, desw, desh, &mi, mode, &pn);
         }
 
@@ -1345,14 +1336,7 @@ int TVPLoadGraphic(iTVPBaseBitmap* dest,
         if (TVPGraphicCacheEnabled)
         {
             data = new tTVPGraphicImageData();
-            if (texture)
-            {
-                data->AssignTexture(texture);
-            }
-            else
-            {
-                data->AssignBitmap(bmp);
-            }
+            data->AssignBitmap(bmp);
             if (dest)
             {
                 data->AssignToTexture(dest);
@@ -1373,30 +1357,15 @@ int TVPLoadGraphic(iTVPBaseBitmap* dest,
         else if (dest)
         {
             tTVPGraphicImageData data;
-            if (texture)
-            {
-                data.AssignTexture(texture);
-            }
-            else
-            {
-                data.AssignBitmap(bmp);
-            }
+            data.AssignBitmap(bmp);
             data.AssignToTexture(dest);
         }
-        if (texture)
-        {
-            ret = texture->GetInternalWidth() * texture->GetInternalHeight() *
-                  4; // assume that always RGBA
-            texture->Release();
-        }
-        else
-        {
-            ret = bmp->GetWidth() * bmp->GetHeight() * bmp->GetBPP() / 8;
-            bmp->Release();
-        }
+        ret = bmp->GetWidth() * bmp->GetHeight() * bmp->GetBPP() / 8;
+        bmp->Release(); bmp = nullptr;
     }
     catch (...)
     {
+        if (bmp) bmp->Release();
         if (mi)
             delete mi;
         if (data)

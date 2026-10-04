@@ -7,7 +7,7 @@ enum class TVPLayerOperationKind : uint32_t
     Unsupported, Copy, CopyColor, CopyMask, CopyOpaque, Fill, FillColor,
     FillMask, Alpha, ConstAlpha, ColorMap, FillBlend, RemoveConstOpacity,
     ConstAlphaSD, UnivTrans, AdditiveAlpha, PsMul, PsOverlay, PsHardLight,
-    AlphaToAdditiveAlpha
+    AlphaToAdditiveAlpha, GrayScale, CopyBlueToAlpha, MultiplyAlpha, BoxBlur
 };
 enum TVPLayerOperationFlags : uint32_t
 {
@@ -22,6 +22,7 @@ struct TVPLayerOperation
     int opacity = 255;
     uint32_t color = 0;
     uint32_t flags = 0;
+    // For BoxBlur these carry the software kernel width and height.
     int phase = 0;
     int vague = 0;
 };

@@ -31,7 +31,8 @@ public:
     SourceScope& operator=(const SourceScope&)=delete;
     ~SourceScope() { source=previous; }
 };
-enum class Stage { ResourceLoad, AMVDecode, Script, GC, Compact, Software, Count };
+enum class Stage { ResourceLoad, AMVDecode, Script, GC, Compact, Software,
+    ImageLoad, ImageDecode, ImageCacheHit, ScriptStorage, Count };
 struct Timing { uint64_t calls=0, ns=0, maxNS=0; };
 struct Transfer {
     bool upload=false, leased=false;
@@ -105,7 +106,8 @@ inline Summary Take() {
     { std::lock_guard<std::mutex> lock(mutex); captured=profile; profile=Profile{};
       const auto now=Now(); out.intervalNS=started ? now-started : 0; started=now; }
     out.decodedFrames=captured.decodedFrames; out.decodedBytes=captured.decodedBytes;
-    constexpr const char* names[]={"resourceLoad","amvDecode","script","gc","compact","software"};
+    constexpr const char* names[]={"resourceLoad","amvDecode","script","gc","compact","software",
+        "imageLoad","imageDecode","imageCacheHit","scriptStorage"};
     for(size_t i=0;i<captured.stages.size();++i) {
         const auto& t=captured.stages[i];
         if(i) out.stages+=',';

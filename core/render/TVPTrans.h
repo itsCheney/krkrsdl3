@@ -22,6 +22,7 @@
 
 #include "LayerBitmap.h"
 #include "transhandler.h"
+#include "RenderManager.h"
 
 //---------------------------------------------------------------------------
 // iTVPSimpleOptionProvider implementation
@@ -80,12 +81,28 @@ class tTVPScanLineProviderForBaseBitmap : public iTVPScanLineProvider
     tjs_uint RefCount;
     bool Own;
     iTVPBaseBitmap* Bitmap;
+    tTVPScopedTexturePixels CPUOutput;
+    tTVPRect OutputRect{0,0,0,0};
+    bool ProcessingOutput=false, OverwriteOutput=false;
 
 public:
     tTVPScanLineProviderForBaseBitmap(iTVPBaseBitmap* bmp, bool own = false);
     ~tTVPScanLineProviderForBaseBitmap();
 
     void Attach(iTVPBaseBitmap* bmp); // attach bitmap
+    void BeginCPUOutput(const tTVPDivisibleData& data) {
+        EndCPUOutput();
+        OutputRect=tTVPRect(data.DestLeft,data.DestTop,data.DestLeft+data.Width,data.DestTop+data.Height);
+        auto* target=Bitmap->GetTexture();
+        auto* first=data.Src1 ? data.Src1->GetTexture() : nullptr;
+        auto* second=data.Src2 ? data.Src2->GetTexture() : nullptr;
+        // Only a complete, non-aliased transition output may discard old pixels.
+        OverwriteOutput=target && !target->IsCPUResident() && first && first!=target &&
+            (!data.Src2 || (second && second!=target)) && OutputRect.left==0 && OutputRect.top==0 &&
+            OutputRect.right==int(target->GetWidth()) && OutputRect.bottom==int(target->GetHeight());
+        ProcessingOutput=true;
+    }
+    void EndCPUOutput() { CPUOutput.Reset(); ProcessingOutput=false; }
 
     tjs_error AddRef() override;
     tjs_error Release() override;
@@ -100,6 +117,18 @@ public:
                                   /*out*/ void** scanline) override;
     virtual iTVPTexture2D* GetTexture() override;
     virtual iTVPTexture2D* GetTextureForRender() override;
+};
+
+class tTVPTransitionCPUOutputScope {
+    tTVPScanLineProviderForBaseBitmap* provider;
+public:
+    explicit tTVPTransitionCPUOutputScope(const tTVPDivisibleData& data)
+        :provider(dynamic_cast<tTVPScanLineProviderForBaseBitmap*>(data.Dest)) {
+        if(provider) provider->BeginCPUOutput(data);
+    }
+    ~tTVPTransitionCPUOutputScope() { if(provider) provider->EndCPUOutput(); }
+    tTVPTransitionCPUOutputScope(const tTVPTransitionCPUOutputScope&)=delete;
+    tTVPTransitionCPUOutputScope& operator=(const tTVPTransitionCPUOutputScope&)=delete;
 };
 //---------------------------------------------------------------------------
 

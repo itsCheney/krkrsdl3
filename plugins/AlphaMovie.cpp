@@ -2,6 +2,9 @@
 
 #include "TVPStorage.h"
 #include "LayerWorkDiagnostics.h"
+#include "AMVDecodedFrameCache.h"
+#include <limits>
+#include <stdexcept>
 #include "tjsNativeLayer.h"
 
 #include <zlib.h>
@@ -34,9 +37,11 @@ struct BufferManager
 
     BufferManager(tjs_uint8* indata, tjs_uint32 inLen)
     {
-        bufferLen = inLen / 4 + 1;
+        // The entropy decoder peeks across words. Keep initialized padding
+        // inside its owned buffer, including payloads ending mid-word.
+        bufferLen = inLen / 4 + 4;
 
-        buffer = new uint32_t[bufferLen];
+        buffer = new uint32_t[bufferLen]();
         memcpy(buffer, indata, inLen);
 
         bit_buffer = ((uint32_t)buffer[0] << 24) | ((uint32_t)indata[1] << 16) |
@@ -1453,7 +1458,7 @@ struct AlphaMovieFrame
 
     // add by author
     // tjs_uint32 ptrPose;
-    tjs_uint8* ptrData = nullptr;
+    uint64_t payloadOffset = 0;
 
     bool parseAMVFrame(TJS::tTJSBinaryStream* stream, bool isZlib)
     {
@@ -1514,6 +1519,8 @@ private:
     tTJSBinaryStream* filePtr = nullptr;
     AlphaMovieHeader _header = {0};
     std::vector<AlphaMovieFrame> frameInfoList;
+    AMVDecodedFrameCache decodedFrames;
+    const std::vector<uint8_t>& DecodeFrame(size_t index);
     uint8_t qtbl[3][64] = {0};
     tTVPBaseTexture* m_BmpBits = nullptr;
 
@@ -1549,130 +1556,93 @@ void tTJSNI_AlphaMovie::open(tTJSString fileName)
     filePtr = TVPCreateStream(fileName);
     if (!filePtr)
         return;
-    const size_t readSize = filePtr->GetSize();
-    if (readSize < 40)
-        return;
+    try {
+        const size_t readSize = filePtr->GetSize();
+        if (readSize < 40) { clear(); return; }
 
-    // header
-    filePtr->SetPosition(0);
-    _header.parseAMVHeader(filePtr);
-    _numOfFrame = _header.frame_cnt;
-    _FPSRate = _header.frame_rate;
-    _screenWidth = _header.width;
-    _screenHeight = _header.height;
+        // header
+        filePtr->SetPosition(0);
+        _header.parseAMVHeader(filePtr);
+        _numOfFrame = _header.frame_cnt;
+        _FPSRate = _header.frame_rate;
+        _screenWidth = _header.width;
+        _screenHeight = _header.height;
 
-    // quantaization_table
-    if (_header.alpha_decode_attr == 2) // qtbl = 64 * 2
-    {
-        if (_header.quantaization_table_size_plus_hdr_size - 40 != 64 * 2)
-            return;
-        for (size_t i = 0; i < 2; i++)
+        // quantaization_table
+        if (_header.alpha_decode_attr == 2) // qtbl = 64 * 2
         {
-            filePtr->ReadBuffer(qtbl[i], 64);
-        }
-    }
-    else // qtbl = 64 * 3
-    {
-        if (_header.quantaization_table_size_plus_hdr_size - 40 != 64 * 3)
-            return;
-        for (size_t i = 0; i < 3; i++)
-        {
-            filePtr->ReadBuffer(qtbl[i], 64);
-        }
-    }
-
-    // 不做优化，直接全量载入，感觉内存也吃不了多少...至于预加载什么的懒得搞了...再说了，现在电脑性能跑个几M的amv应该问题也不大吧
-    frameInfoList.reserve(_numOfFrame);
-    bool isZlib = _header.alpha_decode_attr == 2;
-    filePtr->SetPosition(_header.quantaization_table_size_plus_hdr_size);
-    for (size_t currF = 0; currF < _numOfFrame; currF++)
-    {
-        // frame
-        AlphaMovieFrame _a;
-        _a.parseAMVFrame(filePtr, isZlib);
-
-        // filter
-        if (_a.frame_width == 0 || _a.frame_height == 0)
-        {
-            frameInfoList.push_back(_a);
-            continue;
-        }
-
-        // get All Data
-        if (isZlib) // zlib解压缩
-        {
-            // alpha
-            tjs_uint32 cacheLen = _a.zlib_buffer_size;
-            tjs_uint8* cache = new tjs_uint8[cacheLen];
-            filePtr->ReadBuffer(cache, cacheLen);
-            uLongf alphaSize = _a.frame_width * _a.frame_height;
-            tjs_uint8* alpha_buffer = new tjs_uint8[alphaSize];
-            if (uncompress(alpha_buffer, &alphaSize, cache, cacheLen) != Z_OK)
+            if (_header.quantaization_table_size_plus_hdr_size - 40 != 64 * 2)
+                { clear(); return; }
+            for (size_t i = 0; i < 2; i++)
             {
-                delete[] cache, delete[] alpha_buffer;
-                return;
+                filePtr->ReadBuffer(qtbl[i], 64);
             }
-            // yuv
-            delete[] cache;
-            cacheLen = _a.size_of_frame - _a.zlib_buffer_size;
-            cache = new tjs_uint8[cacheLen];
-            filePtr->ReadBuffer(cache, cacheLen);
-
-            // decode
-            tjs_uint64 rgbaSize = _a.frame_width * _a.frame_height * 4;
-            tjs_uint8* rgba_buffer = new tjs_uint8[rgbaSize];
-            struct BufferManager* stream = new BufferManager(cache, cacheLen);
-            {
-                krkrsdl3::layer_work::StageScope decode(krkrsdl3::layer_work::Stage::AMVDecode);
-                DecodeAndConvertToRGBA(stream, qtbl, rgba_buffer, _a.frame_width, _a.frame_height,
-                                       alpha_buffer, false);
-            }
-            krkrsdl3::layer_work::RecordAMVFrame(rgbaSize);
-            delete stream;
-            delete[] cache;
-            delete[] alpha_buffer;
-
-            // set value
-            _a.ptrData = rgba_buffer;
         }
-        else // jpeg解码
+        else // qtbl = 64 * 3
         {
-            // prepare
-            tjs_uint32 cacheLen = _a.size_of_frame;
-            tjs_uint8* cache = new tjs_uint8[cacheLen];
-            filePtr->ReadBuffer(cache, cacheLen);
-
-            // decode
-            tjs_uint64 rgbaSize = _a.frame_width * _a.frame_height * 4;
-            tjs_uint8* rgba_buffer = new tjs_uint8[rgbaSize];
-            struct BufferManager* stream = new BufferManager(cache, cacheLen);
+            if (_header.quantaization_table_size_plus_hdr_size - 40 != 64 * 3)
+                { clear(); return; }
+            for (size_t i = 0; i < 3; i++)
             {
-                krkrsdl3::layer_work::StageScope decode(krkrsdl3::layer_work::Stage::AMVDecode);
-                DecodeAndConvertToRGBA(stream, qtbl, rgba_buffer, _a.frame_width, _a.frame_height,
-                                       nullptr, true);
+                filePtr->ReadBuffer(qtbl[i], 64);
             }
-            krkrsdl3::layer_work::RecordAMVFrame(rgbaSize);
-            delete stream;
-            delete[] cache;
-
-            // set value
-            _a.ptrData = rgba_buffer;
         }
-        // push
-        frameInfoList.push_back(_a);
+
+        // Build a seek index without decoding the movie into a gigabyte of RGBA.
+        const bool isZlib = _header.alpha_decode_attr == 2;
+        if (_numOfFrame < 0 || uint64_t(_numOfFrame) > readSize / (isZlib ? 24u : 20u))
+            throw std::runtime_error("Invalid AMV frame count");
+        frameInfoList.reserve(_numOfFrame);
+        filePtr->SetPosition(_header.quantaization_table_size_plus_hdr_size);
+        for (int frame = 0; frame < _numOfFrame; ++frame) {
+            AlphaMovieFrame entry{};
+            entry.parseAMVFrame(filePtr,isZlib);
+            entry.payloadOffset=filePtr->GetPosition();
+            if(entry.payloadOffset>readSize || entry.size_of_frame>readSize-entry.payloadOffset ||
+               (isZlib && entry.zlib_buffer_size>entry.size_of_frame))
+                throw std::runtime_error("Invalid AMV frame payload");
+            frameInfoList.push_back(entry);
+            filePtr->SetPosition(entry.payloadOffset+entry.size_of_frame);
+        }
+        m_BmpBits = new tTVPBaseTexture(_header.width, _header.height, 32);
+        m_BmpBits->Fill(tTVPRect(0,0,m_BmpBits->GetWidth(),m_BmpBits->GetHeight()),0);
+        _frame = 0;
+    } catch (...) { clear(); throw; }
+}
+
+const std::vector<uint8_t>& tTJSNI_AlphaMovie::DecodeFrame(size_t index)
+{
+    if(const auto* cached=decodedFrames.Find(index)) return *cached;
+    const auto& frame=frameInfoList.at(index);
+    const uint64_t count=uint64_t(frame.frame_width)*frame.frame_height;
+    if(count>std::numeric_limits<size_t>::max()/4 || count*4>256u*1024u*1024u)
+        throw std::runtime_error("AMV decoded frame is too large");
+    std::vector<uint8_t> rgba(size_t(count)*4);
+    if(count) {
+        const bool isZlib=_header.alpha_decode_attr==2;
+        filePtr->SetPosition(frame.payloadOffset);
+        // Padding protects the legacy bit reader's word-sized tail accesses.
+        std::vector<uint8_t> encoded(size_t(frame.size_of_frame)+16,0);
+        filePtr->ReadBuffer(encoded.data(),frame.size_of_frame);
+        krkrsdl3::layer_work::StageScope decode(krkrsdl3::layer_work::Stage::AMVDecode);
+        std::vector<uint8_t> alpha;
+        if(isZlib) {
+            alpha.resize(size_t(count)); uLongf length=alpha.size();
+            if(uncompress(alpha.data(),&length,encoded.data(),frame.zlib_buffer_size)!=Z_OK || length!=alpha.size())
+                throw std::runtime_error("Invalid AMV alpha payload");
+        }
+        const size_t offset=isZlib ? frame.zlib_buffer_size : 0;
+        BufferManager stream(encoded.data()+offset,frame.size_of_frame-offset);
+        DecodeAndConvertToRGBA(&stream,qtbl,rgba.data(),frame.frame_width,frame.frame_height,
+                               isZlib ? alpha.data() : nullptr,!isZlib);
+        krkrsdl3::layer_work::RecordAMVFrame(rgba.size());
     }
-    m_BmpBits = new tTVPBaseTexture(_header.width, _header.height, 32);
-    m_BmpBits->Fill(tTVPRect(0,0,m_BmpBits->GetWidth(),m_BmpBits->GetHeight()),0);
-    _frame = 0;
+    return decodedFrames.Put(index,std::move(rgba));
 }
 
 void tTJSNI_AlphaMovie::clear()
 {
-    for (size_t i = 0; i < frameInfoList.size(); i++)
-    {
-        if (frameInfoList.at(i).ptrData != nullptr)
-            delete[] frameInfoList.at(i).ptrData;
-    }
+    decodedFrames.Clear();
     frameInfoList.clear();
     _numOfFrame = 0;
     if (filePtr != nullptr)
@@ -1706,19 +1676,20 @@ tjs_int tTJSNI_AlphaMovie::showNextImage(tTJSVariant layer)
     if ((long)src->GetWidth() != _screenWidth || (long)src->GetHeight() != _screenHeight)
         src->SetSize(_screenWidth, _screenHeight);
 
-    if (m_BmpBits != nullptr)
+    if (m_BmpBits != nullptr && !frameInfoList.empty())
     {
         _frame++;
         if (_frame > frameInfoList.size())
             _frame = 1;
         AlphaMovieFrame& currentFrame = frameInfoList.at(_frame - 1);
+        const auto& decoded = DecodeFrame(size_t(_frame - 1));
         // The script can select a canvas different from the file header. Keep
         // the backing bitmap sized to that canvas before placing/clipping frames.
         if(int(m_BmpBits->GetWidth())!=_screenWidth || int(m_BmpBits->GetHeight())!=_screenHeight) {
             m_BmpBits->SetSize(_screenWidth, _screenHeight, false);
             m_BmpBits->Fill(tTVPRect(0,0,m_BmpBits->GetWidth(),m_BmpBits->GetHeight()),0);
         }
-        m_BmpBits->Update(currentFrame.ptrData, currentFrame.frame_width * 4, _left, _top,
+        m_BmpBits->Update(decoded.data(), currentFrame.frame_width * 4, _left, _top,
                           currentFrame.frame_width, currentFrame.frame_height);
         src->AssignMainImage(m_BmpBits);
         src->Update();

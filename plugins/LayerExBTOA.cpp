@@ -1,6 +1,7 @@
 #include "ncbind/ncbind.hpp"
 #include <vector>
 #include "ScopedLayerPixels.h"
+#include "MetalLayerRenderManager.h"
 
 #define NCB_MODULE_NAME TJS_N("layerExBTOA.dll")
 
@@ -18,6 +19,38 @@ iTJSDispatch2* getLayerClass(void)
 // バッファ参照用の型
 typedef unsigned char* WrtRefT;
 typedef unsigned char const* ReadRefT;
+
+static tTJSNI_BaseLayer* NativeLayer(iTJSDispatch2* object)
+{
+    tTJSNI_BaseLayer* layer=nullptr;
+    if(!object || TJS_FAILED(object->NativeInstanceSupport(TJS_NIS_GETINSTANCE,
+        tTJSNC_Layer::ClassID,reinterpret_cast<iTJSNativeInstance**>(&layer)))) return nullptr;
+    return layer;
+}
+// Preserve COW and raw script pointers. Metal's normal operator routing still
+// provides a software fallback if the backend cannot execute a mask operation.
+static bool OperateGPUMask(iTJSDispatch2* object,const char* methodName,const tTVPRect& destination,
+                          iTJSDispatch2* sourceObject=nullptr,const tTVPRect& source=tTVPRect(),int value=255)
+{
+    if(!TVPMetalLayerCompositionActive()) return false;
+    auto* layer=NativeLayer(object);
+    auto* target=layer ? layer->GetMainImageTextureForCPUAccess(false) : nullptr;
+    if(!target || target->IsCPUResident() || target->GetFormat()!=TVPTextureFormat::RGBA) return false;
+    auto* sourceLayer=sourceObject ? NativeLayer(sourceObject) : nullptr;
+    auto* input=sourceLayer ? sourceLayer->GetMainImageTextureForCPUAccess(false) : nullptr;
+    if(sourceObject && (!input || input->GetFormat()!=TVPTextureFormat::RGBA)) return false;
+    // Offset alpha aliases follow CPU scanline order. Defer before COW, so a
+    // shared old source retains the same semantics as the native pixel path.
+    if(sourceLayer==layer && !std::strcmp(methodName,"MultiplyAlpha") && destination!=source) return false;
+    target=layer->GetMainImageTextureForCPUAccess(true);
+    // A self-layer source must follow COW to the writable epoch.
+    if(sourceLayer==layer) input=target;
+    auto* manager=TVPGetRenderManager(); auto* method=manager->GetRenderMethod(methodName);
+    method->SetParameterOpa(method->EnumParameterID("opacity"),value);
+    tRenderTexRectArray::Element texture(input,source);
+    manager->OperateRect(method,target,nullptr,destination,tRenderTexRectArray(input ? &texture : nullptr,input ? 1 : 0));
+    return true;
+}
 
 /**
  * レイヤのサイズとバッファを取得する
@@ -65,7 +98,7 @@ static bool GetLayerBufferAndSize(iTJSDispatch2* lay, long& w, long& h, WrtRefT&
     if (!GetLayerSize(lay, w, h, pitch))
         return false;
 
-    access.Acquire(lay,true,"layerExBTOA.write");
+    access.Acquire(lay,true,krkrsdl3::layer_work::source);
     ptr=static_cast<WrtRefT>(access.Data()); pitch=access.Pitch();
     access.Written(tTVPRect(0,0,w,h));
     return ptr!=nullptr;
@@ -80,6 +113,10 @@ static tjs_error copyRightBlueToLeftAlpha(tTJSVariant* result,
                                           tTJSVariant** param,
                                           iTJSDispatch2* lay)
 {
+    krkrsdl3::layer_work::SourceScope origin("layerExBTOA.rightBlue");
+    long width,height,pitch;
+    if(GetLayerSize(lay,width,height,pitch) && OperateGPUMask(lay,"CopyBlueToAlpha",
+        tTVPRect(0,0,width/2,height),lay,tTVPRect(width/2,0,width/2+width/2,height))) return TJS_S_OK;
     // 書き込み先
     tTVPScopedLayerPixels access;
     WrtRefT dbuf = 0;
@@ -121,6 +158,10 @@ static tjs_error copyBottomBlueToTopAlpha(tTJSVariant* result,
                                           tTJSVariant** param,
                                           iTJSDispatch2* lay)
 {
+    krkrsdl3::layer_work::SourceScope origin("layerExBTOA.bottomBlue");
+    long width,height,pitch;
+    if(GetLayerSize(lay,width,height,pitch) && OperateGPUMask(lay,"CopyBlueToAlpha",
+        tTVPRect(0,0,width,height/2),lay,tTVPRect(0,height/2,width,height/2+height/2))) return TJS_S_OK;
     // 書き込み先
     tTVPScopedLayerPixels access;
     WrtRefT dbuf = 0;
@@ -158,6 +199,9 @@ static tjs_error fillAlpha(tTJSVariant* result,
                            tTJSVariant** param,
                            iTJSDispatch2* lay)
 {
+    krkrsdl3::layer_work::SourceScope origin("layerExBTOA.fillAlpha");
+    long width,height,pitch;
+    if(GetLayerSize(lay,width,height,pitch) && OperateGPUMask(lay,"FillMask",tTVPRect(0,0,width,height))) return TJS_S_OK;
     // 書き込み先
     tTVPScopedLayerPixels access;
     WrtRefT dbuf = 0;
@@ -202,7 +246,7 @@ static tjs_error copyAlphaToProvince(tTJSVariant* result,
     }
 
     tTJSVariant val;
-    tTVPScopedLayerPixels sourceAccess(lay,false,"layerExBTOA.read");
+    tTVPScopedLayerPixels sourceAccess(lay,false,"layerExBTOA.alphaToProvince");
     if ((sbuf = static_cast<ReadRefT>(sourceAccess.Data())) == NULL)
     {
         TVPThrowExceptionMessage(TJS_N("src has no image."));
@@ -353,8 +397,17 @@ static tjs_error clipAlphaRect(tTJSVariant* result,
     if (w <= 0 || h <= 0)
         goto none;
 
-    sourceAccess.Acquire(src,false,"layerExBTOA.read");
-    destinationAccess.Acquire(dst,true,"layerExBTOA.write");
+    if(OperateGPUMask(dst,"MultiplyAlpha",tTVPRect(dx,dy,dx+w,dy+h),src,tTVPRect(sx,sy,sx+w,sy+h))) {
+        if(clr) {
+            for(const auto& region:{tTVPRect(0,0,diw,dy),tTVPRect(0,dy+h,diw,dih),
+                tTVPRect(0,dy,dx,dy+h),tTVPRect(dx+w,dy,diw,dy+h)})
+                if(region.get_width()>0 && region.get_height()>0) OperateGPUMask(dst,"FillMask",region,nullptr,tTVPRect(),clrval);
+        }
+        return TJS_S_OK;
+    }
+
+    sourceAccess.Acquire(src,false,"layerExBTOA.clipAlpha.read");
+    destinationAccess.Acquire(dst,true,"layerExBTOA.clipAlpha.write");
     sbuf=static_cast<ReadRefT>(sourceAccess.Data()); spitch=sourceAccess.Pitch();
     dbuf=static_cast<WrtRefT>(destinationAccess.Data()); dpitch=destinationAccess.Pitch();
     destinationAccess.Written(clr ? tTVPRect(0,0,diw,dih) : tTVPRect(dx,dy,dx+w,dy+h));
@@ -396,6 +449,11 @@ none:
     // 領域範囲外で演算が行われない場合
     if (clr)
     {
+        if(OperateGPUMask(dst,"FillMask",tTVPRect(0,0,diw,dih),nullptr,tTVPRect(),clrval)) return TJS_S_OK;
+        destinationAccess.Acquire(dst,true,"layerExBTOA.clipAlphaRect");
+        dbuf=static_cast<WrtRefT>(destinationAccess.Data()); dpitch=destinationAccess.Pitch();
+        if(!dbuf) TVPThrowExceptionMessage(TJS_N("Layer has no images."));
+        destinationAccess.Written(tTVPRect(0,0,diw,dih));
         for (long y = 0; y < dih; y++)
         {
             WrtRefT p = dbuf + y * dpitch + 3;
@@ -412,6 +470,7 @@ static tjs_error fillByProvince(tTJSVariant* result,
                                 tTJSVariant** param,
                                 iTJSDispatch2* lay)
 {
+    krkrsdl3::layer_work::SourceScope origin("layerExBTOA.fillByProvince");
     iTJSDispatch2* layerClass = getLayerClass();
 
     if (numparams < 2)

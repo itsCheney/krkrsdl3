@@ -366,6 +366,8 @@ struct MetalRenderBackend::Impl
     id<MTLComputePipelineState> ordinaryLayerPipeline = nil, ordinaryInPlacePipeline = nil;
     id<MTLComputePipelineState> dualSourceLayerPipeline = nil;
     id<MTLComputePipelineState> univTransLayerPipeline = nil, affineCopyPipeline = nil;
+    id<MTLComputePipelineState> boxBlurRowsPipeline = nil, boxBlurColumnsPipeline = nil;
+    id<MTLBuffer> boxBlurSums = nil;
     id<MTLRenderCommandEncoder> activeMeshEncoder = nil;
     id<MTLTexture> activeMeshTarget = nil;
     id<MTLComputeCommandEncoder> ordinaryEncoder = nil;
@@ -1069,6 +1071,10 @@ struct MetalRenderBackend::Impl
                                   [ordinary newFunctionWithName:@"affineCopyLayer"] error:&error];
             univTransLayerPipeline = [device newComputePipelineStateWithFunction:
                                       [ordinary newFunctionWithName:@"univTransLayer"] error:&error];
+            boxBlurRowsPipeline = [device newComputePipelineStateWithFunction:
+                                   [ordinary newFunctionWithName:@"boxBlurRows"] error:&error];
+            boxBlurColumnsPipeline = [device newComputePipelineStateWithFunction:
+                                      [ordinary newFunctionWithName:@"boxBlurColumns"] error:&error];
         }
         if(ordinaryLayerPipeline && device.readWriteTextureSupport == MTLReadWriteTextureTier2) {
             // These kernels read only their own destination pixel, into registers,
@@ -1631,7 +1637,7 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
     @autoreleasepool {
         auto& p=*impl_; auto* t=p.Find(target); auto* s=p.Find(source);
         int kind=static_cast<int>(operation.kind);
-        bool needsSource=kind<5 || (kind>=8 && kind<=10) || (kind>=15 && kind<=19);
+        bool needsSource=kind<5 || (kind>=8 && kind<=10) || (kind>=15 && kind<=23);
         if(!p.ordinaryLayerPipeline || !t || t->bytesPerPixel!=4 || kind==0 || (needsSource && !s) ||
             dst.Width()<=0 || dst.Height()<=0 || sampling<0 || sampling>1) return false;
         if(needsSource && (src.Width()==0 || src.Height()==0 || std::min(src.left,src.right)<0 ||
@@ -1639,7 +1645,41 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
         if((operation.flags & TVP_LAYER_DEST_ALPHA) && !p.alphaTables) return false;
         TVPLayerRect clip={std::max(0,dst.left),std::max(0,dst.top),std::min(t->width,dst.right),std::min(t->height,dst.bottom)};
         if(clip.Width()<=0 || clip.Height()<=0) return true;
-        bool overwrite=kind==1 || kind==4 || kind==5 || kind==19;
+        if(operation.kind==TVPLayerOperationKind::BoxBlur) {
+            // Reject unsupported shapes before encoding anything. The first
+            // pass reads all source pixels, so an aliased target needs no copy.
+            if(!p.boxBlurRowsPipeline || !p.boxBlurColumnsPipeline || s->bytesPerPixel!=4 ||
+                src.Width()!=dst.Width() || src.Height()!=dst.Height() || src.Width()<=0 ||
+                src.Height()<=0 || clip.left!=dst.left || clip.top!=dst.top ||
+                clip.right!=dst.right || clip.bottom!=dst.bottom || operation.phase<=0 || operation.vague<=0)
+                return false;
+            const uint64_t bytes=uint64_t(src.Width())*uint64_t(src.Height())*sizeof(simd_uint4);
+            if(bytes>64u*1024u*1024u) return false;
+            if(!p.boxBlurSums || p.boxBlurSums.length<bytes)
+                p.boxBlurSums=[p.device newBufferWithLength:NSUInteger(bytes) options:MTLResourceStorageModePrivate];
+            if(!p.boxBlurSums) return false;
+            struct BoxBlurParameters { simd_int4 source,destination,radius; } params;
+            params.source={src.left,src.top,src.right,src.bottom};
+            params.destination={dst.left,dst.top,dst.right,dst.bottom};
+            params.radius={operation.phase/2,operation.vague/2,0,0};
+            auto rows=p.Compute(); if(!rows) return false;
+            [rows setComputePipelineState:p.boxBlurRowsPipeline];
+            [rows setBytes:&params length:sizeof(params) atIndex:0];
+            [rows setBuffer:p.boxBlurSums offset:0 atIndex:1]; [rows setTexture:s->texture atIndex:0];
+            [rows dispatchThreads:MTLSizeMake(src.Height(),1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+            [rows endEncoding];
+            auto columns=p.Compute(); if(!columns) return false;
+            [columns setComputePipelineState:p.boxBlurColumnsPipeline];
+            [columns setBytes:&params length:sizeof(params) atIndex:0];
+            [columns setBuffer:p.boxBlurSums offset:0 atIndex:1]; [columns setTexture:t->texture atIndex:0];
+            [columns dispatchThreads:MTLSizeMake(src.Width(),1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+            [columns endEncoding];
+            if(p.diagnosticSampled) p.diagnosticWorkload.layerDispatches+=2;
+            p.transientOps+=2;
+            if(p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
+            return true;
+        }
+        bool overwrite=kind==1 || kind==4 || kind==5 || kind==19 || kind==20;
         bool inPlace=p.ordinaryInPlacePipeline!=nil;
         id<MTLTexture> snapshot=nil, sourceTexture=s ? s->texture : p.ordinaryDummy;
         if(!sourceTexture) { p.ordinaryDummy=p.Texture(1,1); sourceTexture=p.ordinaryDummy; }

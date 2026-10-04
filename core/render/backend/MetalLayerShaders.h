@@ -151,6 +151,15 @@ uint layerAlphaToPremulPixel(uint d) {
     return (((((d & 0x00ff00u) * alpha) & 0x00ff0000u) +
              (((d & 0xff00ffu) * alpha) & 0xff00ff00u)) >> 8) + (d & 0xff000000u);
 }
+uint layerMaskPixel(uint d, uint s, int kind) {
+    if (kind == 20) {
+        uint gray = ((s & 255u) * 19u + ((s >> 8) & 255u) * 183u + ((s >> 16) & 255u) * 54u) >> 8;
+        return (s & 0xff000000u) | gray * 0x010101u;
+    }
+    uint alpha = s & 255u;
+    if (kind == 22) { uint product = (d >> 24) * (s >> 24); alpha = (product + (product >> 7)) >> 8; }
+    return (d & 0xffffffu) | (alpha << 24);
+}
 kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
                           constant LayerParameters& p [[buffer(0)]],
                           const device uchar* tables [[buffer(1)]],
@@ -167,7 +176,7 @@ kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
     bool hold = (flags & 1) != 0, straightDestination = (flags & 2) != 0;
     bool premultipliedDestination = (flags & 4) != 0;
     bool full = opa == 255 && (flags & 8) != 0;
-    bool overwrite = kind == 1 || kind == 4 || kind == 5 || kind == 19;
+    bool overwrite = kind == 1 || kind == 4 || kind == 5 || kind == 19 || kind == 20;
     int4 d = int4(0), s = int4(0), color = p.color, result = int4(0);
     if (!overwrite) {
 #ifdef TVP_LAYER_IN_PLACE
@@ -178,7 +187,7 @@ kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
         d = layerBytes(snapshot, xy - p.clip.xy);
 #endif
     }
-    if (kind < 5 || (kind >= 8 && kind <= 10) || (kind >= 15 && kind <= 19))
+    if (kind < 5 || (kind >= 8 && kind <= 10) || (kind >= 15 && kind <= 22))
         s = layerSample(source, p, xy);
     switch (kind) {
         case 1: result = s; break;
@@ -230,8 +239,51 @@ kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
         case 19:
             result = layerUnpack(layerAlphaToPremulPixel(layerPack(s)));
             break;
+        case 20:
+        case 21:
+        case 22:
+            result = layerUnpack(layerMaskPixel(layerPack(d), layerPack(s), kind));
+            break;
     }
     target.write(float4(result & int4(255)) / 255.0, uint2(xy));
+}
+
+// The active software BoxFilterRGBA averages each byte with integer division.
+// Sliding sums preserve that result without CPU readback or radius-dependent
+// per-pixel texture reads. Both software blur method names use this formula.
+struct BoxBlurParameters { int4 source, destination, radius; };
+kernel void boxBlurRows(uint y [[thread_position_in_grid]],
+                       constant BoxBlurParameters& p [[buffer(0)]],
+                       device uint4* sums [[buffer(1)]],
+                       texture2d<float, access::read> source [[texture(0)]]) {
+    int w=p.source.z-p.source.x, h=p.source.w-p.source.y;
+    if(y>=uint(h)) return;
+    int radius=min(p.radius.x,w);
+    uint4 sum=uint4(0);
+    for(int x=0;x<min(w,radius+1);++x)
+        sum+=uint4(layerBytes(source,int2(p.source.x+x,p.source.y+int(y))));
+    for(int x=0;x<w;++x) {
+        sums[y*uint(w)+uint(x)]=sum;
+        if(x-radius>=0) sum-=uint4(layerBytes(source,int2(p.source.x+x-radius,p.source.y+int(y))));
+        if(x+radius+1<w) sum+=uint4(layerBytes(source,int2(p.source.x+x+radius+1,p.source.y+int(y))));
+    }
+}
+kernel void boxBlurColumns(uint x [[thread_position_in_grid]],
+                          constant BoxBlurParameters& p [[buffer(0)]],
+                          const device uint4* sums [[buffer(1)]],
+                          texture2d<float, access::write> target [[texture(0)]]) {
+    int w=p.source.z-p.source.x, h=p.source.w-p.source.y;
+    if(x>=uint(w)) return;
+    int rx=min(p.radius.x,w), ry=min(p.radius.y,h);
+    uint4 sum=uint4(0);
+    for(int y=0;y<min(h,ry+1);++y) sum+=sums[uint(y*w)+x];
+    uint columns=uint(min(w,int(x)+rx+1)-max(0,int(x)-rx));
+    for(int y=0;y<h;++y) {
+        uint area=columns*uint(min(h,y+ry+1)-max(0,y-ry));
+        target.write(float4(sum/area)/255.0,uint2(p.destination.xy+int2(int(x),y)));
+        if(y-ry>=0) sum-=sums[uint((y-ry)*w)+x];
+        if(y+ry+1<h) sum+=sums[uint((y+ry+1)*w)+x];
+    }
 }
 
 struct DualLayerParameters {

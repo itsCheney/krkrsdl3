@@ -827,6 +827,9 @@ void TVPExecuteStorage(const ttstr& name,
                        const tjs_char* modestr)
 {
     krkrsdl3::layer_work::SourceScope source("script.storage");
+    // Includes execution of the loaded script; keep this explicit instead of
+    // inferring image decode time from the legacy resourceLoad total.
+    krkrsdl3::layer_work::StageScope storage(krkrsdl3::layer_work::Stage::ScriptStorage);
     krkrsdl3::layer_work::StageScope stage(krkrsdl3::layer_work::Stage::ResourceLoad);
     // execute storage which contains script
     if (!TVPScriptEngine)

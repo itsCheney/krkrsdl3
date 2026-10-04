@@ -198,6 +198,7 @@ tTVPScanLineProviderForBaseBitmap::~tTVPScanLineProviderForBaseBitmap()
 //---------------------------------------------------------------------------
 void tTVPScanLineProviderForBaseBitmap::Attach(iTVPBaseBitmap* bmp)
 {
+    EndCPUOutput();
     // attach bitmap
     Bitmap = bmp;
 }
@@ -246,6 +247,7 @@ tjs_error tTVPScanLineProviderForBaseBitmap::GetPitchBytes(/*out*/ tjs_int* pitc
 tjs_error tTVPScanLineProviderForBaseBitmap::GetScanLine(/*in*/ tjs_int line,
                                                          /*out*/ const void** scanline)
 {
+    krkrsdl3::layer_work::SourceScope source("transition.source");
     *scanline = Bitmap->GetScanLine(line);
     return TJS_S_OK;
 }
@@ -253,6 +255,16 @@ tjs_error tTVPScanLineProviderForBaseBitmap::GetScanLineForWrite(
     /*in*/ tjs_int line,
     /*out*/ void** scanline)
 {
+    if(ProcessingOutput) {
+        if(!CPUOutput.Data()) {
+            auto* texture=Bitmap->GetTextureForRender(!OverwriteOutput,OverwriteOutput ? &OutputRect : nullptr);
+            CPUOutput.Acquire(texture,true,OverwriteOutput ? "transition.outputOverwrite" : "transition.output",OverwriteOutput);
+            CPUOutput.Written(OutputRect);
+        }
+        *scanline=static_cast<uint8_t*>(CPUOutput.Data())+size_t(line)*CPUOutput.Pitch();
+        return TJS_S_OK;
+    }
+    krkrsdl3::layer_work::SourceScope source("transition.outputUnscoped");
     *scanline = Bitmap->GetScanLineForWrite(line);
     return TJS_S_OK;
 }
