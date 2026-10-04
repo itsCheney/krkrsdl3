@@ -151,7 +151,7 @@ TJS_END_NATIVE_STATIC_METHOD_DECL(/*func. name*/ chopStorageExt)
 //----------------------------------------------------------------------
 TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ clearArchiveCache)
 {
-    emoteplayer::ClearSharedEmoteResourceCache();
+    emoteplayer::ClearSharedEmoteResourceCache("scriptClearArchiveCache");
     TVPClearArchiveCache();
     return TJS_S_OK;
 }

@@ -388,9 +388,24 @@ static EmoteDecodedCache& SharedEmoteCache()
     static auto* cache = new EmoteDecodedCache(64 * 1024 * 1024);
     return *cache;
 }
-void ClearSharedEmoteResourceCache()
+void ClearSharedEmoteResourceCache(const char* reason)
 {
+    // One line per clear: clears are rare and the reason decides whether the
+    // reload that follows was avoidable (e.g. a routine script doCompact).
+    TVPConsoleLog("emote.resourceCache action=clear reason=%s",
+                  reason ? reason : "unspecified");
     SharedEmoteCache().Clear();
+}
+void TrimSharedEmoteResourceCache(const char* reason)
+{
+    const auto budget = SharedEmoteCache().BudgetBytes();
+    const auto keep = budget / 4;
+    const auto removed = SharedEmoteCache().TrimTo(keep);
+    if (removed)
+        TVPConsoleLog("emote.resourceCache action=trim reason=%s removed=%llu retainedBytes=%llu",
+                      reason ? reason : "unspecified",
+                      static_cast<unsigned long long>(removed),
+                      static_cast<unsigned long long>(keep));
 }
 void InvalidateSharedEmoteResource(const std::string& canonicalPath)
 {

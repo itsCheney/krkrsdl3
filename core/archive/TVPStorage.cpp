@@ -1144,7 +1144,7 @@ tTJSBinaryStream* TVPCreateStream(const ttstr& _name, tjs_uint32 flags)
 void TVPClearStorageCaches()
 {
     // clear all storage related caches
-    emoteplayer::ClearSharedEmoteResourceCache();
+    emoteplayer::ClearSharedEmoteResourceCache("storageCaches");
     TVPClearAutoPathCache();
 }
 //---------------------------------------------------------------------------

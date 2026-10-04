@@ -487,7 +487,7 @@ void ResourceManager::unloadAllInternal(const char* diagnosticAction)
 void ResourceManager::clearCache()
 {
     // Drop reusable decoded data while preserving files used by active players.
-    ClearSharedEmoteResourceCache();
+    ClearSharedEmoteResourceCache("scriptClearCache");
     ++_diagnostics.clearCacheCalls;
     recordEmoteCacheEvent("clearCache", _diagnostics, cacheData.size());
 }
@@ -504,13 +504,13 @@ void ResourceManager::setEmotePSBDecryptSeed(tjs_int decryptkey)
 {
     if (_decryptkey == decryptkey) return;
     _decryptkey = decryptkey;
-    ClearSharedEmoteResourceCache();
+    ClearSharedEmoteResourceCache("decryptSeed");
 }
 void ResourceManager::setEmotePSBDecryptFunc(tTJSVariant funclosure)
 {
     _decryptClo = funclosure.AsObjectClosure();
     // Reinstalling the same closure can accompany a change in its script state.
-    ClearSharedEmoteResourceCache();
+    ClearSharedEmoteResourceCache("decryptFunc");
 }
 
 SeparateLayerAdaptor::SeparateLayerAdaptor(iTJSDispatch2* targetLayer)

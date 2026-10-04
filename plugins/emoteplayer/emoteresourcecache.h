@@ -26,7 +26,13 @@ struct EmoteSharedResourceCacheStats
     std::uint64_t generation = 0;
 };
 
-void ClearSharedEmoteResourceCache();
+// Clears all retained entries. `reason` is diagnostics only; callers pass the
+// invalidation source so a device log can attribute reload storms.
+void ClearSharedEmoteResourceCache(const char* reason = "unspecified");
+// Drops least-recently-used entries down to a fraction of the budget. Used for
+// OS/game memory-compact requests: a full clear converts later loads of the
+// same resources into full re-reads, while trimming keeps the hot entries.
+void TrimSharedEmoteResourceCache(const char* reason = "unspecified");
 void InvalidateSharedEmoteResource(const std::string& canonicalPath);
 EmoteSharedResourceCacheStats GetSharedEmoteResourceCacheStats();
 
@@ -126,6 +132,25 @@ public:
         ++_generation;
         // Counters are cumulative across invalidations; a clear is not an LRU
         // eviction. This keeps diagnostics useful when managers come and go.
+    }
+
+    // Drops least-recently-used entries until retained bytes fit keepBytes.
+    // Counted as evictions: the generation is unchanged so in-flight decodes
+    // may still publish (their entries are simply the most recent).
+    std::size_t TrimTo(std::size_t keepBytes)
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        std::size_t removed = 0;
+        while (_retainedBytes > keepBytes && !_order.empty())
+        {
+            const auto& victim = _order.back();
+            _index.erase(victim.indexed);
+            _retainedBytes -= victim.cost;
+            _order.pop_back();
+            ++_evictions;
+            ++removed;
+        }
+        return removed;
     }
 
     template <typename Predicate>

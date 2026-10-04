@@ -31,14 +31,14 @@ void TVPSetXP3ArchiveExtractionFilter(tTVPXP3ArchiveExtractionFilter filter)
 {
     TVPXP3ArchiveExtractionFilter = filter;
     // Reinstalling a callback can also change the decoder state it captures.
-    emoteplayer::ClearSharedEmoteResourceCache();
+    emoteplayer::ClearSharedEmoteResourceCache("archiveExtractionFilter");
 }
 
 static tTVPXP3ArchiveContentFilter TVPXP3ArchiveContentFilter = nullptr;
 void TVPSetXP3ArchiveContentFilter(tTVPXP3ArchiveContentFilter filter)
 {
     TVPXP3ArchiveContentFilter = filter;
-    emoteplayer::ClearSharedEmoteResourceCache();
+    emoteplayer::ClearSharedEmoteResourceCache("archiveContentFilter");
 }
 bool TVPHasXP3ArchiveFilters()
 {

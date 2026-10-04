@@ -42,7 +42,12 @@ struct tTVPClearEmoteResourceCacheCallback : public tTVPCompactEventCallbackIntf
     void OnCompact(tjs_int level) override
     {
         if (level >= TVP_COMPACT_LEVEL_MINIMIZE)
-            emoteplayer::ClearSharedEmoteResourceCache();
+        {
+            // Trim instead of clearing. Games call System.doCompact() routinely
+            // (for example before movies); a full clear turns every later load
+            // of the same resource into a disk read plus a full parse again.
+            emoteplayer::TrimSharedEmoteResourceCache("memoryCompact");
+        }
     }
 };
 static tTVPClearEmoteResourceCacheCallback TVPClearEmoteResourceCacheCallback;
@@ -96,12 +101,12 @@ tTVPApplication::~tTVPApplication()
 {
     delete image_load_thread_;
     // Also cover partially initialized sessions that never reach OnExit.
-    emoteplayer::ClearSharedEmoteResourceCache();
+    emoteplayer::ClearSharedEmoteResourceCache("appDestroy");
 }
 
 bool tTVPApplication::StartApplication()
 {
-    emoteplayer::ClearSharedEmoteResourceCache();
+    emoteplayer::ClearSharedEmoteResourceCache("sessionStart");
     TVPAddCompactEventHook(&TVPClearEmoteResourceCacheCallback, true);
     TVPTerminated = false;
     TVPTerminateOnWindowClose = true;
@@ -225,7 +230,7 @@ void tTVPApplication::OnExit()
     iTVPTexture2D::RecycleProcess();
     TVPProjectDirSelected = false;
     // Save callbacks and script finalizers may load resources during shutdown.
-    emoteplayer::ClearSharedEmoteResourceCache();
+    emoteplayer::ClearSharedEmoteResourceCache("sessionExit");
 }
 
 void tTVPApplication::LoadImageRequest(class iTJSDispatch2* owner,
