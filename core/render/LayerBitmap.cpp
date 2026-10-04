@@ -633,6 +633,7 @@ bool iTVPBaseBitmap::CopyRect(
 //---------------------------------------------------------------------------
 bool iTVPBaseBitmap::Copy9Patch(const iTVPBaseBitmap* ref, tTVPRect& margin)
 {
+    krkrsdl3::layer_work::SourceScope source("bitmap.Copy9Patch");
     if (!Is32BPP())
         return false;
 
@@ -1457,6 +1458,7 @@ bool iTVPBaseBitmap::DoBoxBlurForAlpha(const tTVPRect& rect, const tTVPRect& are
 //---------------------------------------------------------------------------
 void tTVPBaseBitmap::UDFlip(const tTVPRect& rect)
 {
+    krkrsdl3::layer_work::SourceScope source("bitmap.UDFlip");
     // up-down flip for given rectangle
 
     if (rect.left < 0 || rect.top < 0 || rect.right > (tjs_int)GetWidth() ||
@@ -1497,6 +1499,7 @@ void tTVPBaseBitmap::UDFlip(const tTVPRect& rect)
 
 void iTVPBaseBitmap::UDFlip(const tTVPRect& rect)
 {
+    krkrsdl3::layer_work::SourceScope source("bitmap.UDFlip");
     // up-down flip for given rectangle
 
     if (rect.left < 0 || rect.top < 0 || rect.right > (tjs_int)GetWidth() ||
@@ -1513,6 +1516,7 @@ void iTVPBaseBitmap::UDFlip(const tTVPRect& rect)
 //---------------------------------------------------------------------------
 void tTVPBaseBitmap::LRFlip(const tTVPRect& rect)
 {
+    krkrsdl3::layer_work::SourceScope source("bitmap.LRFlip");
     // left-right flip
     if (rect.left < 0 || rect.top < 0 || rect.right > (tjs_int)GetWidth() ||
         rect.bottom > (tjs_int)GetHeight())
@@ -1548,6 +1552,7 @@ void tTVPBaseBitmap::LRFlip(const tTVPRect& rect)
 
 void iTVPBaseBitmap::LRFlip(const tTVPRect& rect)
 {
+    krkrsdl3::layer_work::SourceScope source("bitmap.LRFlip");
     // left-right flip
     if (rect.left < 0 || rect.top < 0 || rect.right > (tjs_int)GetWidth() ||
         rect.bottom > (tjs_int)GetHeight())

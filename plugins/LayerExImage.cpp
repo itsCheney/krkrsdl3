@@ -14,6 +14,7 @@
 void layerExImage::reset()
 {
 	layerExBase_GL::reset();
+	_pixels.Written(tTVPRect(_clipLeft,_clipTop,_clipLeft+_clipWidth,_clipTop+_clipHeight));
 	// バッファ位置をクリッピングにあわせて変更する
 	_buffer += _clipTop * _pitch + _clipLeft * 4;
 	_width  = _clipWidth;
@@ -441,6 +442,7 @@ static const char* copyright =
 
 NCB_GET_INSTANCE_HOOK(layerExImage){
     // インスタンスゲッタ
+    ClassT* pixelsOwner=nullptr;
     NCB_INSTANCE_GETTER(objthis){
         // objthis を iTJSDispatch2* 型の引数とする
         ClassT* obj = GetNativeInstance(objthis); // ネイティブインスタンスポインタ取得
@@ -449,12 +451,15 @@ NCB_GET_INSTANCE_HOOK(layerExImage){
             obj = new ClassT(objthis);       // ない場合は生成する
             SetNativeInstance(objthis, obj); // objthis に obj をネイティブインスタンスとして登録する
         }
+        pixelsOwner=obj;
+        obj->setPixelCaller("layerExImage.write");
         obj->reset();
         return obj;
     }
     // デストラクタ（実際のメソッドが呼ばれた後に呼ばれる）
     ~NCB_GET_INSTANCE_HOOK_CLASS()
     {
+        if(pixelsOwner) pixelsOwner->finishPixels();
     }
 };
 // フックつきアタッチ

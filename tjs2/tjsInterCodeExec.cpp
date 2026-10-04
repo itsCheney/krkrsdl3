@@ -10,6 +10,7 @@
 //---------------------------------------------------------------------------
 
 #include "tjsCommHead.h"
+#include "../core/render/LayerWorkDiagnostics.h"
 
 #include "tjsInterCodeExec.h"
 #include "tjsInterCodeGen.h"
@@ -954,6 +955,7 @@ void tTJSInterCodeContext::ThrowScriptException(tTJSVariant& val,
 tjs_int tTJSInterCodeContext::ExecuteCode(
     tTJSVariant* ra_org, tjs_int startip, tTJSVariant** args, tjs_int numargs, tTJSVariant* result)
 {
+    krkrsdl3::layer_work::StageScope stage(krkrsdl3::layer_work::Stage::Script);
     // execute VM codes
     tjs_int32* codesave;
     try

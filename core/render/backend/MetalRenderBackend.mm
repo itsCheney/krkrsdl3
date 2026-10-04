@@ -1631,7 +1631,7 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
     @autoreleasepool {
         auto& p=*impl_; auto* t=p.Find(target); auto* s=p.Find(source);
         int kind=static_cast<int>(operation.kind);
-        bool needsSource=kind<5 || (kind>=8 && kind<=10);
+        bool needsSource=kind<5 || (kind>=8 && kind<=10) || (kind>=15 && kind<=19);
         if(!p.ordinaryLayerPipeline || !t || t->bytesPerPixel!=4 || kind==0 || (needsSource && !s) ||
             dst.Width()<=0 || dst.Height()<=0 || sampling<0 || sampling>1) return false;
         if(needsSource && (src.Width()==0 || src.Height()==0 || std::min(src.left,src.right)<0 ||
@@ -1639,7 +1639,7 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
         if((operation.flags & TVP_LAYER_DEST_ALPHA) && !p.alphaTables) return false;
         TVPLayerRect clip={std::max(0,dst.left),std::max(0,dst.top),std::min(t->width,dst.right),std::min(t->height,dst.bottom)};
         if(clip.Width()<=0 || clip.Height()<=0) return true;
-        bool overwrite=kind==1 || kind==4 || kind==5;
+        bool overwrite=kind==1 || kind==4 || kind==5 || kind==19;
         bool inPlace=p.ordinaryInPlacePipeline!=nil;
         id<MTLTexture> snapshot=nil, sourceTexture=s ? s->texture : p.ordinaryDummy;
         if(!sourceTexture) { p.ordinaryDummy=p.Texture(1,1); sourceTexture=p.ordinaryDummy; }

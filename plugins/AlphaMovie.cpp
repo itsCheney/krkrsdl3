@@ -1,6 +1,7 @@
 #include "ncbind/ncbind.hpp"
 
 #include "TVPStorage.h"
+#include "LayerWorkDiagnostics.h"
 #include "tjsNativeLayer.h"
 
 #include <zlib.h>
@@ -1541,6 +1542,8 @@ tTJSNI_AlphaMovie::~tTJSNI_AlphaMovie()
 
 void tTJSNI_AlphaMovie::open(tTJSString fileName)
 {
+    krkrsdl3::layer_work::SourceScope source("AlphaMovie.open");
+    krkrsdl3::layer_work::StageScope load(krkrsdl3::layer_work::Stage::ResourceLoad);
     EnsureAlphaMovieTablesInitialized();
     clear();
     filePtr = TVPCreateStream(fileName);
@@ -1619,8 +1622,12 @@ void tTJSNI_AlphaMovie::open(tTJSString fileName)
             tjs_uint64 rgbaSize = _a.frame_width * _a.frame_height * 4;
             tjs_uint8* rgba_buffer = new tjs_uint8[rgbaSize];
             struct BufferManager* stream = new BufferManager(cache, cacheLen);
-            DecodeAndConvertToRGBA(stream, qtbl, rgba_buffer, _a.frame_width, _a.frame_height,
-                                   alpha_buffer, false);
+            {
+                krkrsdl3::layer_work::StageScope decode(krkrsdl3::layer_work::Stage::AMVDecode);
+                DecodeAndConvertToRGBA(stream, qtbl, rgba_buffer, _a.frame_width, _a.frame_height,
+                                       alpha_buffer, false);
+            }
+            krkrsdl3::layer_work::RecordAMVFrame(rgbaSize);
             delete stream;
             delete[] cache;
             delete[] alpha_buffer;
@@ -1639,8 +1646,12 @@ void tTJSNI_AlphaMovie::open(tTJSString fileName)
             tjs_uint64 rgbaSize = _a.frame_width * _a.frame_height * 4;
             tjs_uint8* rgba_buffer = new tjs_uint8[rgbaSize];
             struct BufferManager* stream = new BufferManager(cache, cacheLen);
-            DecodeAndConvertToRGBA(stream, qtbl, rgba_buffer, _a.frame_width, _a.frame_height,
-                                   nullptr, true);
+            {
+                krkrsdl3::layer_work::StageScope decode(krkrsdl3::layer_work::Stage::AMVDecode);
+                DecodeAndConvertToRGBA(stream, qtbl, rgba_buffer, _a.frame_width, _a.frame_height,
+                                       nullptr, true);
+            }
+            krkrsdl3::layer_work::RecordAMVFrame(rgbaSize);
             delete stream;
             delete[] cache;
 
@@ -1678,6 +1689,7 @@ void tTJSNI_AlphaMovie::clear()
 
 tjs_int tTJSNI_AlphaMovie::showNextImage(tTJSVariant layer)
 {
+    krkrsdl3::layer_work::SourceScope source("AlphaMovie.frame");
     tTJSNI_BaseLayer* src = NULL;
     tTJSVariantClosure clo = layer.AsObjectClosureNoAddRef();
     if (clo.Object)

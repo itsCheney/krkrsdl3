@@ -2045,6 +2045,9 @@ GdipImage* LayerExDraw::getRecordImage()
     GdipImage* image = NULL;
     if (metaGraphics)
     {
+        // This method is also reached through a raw callback that bypasses the
+        // normal per-call native getter. Reacquire pixels before using canvas.
+        PixelCall pixels(*this,"layerExDraw.record");
         image = metaGraphics->Clone();
         if (image)
             redraw(image);
@@ -2748,6 +2751,7 @@ NCB_REGISTER_CLASS(GdiPlus)
 // ------------------------------------------------------- LayerExDraw hook
 NCB_GET_INSTANCE_HOOK(LayerExDraw)
 {
+    ClassT* pixelsOwner=nullptr;
     NCB_INSTANCE_GETTER(objthis)
     {
         ClassT* obj = GetNativeInstance(objthis);
@@ -2756,10 +2760,12 @@ NCB_GET_INSTANCE_HOOK(LayerExDraw)
             obj = new ClassT(objthis);
             SetNativeInstance(objthis, obj);
         }
+        pixelsOwner=obj;
+        obj->setPixelCaller("layerExDraw.write");
         obj->reset();
         return obj;
     }
-    ~NCB_GET_INSTANCE_HOOK_CLASS() {}
+    ~NCB_GET_INSTANCE_HOOK_CLASS() { if(pixelsOwner) pixelsOwner->finishPixels(); }
 };
 
 #define LAYEREX_METHOD(type, name) \

@@ -1,5 +1,6 @@
 #pragma once
 #include "LayerRenderOperation.h"
+#include "LayerWorkDiagnostics.h"
 
 #include "ComplexRect.h"
 #include <unordered_map>
@@ -28,6 +29,7 @@ class iTVPTexture2D
 {
 protected:
     int RefCount;
+    unsigned CPUAccessReferences = 0;
     tjs_int Width;  // actual width
     tjs_int Height; // actual height
     // int Flags, TexWidth, TexHeight, ActualWidth, ActualHeight;
@@ -36,6 +38,10 @@ protected:
 public:
     virtual ~iTVPTexture2D(){};
     void AddRef() { ++RefCount; }
+    // Keep native access alive without inventing image sharing for COW. A
+    // read/write alias within one native operation must keep software ordering.
+    void AddCPUAccessRef() { AddRef(); ++CPUAccessReferences; }
+    void ReleaseCPUAccessRef() { --CPUAccessReferences; Release(); }
     virtual void Release();
     tjs_uint GetWidth() const { return Width; }
     tjs_uint GetHeight() const { return Height; }
@@ -52,7 +58,7 @@ public:
     virtual const void* GetPixelData() { return GetScanLineForRead(0); }
     virtual void* GetScanLineForWrite(tjs_uint l) { return (void*)GetScanLineForRead(l); }
     virtual tjs_int GetPitch() const { return 0x100000; }
-    bool IsIndependent() const { return RefCount == 1; }
+    bool IsIndependent() const { return RefCount-int(CPUAccessReferences) == 1; }
 
     // virtual tGLTexture* GetTexture() = 0;
     virtual void Update(const void* pixel,
@@ -93,6 +99,12 @@ public:
     // 显式回读（带缓存）：返回 CPU 像素；软件实现零拷贝返回真实缓冲
     virtual void* LockCPURead() { return const_cast<void*>(GetPixelData()); }
     virtual void UnlockCPU() {}
+    // Native callers hold these only through one operation. Unlike script raw
+    // pointers they neither pin the texture permanently nor end a raw lease.
+    virtual void* LockCPUWrite() { return LockCPURead(); }
+    virtual void UnlockCPUWrite(const tTVPRect& written) {
+        MarkCPUModified(written); UnlockCPU();
+    }
     // CPU 数据已修改，下次 GPU 使用前需上传
     virtual void MarkCPUModified() {}
     // 同上，但已知被写区域，仅上传该区域
@@ -115,6 +127,39 @@ public:
     virtual void ReleasePersistentCPUData(const tTVPRect* written) {}
 
     static void RecycleProcess();
+};
+
+class tTVPScopedTexturePixels {
+    iTVPTexture2D* texture = nullptr;
+    void* pixels = nullptr;
+    bool write = false;
+    tTVPRect written{0,0,0,0};
+    char origin[48]{};
+public:
+    tTVPScopedTexturePixels() = default;
+    tTVPScopedTexturePixels(const tTVPScopedTexturePixels&) = delete;
+    tTVPScopedTexturePixels& operator=(const tTVPScopedTexturePixels&) = delete;
+    ~tTVPScopedTexturePixels() { Reset(); }
+    void Reset() {
+        if(!texture) return;
+        krkrsdl3::layer_work::SourceScope scope(origin);
+        if(write) texture->UnlockCPUWrite(written); else texture->UnlockCPU();
+        texture->ReleaseCPUAccessRef(); texture=nullptr; pixels=nullptr;
+    }
+    void Acquire(iTVPTexture2D* value,bool forWrite,const char* caller="native.layerPixels") {
+        Reset(); if(!value) return;
+        std::snprintf(origin,sizeof(origin),"%s",caller);
+        krkrsdl3::layer_work::SourceScope scope(origin);
+        value->AddCPUAccessRef();
+        try { pixels=forWrite ? value->LockCPUWrite() : value->LockCPURead(); }
+        catch(...) { value->ReleaseCPUAccessRef(); throw; }
+        texture=value; write=forWrite; written=tTVPRect(0,0,0,0);
+    }
+    void Written(const tTVPRect& region) { written=region; }
+    void* Data() const { return pixels; }
+    int Pitch() const { return texture ? texture->GetPitch() : 0; }
+    unsigned Width() const { return texture ? texture->GetWidth() : 0; }
+    unsigned Height() const { return texture ? texture->GetHeight() : 0; }
 };
 
 class iTVPRenderMethod

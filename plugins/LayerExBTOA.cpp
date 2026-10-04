@@ -1,5 +1,6 @@
 #include "ncbind/ncbind.hpp"
 #include <vector>
+#include "ScopedLayerPixels.h"
 
 #define NCB_MODULE_NAME TJS_N("layerExBTOA.dll")
 
@@ -57,19 +58,17 @@ static bool GetLayerSize(iTJSDispatch2* lay, long& w, long& h, long& pitch)
 }
 
 // 書き込み用
-static bool GetLayerBufferAndSize(iTJSDispatch2* lay, long& w, long& h, WrtRefT& ptr, long& pitch)
+static bool GetLayerBufferAndSize(iTJSDispatch2* lay, long& w, long& h, WrtRefT& ptr, long& pitch, tTVPScopedLayerPixels& access)
 {
     iTJSDispatch2* layerClass = getLayerClass();
 
     if (!GetLayerSize(lay, w, h, pitch))
         return false;
 
-    // バッファ取得
-    tTJSVariant val;
-    if (TJS_FAILED(layerClass->PropGet(0, TJS_N("mainImageBufferForWrite"), 0, &val, lay)))
-        return false;
-    ptr = reinterpret_cast<WrtRefT>(val.AsInteger());
-    return (ptr != 0);
+    access.Acquire(lay,true,"layerExBTOA.write");
+    ptr=static_cast<WrtRefT>(access.Data()); pitch=access.Pitch();
+    access.Written(tTVPRect(0,0,w,h));
+    return ptr!=nullptr;
 }
 
 /**
@@ -82,15 +81,17 @@ static tjs_error copyRightBlueToLeftAlpha(tTJSVariant* result,
                                           iTJSDispatch2* lay)
 {
     // 書き込み先
+    tTVPScopedLayerPixels access;
     WrtRefT dbuf = 0;
     long dw, dh, dpitch;
-    if (!GetLayerBufferAndSize(lay, dw, dh, dbuf, dpitch))
+    if (!GetLayerBufferAndSize(lay, dw, dh, dbuf, dpitch, access))
     {
         TVPThrowExceptionMessage(TJS_N("dest must be Layer."));
     }
 
     // 半分
     dw /= 2;
+    access.Written(tTVPRect(0,0,dw,dh));
     // コピー
 
     WrtRefT sbuf = dbuf + dw * 4;
@@ -121,15 +122,17 @@ static tjs_error copyBottomBlueToTopAlpha(tTJSVariant* result,
                                           iTJSDispatch2* lay)
 {
     // 書き込み先
+    tTVPScopedLayerPixels access;
     WrtRefT dbuf = 0;
     long dw, dh, dpitch;
-    if (!GetLayerBufferAndSize(lay, dw, dh, dbuf, dpitch))
+    if (!GetLayerBufferAndSize(lay, dw, dh, dbuf, dpitch, access))
     {
         TVPThrowExceptionMessage(TJS_N("dest must be Layer."));
     }
 
     // 半分
     dh /= 2;
+    access.Written(tTVPRect(0,0,dw,dh));
 
     // コピー
     WrtRefT sbuf = dbuf + dh * dpitch;
@@ -156,9 +159,10 @@ static tjs_error fillAlpha(tTJSVariant* result,
                            iTJSDispatch2* lay)
 {
     // 書き込み先
+    tTVPScopedLayerPixels access;
     WrtRefT dbuf = 0;
     long dw, dh, dpitch;
-    if (!GetLayerBufferAndSize(lay, dw, dh, dbuf, dpitch))
+    if (!GetLayerBufferAndSize(lay, dw, dh, dbuf, dpitch, access))
     {
         TVPThrowExceptionMessage(TJS_N("dest must be Layer."));
     }
@@ -198,8 +202,8 @@ static tjs_error copyAlphaToProvince(tTJSVariant* result,
     }
 
     tTJSVariant val;
-    if (TJS_FAILED(layerClass->PropGet(0, TJS_N("mainImageBuffer"), 0, &val, lay)) ||
-        (sbuf = reinterpret_cast<ReadRefT>(val.AsInteger())) == NULL)
+    tTVPScopedLayerPixels sourceAccess(lay,false,"layerExBTOA.read");
+    if ((sbuf = static_cast<ReadRefT>(sourceAccess.Data())) == NULL)
     {
         TVPThrowExceptionMessage(TJS_N("src has no image."));
     }
@@ -257,6 +261,7 @@ static tjs_error clipAlphaRect(tTJSVariant* result,
 {
     iTJSDispatch2* layerClass = getLayerClass();
 
+    tTVPScopedLayerPixels sourceAccess, destinationAccess;
     ReadRefT sbuf = 0;
     WrtRefT dbuf = 0;
     iTJSDispatch2* src = 0;
@@ -348,14 +353,11 @@ static tjs_error clipAlphaRect(tTJSVariant* result,
     if (w <= 0 || h <= 0)
         goto none;
 
-    // バッファ取得
-    if (TJS_FAILED(layerClass->PropGet(0, TJS_N("mainImageBuffer"), 0, &val, src)))
-        return false;
-    sbuf = reinterpret_cast<ReadRefT>(val.AsInteger());
-
-    if (TJS_FAILED(layerClass->PropGet(0, TJS_N("mainImageBufferForWrite"), 0, &val, dst)))
-        return false;
-    dbuf = reinterpret_cast<WrtRefT>(val.AsInteger());
+    sourceAccess.Acquire(src,false,"layerExBTOA.read");
+    destinationAccess.Acquire(dst,true,"layerExBTOA.write");
+    sbuf=static_cast<ReadRefT>(sourceAccess.Data()); spitch=sourceAccess.Pitch();
+    dbuf=static_cast<WrtRefT>(destinationAccess.Data()); dpitch=destinationAccess.Pitch();
+    destinationAccess.Written(clr ? tTVPRect(0,0,diw,dih) : tTVPRect(dx,dy,dx+w,dy+h));
 
     if (!sbuf || !dbuf)
         TVPThrowExceptionMessage(TJS_N("Layer has no images."));
@@ -418,9 +420,10 @@ static tjs_error fillByProvince(tTJSVariant* result,
     DWORD color = (int)*param[1];
 
     // 書き込み先
+    tTVPScopedLayerPixels access;
     WrtRefT dbuf = 0;
     long dw, dh, dpitch;
-    if (!GetLayerBufferAndSize(lay, dw, dh, dbuf, dpitch))
+    if (!GetLayerBufferAndSize(lay, dw, dh, dbuf, dpitch, access))
     {
         TVPThrowExceptionMessage(TJS_N("must be Layer."));
     }

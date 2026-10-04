@@ -2711,6 +2711,12 @@ void iTVPRenderManager::RegisterRenderMethod(const char* name, iTVPRenderMethod*
         {"ApplyColorMap", K::ColorMap, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
         {"ApplyColorMap_d", K::ColorMap, TVP_LAYER_DEST_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
         {"ApplyColorMap_a", K::ColorMap, TVP_LAYER_DEST_PREMULTIPLIED | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"AdditiveAlphaBlend", K::AdditiveAlpha, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"AdditiveAlphaBlend_a", K::AdditiveAlpha, TVP_LAYER_DEST_PREMULTIPLIED | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsMulBlend", K::PsMul, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsOverlayBlend", K::PsOverlay, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsHardLightBlend", K::PsHardLight, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"AlphaToAdditiveAlpha", K::AlphaToAdditiveAlpha, 0, false},
     };
     for (const auto& entry : entries)
         if (!strcmp(name, entry.name)) {
@@ -3006,6 +3012,7 @@ public:
         REGISER_BLEND_4(56, Lighten);
         REGISER_BLEND_4(42, Screen);
         REGISER_BLEND_4(52, AdditiveAlpha);
+        RegisterRenderMethod("AdditiveAlphaBlend_HDA", GetRenderMethod("AdditiveAlphaBlend"));
         {
             static tTVPRenderMethod_BltAndOpa<52, TVPAdditiveAlphaBlend_a, TVPAdditiveAlphaBlend_ao>
                 method;
@@ -3015,6 +3022,7 @@ public:
         REGISER_BLEND_4(30, PsAdd);
         REGISER_BLEND_4(29, PsSub);
         REGISER_BLEND_4(27, PsMul);
+        RegisterRenderMethod("PsMulBlend_HDA", GetRenderMethod("PsMulBlend"));
     }
 
     void Register_4()
@@ -3022,6 +3030,8 @@ public:
         REGISER_BLEND_4(27, PsScreen);
         REGISER_BLEND_4(15, PsOverlay);
         REGISER_BLEND_4(15, PsHardLight);
+        RegisterRenderMethod("PsOverlayBlend_HDA", GetRenderMethod("PsOverlayBlend"));
+        RegisterRenderMethod("PsHardLightBlend_HDA", GetRenderMethod("PsHardLightBlend"));
         REGISER_BLEND_4(10, PsSoftLight);
         REGISER_BLEND_4(10, PsColorDodge);
         REGISER_BLEND_4(10, PsColorDodge5);

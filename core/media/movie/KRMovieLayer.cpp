@@ -2,6 +2,7 @@
 #include "KRMovieLayer.h"
 #include "CodecVideo.h"
 #include "LayerBitmap.h"
+#include "LayerWorkDiagnostics.h"
 #include "TVPApplication.h"
 extern "C"
 {
@@ -12,6 +13,7 @@ NS_KRMOVIE_BEGIN
 
 tTVPBaseTexture* VideoPresentLayer::GetFrontBuffer()
 {
+    krkrsdl3::layer_work::SourceScope source("video.frame");
     BitmapPicture pic;
     if (!m_usedPicture)
     {

@@ -1,4 +1,5 @@
 #include "emotefile.h"
+#include "LayerWorkDiagnostics.h"
 #include "emoteresourcecache.h"
 
 #include "TVPStorage.h"
@@ -1788,6 +1789,8 @@ std::shared_ptr<const EmoteDecodedResource> emotefile::SnapshotDecodedResource()
 }
 bool emotefile::load(const ttstr& filePath)
 {
+    krkrsdl3::layer_work::SourceScope source("Emote.resource");
+    krkrsdl3::layer_work::StageScope stage(krkrsdl3::layer_work::Stage::ResourceLoad);
     _sharedCacheHit = false;
     _archiveFilterBypass = TVPHasXP3ArchiveFilters();
     ClearAniTree();

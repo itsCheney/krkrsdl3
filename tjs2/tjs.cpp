@@ -10,6 +10,7 @@
 //---------------------------------------------------------------------------
 
 #include "tjsCommHead.h"
+#include "../core/render/LayerWorkDiagnostics.h"
 
 #include <assert.h>
 #include "tjs.h"
@@ -501,6 +502,7 @@ tjs_int32 tTJS::GetPPValue(const tjs_char* name)
 //---------------------------------------------------------------------------
 void tTJS::DoGarbageCollection()
 {
+    krkrsdl3::layer_work::StageScope stage(krkrsdl3::layer_work::Stage::GC);
     // do garbage collection
     // The former global CompactNow hook is empty; compact this VM's pool.
     if (VariantArrayStack)

@@ -1,4 +1,5 @@
 #include "ncbind/ncbind.hpp"
+#include "ScopedLayerPixels.h"
 
 #define NCB_MODULE_NAME TJS_N("shrinkCopy.dll")
 
@@ -58,37 +59,32 @@ struct LayerUtils
 
     // 読み込み用
     static bool GetLayerBufferAndSize(
-        iTJSDispatch2* lay, long& w, long& h, BufRefT& ptr, long& pitch)
+        iTJSDispatch2* lay, long& w, long& h, BufRefT& ptr, long& pitch, tTVPScopedLayerPixels& access)
     {
         if (!GetLayerSize(lay, w, h, pitch))
             return false;
 
-        // バッファ取得
-        tTJSVariant val;
-        if (TJS_FAILED(lay->PropGet(0, TJS_N("mainImageBuffer"), 0, &val, lay)))
-            return false;
-        ptr = reinterpret_cast<BufRefT>(val.AsInteger());
-        return (ptr != 0);
+        access.Acquire(lay,false,"shrinkCopy.read");
+        ptr=static_cast<BufRefT>(access.Data()); pitch=access.Pitch();
+        return ptr!=nullptr;
     }
 
     // 書き込み用
     static bool GetLayerBufferAndSize(
-        iTJSDispatch2* lay, long& w, long& h, WrtRefT& ptr, long& pitch)
+        iTJSDispatch2* lay, long& w, long& h, WrtRefT& ptr, long& pitch, tTVPScopedLayerPixels& access)
     {
         if (!GetLayerSize(lay, w, h, pitch))
             return false;
 
-        // バッファ取得
-        tTJSVariant val;
-        if (TJS_FAILED(lay->PropGet(0, TJS_N("mainImageBufferForWrite"), 0, &val, lay)))
-            return false;
-        ptr = reinterpret_cast<WrtRefT>(val.AsInteger());
-        return (ptr != 0);
+        access.Acquire(lay,true,"shrinkCopy.write");
+        ptr=static_cast<WrtRefT>(access.Data()); pitch=access.Pitch();
+        return ptr!=nullptr;
     }
 };
 
 struct ShrinkCopy : public LayerUtils
 {
+    tTVPScopedLayerPixels sourceAccess, destinationAccess;
     // TJS Method
     static tjs_error(layerShrinkCopy)(tTJSVariant* result,
                                       tjs_int numparams,
@@ -146,8 +142,8 @@ struct ShrinkCopy : public LayerUtils
             return false;
 
         // サイズ取得
-        if (!GetLayerBufferAndSize(src, siw, sih, ps, spch) ||
-            !GetLayerBufferAndSize(dst, diw, dih, pd, dpch))
+        if (!GetLayerBufferAndSize(src, siw, sih, ps, spch, sourceAccess) ||
+            !GetLayerBufferAndSize(dst, diw, dih, pd, dpch, destinationAccess))
             return false;
 
         return true;
@@ -222,6 +218,7 @@ struct ShrinkCopy : public LayerUtils
 
     void copy()
     {
+        destinationAccess.Written(tTVPRect(dtx+dsx,dty+dsy,dtx+dex,dty+dey));
         AvgInfoT *horz = 0, *vert = 0;
         void* buf = allocAvgBuffer(horz, vert, dex - dsx, dey - dsy);
         if (!horz || !vert)
@@ -435,6 +432,7 @@ NCB_ATTACH_FUNCTION(shrinkCopy, Layer, ShrinkCopy::layerShrinkCopy);
 
 struct LimitedShrink : public LayerUtils
 {
+    tTVPScopedLayerPixels sourceAccess, destinationAccess;
     // TJS Method
     static tjs_error(layerShrinkCopy)(tTJSVariant* result,
                                       tjs_int numparams,
@@ -467,7 +465,7 @@ struct LimitedShrink : public LayerUtils
 
     bool check()
     {
-        return (stepx > 0 && stepy > 0 && GetLayerBufferAndSize(src, siw, sih, ps, spch) &&
+        return (stepx > 0 && stepy > 0 && GetLayerBufferAndSize(src, siw, sih, ps, spch, sourceAccess) &&
                 IsValidLayer(dst));
     }
     bool resize()
@@ -476,10 +474,11 @@ struct LimitedShrink : public LayerUtils
         tTJSVariant nh((tjs_int)((sih + stepy - 1) / stepy));
         tTJSVariant* param[] = {&nw, &nh};
         return (TJS_SUCCEEDED(dst->FuncCall(0, TJS_N("setImageSize"), 0, NULL, 2, param, dst)) &&
-                GetLayerBufferAndSize(dst, diw, dih, pd, dpch));
+                GetLayerBufferAndSize(dst, diw, dih, pd, dpch, destinationAccess));
     }
     void copy()
     {
+        destinationAccess.Written(tTVPRect(0,0,diw,dih));
         xdiv = siw / stepx;
         xrem = siw - xdiv * stepx;
         if (stepy <= 1)

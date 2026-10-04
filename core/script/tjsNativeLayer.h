@@ -486,6 +486,8 @@ public:
     void SetProvincePixel(tjs_int x, tjs_int y, tjs_int n);
 
     const void* GetMainImagePixelBuffer() const;
+    // Internal native access; raw TJS properties keep their persistent contract.
+    iTVPTexture2D* GetMainImageTextureForCPUAccess(bool write);
     void* GetMainImagePixelBufferForWrite();
     // For callers that replace every pixel of the layer. Skips the GPU readback
     // that GetMainImagePixelBufferForWrite performs to preserve existing content.

@@ -6,6 +6,7 @@
 #include "TVPMsg.h"
 #include "tjsNativeLayer.h"
 #include "RenderManager.h"
+#include "ScopedLayerPixels.h"
 
 /**
  * プロパティのキャッシュ処理用
@@ -163,6 +164,25 @@ struct layerExBase_GL
     // クリップ情報
     GeometryT _clipLeft, _clipTop, _clipWidth, _clipHeight;
     DispatchT _obj;
+    tTVPScopedLayerPixels _pixels;
+    const char* _pixelCaller="layerExBase";
+    void setPixelCaller(const char* name) { _pixelCaller=name; }
+    void finishPixels() { _pixels.Reset(); _buffer=nullptr; }
+    class PixelCall {
+        layerExBase_GL& owner;
+        bool owns;
+    public:
+        PixelCall(layerExBase_GL& value,const char* caller):owner(value),owns(!value._pixels.Data()) {
+            if(owns) {
+                owner.setPixelCaller(caller);
+                try { owner.reset(); }
+                catch(...) { owner.finishPixels(); throw; }
+            }
+        }
+        ~PixelCall() { if(owns) owner.finishPixels(); }
+        PixelCall(const PixelCall&)=delete;
+        PixelCall& operator=(const PixelCall&)=delete;
+    };
 
     layerExBase_GL(DispatchT obj) : _obj(obj)
     {
@@ -178,17 +198,22 @@ struct layerExBase_GL
 
     virtual void reset()
     {
+        _pixels.Reset();
         _width = (GeometryT)_this->GetImageWidth();
         _height = (GeometryT)_this->GetImageHeight();
         if (TVPIsSoftwareRenderManager() || TVPMetalLayerCompositionActive())
         {
-            _buffer = (BufferT)_this->GetMainImagePixelBufferForWrite();
-            _pitch = (PitchT)_this->GetMainImagePixelBufferPitch();
+            _pixels.Acquire(_obj,true,_pixelCaller);
+            _buffer = (BufferT)_pixels.Data();
+            _pitch = (PitchT)_pixels.Pitch();
         }
         _clipLeft = (GeometryT)_this->GetClipLeft();
         _clipTop = (GeometryT)_this->GetClipTop();
         _clipWidth = (GeometryT)_this->GetClipWidth();
         _clipHeight = (GeometryT)_this->GetClipHeight();
+        // Some native operations bypass the clip (raster copies/record redraw).
+        // Derived operations may narrow this only when their writes are known.
+        _pixels.Written(tTVPRect(0,0,_width,_height));
     }
     virtual void redraw()
     {

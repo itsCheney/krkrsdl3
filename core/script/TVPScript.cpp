@@ -10,6 +10,7 @@
 //---------------------------------------------------------------------------
 
 #include "tjsCommHead.h"
+#include "LayerWorkDiagnostics.h"
 #include "TVPScript.h"
 
 #include "tjs.h"
@@ -825,6 +826,8 @@ void TVPExecuteStorage(const ttstr& name,
                        bool isexpression,
                        const tjs_char* modestr)
 {
+    krkrsdl3::layer_work::SourceScope source("script.storage");
+    krkrsdl3::layer_work::StageScope stage(krkrsdl3::layer_work::Stage::ResourceLoad);
     // execute storage which contains script
     if (!TVPScriptEngine)
         TVPThrowInternalError;

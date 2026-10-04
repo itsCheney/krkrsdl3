@@ -97,6 +97,8 @@ class LayerTexture final : public iTVPTexture2D {
     // telling us, so such a texture re-uploads until the lease is released.
     bool writeLeased = false;
     unsigned locks = 0;
+    unsigned scopedWrites = 0;
+    char uploadOrigin[48]="initial", rawWriteOrigin[48]="script.rawWrite";
     // Union of CPU writes since the last upload; meaningful only while dirty.
     tTVPRect damage;
     // Damage outstanding when the current write lease opened. A lease widens
@@ -219,6 +221,10 @@ class LayerTexture final : public iTVPTexture2D {
         tTVPRect r(std::max(0,requested.left),std::max(0,requested.top),
                    std::min(int(Width),requested.right),std::min(int(Height),requested.bottom));
         if(r.get_width()<=0 || r.get_height()<=0) return;
+        const char* caller=krkrsdl3::layer_work::source;
+        if(!std::strcmp(caller,"unattributed")) caller="bitmap.cpuWrite";
+        if(dirty && std::strcmp(uploadOrigin,caller)) caller="mixed";
+        std::snprintf(uploadOrigin,sizeof(uploadOrigin),"%s",caller);
         InvalidatePointCache(&r,false,point_trace::Invalidation::CPUWrite,"cpu.write");
         if(!dirty) { damage=r; dirty=true; return; }
         damage.left=std::min(damage.left,r.left); damage.top=std::min(damage.top,r.top);
@@ -229,8 +235,15 @@ class LayerTexture final : public iTVPTexture2D {
         if(valid) return false;
         if(!session->backend || !handle) throw std::runtime_error("GPU Layer read without a session");
         int pitch=0;
+        const bool diagnostics=krkrsdl3::layer_work::enabled.load(std::memory_order_relaxed);
+        const auto started=diagnostics ? krkrsdl3::layer_work::Now() : 0;
         if(!session->backend->ReadLayerTexture(handle,pixels,pitch) || pitch!=GetPitch())
             throw std::runtime_error("GPU Layer readback failed");
+        constexpr const char* categories[]={"bitmap.lock","fallback","script.rawPointer","bitmap.scanline","session.detach","bitmap.point"};
+        const char* origin=krkrsdl3::layer_work::source;
+        if(!std::strcmp(origin,"unattributed")) origin=categories[static_cast<int>(source)];
+        if(diagnostics) krkrsdl3::layer_work::Record(false,textureID,Width,Height,Bytes(),
+            krkrsdl3::layer_work::Now()-started,session->backend->GetLastReadbackWaitNanoseconds(),false,origin);
         session->stats.readbackBytes+=Bytes(); session->stats.cpuCacheBytes+=Bytes(); valid=true;
         const int index=static_cast<int>(source);
         session->stats.readbackBytesBySource[index]+=Bytes();
@@ -265,7 +278,7 @@ public:
     }
     bool Belongs(const std::shared_ptr<Session>& s) const { return session==s && handle; }
     void MarkEmoteAlpha() { emoteAlphaEligible=true; }
-    bool HasEmoteAlpha() const { return format==TVPTextureFormat::RGBA && handle && session->backend && !pinned && !writeLeased; }
+    bool HasEmoteAlpha() const { return format==TVPTextureFormat::RGBA && handle && session->backend && !pinned && !writeLeased && !scopedWrites; }
     std::shared_ptr<krkrsdl3::AsyncAlphaTile> DemandAlpha(int x,int y) {
         return alphaTiles.Demand(x,y,Width,Height);
     }
@@ -299,7 +312,7 @@ public:
     }
     TVPTextureFormat::e GetFormat() const override { return format; }
     tjs_int GetPitch() const override { return Width*(format==TVPTextureFormat::Gray ? 1 : 4); }
-    bool IsCPUResident() const override { return pinned || !handle; }
+    bool IsCPUResident() const override { return pinned || !handle || scopedWrites; }
     bool IsStatic() override { return readonly && !pinned; }
     bool IsOpaque() override { return false; }
     const void* GetScanLineForRead(tjs_uint y) override { Read(TVPLayerReadbackSource::Pixels); return pixels.data()+size_t(y)*GetPitch(); }
@@ -312,6 +325,13 @@ public:
     }
     void* LockCPURead() override { Read(TVPLayerReadbackSource::Lock); ++locks; return pixels.data(); }
     void UnlockCPU() override { if(locks) --locks; }
+    void* LockCPUWrite() override {
+        Read(TVPLayerReadbackSource::Pixels); ++locks; ++scopedWrites; return pixels.data();
+    }
+    void UnlockCPUWrite(const tTVPRect& written) override {
+        if(!scopedWrites) return;
+        MarkDirty(written); --scopedWrites; UnlockCPU();
+    }
     void MarkCPUModified() override { Read(TVPLayerReadbackSource::Fallback); MarkDirtyAll(); }
     void MarkCPUModified(const tTVPRect& written) override { Read(TVPLayerReadbackSource::Fallback); MarkDirty(written); }
     void InvalidateCPUCache() override {
@@ -335,6 +355,8 @@ public:
     void* GetPersistentCPUData(bool write) override {
         Read(TVPLayerReadbackSource::Persistent); if(!pinned) { pinned=true; ++session->stats.pinnedCPUTextures; }
         if(write) {
+            std::snprintf(rawWriteOrigin,sizeof(rawWriteOrigin),"%s",
+                std::strcmp(krkrsdl3::layer_work::source,"unattributed") ? krkrsdl3::layer_work::source : "script.rawWrite");
             if(!writeLeased) { leaseHadDamage=dirty; leaseDamage=damage; writeLeased=true; }
             MarkDirtyAll();
         }
@@ -370,17 +392,21 @@ public:
         if(!session->backend || !handle) return nullptr;
         // Only actual CPU writes need an upload. A pinned texture keeps its raw
         // pointer alive but is not itself a reason to re-send unchanged pixels.
-        if(dirty || writeLeased) {
-            if(writeLeased) MarkDirtyAll();
+        if(dirty || writeLeased || scopedWrites) {
+            if(writeLeased || scopedWrites) MarkDirtyAll();
             Read(TVPLayerReadbackSource::Pixels);
             const int bpp=format==TVPTextureFormat::Gray ? 1 : 4;
             const auto* source=pixels.data()+size_t(damage.top)*GetPitch()+size_t(damage.left)*bpp;
+            const auto started=krkrsdl3::layer_work::enabled.load(std::memory_order_relaxed) ? krkrsdl3::layer_work::Now() : 0;
             if(!session->backend->UpdateLayerTexture(handle,source,GetPitch(),Rect(damage)))
                 throw std::runtime_error("GPU Layer upload failed");
             // A caller may query then modify an outstanding CPU write pointer.
             // Samples taken while dirty cannot outlive uploading that damage.
             InvalidatePointCache(&damage,false,point_trace::Invalidation::CPUUpload,"cpu.upload");
             session->stats.uploadedBytes+=size_t(damage.get_width())*bpp*damage.get_height();
+            krkrsdl3::layer_work::Record(true,textureID,Width,Height,size_t(damage.get_width())*bpp*damage.get_height(),
+                started ? krkrsdl3::layer_work::Now()-started : 0,0,writeLeased || scopedWrites,
+                writeLeased ? rawWriteOrigin : uploadOrigin);
             dirty=false; leaseHadDamage=false;
         }
         return handle;
@@ -432,14 +458,18 @@ public:
         const auto* source=static_cast<const uint8_t*>(data)+size_t(r.top-requested.top)*pitch+
                            size_t(r.left-requested.left)*bpp;
         int bytes=r.get_width()*bpp;
-        if(pinned || dirty || !handle) {
+        if(pinned || dirty || locks || !handle) {
             Read(TVPLayerReadbackSource::Pixels); for(int y=0;y<r.get_height();++y)
                 std::memcpy(pixels.data()+size_t(y+r.top)*GetPitch()+r.left*bpp,source+size_t(y)*pitch,bytes);
             MarkDirty(r); return;
         }
+        const auto started=krkrsdl3::layer_work::enabled.load(std::memory_order_relaxed) ? krkrsdl3::layer_work::Now() : 0;
         if(!session->backend->UpdateLayerTexture(handle,source,pitch,Rect(r)))
             throw std::runtime_error("GPU Layer update failed");
         session->stats.uploadedBytes+=size_t(bytes)*r.get_height();
+        krkrsdl3::layer_work::Record(true,textureID,Width,Height,size_t(bytes)*r.get_height(),
+            started ? krkrsdl3::layer_work::Now()-started : 0,0,false,
+            std::strcmp(krkrsdl3::layer_work::source,"unattributed") ? krkrsdl3::layer_work::source : "bitmap.update");
         InvalidateCPUCacheRegion(r,false,point_trace::Invalidation::GPUUpdate,"texture.update");
     }
     uint32_t ReadPoint(int x,int y,bool alphaOnly) {
@@ -493,6 +523,8 @@ public:
                 const int index=static_cast<int>(TVPLayerReadbackSource::Point);
                 session->stats.readbackBytesBySource[index]+=bpp;
                 ++session->stats.readbackCountBySource[index];
+                krkrsdl3::layer_work::Record(false,textureID,Width,Height,bpp,trace.wallNS,trace.gpuWaitNS,
+                    false,"bitmap.point");
                 uint32_t value=0;
                 if(format==TVPTextureFormat::Gray) value=sample[0];
                 else std::memcpy(&value,sample.data(),4);
@@ -664,6 +696,12 @@ public:
             ++session->stats.gpuOperations; return true;
         }
         if(!method->DescribeGpuOperation(op)) return RejectMethod(TVPLayerGPURejectReason::UnsupportedMethod,method);
+        // ApplySelf copies the reference before converting, including after COW.
+        if(op.kind==TVPLayerOperationKind::AlphaToAdditiveAlpha && inputs.size()==0) {
+            if(!reference) return Reject(TVPLayerGPURejectReason::SourceUnavailable);
+            tRenderTexRectArray::Element input(reference,dst);
+            return GPU(method,target,nullptr,dst,tRenderTexRectArray(&input,1));
+        }
         if(op.kind==TVPLayerOperationKind::UnivTrans || op.kind==TVPLayerOperationKind::ConstAlphaSD)
             return RejectMethod(TVPLayerGPURejectReason::MultipleInputs,method,inputs.size());
         if(stretch<0 || stretch>2) return Reject(TVPLayerGPURejectReason::UnsupportedStretch);
@@ -672,6 +710,14 @@ public:
         if(inputs.size()) {
             source=dynamic_cast<LayerTexture*>(inputs[0].first); src=inputs[0].second;
             if(!source || !source->Belongs(session)) return Reject(TVPLayerGPURejectReason::SourceUnavailable);
+            const bool newBlend=op.kind==TVPLayerOperationKind::AdditiveAlpha ||
+                op.kind==TVPLayerOperationKind::PsMul || op.kind==TVPLayerOperationKind::PsOverlay ||
+                op.kind==TVPLayerOperationKind::PsHardLight;
+            // Offset self-blends are scanline-order dependent in software.
+            // A GPU snapshot would change them; same-pixel aliases are safe.
+            if(newBlend && source==t && (src.left!=dst.left || src.top!=dst.top ||
+                src.right!=dst.right || src.bottom!=dst.bottom))
+                return Reject(TVPLayerGPURejectReason::InvalidGeometry);
             if(op.kind==TVPLayerOperationKind::ColorMap) {
                 if(source->GetFormat()!=TVPTextureFormat::Gray) return Reject(TVPLayerGPURejectReason::SourceFormat);
             } else if(source->GetFormat()!=TVPTextureFormat::RGBA) {
@@ -691,7 +737,8 @@ public:
             }
         } else if(op.kind!=TVPLayerOperationKind::Fill && op.kind!=TVPLayerOperationKind::FillColor &&
                   op.kind!=TVPLayerOperationKind::FillMask && op.kind!=TVPLayerOperationKind::FillBlend &&
-                  op.kind!=TVPLayerOperationKind::RemoveConstOpacity) {
+                  op.kind!=TVPLayerOperationKind::RemoveConstOpacity &&
+                  op.kind!=TVPLayerOperationKind::AlphaToAdditiveAlpha) {
             return Reject(TVPLayerGPURejectReason::UnsupportedKind);
         }
         if(!session->tablesReady) {
@@ -708,10 +755,15 @@ public:
             !(op.flags&(TVP_LAYER_DEST_ALPHA|TVP_LAYER_DEST_PREMULTIPLIED));
         const bool preservesAlpha=op.kind==TVPLayerOperationKind::CopyColor ||
             op.kind==TVPLayerOperationKind::FillColor ||
+            (op.kind==TVPLayerOperationKind::AlphaToAdditiveAlpha && source==t) ||
             (plainHDA && (op.kind==TVPLayerOperationKind::Alpha ||
                           op.kind==TVPLayerOperationKind::ConstAlpha ||
                           op.kind==TVPLayerOperationKind::ColorMap ||
-                          op.kind==TVPLayerOperationKind::FillBlend));
+                          op.kind==TVPLayerOperationKind::FillBlend ||
+                          op.kind==TVPLayerOperationKind::AdditiveAlpha ||
+                          op.kind==TVPLayerOperationKind::PsMul ||
+                          op.kind==TVPLayerOperationKind::PsOverlay ||
+                          op.kind==TVPLayerOperationKind::PsHardLight));
         t->InvalidateCPUCacheRegion(dst,preservesAlpha); ++session->stats.gpuOperations; return true;
     }
     void OperateRect(iTVPRenderMethod* method,iTVPTexture2D* target,iTVPTexture2D* reference,const tTVPRect& dst,const tRenderTexRectArray& inputs) override {
@@ -731,6 +783,8 @@ public:
             if(fallbackDst.get_width()<=0 || fallbackDst.get_height()<=0) return;
         }
         CPUViews views; std::vector<std::pair<iTVPTexture2D*,tTVPRect>> textures;
+        krkrsdl3::layer_work::SourceScope source(method ? method->GetName().c_str() : "fallback.unnamed");
+        krkrsdl3::layer_work::StageScope software(krkrsdl3::layer_work::Stage::Software);
         auto* targetView=views.Get(target,TVPLayerFallbackReadbackRole::Target);
         auto* referenceView=views.Get(reference,TVPLayerFallbackReadbackRole::Reference);
         for(size_t i=0;i<inputs.size();++i) {
@@ -795,6 +849,8 @@ public:
     void OperateTriangles(iTVPRenderMethod* method,int count,iTVPTexture2D* target,iTVPTexture2D* reference,const tTVPRect& clip,const tTVPPointD* points,const tRenderTexQuadArray& inputs) override {
         if(GPUAffineCopy(method,count,target,clip,points,inputs)) return;
         Reject(TVPLayerGPURejectReason::Triangles);
+        krkrsdl3::layer_work::SourceScope source(method ? method->GetName().c_str() : "fallback.triangles");
+        krkrsdl3::layer_work::StageScope work(krkrsdl3::layer_work::Stage::Software);
         const bool profile=session && triangle_trace::Enabled();
         const auto start=profile ? TriangleClock::now() : TriangleClock::time_point{};
         uint64_t beforeBytes[static_cast<int>(TVPLayerFallbackReadbackRole::Count)] = {};
@@ -855,6 +911,8 @@ public:
     }
     void OperatePerspective(iTVPRenderMethod* method,int count,iTVPTexture2D* target,iTVPTexture2D* reference,const tTVPRect& clip,const tTVPPointD* points,const tRenderTexQuadArray& inputs) override {
         Reject(TVPLayerGPURejectReason::Perspective);
+        krkrsdl3::layer_work::SourceScope source(method ? method->GetName().c_str() : "fallback.perspective");
+        krkrsdl3::layer_work::StageScope work(krkrsdl3::layer_work::Stage::Software);
         CPUViews views; std::vector<std::pair<iTVPTexture2D*,const tTVPPointD*>> textures;
         auto* targetView=views.Get(target,TVPLayerFallbackReadbackRole::Target);
         auto* referenceView=views.Get(reference,TVPLayerFallbackReadbackRole::Reference);
@@ -869,6 +927,7 @@ LayerManager& Manager() { static auto* manager=new LayerManager; return *manager
 bool TVPBindMetalLayerRenderManager(krkrsdl3::iTVPRenderBackend* backend) {
     TVPUnbindMetalLayerRenderManager();
     fallbackReason.clear();
+    if(krkrsdl3::layer_work::enabled.load(std::memory_order_relaxed)) krkrsdl3::layer_work::SetEnabled(true);
     if(!backend || !backend->SupportsLayerOperations()) {
         fallbackReason="ordinary Layer pipeline unavailable"; return false;
     }

@@ -1,4 +1,5 @@
 #include "tjsCommHead.h"
+#include "LayerWorkDiagnostics.h"
 #include "TVPEvent.h"
 
 #include "TVPSystem.h"
@@ -1042,6 +1043,7 @@ void TVPRemoveCompactEventHook(tTVPCompactEventCallbackIntf* cb)
 extern void TVPDoSaveSystemVariables();
 void TVPDeliverCompactEvent(tjs_int level)
 {
+    krkrsdl3::layer_work::StageScope stage(krkrsdl3::layer_work::Stage::Compact);
     // must be called by each platforms's implementation
     // std::vector<tTVPCompactEventCallbackIntf *>::iterator i;
     if (TVPCompactEventVector.size())

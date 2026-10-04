@@ -10,6 +10,7 @@
 //---------------------------------------------------------------------------
 
 #include "tjsCommHead.h"
+#include "LayerWorkDiagnostics.h"
 
 #include "TVPGraphicsLoader.h"
 
@@ -1285,6 +1286,8 @@ int TVPLoadGraphic(iTVPBaseBitmap* dest,
                    ttstr* provincename,
                    iTJSDispatch2** metainfo)
 {
+    krkrsdl3::layer_work::SourceScope source("image.load");
+    krkrsdl3::layer_work::StageScope stage(krkrsdl3::layer_work::Stage::ResourceLoad);
     std::lock_guard<std::recursive_mutex> lock(TVPGraphicCacheMutex);
     // loading with cache management
     ttstr nname = TVPNormalizeStorageName(name);

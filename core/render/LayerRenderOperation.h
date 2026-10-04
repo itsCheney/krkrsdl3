@@ -6,7 +6,8 @@ enum class TVPLayerOperationKind : uint32_t
 {
     Unsupported, Copy, CopyColor, CopyMask, CopyOpaque, Fill, FillColor,
     FillMask, Alpha, ConstAlpha, ColorMap, FillBlend, RemoveConstOpacity,
-    ConstAlphaSD, UnivTrans
+    ConstAlphaSD, UnivTrans, AdditiveAlpha, PsMul, PsOverlay, PsHardLight,
+    AlphaToAdditiveAlpha
 };
 enum TVPLayerOperationFlags : uint32_t
 {

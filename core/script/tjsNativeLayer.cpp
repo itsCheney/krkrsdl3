@@ -2980,6 +2980,13 @@ const void* tTJSNI_BaseLayer::GetMainImagePixelBuffer() const
     return MainImage->GetTexture()->GetPersistentCPUData(false);
 }
 //---------------------------------------------------------------------------
+iTVPTexture2D* tTJSNI_BaseLayer::GetMainImageTextureForCPUAccess(bool write)
+{
+    if(!MainImage) return nullptr;
+    if(write) { ImageModified=true; return MainImage->GetTextureForRender(true,nullptr); }
+    return MainImage->GetTexture();
+}
+//---------------------------------------------------------------------------
 void* tTJSNI_BaseLayer::GetMainImagePixelBufferForWrite()
 {
     if (!MainImage)

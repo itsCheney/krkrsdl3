@@ -95,6 +95,62 @@ kernel void affineCopyLayer(uint2 tid [[thread_position_in_grid]],
     // Software Copy replaces the full clip, including transparent warp border.
     target.write(float4(result)/255.0,uint2(xy));
 }
+uint layerPack(int4 c) {
+    return (uint(c.r) & 255u) | ((uint(c.g) & 255u) << 8) |
+           ((uint(c.b) & 255u) << 16) | ((uint(c.a) & 255u) << 24);
+}
+int4 layerUnpack(uint c) {
+    return int4(int(c & 255u), int((c >> 8) & 255u),
+                int((c >> 16) & 255u), int((c >> 24) & 255u));
+}
+// Packed unsigned formulas preserve tvpgl's byte rounding and wraparound.
+// These helpers are also extracted verbatim for portable software parity tests.
+uint layerPremulPixel(uint d, uint s, int opa, uint flags) {
+    if (opa != 255) {
+        s = (((s & 0xff00ffu) * uint(opa) >> 8) & 0xff00ffu) +
+            (((s >> 8) & 0xff00ffu) * uint(opa) & 0xff00ff00u);
+    }
+    uint sa = s >> 24, result = 0;
+    for (uint shift = 0; shift < 24; shift += 8) {
+        uint color = min(255u, ((s >> shift) & 255u) +
+                         ((((d >> shift) & 255u) * (255u - sa)) >> 8));
+        result |= color << shift;
+    }
+    uint da = d >> 24;
+    uint alpha = (flags & 1u) != 0 ? da : da + sa - ((da * sa) >> 8);
+    if ((flags & 1u) == 0) alpha -= alpha >> 8;
+    return result | (alpha << 24);
+}
+uint layerPsPixel(uint d, uint s, int kind, int opa, uint flags) {
+    uint alpha = s >> 24;
+    if (opa != 255) alpha = (alpha * uint(opa)) >> 8;
+    if (kind == 16) {
+        s = (((((d >> 16) & 255u) * (s & 0x00ff0000u)) & 0xff000000u) |
+             ((((d >> 8) & 255u) * (s & 0x0000ff00u)) & 0x00ff0000u) |
+             (((d & 255u) * (s & 255u)))) >> 8;
+    } else {
+        uint blended = 0;
+        for (uint shift = 0; shift < 24; shift += 8) {
+            uint dc = (d >> shift) & 255u, sc = (s >> shift) & 255u;
+            if (kind == 18) { uint swap = dc; dc = sc; sc = swap; }
+            // Production software enables TVPPS_USE_OVERLAY_TABLE: divide by
+            // 255, rather than the approximate >>7 non-table implementation.
+            uint product = sc * dc * 2u / 255u;
+            uint color = dc < 128u ? product : (sc + dc) * 2u - product - 255u;
+            blended |= color << shift;
+        }
+        s = blended;
+    }
+    uint rb = d & 0x00ff00ffu, g = d & 0x0000ff00u;
+    uint result = (((((s & 0x00ff00ffu) - rb) * alpha) >> 8) + rb) & 0x00ff00ffu;
+    result |= (((((s & 0x0000ff00u) - g) * alpha) >> 8) + g) & 0x0000ff00u;
+    return result | ((flags & 1u) != 0 ? d & 0xff000000u : 0u);
+}
+uint layerAlphaToPremulPixel(uint d) {
+    uint alpha = d >> 24;
+    return (((((d & 0x00ff00u) * alpha) & 0x00ff0000u) +
+             (((d & 0xff00ffu) * alpha) & 0xff00ff00u)) >> 8) + (d & 0xff000000u);
+}
 kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
                           constant LayerParameters& p [[buffer(0)]],
                           const device uchar* tables [[buffer(1)]],
@@ -111,7 +167,7 @@ kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
     bool hold = (flags & 1) != 0, straightDestination = (flags & 2) != 0;
     bool premultipliedDestination = (flags & 4) != 0;
     bool full = opa == 255 && (flags & 8) != 0;
-    bool overwrite = kind == 1 || kind == 4 || kind == 5;
+    bool overwrite = kind == 1 || kind == 4 || kind == 5 || kind == 19;
     int4 d = int4(0), s = int4(0), color = p.color, result = int4(0);
     if (!overwrite) {
 #ifdef TVP_LAYER_IN_PLACE
@@ -122,7 +178,8 @@ kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
         d = layerBytes(snapshot, xy - p.clip.xy);
 #endif
     }
-    if (kind < 5 || (kind >= 8 && kind <= 10)) s = layerSample(source, p, xy);
+    if (kind < 5 || (kind >= 8 && kind <= 10) || (kind >= 15 && kind <= 19))
+        s = layerSample(source, p, xy);
     switch (kind) {
         case 1: result = s; break;
         case 2: result = int4(s.rgb, d.a); break;
@@ -162,6 +219,17 @@ kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
             // software byte formula A * (255 - strength) >> 8.
             result = int4(d.rgb, (d.a * (255 - opa)) >> 8);
             break;
+        case 15:
+            result = layerUnpack(layerPremulPixel(layerPack(d), layerPack(s), opa, uint(flags)));
+            break;
+        case 16:
+        case 17:
+        case 18:
+            result = layerUnpack(layerPsPixel(layerPack(d), layerPack(s), kind, opa, uint(flags)));
+            break;
+        case 19:
+            result = layerUnpack(layerAlphaToPremulPixel(layerPack(s)));
+            break;
     }
     target.write(float4(result & int4(255)) / 255.0, uint2(xy));
 }
@@ -170,14 +238,6 @@ struct DualLayerParameters {
     int4 destination, source1, source2, clip;
     int4 operation; // kind, opacity, flags, reserved
 };
-uint layerPack(int4 c) {
-    return (uint(c.r) & 255u) | ((uint(c.g) & 255u) << 8) |
-           ((uint(c.b) & 255u) << 16) | ((uint(c.a) & 255u) << 24);
-}
-int4 layerUnpack(uint c) {
-    return int4(int(c & 255u), int((c >> 8) & 255u),
-                int((c >> 16) & 255u), int((c >> 24) & 255u));
-}
 uint constAlphaSD(uint s1, uint s2, uint opa) {
     uint rb = s1 & 0x00ff00ffu;
     rb = (rb + ((((s2 & 0x00ff00ffu) - rb) * opa) >> 8)) & 0x00ff00ffu;
