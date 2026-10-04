@@ -15,6 +15,7 @@
 #include "PointReadTrace.h"
 #include "TVPMsg.h"
 #include "LayerBitmap.h"
+#include "RenderManager.h"
 #include "TVPStorage.h"
 #include "TVPEvent.h"
 #include "TVPSystem.h"
