@@ -1586,29 +1586,33 @@ bool MetalRenderBackend::RequestLayerTextureRegionRead(void* handle, const TVPLa
              sourceSize:MTLSizeMake(region.Width(), region.Height(), 1)
              toBuffer:staging destinationOffset:0 destinationBytesPerRow:rowBytes destinationBytesPerImage:bytes];
         [encoder endEncoding];
+        // Objective-C blocks capture C++ reference variables as references.
+        // Both API arguments may be temporaries or short-lived caller locals.
+        const TVPLayerRect readRegion = region;
+        const std::shared_ptr<AsyncLayerReadback> result = request;
         [p.Commands() addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
             if (buffer.status == MTLCommandBufferStatusCompleted &&
-                !request->canceled.load(std::memory_order_acquire)) {
-                const int pitch = region.Width() * 4;
+                !result->canceled.load(std::memory_order_acquire)) {
+                const int pitch = readRegion.Width() * 4;
                 try {
-                    request->rgba.resize(size_t(pitch) * region.Height());
-                    for (int y = 0; y < region.Height(); ++y)
-                        std::memcpy(request->rgba.data() + size_t(y) * pitch,
+                    result->rgba.resize(size_t(pitch) * readRegion.Height());
+                    for (int y = 0; y < readRegion.Height(); ++y)
+                        std::memcpy(result->rgba.data() + size_t(y) * pitch,
                                     static_cast<const uint8_t*>(staging.contents) + size_t(y) * rowBytes,
                                     size_t(pitch));
-                    request->pitch = pitch;
+                    result->pitch = pitch;
                 } catch (...) {
-                    request->failed.store(true, std::memory_order_relaxed);
+                    result->failed.store(true, std::memory_order_relaxed);
                 }
             } else if (buffer.status != MTLCommandBufferStatusCompleted) {
-                request->failed.store(true, std::memory_order_relaxed);
-                if (request->presentation) request->presentation->failed.store(true, std::memory_order_release);
+                result->failed.store(true, std::memory_order_relaxed);
+                if (result->presentation) result->presentation->failed.store(true, std::memory_order_release);
             }
             // A completed command buffer may retain its handler object. Drop
             // the handler's strong staging reference after CPU copying, before
             // publishing completion; its bytes can never outlive the lease.
             staging = nil;
-            request->completed.store(true, std::memory_order_release);
+            result->completed.store(true, std::memory_order_release);
         }];
         // No Submit(), queue wait or waitUntilCompleted is introduced here.
         // The ordinary frame flush owns submission and presentation cadence.
