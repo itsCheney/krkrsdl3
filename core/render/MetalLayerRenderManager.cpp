@@ -711,7 +711,10 @@ public:
         }
         if(op.kind==TVPLayerOperationKind::UnivTrans || op.kind==TVPLayerOperationKind::ConstAlphaSD)
             return RejectMethod(TVPLayerGPURejectReason::MultipleInputs,method,inputs.size());
-        if(stretch<0 || stretch>2) return Reject(TVPLayerGPURejectReason::UnsupportedStretch);
+        // Ordinary software rectangles ignore the filter for 1:1 operations,
+        // and map cubic/higher positive values to ResizeRGBA's bilinear path.
+        // Affine/triangle filters have a separate, stricter contract below.
+        if(stretch<0) return Reject(TVPLayerGPURejectReason::UnsupportedStretch);
         if(op.opacity<0 || op.opacity>255) return Reject(TVPLayerGPURejectReason::InvalidOpacity);
         LayerTexture* source=nullptr; tTVPRect src(0,0,1,1);
         if(inputs.size()) {
@@ -719,7 +722,9 @@ public:
             if(!source || !source->Belongs(session)) return Reject(TVPLayerGPURejectReason::SourceUnavailable);
             const bool newBlend=op.kind==TVPLayerOperationKind::AdditiveAlpha ||
                 op.kind==TVPLayerOperationKind::PsMul || op.kind==TVPLayerOperationKind::PsOverlay ||
-                op.kind==TVPLayerOperationKind::PsHardLight || op.kind==TVPLayerOperationKind::MultiplyAlpha;
+                op.kind==TVPLayerOperationKind::PsHardLight || op.kind==TVPLayerOperationKind::MultiplyAlpha ||
+                op.kind==TVPLayerOperationKind::PsScreen || op.kind==TVPLayerOperationKind::PsColorDodge5 ||
+                op.kind==TVPLayerOperationKind::Add;
             // Offset self-blends are scanline-order dependent in software.
             // A GPU snapshot would change them; same-pixel aliases are safe.
             if(newBlend && source==t && (src.left!=dst.left || src.top!=dst.top ||
@@ -775,7 +780,10 @@ public:
                           op.kind==TVPLayerOperationKind::AdditiveAlpha ||
                           op.kind==TVPLayerOperationKind::PsMul ||
                           op.kind==TVPLayerOperationKind::PsOverlay ||
-                          op.kind==TVPLayerOperationKind::PsHardLight));
+                          op.kind==TVPLayerOperationKind::PsHardLight ||
+                          op.kind==TVPLayerOperationKind::PsScreen ||
+                          op.kind==TVPLayerOperationKind::PsColorDodge5 ||
+                          op.kind==TVPLayerOperationKind::Add));
         t->InvalidateCPUCacheRegion(dst,preservesAlpha); ++session->stats.gpuOperations; return true;
     }
     void OperateRect(iTVPRenderMethod* method,iTVPTexture2D* target,iTVPTexture2D* reference,const tTVPRect& dst,const tRenderTexRectArray& inputs) override {

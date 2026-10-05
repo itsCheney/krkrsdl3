@@ -32,7 +32,7 @@ public:
     ~SourceScope() { source=previous; }
 };
 enum class Stage { ResourceLoad, AMVDecode, Script, GC, Compact, Software,
-    ImageLoad, ImageDecode, ImageCacheHit, ScriptStorage, Count };
+    ImageLoad, ImageDecode, ImageCacheHit, ScriptStorage, ImageResolve, ImageOpen, ImageCodec, Count };
 struct Timing { uint64_t calls=0, ns=0, maxNS=0; };
 struct Transfer {
     bool upload=false, leased=false;
@@ -107,7 +107,7 @@ inline Summary Take() {
       const auto now=Now(); out.intervalNS=started ? now-started : 0; started=now; }
     out.decodedFrames=captured.decodedFrames; out.decodedBytes=captured.decodedBytes;
     constexpr const char* names[]={"resourceLoad","amvDecode","script","gc","compact","software",
-        "imageLoad","imageDecode","imageCacheHit","scriptStorage"};
+        "imageLoad","imageDecode","imageCacheHit","scriptStorage","imageResolve","imageOpen","imageCodec"};
     for(size_t i=0;i<captured.stages.size();++i) {
         const auto& t=captured.stages[i];
         if(i) out.stages+=',';

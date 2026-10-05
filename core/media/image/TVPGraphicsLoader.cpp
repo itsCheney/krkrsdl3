@@ -31,6 +31,7 @@
 #include "tjsNativeLayer.h"
 
 #include <mutex>
+#include <SDL3/SDL.h>
 
 //---------------------------------------------------------------------------
 // default handlers
@@ -1097,9 +1098,17 @@ static tTVPBitmap* TVPInternalLoadBitmap(const ttstr& _name,
     // size graphic.
 
     ttstr name(_name), maskname;
-    TVPNormalizeGraphicNames(name, &maskname, mode == glmNormal ? provincename : nullptr);
-    tTVPStreamHolder holder(name); // open a storage named "name"
-    tTVPRegisterGraphicInfo* handler = TVPGraphicType.QuickTest(holder.Get());
+    {
+        krkrsdl3::layer_work::StageScope resolve(krkrsdl3::layer_work::Stage::ImageResolve);
+        TVPNormalizeGraphicNames(name, &maskname, mode == glmNormal ? provincename : nullptr);
+    }
+    tTVPStreamHolder holder;
+    tTVPRegisterGraphicInfo* handler;
+    {
+        krkrsdl3::layer_work::StageScope open(krkrsdl3::layer_work::Stage::ImageOpen);
+        holder.Open(name);
+        handler=TVPGraphicType.QuickTest(holder.Get());
+    }
     if (!handler)
         TVPThrowExceptionMessage(TVPImageLoadError, TJS_N("Invalid image"));
 
@@ -1129,9 +1138,28 @@ static tTVPBitmap* TVPInternalLoadBitmap(const ttstr& _name,
         keyidx = -1;
     }
 
+    const bool measure=krkrsdl3::layer_work::enabled.load(std::memory_order_relaxed);
+    const uint64_t codecStart=measure ? krkrsdl3::layer_work::Now() : 0;
+    {
+    krkrsdl3::layer_work::StageScope codec(krkrsdl3::layer_work::Stage::ImageCodec);
     handler->Load(handler->FormatData, (void*)&data, TVPLoadGraphic_SizeCallback,
                   TVPLoadGraphic_ScanLineCallback, TVPLoadGraphic_MetaInfoPushCallback,
                   holder.Get(), keyidx, mode);
+    }
+    if(measure) {
+        const uint64_t elapsed=krkrsdl3::layer_work::Now()-codecStart;
+        // Bounded slow-resource attribution; no per-image output when disabled.
+        static thread_local uint64_t window=0;
+        static thread_local unsigned reported=0;
+        if(codecStart-window>=1000000000ULL) { window=codecStart; reported=0; }
+        if(data.Dest && elapsed>=16000000ULL && reported<8) {
+            ++reported;
+            const auto asset=TVPExtractStorageName(name).AsStdString();
+            const auto format=handler->id.AsStdString();
+            SDL_Log("image.codecSlow format=%.32s asset=%.160s width=%u height=%u wallMS=%.3f",
+                format.c_str(),asset.c_str(),data.Dest->GetWidth(),data.Dest->GetHeight(),double(elapsed)/1000000.0);
+        }
+    }
 
     *MetaInfo = data.MetaInfo;
 
@@ -1147,8 +1175,11 @@ static tTVPBitmap* TVPInternalLoadBitmap(const ttstr& _name,
     if (!maskname.IsEmpty())
     {
         // open the mask file
-        holder.Open(maskname);
-        handler = TVPGraphicType.QuickTest(holder.Get());
+        {
+            krkrsdl3::layer_work::StageScope open(krkrsdl3::layer_work::Stage::ImageOpen);
+            holder.Open(maskname);
+            handler = TVPGraphicType.QuickTest(holder.Get());
+        }
 
         // fill "data"'s member
         data.Type = lgtMask;
@@ -1161,6 +1192,7 @@ static tTVPBitmap* TVPInternalLoadBitmap(const ttstr& _name,
         try
         {
             // load image via handler
+            krkrsdl3::layer_work::StageScope codec(krkrsdl3::layer_work::Stage::ImageCodec);
             handler->Load(handler->FormatData, (void*)&data, TVPLoadGraphic_SizeCallback,
                           TVPLoadGraphic_ScanLineCallback, NULL, holder.Get(), -1, glmGrayscale);
         }

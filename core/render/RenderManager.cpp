@@ -2745,6 +2745,9 @@ void iTVPRenderManager::RegisterRenderMethod(const char* name, iTVPRenderMethod*
         {"PsMulBlend", K::PsMul, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
         {"PsOverlayBlend", K::PsOverlay, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
         {"PsHardLightBlend", K::PsHardLight, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsScreenBlend", K::PsScreen, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsColorDodge5Blend", K::PsColorDodge5, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"AddBlend", K::Add, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
         {"AlphaToAdditiveAlpha", K::AlphaToAdditiveAlpha, 0, false},
         {"DoGrayScale", K::GrayScale, 0, false},
         {"CopyBlueToAlpha", K::CopyBlueToAlpha, 0, false},
@@ -3198,7 +3201,7 @@ public:
         {
             case eParameters::StretchType:
                 StretchType = (tTVPBBStretchType)Value;
-                if (StretchType > sizeof(stretchMode) / sizeof(stretchMode[0]))
+                if (StretchType >= sizeof(stretchMode) / sizeof(stretchMode[0]))
                 {
                     StretchType = (tTVPBBStretchType)(sizeof(stretchMode) / sizeof(stretchMode[0]) - 1);
                 }

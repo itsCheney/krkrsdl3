@@ -124,6 +124,19 @@ uint layerPremulPixel(uint d, uint s, int opa, uint flags) {
 uint layerPsPixel(uint d, uint s, int kind, int opa, uint flags) {
     uint alpha = s >> 24;
     if (opa != 255) alpha = (alpha * uint(opa)) >> 8;
+    if (kind == 24 || kind == 25) {
+        uint result=0;
+        for(uint shift=0;shift<24;shift+=8) {
+            uint dc=(d>>shift)&255u, sc=(s>>shift)&255u, color;
+            if(kind==24) color=dc+(((sc-((dc*sc)>>8))*alpha)>>8);
+            else {
+                sc=(sc*alpha)>>8;
+                color=255u-sc<=dc ? 255u : dc*255u/(255u-sc);
+            }
+            result|=color<<shift;
+        }
+        return result | ((flags & 1u)!=0 ? d & 0xff000000u : 0u);
+    }
     if (kind == 16) {
         s = (((((d >> 16) & 255u) * (s & 0x00ff0000u)) & 0xff000000u) |
              ((((d >> 8) & 255u) * (s & 0x0000ff00u)) & 0x00ff0000u) |
@@ -151,6 +164,17 @@ uint layerAlphaToPremulPixel(uint d) {
     return (((((d & 0x00ff00u) * alpha) & 0x00ff0000u) +
              (((d & 0xff00ffu) * alpha) & 0xff00ff00u)) >> 8) + (d & 0xff000000u);
 }
+uint layerAddPixel(uint d,uint s,int opa,uint flags) {
+    uint result=0;
+    for(uint shift=0;shift<24;shift+=8) {
+        uint sc=(s>>shift)&255u;
+        if(opa!=255) sc=(sc*uint(opa))>>8;
+        result|=min(255u,((d>>shift)&255u)+sc)<<shift;
+    }
+    uint alpha=d>>24;
+    if(opa==255 && (flags&1u)==0) alpha=min(255u,alpha+(s>>24));
+    return result | (alpha<<24);
+}
 uint layerMaskPixel(uint d, uint s, int kind) {
     if (kind == 20) {
         uint gray = ((s & 255u) * 19u + ((s >> 8) & 255u) * 183u + ((s >> 16) & 255u) * 54u) >> 8;
@@ -160,35 +184,11 @@ uint layerMaskPixel(uint d, uint s, int kind) {
     if (kind == 22) { uint product = (d >> 24) * (s >> 24); alpha = (product + (product >> 7)) >> 8; }
     return (d & 0xffffffu) | (alpha << 24);
 }
-kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
-                          constant LayerParameters& p [[buffer(0)]],
-                          const device uchar* tables [[buffer(1)]],
-                          texture2d<float, access::read> source [[texture(0)]],
-                          texture2d<float, access::read> snapshot [[texture(1)]],
-#ifdef TVP_LAYER_IN_PLACE
-                          texture2d<float, access::read_write> target [[texture(2)]]) {
-#else
-                          texture2d<float, access::write> target [[texture(2)]]) {
-#endif
-    int2 xy = p.clip.xy + int2(tid);
-    if (any(xy >= p.clip.zw)) return;
-    int kind = p.operation.x, opa = p.operation.y, flags = p.operation.z;
-    bool hold = (flags & 1) != 0, straightDestination = (flags & 2) != 0;
-    bool premultipliedDestination = (flags & 4) != 0;
-    bool full = opa == 255 && (flags & 8) != 0;
-    bool overwrite = kind == 1 || kind == 4 || kind == 5 || kind == 19 || kind == 20;
-    int4 d = int4(0), s = int4(0), color = p.color, result = int4(0);
-    if (!overwrite) {
-#ifdef TVP_LAYER_IN_PLACE
-        // Each thread snapshots only its own pixel in registers. Source aliases
-        // are copied separately before dispatch; no neighboring target is read.
-        d = int4(round(target.read(uint2(xy)) * 255.0));
-#else
-        d = layerBytes(snapshot, xy - p.clip.xy);
-#endif
-    }
-    if (kind < 5 || (kind >= 8 && kind <= 10) || (kind >= 15 && kind <= 22))
-        s = layerSample(source, p, xy);
+int4 layerPixel(int4 d,int4 s,int4 color,int kind,int opa,int flags,const device uchar* tables) {
+    bool hold=(flags&1)!=0, straightDestination=(flags&2)!=0;
+    bool premultipliedDestination=(flags&4)!=0;
+    bool full=opa==255 && (flags&8)!=0;
+    int4 result=int4(0);
     switch (kind) {
         case 1: result = s; break;
         case 2: result = int4(s.rgb, d.a); break;
@@ -234,7 +234,12 @@ kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
         case 16:
         case 17:
         case 18:
+        case 24:
+        case 25:
             result = layerUnpack(layerPsPixel(layerPack(d), layerPack(s), kind, opa, uint(flags)));
+            break;
+        case 26:
+            result = layerUnpack(layerAddPixel(layerPack(d), layerPack(s), opa, uint(flags)));
             break;
         case 19:
             result = layerUnpack(layerAlphaToPremulPixel(layerPack(s)));
@@ -245,8 +250,60 @@ kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
             result = layerUnpack(layerMaskPixel(layerPack(d), layerPack(s), kind));
             break;
     }
-    target.write(float4(result & int4(255)) / 255.0, uint2(xy));
+    return result & int4(255);
 }
+kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
+                          constant LayerParameters& p [[buffer(0)]],
+                          const device uchar* tables [[buffer(1)]],
+                          texture2d<float, access::read> source [[texture(0)]],
+                          texture2d<float, access::read> snapshot [[texture(1)]],
+#ifdef TVP_LAYER_IN_PLACE
+                          texture2d<float, access::read_write> target [[texture(2)]]) {
+#else
+                          texture2d<float, access::write> target [[texture(2)]]) {
+#endif
+    int2 xy = p.clip.xy + int2(tid);
+    if (any(xy >= p.clip.zw)) return;
+    int kind = p.operation.x, opa = p.operation.y, flags = p.operation.z;
+    bool overwrite = kind == 1 || kind == 4 || kind == 5 || kind == 19 || kind == 20;
+    int4 d = int4(0), s = int4(0), color = p.color;
+    if (!overwrite) {
+#ifdef TVP_LAYER_IN_PLACE
+        // Each thread snapshots only its own pixel in registers. Source aliases
+        // are copied separately before dispatch; no neighboring target is read.
+        d = int4(round(target.read(uint2(xy)) * 255.0));
+#else
+        d = layerBytes(snapshot, xy - p.clip.xy);
+#endif
+    }
+    if (kind < 5 || (kind >= 8 && kind <= 10) || (kind >= 15 && kind <= 26))
+        s = layerSample(source, p, xy);
+    int4 result=layerPixel(d,s,color,kind,opa,flags,tables);
+    target.write(float4(result) / 255.0,uint2(xy));
+}
+#ifdef TVP_LAYER_FRAMEBUFFER_FETCH
+struct LayerRasterVertex { float4 position [[position]]; };
+struct LayerRasterColor { float4 value [[color(0), raster_order_group(0)]]; };
+vertex LayerRasterVertex ordinaryLayerVertex(uint id [[vertex_id]],
+    constant LayerParameters& p [[buffer(0)]],constant int2& targetSize [[buffer(1)]]) {
+    int2 corner=int2(int(id&1),int(id>>1));
+    float2 xy=float2(select(p.clip.xy,p.clip.zw,bool2(corner)));
+    float2 position=xy/float2(targetSize)*2.0-1.0;
+    return {float4(position.x,-position.y,0,1)};
+}
+fragment LayerRasterColor ordinaryLayerFragment(LayerRasterVertex in [[stage_in]],
+    float4 previous [[color(0), raster_order_group(0)]],
+    constant LayerParameters& p [[buffer(0)]],const device uchar* tables [[buffer(1)]],
+    texture2d<float,access::read> source [[texture(0)]]) {
+    int2 xy=int2(in.position.xy);
+    int kind=p.operation.x;
+    int4 s=int4(0);
+    if(kind<5 || (kind>=8 && kind<=10) || (kind>=15 && kind<=26)) s=layerSample(source,p,xy);
+    int4 d=int4(round(previous*255.0));
+    return {float4(layerPixel(d,s,p.color,kind,p.operation.y,p.operation.z,tables))/255.0};
+}
+#endif
+
 
 // The active software BoxFilterRGBA averages each byte with integer division.
 // Sliding sums preserve that result without CPU readback or radius-dependent

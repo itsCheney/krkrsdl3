@@ -19,6 +19,15 @@ struct Workload
     uint32_t renderEncoders = 0, computeEncoders = 0, blitEncoders = 0;
     uint32_t meshDraws = 0, deformDraws = 0, maskedDraws = 0, clears = 0;
     uint32_t layerDispatches = 0, windowDraws = 0;
+    uint32_t rectCalls=0, tileDraws=0;
+    uint64_t rectPixels=0, scaledPixels=0, aliasPixels=0, blurPixels=0;
+    uint64_t pixelsByKind[27]{};
+    void Rect(int kind,uint64_t pixels,bool scaled,bool alias,bool tile) {
+        ++rectCalls; tileDraws+=tile; rectPixels+=pixels;
+        if(scaled) scaledPixels+=pixels; if(alias) aliasPixels+=pixels;
+        if(kind==23) blurPixels+=pixels;
+        if(kind>=0 && kind<27) pixelsByKind[kind]+=pixels;
+    }
     const char* Bucket() const
     {
         switch (stages) {
@@ -54,6 +63,8 @@ public:
     bool IsHardware() const override { return true; }
     void FetchInfo() override;
     bool SupportsLayerOperations() const override;
+    bool SupportsLayerTileRendering() const;
+    bool IsLayerTileRenderingActive() const;
     bool SetLayerAlphaTables(const uint8_t*, const uint8_t*) override;
     void* CreateLayerTexture(int, int, TVPLayerTextureFormat) override;
     void DestroyLayerTexture(void*) override;
