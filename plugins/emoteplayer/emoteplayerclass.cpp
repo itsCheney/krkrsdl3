@@ -508,9 +508,41 @@ void ResourceManager::setEmotePSBDecryptSeed(tjs_int decryptkey)
 }
 void ResourceManager::setEmotePSBDecryptFunc(tTJSVariant funclosure)
 {
+    // AsObjectClosure adds references. Acquire the replacement before releasing
+    // the old closure, including when a script reinstalls the same callback.
+    auto previous = _decryptClo;
     _decryptClo = funclosure.AsObjectClosure();
+    previous.Release();
     // Reinstalling the same closure can accompany a change in its script state.
     ClearSharedEmoteResourceCache("decryptFunc");
+}
+
+void ResourceManager::ResetSession()
+{
+    if (_motionWorkLayer || _kagWindow || _decryptClo.Object || _decryptClo.ObjThis)
+        TVPConsoleLog("emote.sessionReset workLayer=%d window=%d callback=%d context=%d",
+                      _motionWorkLayer ? 1 : 0, _kagWindow ? 1 : 0,
+                      _decryptClo.Object ? 1 : 0, _decryptClo.ObjThis ? 1 : 0);
+    // Clear borrowed identities before releasing anything: native Layer
+    // invalidation can release the last reference to the adaptor itself.
+    auto* workLayer = _motionWorkLayer;
+    _motionWorkLayer = nullptr;
+    _kagWindow = nullptr;
+    auto callback = _decryptClo;
+    _decryptClo = tTJSVariantClosure(nullptr);
+    _decryptkey = 0;
+    Motion::setEnableD3D(false);
+    if (workLayer) {
+        workLayer->AddRef();
+        workLayer->clear();
+        workLayer->Release();
+    }
+    callback.Release();
+}
+
+void ResetEmotePlayerSession()
+{
+    ResourceManager::ResetSession();
 }
 
 SeparateLayerAdaptor::SeparateLayerAdaptor(iTJSDispatch2* targetLayer)
@@ -537,6 +569,7 @@ SeparateLayerAdaptor::SeparateLayerAdaptor(iTJSDispatch2* targetLayer)
 }
 SeparateLayerAdaptor::~SeparateLayerAdaptor()
 {
+    if (_motionWorkLayer == this) _motionWorkLayer = nullptr;
     clear();
 }
 void SeparateLayerAdaptor::assign(iTJSDispatch2* anotherAdaptor)

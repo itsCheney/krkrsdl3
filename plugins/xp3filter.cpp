@@ -8,6 +8,7 @@
 #include "TVPSystem.h"
 #include "TVPMsg.h"
 #include "PlatformThread.h"
+#include "Platform.h"
 #include "PlatformMutex.h"
 #include "TextStream.h"
 #include <memory>
@@ -329,6 +330,12 @@ struct XP3FilterDecoder
     XP3FilterDecoder() : ManagedDecoder(nullptr), ManagedFilter(nullptr) {}
     ~XP3FilterDecoder()
     {
+        // Closures own references outside the helper VM's global object.
+        // Release them while the VM is alive, including their bound context.
+        auto decoder = ManagedDecoder, filter = ManagedFilter;
+        ManagedDecoder = ManagedFilter = tTJSVariantClosure(nullptr);
+        decoder.Release();
+        filter.Release();
         if (ScriptEngine)
             delete ScriptEngine;
     }
@@ -457,6 +464,30 @@ static XP3FilterDecoder* AddXP3Decoder()
 static std::map<uint64_t, XP3FilterDecoder*> _thread_decoders;
 static tTJSCriticalSection _decoders_mtx;
 static std::vector<XP3FilterDecoder*> _cached_decoders;
+static void ClearXP3Decoders()
+{
+    _ManagedDecoderInited = _ManagedFilterInited = false;
+    // Remove identities before running any script/native finalizers.
+    auto active = std::move(_thread_decoders);
+    auto cached = std::move(_cached_decoders);
+    _thread_decoders.clear();
+    _cached_decoders.clear();
+    for (auto& item : active) delete item.second;
+    for (auto* decoder : cached) delete decoder;
+}
+
+void TVPResetXP3FilterSession()
+{
+    tTJSCriticalSectionHolder lock(_decoders_mtx);
+    TVPConsoleLog("xp3.sessionReset activeDecoders=%llu pooledDecoders=%llu managedDecoder=%d managedFilter=%d",
+                  static_cast<unsigned long long>(_thread_decoders.size()),
+                  static_cast<unsigned long long>(_cached_decoders.size()),
+                  _ManagedDecoderInited ? 1 : 0, _ManagedFilterInited ? 1 : 0);
+    TVPSetXP3ArchiveExtractionFilter(nullptr);
+    TVPSetXP3ArchiveContentFilter(nullptr);
+    sXP3FilterScript.Clear();
+    ClearXP3Decoders();
+}
 static XP3FilterDecoder* FetchXP3Decoder()
 {
     tTJSCriticalSectionHolder lk(_decoders_mtx);
@@ -564,13 +595,10 @@ void TVPXP3ArchiveExtractionFilterWrapper(tTVPXP3ExtractionFilterInfo* info, tTJ
 
 void TVPSetXP3FilterScript(ttstr content)
 {
+    tTJSCriticalSectionHolder lock(_decoders_mtx);
     if (sXP3FilterScript != content)
     {
-        for (auto it : _thread_decoders)
-        {
-            delete it.second;
-        }
-        _thread_decoders.clear();
+        ClearXP3Decoders();
     }
     if (content.IsEmpty())
     {
@@ -609,3 +637,4 @@ static void PostRegistCallback()
 }
 
 NCB_POST_REGIST_CALLBACK(PostRegistCallback);
+NCB_POST_UNREGIST_CALLBACK(TVPResetXP3FilterSession);

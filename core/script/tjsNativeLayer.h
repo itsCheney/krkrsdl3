@@ -19,7 +19,7 @@ extern bool TVPFreeUnusedLayerCache;
 //---------------------------------------------------------------------------
 // initial bitmap holder ( since tTVPBaseBitmap cannot create empty bitmap )
 //---------------------------------------------------------------------------
-const tTVPBaseTexture& TVPGetInitialBitmap();
+tTVPBaseTexture TVPGetInitialBitmap();
 //---------------------------------------------------------------------------
 
 //---------------------------------------------------------------------------

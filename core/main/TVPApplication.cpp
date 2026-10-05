@@ -27,6 +27,8 @@
 #include "KRMovieOverlay.h"
 #include "tjsNativeVideoOverlay.h"
 #include "emoteplayer/emoteresourcecache.h"
+#include "emoteplayer/emotesession.h"
+#include "xp3filter.h"
 
 #include "TVPStorage.h"
 #include "TVPColor.h"
@@ -214,7 +216,13 @@ void tTVPApplication::OnExit()
     // plugin formats). Run them before at-exit clears archive caches/factories.
     if (TVPGetScriptEngine())
         TVPDeliverCompactEvent(TVP_COMPACT_LEVEL_MAX);
+    // Finish session-owned native layers/callbacks before at-exit/plugin/VM
+    // teardown. They must never root or refer to a previous game's objects.
+    emoteplayer::ResetEmotePlayerSession();
     TVPSystemUninit();
+    // Wave decoder workers stop inside SystemUninit; image loading stopped
+    // above. No worker can retain/use an XP3 helper VM during this reset.
+    TVPResetXP3FilterSession();
     TVPUnloadPlugins();
     TVPResetEventState();
     TVPResetGraphicSessionState();
@@ -226,6 +234,8 @@ void tTVPApplication::OnExit()
     TVPUninitScriptEngine();
     TVPClearAllAutoPath();
     TVPClearAllWindows();
+    // Script finalizers can repopulate image caches after the first reset.
+    TVPResetGraphicSessionState();
     krkrsdl3::TVPClearAllTexture();
     iTVPTexture2D::RecycleProcess();
     TVPProjectDirSelected = false;

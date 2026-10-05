@@ -1733,6 +1733,7 @@ emotefile::~emotefile()
     if (filePtr != nullptr)
         delete filePtr;
     ClearAniTree();
+    _decryptClo.Release();
 }
 void emotefile::setSeed(tjs_int seed)
 {
@@ -1740,7 +1741,12 @@ void emotefile::setSeed(tjs_int seed)
 }
 void emotefile::setFun(tTJSVariantClosure decryptClo)
 {
+    // A file may outlive replacement of the manager's session callback.
+    // Retain both the callable and its bound context for this file's lifetime.
+    decryptClo.AddRef();
+    auto previous = _decryptClo;
     _decryptClo = decryptClo;
+    previous.Release();
 }
 void emotefile::LoadDecodedResource(std::shared_ptr<const EmoteDecodedResource> resource)
 {

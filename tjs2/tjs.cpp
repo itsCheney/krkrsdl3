@@ -13,6 +13,7 @@
 #include "../core/render/LayerWorkDiagnostics.h"
 
 #include <assert.h>
+#include <atomic>
 #include "tjs.h"
 #include "tjsScriptBlock.h"
 #include "tjsArray.h"
@@ -33,6 +34,10 @@
 
 namespace TJS
 {
+// XP3 filters run additional engines alongside the game's VM. The fallback
+// object/register/script pools are process-wide, so only the last engine may
+// force-clear them after its own ordinary reference-counted teardown.
+static std::atomic<unsigned> TVPActiveTJSEngines{0};
 #ifndef TJS_NO_REGEXP
 extern iTJSDispatch2* TJSCreateRegExpClass();
 // to avoid to include large regexp library header
@@ -175,6 +180,7 @@ tTJS::tTJS()
     dsp->Release();
     Global->PropSet(TJS_MEMBERENSURE, TJS_N("RegExp"), NULL, &val, Global);
 #endif
+    TVPActiveTJSEngines.fetch_add(1, std::memory_order_relaxed);
 }
 //---------------------------------------------------------------------------
 tTJS::~tTJS()
@@ -202,8 +208,9 @@ tTJS::~tTJS()
 
     delete VariantArrayStack;
     VariantArrayStack = nullptr;
+    const bool lastEngine = TVPActiveTJSEngines.fetch_sub(1, std::memory_order_acq_rel) == 1;
 #ifndef TJS_NO_REGEXP
-    TJSReleaseRegex();
+    if (lastEngine) TJSReleaseRegex();
 #endif
 
     if (TJSEnableDebugMode)
@@ -214,12 +221,15 @@ tTJS::~tTJS()
 
     TJSReleaseGlobalStringMap();
 
+    // These shared tables maintain their own per-engine reference counts.
     TJSReservedWordsHashRelease();
 
     // 清除所有难以自动释放的堆内存
-    TJSClearScriptBlockHeap();
-    TJSClearObjectHeap();
-    TJSClearRegisterHeap();
+    if (lastEngine) {
+        TJSClearScriptBlockHeap();
+        TJSClearObjectHeap();
+        TJSClearRegisterHeap();
+    }
 }
 //---------------------------------------------------------------------------
 iTJSDispatch2* tTJS::GetGlobal()

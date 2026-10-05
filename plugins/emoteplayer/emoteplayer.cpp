@@ -176,10 +176,12 @@ NCB_REGISTER_CLASS(Motion)
 
 static void emoteplayer_init()
 {
+    ResourceManager::ResetSession();
 }
 
 static void emoteplayer_done()
 {
+    ResourceManager::ResetSession();
 }
 
 NCB_PRE_REGIST_CALLBACK(emoteplayer_init);

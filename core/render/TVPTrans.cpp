@@ -29,7 +29,7 @@
 #include "tjsUtils.h"
 
 // tjsNativeLayer.h 中声明的函数
-const tTVPBaseTexture& TVPGetInitialBitmap();
+tTVPBaseTexture TVPGetInitialBitmap();
 
 //---------------------------------------------------------------------------
 // iTVPSimpleOptionProvider implementation

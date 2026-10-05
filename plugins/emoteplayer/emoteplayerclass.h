@@ -92,6 +92,9 @@ public:
 
     static void setEmotePSBDecryptSeed(tjs_int decryptkey);
     static void setEmotePSBDecryptFunc(tTJSVariant funclosure);
+    // Drop VM-owned callbacks and the borrowed work-layer/window cache while
+    // the current script engine and render backend are still alive.
+    static void ResetSession();
 
     static iTJSDispatch2* _kagWindow; // 本身就是唯一的，所以直接static
     std::map<ttstr, emotefile*> cacheData;

@@ -228,13 +228,16 @@ bool Layer_FetchImageSize(ttstr imageName, int& w, int& h)
 }
 
 //---------------------------------------------------------------------------
-const tTVPBaseTexture& TVPGetInitialBitmap()
+tTVPBaseTexture TVPGetInitialBitmap()
 {
     tTVPTempBitmapHolder::AddRef(); // ensure default bitmap
-    const tTVPBaseTexture* bmp = TVPTempBitmapHolder->Get();
-    tTVPTempBitmapHolder::Release();
-
-    return *bmp;
+    struct HolderLease {
+        ~HolderLease() { tTVPTempBitmapHolder::Release(); }
+    } lease;
+    // Copy the texture reference before releasing the holder. The first caller
+    // after a game exit may be an image/transition loader with no live Layer.
+    // Returning a borrowed reference left it dangling in precisely that case.
+    return tTVPBaseTexture(*TVPTempBitmapHolder->Get());
 }
 //---------------------------------------------------------------------------
 void TVPTempBitmapHolderAddRef()
