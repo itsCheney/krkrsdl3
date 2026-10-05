@@ -83,6 +83,7 @@ public:
     bool IsHardware() const override { return true; }
     void FetchInfo() override;
     bool SupportsLayerOperations() const override;
+    TVPLayerParameterUploadStats GetLayerParameterUploadStats() const override;
     bool SupportsLayerTileRendering() const;
     bool IsLayerTileRenderingActive() const;
     bool SetLayerAlphaTables(const uint8_t*, const uint8_t*) override;

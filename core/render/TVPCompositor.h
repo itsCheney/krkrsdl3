@@ -185,6 +185,7 @@ public:
     // Optional ordinary-Layer resources. Rectangles use integer pixels, not
     // normalized Emote UVs. Unsupported backends keep software RenderManager.
     virtual bool SupportsLayerOperations() const { return false; }
+    virtual TVPLayerParameterUploadStats GetLayerParameterUploadStats() const { return {}; }
     virtual bool SetLayerAlphaTables(const uint8_t*, const uint8_t*) { return false; }
     virtual void* CreateLayerTexture(int, int, TVPLayerTextureFormat) { return nullptr; }
     virtual void DestroyLayerTexture(void*) {}

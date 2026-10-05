@@ -376,6 +376,30 @@ struct MetalRenderBackend::Impl
     id<MTLComputeCommandEncoder> ordinaryEncoder = nil;
     id<MTLTexture> ordinaryBoundSource = nil, ordinaryBoundTarget = nil;
     id<MTLBuffer> alphaTables = nil;
+    struct GammaLUTCache {
+        std::shared_ptr<const TVPLayerGammaLUT> snapshot;
+        id<MTLBuffer> buffer = nil;
+    };
+    std::array<GammaLUTCache,2> gammaLUTCaches;
+    TVPLayerParameterUploadStats parameterUploadStats;
+    id<MTLBuffer> GammaLUTBuffer(const TVPLayerOperation& operation) {
+        if(!operation.gammaLUT) return nil;
+        auto& entry=gammaLUTCaches[(operation.flags&TVP_LAYER_DEST_PREMULTIPLIED) ? 1 : 0];
+        if(entry.buffer && entry.snapshot && entry.snapshot->version==operation.gammaLUT->version &&
+           entry.snapshot->bytes==operation.gammaLUT->bytes) return entry.buffer;
+        // A changed version gets new immutable storage. Normal command buffers
+        // retain every bound old buffer until completion, even if this cache is
+        // replaced again while that command buffer is still being encoded.
+        id<MTLBuffer> buffer=[device newBufferWithBytes:operation.gammaLUT->bytes.data()
+                                                length:operation.gammaLUT->bytes.size()
+                                               options:MTLResourceStorageModeShared];
+        if(!buffer) return nil;
+        entry.snapshot=operation.gammaLUT;
+        entry.buffer=buffer;
+        ++parameterUploadStats.gammaLUTUploads;
+        parameterUploadStats.gammaLUTUploadedBytes+=operation.gammaLUT->bytes.size();
+        return buffer;
+    }
     id<MTLTexture> ordinaryDummy = nil, ordinarySnapshot = nil, ordinarySourceSnapshot = nil;
     id<MTLTexture> dualSourceSnapshot1 = nil, dualSourceSnapshot2 = nil;
     id<MTLTexture> univSourceSnapshot1 = nil, univSourceSnapshot2 = nil;
@@ -1511,6 +1535,9 @@ bool MetalRenderBackend::SupportsLayerTileRendering() const {
     return false;
 }
 bool MetalRenderBackend::IsLayerTileRenderingActive() const { return impl_->ordinaryRenderPipeline!=nil; }
+TVPLayerParameterUploadStats MetalRenderBackend::GetLayerParameterUploadStats() const {
+    return impl_ ? impl_->parameterUploadStats : TVPLayerParameterUploadStats{};
+}
 bool MetalRenderBackend::SetLayerAlphaTables(const uint8_t* opacity, const uint8_t* negative) {
     @autoreleasepool {
         if (!opacity || !negative || !SupportsLayerOperations()) return false;
@@ -1698,11 +1725,26 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
         bool needsSource=TVPLayerOperationNeedsSource(operation.kind);
         if(!p.ordinaryLayerPipeline || !t || t->bytesPerPixel!=4 || (needsSource && !s) ||
             dst.Width()<=0 || dst.Height()<=0 || sampling<0 || sampling>1) return false;
+        if(needsSource && s->bytesPerPixel!=(traits->sourceFormats[0]==TVPLayerTextureFormat::R8 ? 1 : 4))
+            return false;
+        if(needsSource && TVPLayerOperationRequiresForwardSource(operation.kind) &&
+           (src.Width()<=0 || src.Height()<=0)) return false;
+        const bool gamma=operation.kind==TVPLayerOperationKind::AdjustGamma;
+        if(gamma && !operation.gammaLUT) return false;
         if(needsSource && (src.Width()==0 || src.Height()==0 || std::min(src.left,src.right)<0 ||
             std::min(src.top,src.bottom)<0 || std::max(src.left,src.right)>s->width || std::max(src.top,src.bottom)>s->height)) return false;
+        // R8 masks have no software-compatible resize/mirror path. Keep the
+        // direct backend entry within the same domain as the Layer manager.
+        if(operation.kind==TVPLayerOperationKind::RemoveOpacity &&
+           (src.Width()!=dst.Width() || src.Height()!=dst.Height() || src.Width()<=0 || src.Height()<=0 ||
+            dst.left<0 || dst.top<0 || dst.right>t->width || dst.bottom>t->height)) return false;
         if((operation.flags & TVP_LAYER_DEST_ALPHA) && !p.alphaTables) return false;
         TVPLayerRect clip={std::max(0,dst.left),std::max(0,dst.top),std::min(t->width,dst.right),std::min(t->height,dst.bottom)};
         if(clip.Width()<=0 || clip.Height()<=0) return true;
+        // Allocate/copy parameters before encoding snapshots or target writes.
+        // A LUT never changes in place and introduces no submit or GPU wait.
+        id<MTLBuffer> gammaBuffer=gamma ? p.GammaLUTBuffer(operation) : nil;
+        if(gamma && !gammaBuffer) return false;
         if(operation.kind==TVPLayerOperationKind::BoxBlur) {
             // Reject unsupported shapes before encoding anything. The first
             // pass reads all source pixels, so an aliased target needs no copy.
@@ -1775,10 +1817,16 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
         params.operation={kind,operation.opacity,static_cast<int>(operation.flags),sampling};
         params.color={int(operation.color&255),int((operation.color>>8)&255),int((operation.color>>16)&255),int(operation.color>>24)};
         if(!p.alphaTables) p.alphaTables=[p.device newBufferWithLength:131072 options:MTLResourceStorageModeShared];
+        if(!p.alphaTables) return false;
+        // The dynamic shader branch does not read a LUT for other kinds, but
+        // Metal validation still needs a valid buffer(2). Reuse the existing
+        // >=768-byte alpha-table buffer without another allocation or upload.
+        if(!gammaBuffer) gammaBuffer=p.alphaTables;
         if(tile) {
             auto e=p.OrdinaryRender(t->texture);
             [e setVertexBytes:&params length:sizeof(params) atIndex:0];
             [e setFragmentBytes:&params length:sizeof(params) atIndex:0];
+            [e setFragmentBuffer:gammaBuffer offset:0 atIndex:2];
             if(p.ordinaryRenderSource!=sourceTexture) {
                 [e setFragmentTexture:sourceTexture atIndex:0]; p.ordinaryRenderSource=sourceTexture;
             }
@@ -1793,6 +1841,7 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
         }
         id<MTLComputeCommandEncoder> e=inPlace ? p.OrdinaryCompute() : p.Compute(); if(!e) return false;
         [e setBytes:&params length:sizeof(params) atIndex:0];
+        [e setBuffer:gammaBuffer offset:0 atIndex:2];
         if(inPlace) {
             if(p.ordinaryBoundSource!=sourceTexture) { [e setTexture:sourceTexture atIndex:0]; p.ordinaryBoundSource=sourceTexture; }
             if(p.ordinaryBoundTarget!=t->texture) { [e setTexture:t->texture atIndex:2]; p.ordinaryBoundTarget=t->texture; }
@@ -1935,7 +1984,11 @@ bool MetalRenderBackend::OperateLayerRectDualSource(const TVPLayerOperation& ope
         [e setTexture:t->texture atIndex:2];
         [e dispatchThreads:MTLSizeMake(clip.Width(),clip.Height(),1)
              threadsPerThreadgroup:MTLSizeMake(8,8,1)];
-        if (p.diagnosticSampled) ++p.diagnosticWorkload.layerDispatches;
+        if (p.diagnosticSampled) {
+            ++p.diagnosticWorkload.layerDispatches;
+            p.diagnosticWorkload.Rect(static_cast<int>(operation.kind),uint64_t(clip.Width())*clip.Height(),
+                                      false,s1==t || s2==t,false);
+        }
         [e endEncoding];
         // Compute dispatch over existing GPU textures; no host-visible bytes.
         if(++p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();

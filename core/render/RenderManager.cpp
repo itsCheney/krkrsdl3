@@ -1993,9 +1993,26 @@ public:
 template<void (*&Func)(tjs_uint32*, tjs_int, tTVPGLGammaAdjustTempData*)>
 class tTVPRenderMethod_AdjustGamma : public tTVPRenderMethod_Software
 {
-    tTVPGLGammaAdjustTempData temp;
+    tTVPGLGammaAdjustTempData temp{};
+    uint64_t gammaVersion = 0;
+    void SnapshotLUT(const tTVPGLGammaAdjustTempData& next) {
+        static_assert(sizeof(temp) == 768, "Gamma snapshot must preserve software B/G/R layout");
+        if (GpuOperation.gammaLUT && !std::memcmp(GpuOperation.gammaLUT->bytes.data(), &next, sizeof(next))) {
+            temp = next;
+            return;
+        }
+        auto snapshot = std::make_shared<TVPLayerGammaLUT>();
+        snapshot->version = gammaVersion + 1;
+        std::memcpy(snapshot->bytes.data(), &next, sizeof(next));
+        temp = next;
+        gammaVersion = snapshot->version;
+        GpuOperation.gammaLUT = std::move(snapshot);
+    }
 
 public:
+    // Keep the software singleton's original zero-initialized LUT until a
+    // caller supplies parameters. Never substitute an identity curve here.
+    tTVPRenderMethod_AdjustGamma() { SnapshotLUT(temp); }
     virtual int EnumParameterID(const char* name)
     {
         if (!strcmp(name, "gammaAdjustData"))
@@ -2004,7 +2021,9 @@ public:
     }
     virtual void SetParameterPtr(int id, const void* data)
     {
-        TVPInitGammaAdjustTempData(&temp, (tTVPGLGammaAdjustData*)data);
+        tTVPGLGammaAdjustTempData next{};
+        TVPInitGammaAdjustTempData(&next, (const tTVPGLGammaAdjustData*)data);
+        SnapshotLUT(next);
     }
 
     virtual void DoRender(iTVPTexture2D* _tar,
@@ -2734,6 +2753,8 @@ void iTVPRenderManager::RegisterRenderMethod(const char* name, iTVPRenderMethod*
         {"RemoveConstOpacity", K::RemoveConstOpacity, 0, true},
         {"ConstAlphaBlend_SD", K::ConstAlphaSD, 0, true},
         {"ConstAlphaBlend_SD_d", K::ConstAlphaSD, TVP_LAYER_DEST_ALPHA, true},
+        {"ConstAlphaBlend_SD_a", K::ConstAlphaSD, TVP_LAYER_DEST_PREMULTIPLIED, true},
+        {"AlphaBlend_SD", K::AlphaSD, 0, true},
         {"UnivTransBlend", K::UnivTrans, 0, false},
         {"UnivTransBlend_d", K::UnivTrans, TVP_LAYER_DEST_ALPHA, false},
         {"UnivTransBlend_a", K::UnivTrans, TVP_LAYER_DEST_PREMULTIPLIED, false},
@@ -2756,6 +2777,17 @@ void iTVPRenderManager::RegisterRenderMethod(const char* name, iTVPRenderMethod*
         {"PsScreenBlend", K::PsScreen, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
         {"PsColorDodge5Blend", K::PsColorDodge5, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
         {"AddBlend", K::Add, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"SubBlend", K::Sub, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"MulBlend", K::Mul, TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"MulBlend_HDA", K::Mul, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"ColorDodgeBlend", K::ColorDodge, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"DarkenBlend", K::Darken, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"LightenBlend", K::Lighten, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"ScreenBlend", K::Screen, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"RemoveOpacity", K::RemoveOpacity, TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"AdditiveAlphaToAlpha", K::AdditiveAlphaToAlpha, 0, false},
+        {"AdjustGamma", K::AdjustGamma, 0, false},
+        {"AdjustGamma_a", K::AdjustGamma, TVP_LAYER_DEST_PREMULTIPLIED, false},
         {"AlphaToAdditiveAlpha", K::AlphaToAdditiveAlpha, 0, false},
         {"DoGrayScale", K::GrayScale, 0, false},
         {"CopyBlueToAlpha", K::CopyBlueToAlpha, 0, false},

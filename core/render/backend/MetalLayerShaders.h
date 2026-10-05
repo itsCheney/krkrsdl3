@@ -186,7 +186,70 @@ uint layerMaskPixel(uint d, uint s, int kind) {
     if (kind == TVP_LAYER_KIND_MultiplyAlpha) { uint product = (d >> 24) * (s >> 24); alpha = (product + (product >> 7)) >> 8; }
     return (d & 0xffffffu) | (alpha << 24);
 }
-int4 layerPixel(int4 d,int4 s,int4 color,int kind,int opa,int flags,const device uchar* tables) {
+uint constAlphaSD(uint s1, uint s2, uint opa);
+uint univTransBlendARGB(uint s1, uint s2, uint opa);
+uint layerP1APixel(uint d,uint s,int kind,int opa,uint flags) {
+    if(kind==TVP_LAYER_KIND_AlphaSD) return constAlphaSD(d,s,uint(opa));
+    if(kind==TVP_LAYER_KIND_RemoveOpacity) {
+        uint alpha=d>>24, mask=s&255u;
+        uint result=opa==255 ? (alpha*(255u-mask))>>8 :
+            (alpha*(65535u-mask*uint(opa>127 ? opa+1 : opa)))>>16;
+        return (d&0xffffffu)|(result<<24);
+    }
+    uint result=0;
+    for(uint shift=0;shift<24;shift+=8) {
+        uint dc=(d>>shift)&255u, sc=(s>>shift)&255u, color=0;
+        if(kind==TVP_LAYER_KIND_Sub || kind==TVP_LAYER_KIND_Mul) {
+            if(opa!=255) sc=255u-(((255u-sc)*uint(opa))>>8);
+            color=kind==TVP_LAYER_KIND_Sub ? uint(max(0,int(dc)+int(sc)-255)) : (dc*sc)>>8;
+        } else if(kind==TVP_LAYER_KIND_ColorDodge) {
+            if(opa!=255) sc=(sc*uint(opa))>>8;
+            uint denominator=255u-sc;
+            uint reciprocal=denominator==0 ? 65536u : 65536u/denominator;
+            color=min(255u,(dc*reciprocal)>>8);
+        } else if(kind==TVP_LAYER_KIND_Darken || kind==TVP_LAYER_KIND_Lighten) {
+            uint blended=kind==TVP_LAYER_KIND_Darken ? min(dc,sc) : max(dc,sc);
+            color=opa==255 ? blended : uint(int(dc)+((int(blended)-int(dc))*opa>>8));
+        } else if(kind==TVP_LAYER_KIND_Screen) {
+            if(opa!=255) sc=(sc*uint(opa))>>8;
+            color=255u-(((255u-dc)*(255u-sc))>>8);
+        }
+        result|=(color&255u)<<shift;
+    }
+    // Both current Mul bindings preserve alpha, including the non-HDA name.
+    return result|((kind==TVP_LAYER_KIND_Mul || (flags&1u)!=0) ? d&0xff000000u : 0u);
+}
+uint layerPremulToAlphaPixel(uint s) {
+    uint alpha=s>>24, result=s&0xff000000u;
+    for(uint shift=0;shift<24;shift+=8) {
+        uint color=alpha==0 ? 0u : min(255u,(((s>>shift)&255u)*255u)/alpha);
+        result|=color<<shift;
+    }
+    return result;
+}
+uint layerGammaPixel(uint d,uint flags,const device uchar* gamma) {
+    uint alpha=d>>24, result=d&0xff000000u;
+    if((flags&4u)==0 && alpha==0) return d;
+    if((flags&4u)!=0 && d==0) return 0;
+    // tTVPGLGammaAdjustTempData stores B/G/R tables. Software's low byte
+    // indexes R and its high RGB byte indexes B, preserving existing ordering.
+    for(uint channel=0;channel<3;++channel) {
+        uint shift=channel*8u, color=(d>>shift)&255u, offset=(2u-channel)*256u;
+        if((flags&4u)==0 || alpha==255) color=uint(gamma[offset+color]);
+        else {
+            uint adjusted=alpha+(alpha>>7);
+            if(color>alpha) color=(uint(gamma[offset+255u])*adjusted>>8)+color-alpha;
+            else {
+                uint reciprocal=alpha==0 ? 32767u : min(32767u,65536u/alpha);
+                uint index=min(255u,(reciprocal*color)>>8);
+                color=uint(gamma[offset+index])*adjusted>>8;
+            }
+        }
+        result|=(color&255u)<<shift;
+    }
+    return result;
+}
+int4 layerPixel(int4 d,int4 s,int4 color,int kind,int opa,int flags,const device uchar* tables,const device uchar* gamma) {
     bool hold=(flags&1)!=0, straightDestination=(flags&2)!=0;
     bool premultipliedDestination=(flags&4)!=0;
     bool full=opa==255 && (flags&8)!=0;
@@ -243,6 +306,22 @@ int4 layerPixel(int4 d,int4 s,int4 color,int kind,int opa,int flags,const device
         case TVP_LAYER_KIND_Add:
             result = layerUnpack(layerAddPixel(layerPack(d), layerPack(s), opa, uint(flags)));
             break;
+        case TVP_LAYER_KIND_Sub:
+        case TVP_LAYER_KIND_Mul:
+        case TVP_LAYER_KIND_ColorDodge:
+        case TVP_LAYER_KIND_Darken:
+        case TVP_LAYER_KIND_Lighten:
+        case TVP_LAYER_KIND_Screen:
+        case TVP_LAYER_KIND_RemoveOpacity:
+        case TVP_LAYER_KIND_AlphaSD:
+            result=layerUnpack(layerP1APixel(layerPack(d),layerPack(s),kind,opa,uint(flags)));
+            break;
+        case TVP_LAYER_KIND_AdditiveAlphaToAlpha:
+            result=layerUnpack(layerPremulToAlphaPixel(layerPack(s)));
+            break;
+        case TVP_LAYER_KIND_AdjustGamma:
+            result=layerUnpack(layerGammaPixel(layerPack(d),uint(flags),gamma));
+            break;
         case TVP_LAYER_KIND_AlphaToAdditiveAlpha:
             result = layerUnpack(layerAlphaToPremulPixel(layerPack(s)));
             break;
@@ -257,6 +336,7 @@ int4 layerPixel(int4 d,int4 s,int4 color,int kind,int opa,int flags,const device
 kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
                           constant LayerParameters& p [[buffer(0)]],
                           const device uchar* tables [[buffer(1)]],
+                          const device uchar* gamma [[buffer(2)]],
                           texture2d<float, access::read> source [[texture(0)]],
                           texture2d<float, access::read> snapshot [[texture(1)]],
 #ifdef TVP_LAYER_IN_PLACE
@@ -280,7 +360,7 @@ kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
     }
     if (layerNeedsSource(kind))
         s = layerSample(source, p, xy);
-    int4 result=layerPixel(d,s,color,kind,opa,flags,tables);
+    int4 result=layerPixel(d,s,color,kind,opa,flags,tables,gamma);
     target.write(float4(result) / 255.0,uint2(xy));
 }
 #ifdef TVP_LAYER_FRAMEBUFFER_FETCH
@@ -296,13 +376,14 @@ vertex LayerRasterVertex ordinaryLayerVertex(uint id [[vertex_id]],
 fragment LayerRasterColor ordinaryLayerFragment(LayerRasterVertex in [[stage_in]],
     float4 previous [[color(0), raster_order_group(0)]],
     constant LayerParameters& p [[buffer(0)]],const device uchar* tables [[buffer(1)]],
+    const device uchar* gamma [[buffer(2)]],
     texture2d<float,access::read> source [[texture(0)]]) {
     int2 xy=int2(in.position.xy);
     int kind=p.operation.x;
     int4 s=int4(0);
     if(layerNeedsSource(kind)) s=layerSample(source,p,xy);
     int4 d=int4(round(previous*255.0));
-    return {float4(layerPixel(d,s,p.color,kind,p.operation.y,p.operation.z,tables))/255.0};
+    return {float4(layerPixel(d,s,p.color,kind,p.operation.y,p.operation.z,tables,gamma))/255.0};
 }
 #endif
 
@@ -387,6 +468,7 @@ kernel void dualSourceLayer(uint2 tid [[thread_position_in_grid]],
     uint s2 = layerPack(layerBytes(source2, p2));
     uint out = (p.operation.z & 2) != 0
         ? constAlphaSDDestAlpha(s1, s2, uint(p.operation.y), tables)
+        : (p.operation.z & 4) != 0 ? univTransBlendARGB(s1,s2,uint(p.operation.y))
         : constAlphaSD(s1, s2, uint(p.operation.y));
     target.write(float4(layerUnpack(out)) / 255.0, uint2(xy));
 }

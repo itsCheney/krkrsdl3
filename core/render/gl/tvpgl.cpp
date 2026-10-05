@@ -11139,19 +11139,19 @@ extern "C"
                         if (t > alpha)
                             d_tmp = (temp->R[255] * alpha_adj >> 8) + t - alpha;
                         else
-                            d_tmp = temp->R[recip * t >> 8] * alpha_adj >> 8;
+                            d_tmp = temp->R[((recip * t >> 8) > 255 ? 255 : (recip * t >> 8))] * alpha_adj >> 8;
                         /* G */
                         t = (d >> 8) & 0xff;
                         if (t > alpha)
                             d_tmp |= ((temp->G[255] * alpha_adj >> 8) + t - alpha) << 8;
                         else
-                            d_tmp |= (temp->G[recip * t >> 8] * alpha_adj >> 8) << 8;
+                            d_tmp |= (temp->G[((recip * t >> 8) > 255 ? 255 : (recip * t >> 8))] * alpha_adj >> 8) << 8;
                         /* R */
                         t = (d >> 16) & 0xff;
                         if (t > alpha)
                             d_tmp |= ((temp->B[255] * alpha_adj >> 8) + t - alpha) << 16;
                         else
-                            d_tmp |= (temp->B[recip * t >> 8] * alpha_adj >> 8) << 16;
+                            d_tmp |= (temp->B[((recip * t >> 8) > 255 ? 255 : (recip * t >> 8))] * alpha_adj >> 8) << 16;
                         /* A */
                         d_tmp |= d & 0xff000000;
 

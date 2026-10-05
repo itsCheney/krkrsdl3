@@ -1,6 +1,8 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <array>
+#include <memory>
 
 // Common software RenderManager semantics, independent of Emote blend modes.
 #define TVP_LAYER_OPERATION_ENUM_ROW(name, id, ...) name = id,
@@ -27,6 +29,18 @@ enum TVPLayerOperationFlags : uint32_t
     TVP_LAYER_DEST_PREMULTIPLIED = 4,
     TVP_LAYER_FULL_OPACITY_BRANCH = 8,
 };
+// Immutable parameter bytes follow tTVPGLGammaAdjustTempData's B/G/R layout.
+// Operations retain the snapshot, never a caller's gammaAdjustData pointer.
+struct TVPLayerGammaLUT
+{
+    uint64_t version = 0;
+    std::array<uint8_t,768> bytes{};
+};
+struct TVPLayerParameterUploadStats
+{
+    uint64_t gammaLUTUploads = 0;
+    uint64_t gammaLUTUploadedBytes = 0;
+};
 struct TVPLayerOperation
 {
     TVPLayerOperationKind kind = TVPLayerOperationKind::Unsupported;
@@ -36,6 +50,7 @@ struct TVPLayerOperation
     // For BoxBlur these carry the software kernel width and height.
     int phase = 0;
     int vague = 0;
+    std::shared_ptr<const TVPLayerGammaLUT> gammaLUT;
 };
 enum class TVPLayerTextureFormat { RGBA8, R8 };
 enum class TVPLayerReferenceRule { Ignored, UsedWhenNoInput };
@@ -45,7 +60,7 @@ enum class TVPLayerAliasRule {
 };
 enum TVPLayerParameterResources : uint32_t {
     TVP_LAYER_RESOURCE_ALPHA_TABLES = 1,
-    // Reserved contract for future Gamma mappings; none are enabled by P0.
+    // Gamma has an owned per-call LUT; image upload counters exclude it.
     TVP_LAYER_RESOURCE_GAMMA_LUT = 2
 };
 enum TVPLayerGeometry : uint32_t {
@@ -105,6 +120,18 @@ inline constexpr bool TVPLayerOperationNeedsSource(TVPLayerOperationKind kind) {
 inline constexpr bool TVPLayerOperationReadsTarget(TVPLayerOperationKind kind) {
     const auto* traits = TVPGetLayerOperationTraits(kind);
     return traits && traits->readsTarget;
+}
+// P1A's software blend/ApplySelf wrappers do not define mirrored source
+// rectangles. Preserve earlier kinds' routing and keep new domains explicit.
+inline constexpr bool TVPLayerOperationRequiresForwardSource(TVPLayerOperationKind kind) {
+    switch(kind) {
+        case TVPLayerOperationKind::Sub: case TVPLayerOperationKind::Mul:
+        case TVPLayerOperationKind::ColorDodge: case TVPLayerOperationKind::Darken:
+        case TVPLayerOperationKind::Lighten: case TVPLayerOperationKind::Screen:
+        case TVPLayerOperationKind::RemoveOpacity: case TVPLayerOperationKind::AdditiveAlphaToAlpha:
+        case TVPLayerOperationKind::AlphaSD: return true;
+        default: return false;
+    }
 }
 inline constexpr bool TVPLayerOperationPreservesAlpha(const TVPLayerOperation& op, bool sourceIsTarget) {
     const auto* traits = TVPGetLayerOperationTraits(op.kind);
@@ -201,4 +228,6 @@ struct TVPLayerRenderStats
     uint64_t gpuRejectCountByReason[static_cast<int>(TVPLayerGPURejectReason::Count)] = {};
     uint64_t pointCacheHits = 0;
     uint64_t pointCacheMisses = 0;
+    uint64_t gammaLUTUploads = 0;
+    uint64_t gammaLUTUploadedBytes = 0;
 };

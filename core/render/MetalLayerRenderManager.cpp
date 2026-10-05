@@ -3,6 +3,7 @@
 #include "MetalLayerRenderManager.h"
 #include "LayerBitmap.h"
 #include "TVPCompositor.h"
+#include "TVPMsg.h"
 #include "gl/tvpgl.h"
 #include "Platform.h"
 #include "PointReadTrace.h"
@@ -85,8 +86,9 @@ struct Session {
     std::unordered_map<std::string,uint64_t> unsupportedMethods;
     TriangleInterval triangles;
     bool tablesReady = false;
+    TVPLayerParameterUploadStats parameterBaseline;
     unsigned sourceRejectionReports=0;
-    explicit Session(iTVPRenderBackend* b) : backend(b) {}
+    explicit Session(iTVPRenderBackend* b) : backend(b), parameterBaseline(b->GetLayerParameterUploadStats()) {}
 };
 TVPLayerRect Rect(const tTVPRect& r) { return {r.left,r.top,r.right,r.bottom}; }
 class LayerTexture final : public iTVPTexture2D {
@@ -786,6 +788,53 @@ public:
         t->InvalidateCPUCacheRegion(dst,preservesAlpha); ++session->stats.gpuOperations; return true;
     }
     void OperateRect(iTVPRenderMethod* method,iTVPTexture2D* target,iTVPTexture2D* reference,const tTVPRect& dst,const tRenderTexRectArray& inputs) override {
+        // Software's generic resize primitive assumes RGBA byte addressing.
+        // R8 mask scaling/mirroring has no safe software reference path.
+        TVPLayerOperation requested;
+        if(method && method->DescribeGpuOperation(requested) &&
+           (TVPLayerOperationRequiresForwardSource(requested.kind) || requested.kind==TVPLayerOperationKind::AdjustGamma ||
+            (requested.kind==TVPLayerOperationKind::ConstAlphaSD && (requested.flags&TVP_LAYER_DEST_PREMULTIPLIED)))) {
+            // These new software references write uint32 pixels. Invalid R8/RGB
+            // targets or sources must not reach a 32-bit software fallback.
+            if(!target || target->GetFormat()!=TVPTextureFormat::RGBA) {
+                Reject(TVPLayerGPURejectReason::SourceFormat);
+                TVPThrowExceptionMessage(TJS_N("This Layer method requires an RGBA target."));
+            }
+            if(requested.kind==TVPLayerOperationKind::RemoveOpacity) {
+                for(size_t i=0;i<inputs.size();++i) if(!inputs[i].first ||
+                   (inputs[i].first->GetFormat()!=TVPTextureFormat::Gray && inputs[i].first->GetFormat()!=TVPTextureFormat::RGBA)) {
+                    Reject(TVPLayerGPURejectReason::SourceFormat);
+                    TVPThrowExceptionMessage(TJS_N("RemoveOpacity requires an R8 mask or a software-compatible RGBA input."));
+                }
+            } else {
+                for(size_t i=0;i<inputs.size();++i) if(!inputs[i].first || inputs[i].first->GetFormat()!=TVPTextureFormat::RGBA) {
+                    Reject(TVPLayerGPURejectReason::SourceFormat);
+                    TVPThrowExceptionMessage(TJS_N("This Layer method requires RGBA inputs."));
+                }
+                if(requested.kind==TVPLayerOperationKind::AdditiveAlphaToAlpha && inputs.size()==0 &&
+                   (!reference || reference->GetFormat()!=TVPTextureFormat::RGBA)) {
+                    Reject(TVPLayerGPURejectReason::SourceFormat);
+                    TVPThrowExceptionMessage(TJS_N("Alpha conversion requires an RGBA reference."));
+                }
+            }
+        }
+        if(method && method->DescribeGpuOperation(requested) &&
+           TVPLayerOperationRequiresForwardSource(requested.kind) && inputs.size()==1 &&
+           (inputs[0].second.get_width()<=0 || inputs[0].second.get_height()<=0)) {
+            Reject(TVPLayerGPURejectReason::InvalidGeometry);
+            TVPThrowExceptionMessage(TJS_N("This Layer method requires a forward source rectangle."));
+        }
+        if(method && method->DescribeGpuOperation(requested) && requested.kind==TVPLayerOperationKind::RemoveOpacity &&
+           inputs.size()==1 && inputs[0].first && inputs[0].first->GetFormat()==TVPTextureFormat::Gray) {
+            const auto& source=inputs[0].second;
+            if(source.get_width()!=dst.get_width() || source.get_height()!=dst.get_height() ||
+               source.get_width()<=0 || source.get_height()<=0 || source.left<0 || source.top<0 ||
+               source.right>int(inputs[0].first->GetWidth()) || source.bottom>int(inputs[0].first->GetHeight()) ||
+               !target || dst.left<0 || dst.top<0 || dst.right>int(target->GetWidth()) || dst.bottom>int(target->GetHeight())) {
+                Reject(TVPLayerGPURejectReason::InvalidGeometry);
+                TVPThrowExceptionMessage(TJS_N("RemoveOpacity requires equal-size, in-bounds R8 mask rectangles without mirroring."));
+            }
+        }
         if(GPU(method,target,reference,dst,inputs)) return;
         tTVPRect fallbackDst=dst;
         TVPLayerOperation op;
@@ -974,7 +1023,15 @@ void TVPUnbindMetalLayerRenderManager() {
     manager.session->backend=nullptr; manager.session.reset();
 }
 bool TVPMetalLayerCompositionActive() { return bool(Manager().session); }
-TVPLayerRenderStats TVPGetMetalLayerRenderStats() { return Manager().session?Manager().session->stats:TVPLayerRenderStats{}; }
+TVPLayerRenderStats TVPGetMetalLayerRenderStats() {
+    const auto& session=Manager().session;
+    if(!session) return {};
+    auto stats=session->stats;
+    const auto parameters=session->backend->GetLayerParameterUploadStats();
+    stats.gammaLUTUploads=parameters.gammaLUTUploads-session->parameterBaseline.gammaLUTUploads;
+    stats.gammaLUTUploadedBytes=parameters.gammaLUTUploadedBytes-session->parameterBaseline.gammaLUTUploadedBytes;
+    return stats;
+}
 
 void TVPSetMetalLayerTriangleDiagnostics(bool enabled) {
     if(triangle_trace::Enabled()==enabled) return;
