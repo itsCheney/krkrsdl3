@@ -284,6 +284,12 @@ public:
 
     virtual bool GetRenderStat(unsigned int& drawCount, uint64_t& vmemsize) = 0;
     virtual bool GetTextureStat(iTVPTexture2D* texture, uint64_t& vmemsize) { return false; }
+    // Process-lived scratch caches must belong to the current render session.
+    // Detached GPU textures are safe CPU objects, but cannot be GPU sources in
+    // a newly bound session. This is only for regenerable native caches.
+    virtual bool CanReuseCachedTexture(iTVPTexture2D* texture) const {
+        return texture && texture->IsCPUResident();
+    }
 
     virtual void BeginStencil(iTVPTexture2D* reftex) {}
     virtual void EndStencil() {}

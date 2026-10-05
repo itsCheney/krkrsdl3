@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
+#include <SDL3/SDL.h>
 
 extern "C" {
 extern unsigned char TVPOpacityOnOpacityTable[65536];
@@ -84,6 +85,7 @@ struct Session {
     std::unordered_map<std::string,uint64_t> unsupportedMethods;
     TriangleInterval triangles;
     bool tablesReady = false;
+    unsigned sourceRejectionReports=0;
     explicit Session(iTVPRenderBackend* b) : backend(b) {}
 };
 TVPLayerRect Rect(const tTVPRect& r) { return {r.left,r.top,r.right,r.bottom}; }
@@ -581,6 +583,20 @@ public:
         if(session) ++session->stats.gpuRejectCountByReason[static_cast<int>(reason)];
         return false;
     }
+    bool RejectSource(iTVPRenderMethod* method,iTVPTexture2D* texture) {
+        if(session && krkrsdl3::layer_work::enabled.load(std::memory_order_relaxed) && session->sourceRejectionReports<8) {
+            ++session->sourceRejectionReports;
+            auto* layer=dynamic_cast<LayerTexture*>(texture);
+            uint64_t id=0,version=0;
+            if(texture) texture->GetContentKey(id,version);
+            SDL_Log("layer.sourceUnavailable method=%.40s sourceType=%s width=%u height=%u cpuResident=%d currentSession=%d texture=%llu version=%llu",
+                method ? method->GetName().c_str() : "unnamed",layer ? "metal-layer" : texture ? "other" : "null",
+                texture ? texture->GetWidth() : 0,texture ? texture->GetHeight() : 0,
+                texture ? int(texture->IsCPUResident()) : 0,layer ? int(layer->Belongs(session)) : 0,
+                static_cast<unsigned long long>(id),static_cast<unsigned long long>(version));
+        }
+        return Reject(TVPLayerGPURejectReason::SourceUnavailable);
+    }
     bool RejectMethod(TVPLayerGPURejectReason reason, iTVPRenderMethod* method, size_t inputCount=0) {
         if(session) {
             ++session->stats.gpuRejectCountByReason[static_cast<int>(reason)];
@@ -624,6 +640,10 @@ public:
     }
     bool GetTextureStat(iTVPTexture2D* t,uint64_t& memory) override {
         memory=t?uint64_t(t->GetPitch())*t->GetHeight():0; return t!=nullptr;
+    }
+    bool CanReuseCachedTexture(iTVPTexture2D* texture) const override {
+        auto* cached=dynamic_cast<LayerTexture*>(texture);
+        return session && cached && cached->Belongs(session) && !cached->IsCPUResident();
     }
     bool GPU(iTVPRenderMethod* method,iTVPTexture2D* target,iTVPTexture2D* reference,tTVPRect dst,const tRenderTexRectArray& inputs) {
         auto* t=dynamic_cast<LayerTexture*>(target); TVPLayerOperation op;
@@ -719,7 +739,7 @@ public:
         LayerTexture* source=nullptr; tTVPRect src(0,0,1,1);
         if(inputs.size()) {
             source=dynamic_cast<LayerTexture*>(inputs[0].first); src=inputs[0].second;
-            if(!source || !source->Belongs(session)) return Reject(TVPLayerGPURejectReason::SourceUnavailable);
+            if(!source || !source->Belongs(session)) return RejectSource(method,inputs[0].first);
             const bool newBlend=op.kind==TVPLayerOperationKind::AdditiveAlpha ||
                 op.kind==TVPLayerOperationKind::PsMul || op.kind==TVPLayerOperationKind::PsOverlay ||
                 op.kind==TVPLayerOperationKind::PsHardLight || op.kind==TVPLayerOperationKind::MultiplyAlpha ||

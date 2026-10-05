@@ -1,4 +1,5 @@
 #include "tjsCommHead.h"
+#include <memory>
 
 #include "tjsNativeLayer.h"
 
@@ -85,11 +86,11 @@ private:
     tTVPBaseTexture* InternalGetTemp(tjs_uint w, tjs_uint h, bool fit)
     {
         // compact initialization
-        if (!TempCompactInit)
-        {
-            TVPAddCompactEventHook(this);
-            TempCompactInit = true;
-        }
+        // Session reset removes nonpersistent hooks even if this holder is
+        // retained. Registration is deduplicated; ensure the current session
+        // can compact its temporary images too.
+        TVPAddCompactEventHook(this);
+        TempCompactInit = true;
 
         // align width to even
         if (!fit)
@@ -107,6 +108,14 @@ private:
         else
         {
             tTVPBaseTexture* bmp = Temporaries[TempLevel - 1];
+            if (!TVPGetRenderManager()->CanReuseCachedTexture(bmp->GetTexture()))
+            {
+                // An old embedded-game session may have detached this cache
+                // to CPU ownership. Its contents are temporary, so regenerate.
+                auto* replacement=new tTVPBaseTexture(w,h);
+                delete bmp;
+                Temporaries[TempLevel - 1] = bmp = replacement;
+            }
             if (!fit)
             {
                 tjs_uint bw = bmp->GetWidth();
@@ -181,7 +190,18 @@ public:
         }
     }
 
-    static const tTVPBaseTexture* Get() { return TVPTempBitmapHolder->Bitmap; }
+    static const tTVPBaseTexture* Get() {
+        auto*& bitmap=TVPTempBitmapHolder->Bitmap;
+        if (!TVPGetRenderManager()->CanReuseCachedTexture(bitmap->GetTexture())) {
+            // Recreate the transparent-white prototype in the current session.
+            // Existing Layer snapshots retain their own texture references.
+            std::unique_ptr<tTVPBaseTexture> replacement(new tTVPBaseTexture(32,32));
+            replacement->Fill(tTVPRect(0,0,32,32),TVP_RGBA2COLOR(255,255,255,0));
+            delete bitmap;
+            bitmap=replacement.release();
+        }
+        return bitmap;
+    }
 
     static tTVPBaseTexture* GetTemp(tjs_uint w, tjs_uint h, bool fit = false)
     {

@@ -2548,6 +2548,11 @@ bool tTVPNativeBaseBitmap::InternalBlendText(tTVPCharacterData* data,
         }
 
         // blend to the texture
+        if (_CharacterTexture && !GetRenderManager()->CanReuseCachedTexture(_CharacterTexture))
+        {
+            _CharacterTexture->Release();
+            _CharacterTexture = nullptr;
+        }
         if (!_CharacterTexture)
         {
             _CharacterTexture =
