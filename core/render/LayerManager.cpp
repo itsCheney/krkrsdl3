@@ -31,11 +31,18 @@
 
 namespace {
 std::vector<tTVPLayerManager*> asyncInputManagers;
+
+bool TVPIsLiveAlphaLayer(const std::vector<tTJSNI_BaseLayer*>& nodes,
+                         tTJSNI_BaseLayer* layer, uint64_t lifetimeID) {
+    if(!layer) return false;
+    const auto it=std::find(nodes.begin(),nodes.end(),layer);
+    return it!=nodes.end() && layer->GetLifetimeID()==lifetimeID;
+}
 }
 struct tTVPLayerManager::AlphaPointerFrame {
     struct Point {
         tTJSNI_BaseLayer* layer = nullptr;
-        std::shared_ptr<iTJSDispatch2> owner;
+        uint64_t lifetimeID = 0;
         int x=0,y=0,width=0,height=0,px=0,py=0;
         uint64_t textureID=0;
         tjs_int hitType=0;
@@ -93,8 +100,7 @@ std::shared_ptr<tTVPLayerManager::AlphaPointerFrame> tTVPLayerManager::PrepareAl
         if(!layer || !layer->GetOwnerNoAddRef() || !layer->GetNodeVisible()) continue;
         AlphaPointerFrame::Point point;
         point.layer=layer;
-        auto* owner=layer->GetOwnerNoAddRef(); owner->AddRef();
-        point.owner=std::shared_ptr<iTJSDispatch2>(owner,[](iTJSDispatch2* p){p->Release();});
+        point.lifetimeID=layer->GetLifetimeID();
         point.x=x; point.y=y; layer->FromPrimaryCoordinates(point.x,point.y);
         point.width=layer->GetRect().get_width(); point.height=layer->GetRect().get_height();
         point.inside=point.x>=0 && point.y>=0 && point.x<point.width && point.y<point.height;
@@ -128,8 +134,8 @@ void tTVPLayerManager::BindAlphaPresentation() {
         if(frame->canceled || frame->presentation) continue;
         const auto& nodes=GetAllNodes();
         bool removed=false;
-        for(const auto& pair:frame->points) if(std::find(nodes.begin(),nodes.end(),pair.first)==nodes.end() ||
-            pair.first->GetOwnerNoAddRef()!=pair.second.owner.get()) { removed=true; break; }
+        for(const auto& pair:frame->points)
+            if(!TVPIsLiveAlphaLayer(nodes,pair.first,pair.second.lifetimeID)) { removed=true; break; }
         if(removed) { frame->canceled=true; CancelAlphaPointerChain(frame->pointerChain); continue; }
         // Bind only once, before callbacks. Resize/COW while waiting for this
         // first composition use the new epoch and its actual coordinate map.
@@ -146,7 +152,8 @@ void tTVPLayerManager::CaptureAlphaForPresentation(tTJSNI_BaseLayer* layer) {
         auto found=frame->points.find(layer);
         if(found==frame->points.end() || found->second.sourceBound) continue;
         auto& point=found->second;
-        if(layer->GetOwnerNoAddRef()!=point.owner.get()) {
+        const auto& nodes=GetAllNodes();
+        if(!TVPIsLiveAlphaLayer(nodes,layer,point.lifetimeID)) {
             frame->canceled=true; CancelAlphaPointerChain(frame->pointerChain); continue;
         }
         point.x=frame->x; point.y=frame->y; layer->FromPrimaryCoordinates(point.x,point.y);
@@ -204,13 +211,12 @@ void tTVPLayerManager::FinishAlphaPresentation() {
 }
 bool tTVPLayerManager::ResolveAlphaPointer(const std::shared_ptr<AlphaPointerFrame>& frame) {
     if(frame->canceled) return true;
-    // Membership and owner identity precede every raw-pointer getter/update,
+    // Membership and generation identity precede every raw-pointer getter/update,
     // including retry after a failed drawable. A recycled NI address cannot
-    // make an old event target a new TJS owner.
+    // make an old event target a new native layer instance.
     const auto& nodes=GetAllNodes();
     for(const auto& pair:frame->points) {
-        if(std::find(nodes.begin(),nodes.end(),pair.first)==nodes.end() ||
-           pair.first->GetOwnerNoAddRef()!=pair.second.owner.get()) {
+        if(!TVPIsLiveAlphaLayer(nodes,pair.first,pair.second.lifetimeID)) {
             frame->canceled=true; CancelAlphaPointerChain(frame->pointerChain); return true;
         }
     }
