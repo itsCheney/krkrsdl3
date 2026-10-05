@@ -1,4 +1,5 @@
 #include "tjsCommHead.h"
+#include <atomic>
 #include <memory>
 
 #include "tjsNativeLayer.h"
@@ -31,6 +32,9 @@
 // global flags
 //---------------------------------------------------------------------------
 bool TVPFreeUnusedLayerCache = false;
+namespace {
+std::atomic<uint64_t> TVPNextLayerLifetimeID{1};
+}
 // set true to free unused layer cache bitmap
 // (layer cache is not freed until system compact event if this is false)
 //---------------------------------------------------------------------------
@@ -359,6 +363,7 @@ tTJSNI_BaseLayer::tTJSNI_BaseLayer()
 
     // object lifetime stuff
     Owner = NULL;
+    LifetimeID = TVPNextLayerLifetimeID.fetch_add(1, std::memory_order_relaxed);
     ActionOwner.ObjThis = ActionOwner.Object = NULL;
     Shutdown = false;
     CompactEventHookInit = false;
