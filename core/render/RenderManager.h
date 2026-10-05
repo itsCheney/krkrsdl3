@@ -6,10 +6,10 @@
 #include <unordered_map>
 #include <stdint.h>
 #include <string>
+#include <vector>
 
-// 由于gpu兼容软渲染，但软渲染不兼容gpu
-// 所以对于内核我们按照krkr2/krkrz原版思路，保持完全软渲染
-// gpu加速则放入插件中，使用特殊的Layer和DrawDevice来实现
+// Software methods define ordinary Layer semantics. The Metal facade reuses
+// their canonical objects and accelerates the documented supported input domain.
 struct TVPTextureFormat
 {
     enum e
@@ -226,6 +226,15 @@ public:
 typedef tRenderTextureArray<tTVPRect> tRenderTexRectArray;
 typedef tRenderTextureArray<const tTVPPointD*> tRenderTexQuadArray;
 
+// A read-only snapshot of the canonical software registry, including aliases.
+// Method parameters and process-lived method objects are never copied or changed.
+struct TVPRenderMethodRegistration
+{
+    std::string name;
+    std::string canonicalName;
+    const iTVPRenderMethod* method;
+};
+
 class tTVPBitmap;
 namespace TJS
 {
@@ -243,6 +252,7 @@ protected:
         return nullptr;
     }
     std::unordered_map<uint32_t, iTVPRenderMethod*> AllMethods;
+    std::vector<TVPRenderMethodRegistration> MethodRegistrations;
 
 public:
     void Initialize();
@@ -267,6 +277,10 @@ public:
 
     // each method is singleton in whole lifecycle
     virtual iTVPRenderMethod* GetRenderMethod(const char* name, uint32_t* hint = nullptr);
+    // Unlike GetRenderMethod, a missing audit lookup never shows a message box.
+    // Audit the software registry; GPU facades delegate ordinary method lookup.
+    const iTVPRenderMethod* FindRegisteredRenderMethod(const char* name) const;
+    std::vector<TVPRenderMethodRegistration> GetRenderMethodRegistrations() const;
 #define RENDER_METHOD_FLAG_NONE 0
 #define RENDER_METHOD_FLAG_TARGET_AS_INPUT 1
     iTVPRenderMethod* CompileRenderMethod(const char* name,

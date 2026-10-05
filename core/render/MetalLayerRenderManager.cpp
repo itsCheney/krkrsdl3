@@ -723,8 +723,10 @@ public:
             ++session->stats.gpuOperations; return true;
         }
         if(!method->DescribeGpuOperation(op)) return RejectMethod(TVPLayerGPURejectReason::UnsupportedMethod,method);
+        const auto* traits=TVPGetLayerOperationTraits(op.kind);
+        if(!traits) return Reject(TVPLayerGPURejectReason::UnsupportedKind);
         // ApplySelf copies the reference before converting, including after COW.
-        if((op.kind==TVPLayerOperationKind::AlphaToAdditiveAlpha || op.kind==TVPLayerOperationKind::GrayScale) && inputs.size()==0) {
+        if(traits->referenceRule==TVPLayerReferenceRule::UsedWhenNoInput && inputs.size()==0) {
             if(!reference) return Reject(TVPLayerGPURejectReason::SourceUnavailable);
             tRenderTexRectArray::Element input(reference,dst);
             return GPU(method,target,nullptr,dst,tRenderTexRectArray(&input,1));
@@ -740,17 +742,12 @@ public:
         if(inputs.size()) {
             source=dynamic_cast<LayerTexture*>(inputs[0].first); src=inputs[0].second;
             if(!source || !source->Belongs(session)) return RejectSource(method,inputs[0].first);
-            const bool newBlend=op.kind==TVPLayerOperationKind::AdditiveAlpha ||
-                op.kind==TVPLayerOperationKind::PsMul || op.kind==TVPLayerOperationKind::PsOverlay ||
-                op.kind==TVPLayerOperationKind::PsHardLight || op.kind==TVPLayerOperationKind::MultiplyAlpha ||
-                op.kind==TVPLayerOperationKind::PsScreen || op.kind==TVPLayerOperationKind::PsColorDodge5 ||
-                op.kind==TVPLayerOperationKind::Add;
             // Offset self-blends are scanline-order dependent in software.
             // A GPU snapshot would change them; same-pixel aliases are safe.
-            if(newBlend && source==t && (src.left!=dst.left || src.top!=dst.top ||
+            if(traits->aliasRule==TVPLayerAliasRule::SamePixelOnly && source==t && (src.left!=dst.left || src.top!=dst.top ||
                 src.right!=dst.right || src.bottom!=dst.bottom))
                 return Reject(TVPLayerGPURejectReason::InvalidGeometry);
-            if(op.kind==TVPLayerOperationKind::ColorMap) {
+            if(traits->sourceFormats[0]==TVPLayerTextureFormat::R8) {
                 if(source->GetFormat()!=TVPTextureFormat::Gray) return Reject(TVPLayerGPURejectReason::SourceFormat);
             } else if(source->GetFormat()!=TVPTextureFormat::RGBA) {
                 return Reject(TVPLayerGPURejectReason::SourceFormat);
@@ -772,10 +769,7 @@ public:
             } else if((sw<0 || sh<0) && (std::abs(sw)!=dw || std::abs(sh)!=dh)) {
                 return Reject(TVPLayerGPURejectReason::InvalidGeometry);
             }
-        } else if(op.kind!=TVPLayerOperationKind::Fill && op.kind!=TVPLayerOperationKind::FillColor &&
-                  op.kind!=TVPLayerOperationKind::FillMask && op.kind!=TVPLayerOperationKind::FillBlend &&
-                  op.kind!=TVPLayerOperationKind::RemoveConstOpacity &&
-                  op.kind!=TVPLayerOperationKind::AlphaToAdditiveAlpha && op.kind!=TVPLayerOperationKind::GrayScale) {
+        } else if(!(traits->logicalInputCountMask & 1)) {
             return Reject(TVPLayerGPURejectReason::UnsupportedKind);
         }
         if(!session->tablesReady) {
@@ -788,22 +782,7 @@ public:
             return Reject(TVPLayerGPURejectReason::BackendFailure);
         // Only plain HDA blending preserves destination alpha. The _d/_a
         // formulas can change it even if HOLD_ALPHA is also set.
-        const bool plainHDA=(op.flags&TVP_LAYER_HOLD_ALPHA) &&
-            !(op.flags&(TVP_LAYER_DEST_ALPHA|TVP_LAYER_DEST_PREMULTIPLIED));
-        const bool preservesAlpha=op.kind==TVPLayerOperationKind::CopyColor ||
-            op.kind==TVPLayerOperationKind::FillColor ||
-            ((op.kind==TVPLayerOperationKind::AlphaToAdditiveAlpha || op.kind==TVPLayerOperationKind::GrayScale) && source==t) ||
-            (plainHDA && (op.kind==TVPLayerOperationKind::Alpha ||
-                          op.kind==TVPLayerOperationKind::ConstAlpha ||
-                          op.kind==TVPLayerOperationKind::ColorMap ||
-                          op.kind==TVPLayerOperationKind::FillBlend ||
-                          op.kind==TVPLayerOperationKind::AdditiveAlpha ||
-                          op.kind==TVPLayerOperationKind::PsMul ||
-                          op.kind==TVPLayerOperationKind::PsOverlay ||
-                          op.kind==TVPLayerOperationKind::PsHardLight ||
-                          op.kind==TVPLayerOperationKind::PsScreen ||
-                          op.kind==TVPLayerOperationKind::PsColorDodge5 ||
-                          op.kind==TVPLayerOperationKind::Add));
+        const bool preservesAlpha=TVPLayerOperationPreservesAlpha(op,source==t);
         t->InvalidateCPUCacheRegion(dst,preservesAlpha); ++session->stats.gpuOperations; return true;
     }
     void OperateRect(iTVPRenderMethod* method,iTVPTexture2D* target,iTVPTexture2D* reference,const tTVPRect& dst,const tRenderTexRectArray& inputs) override {

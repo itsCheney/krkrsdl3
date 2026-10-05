@@ -1,6 +1,7 @@
 #include "tjsCommHead.h"
 #include "RenderManager.h"
 #include <climits>
+#include <algorithm>
 
 #include "TVPMsg.h"
 #include "LayerBitmap.h"
@@ -2704,12 +2705,19 @@ void iTVPRenderManager::Initialize()
 
 void iTVPRenderManager::RegisterRenderMethod(const char* name, iTVPRenderMethod* method)
 {
+    if (!name || !method) {
+        TVPConsoleLog("render.registerFailed name=%s backend=%s reason=null_method_or_name",
+                      name ? name : "<null>", GetName());
+        return;
+    }
     tjs_uint32 hash = tTJSHashFunc<tjs_char*>::Make(name);
     assert(method && AllMethods.find(hash) == AllMethods.end());
+    if (AllMethods.find(hash) != AllMethods.end()) return;
     AllMethods[hash] = method;
     // Aliases share the same method object. Keep its first/canonical name for
     // diagnostic attribution instead of relabeling AlphaBlend as its HDA alias.
     if (method->GetName().empty()) method->SetName(name);
+    MethodRegistrations.push_back({name, method->GetName(), method});
     // Canonical software methods live for the process. Semantic metadata is
     // attached to those same objects, so static pointers/parameter IDs remain
     // valid across software and GPU sessions (including registered aliases).
@@ -2762,6 +2770,22 @@ void iTVPRenderManager::RegisterRenderMethod(const char* name, iTVPRenderMethod*
         }
 }
 
+const iTVPRenderMethod* iTVPRenderManager::FindRegisteredRenderMethod(const char* name) const
+{
+    if (!name) return nullptr;
+    auto it = AllMethods.find(tTJSHashFunc<tjs_char*>::Make(name));
+    return it == AllMethods.end() ? nullptr : it->second;
+}
+
+std::vector<TVPRenderMethodRegistration> iTVPRenderManager::GetRenderMethodRegistrations() const
+{
+    auto snapshot = MethodRegistrations;
+    std::sort(snapshot.begin(), snapshot.end(), [](const auto& a, const auto& b) {
+        return a.name < b.name;
+    });
+    return snapshot;
+}
+
 iTVPRenderMethod* iTVPRenderManager::CompileRenderMethod(const char* name,
                                                          const char* script,
                                                          int nTex,
@@ -2770,6 +2794,11 @@ iTVPRenderMethod* iTVPRenderManager::CompileRenderMethod(const char* name,
     auto it = AllMethods.find(tTJSHashFunc<tjs_char*>::Make(name));
     assert(it == AllMethods.end());
     iTVPRenderMethod* method = GetRenderMethodFromScript(script, nTex, flags);
+    if (!method) {
+        TVPConsoleLog("render.compileFailed name=%s backend=%s reason=unsupported_or_failed",
+                      name, GetName());
+        return nullptr;
+    }
     RegisterRenderMethod(name, method);
     return method;
 }

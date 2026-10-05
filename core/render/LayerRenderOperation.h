@@ -1,15 +1,25 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 
 // Common software RenderManager semantics, independent of Emote blend modes.
+#define TVP_LAYER_OPERATION_ENUM_ROW(name, id, ...) name = id,
 enum class TVPLayerOperationKind : uint32_t
 {
-    Unsupported, Copy, CopyColor, CopyMask, CopyOpaque, Fill, FillColor,
-    FillMask, Alpha, ConstAlpha, ColorMap, FillBlend, RemoveConstOpacity,
-    ConstAlphaSD, UnivTrans, AdditiveAlpha, PsMul, PsOverlay, PsHardLight,
-    AlphaToAdditiveAlpha, GrayScale, CopyBlueToAlpha, MultiplyAlpha, BoxBlur,
-    PsScreen, PsColorDodge5, Add
+#define TVP_LAYER_OPERATION TVP_LAYER_OPERATION_ENUM_ROW
+#define TVP_LAYER_OPERATION_COUNT(count) Count = count
+#include "LayerOperationDefinitions.def"
+#undef TVP_LAYER_OPERATION_COUNT
+#undef TVP_LAYER_OPERATION
 };
+inline constexpr std::size_t TVP_LAYER_OPERATION_COUNT =
+    static_cast<std::size_t>(TVPLayerOperationKind::Count);
+// These names are also injected into runtime MSL and used by scalar extraction.
+#define TVP_LAYER_OPERATION(name, id, ...) inline constexpr int TVP_LAYER_KIND_##name = id;
+#define TVP_LAYER_OPERATION_COUNT(count)
+#include "LayerOperationDefinitions.def"
+#undef TVP_LAYER_OPERATION_COUNT
+#undef TVP_LAYER_OPERATION
 enum TVPLayerOperationFlags : uint32_t
 {
     TVP_LAYER_HOLD_ALPHA = 1,
@@ -27,6 +37,92 @@ struct TVPLayerOperation
     int phase = 0;
     int vague = 0;
 };
+enum class TVPLayerTextureFormat { RGBA8, R8 };
+enum class TVPLayerReferenceRule { Ignored, UsedWhenNoInput };
+enum class TVPLayerAlphaRule { Writes, Preserves, PlainHDA, SourceAlpha };
+enum class TVPLayerAliasRule {
+    Unsupported, Ignored, Snapshot, SamePixelOnly, ReadAllBeforeWrite
+};
+enum TVPLayerParameterResources : uint32_t {
+    TVP_LAYER_RESOURCE_ALPHA_TABLES = 1,
+    // Reserved contract for future Gamma mappings; none are enabled by P0.
+    TVP_LAYER_RESOURCE_GAMMA_LUT = 2
+};
+enum TVPLayerGeometry : uint32_t {
+    TVP_LAYER_GEOMETRY_RECT = 1,
+    // Copy/flags=0 only, subject to the existing affine Prepare/clip checks.
+    TVP_LAYER_GEOMETRY_AFFINE_COPY_SUBSET = 2
+};
+struct TVPLayerOperationTraits {
+    TVPLayerOperationKind kind;
+    const char* name;
+    uint8_t logicalInputCountMask;
+    uint8_t backendInputCount;
+    TVPLayerTextureFormat targetFormat;
+    TVPLayerTextureFormat sourceFormats[3];
+    TVPLayerReferenceRule referenceRule;
+    bool readsTarget;
+    TVPLayerAlphaRule alphaRule;
+    TVPLayerAliasRule aliasRule;
+    uint32_t parameterResources;
+    uint32_t geometries;
+};
+#define TVP_LAYER_OPERATION_TRAIT_ROW(name, id, mask, inputs, f0, f1, f2, reference, reads, alpha, alias, resources, geometry) \
+    {static_cast<TVPLayerOperationKind>(id), #name, mask, inputs, TVPLayerTextureFormat::RGBA8, \
+     {TVPLayerTextureFormat::f0, TVPLayerTextureFormat::f1, TVPLayerTextureFormat::f2}, \
+     TVPLayerReferenceRule::reference, reads, TVPLayerAlphaRule::alpha, TVPLayerAliasRule::alias, resources, geometry},
+inline constexpr TVPLayerOperationTraits TVP_LAYER_OPERATION_TRAITS[] = {
+#define TVP_LAYER_OPERATION TVP_LAYER_OPERATION_TRAIT_ROW
+#define TVP_LAYER_OPERATION_COUNT(count)
+#include "LayerOperationDefinitions.def"
+#undef TVP_LAYER_OPERATION_COUNT
+#undef TVP_LAYER_OPERATION
+};
+template<std::size_t N>
+constexpr bool TVPLayerOperationDefinitionsValid(const TVPLayerOperationTraits (&traits)[N]) {
+    for (std::size_t i = 0; i < N; ++i)
+        if (static_cast<std::size_t>(traits[i].kind) != i) return false;
+    return true;
+}
+constexpr bool TVPLayerOperationDefinitionsValid() {
+    return sizeof(TVP_LAYER_OPERATION_TRAITS) / sizeof(TVP_LAYER_OPERATION_TRAITS[0]) == TVP_LAYER_OPERATION_COUNT &&
+           TVPLayerOperationDefinitionsValid(TVP_LAYER_OPERATION_TRAITS);
+}
+static_assert(TVPLayerOperationDefinitionsValid(), "Layer IDs/traits/Count must agree");
+template<std::size_t N>
+inline constexpr const TVPLayerOperationTraits* TVPFindLayerOperationTraits(
+        const TVPLayerOperationTraits (&traits)[N], uint32_t id) {
+    return id > 0 && id < N ? &traits[id] : nullptr;
+}
+inline constexpr const TVPLayerOperationTraits* TVPGetLayerOperationTraits(TVPLayerOperationKind kind) {
+    const auto id = static_cast<uint32_t>(kind);
+    return TVPFindLayerOperationTraits(TVP_LAYER_OPERATION_TRAITS, id);
+}
+inline constexpr bool TVPLayerOperationNeedsSource(TVPLayerOperationKind kind) {
+    const auto* traits = TVPGetLayerOperationTraits(kind);
+    return traits && traits->backendInputCount != 0;
+}
+inline constexpr bool TVPLayerOperationReadsTarget(TVPLayerOperationKind kind) {
+    const auto* traits = TVPGetLayerOperationTraits(kind);
+    return traits && traits->readsTarget;
+}
+inline constexpr bool TVPLayerOperationPreservesAlpha(const TVPLayerOperation& op, bool sourceIsTarget) {
+    const auto* traits = TVPGetLayerOperationTraits(op.kind);
+    if (!traits) return false;
+    switch (traits->alphaRule) {
+        case TVPLayerAlphaRule::Preserves: return true;
+        case TVPLayerAlphaRule::SourceAlpha: return sourceIsTarget;
+        case TVPLayerAlphaRule::PlainHDA:
+            return (op.flags & TVP_LAYER_HOLD_ALPHA) &&
+                   !(op.flags & (TVP_LAYER_DEST_ALPHA | TVP_LAYER_DEST_PREMULTIPLIED));
+        default: return false;
+    }
+}
+inline constexpr bool TVPLayerOperationNeedsAlphaTables(const TVPLayerOperation& op) {
+    const auto* traits = TVPGetLayerOperationTraits(op.kind);
+    return traits && (traits->parameterResources & TVP_LAYER_RESOURCE_ALPHA_TABLES) &&
+           (op.flags & TVP_LAYER_DEST_ALPHA);
+}
 struct TVPLayerRect
 {
     int left = 0, top = 0, right = 0, bottom = 0;
@@ -39,7 +135,6 @@ struct TVPLayerAffineCopy {
     TVPLayerRect clip, sourceCrop;
     double inverse[6] = {}; // source x/y = a*x + b*y + c, destination centers
 };
-enum class TVPLayerTextureFormat { RGBA8, R8 };
 // Why a GPU->CPU readback happened. Readbacks are synchronous and dominate
 // main-thread time, so attribution matters more than the total: the same byte
 // count means very different things for a per-frame present than for a one-off

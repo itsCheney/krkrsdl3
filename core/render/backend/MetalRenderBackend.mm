@@ -794,11 +794,7 @@ struct MetalRenderBackend::Impl
                             static_cast<unsigned long long>(firstRenderFrame),
                             static_cast<unsigned long long>(lastRenderFrame), submittedAtMS,
                             double(SDL_GetTicksNS()) / 1000000.0);
-                    std::string kinds;
-                    for(int kind=0;kind<27;++kind) if(workload.pixelsByKind[kind]) {
-                        if(!kinds.empty()) kinds+=',';
-                        kinds+=std::to_string(kind)+":"+std::to_string(workload.pixelsByKind[kind]);
-                    }
+                    const std::string kinds=workload.KindPixelSummary();
                     SDL_Log("metal.layerWork id=%llu rectCalls=%u tileDraws=%u rectPixels=%llu "
                         "scaledPixels=%llu aliasPixels=%llu blurPixels=%llu kindPixels=%s",
                         static_cast<unsigned long long>(serial),workload.rectCalls,workload.tileDraws,
@@ -1095,7 +1091,8 @@ struct MetalRenderBackend::Impl
         }
         MTLCompileOptions* ordinaryOptions = [MTLCompileOptions new];
         ordinaryOptions.fastMathEnabled = NO;
-        id<MTLLibrary> ordinary = [device newLibraryWithSource:[NSString stringWithUTF8String:kMetalLayerShaders]
+        const std::string ordinarySource=TVPBuildMetalLayerShaderSource();
+        id<MTLLibrary> ordinary = [device newLibraryWithSource:[NSString stringWithUTF8String:ordinarySource.c_str()]
                                                       options:ordinaryOptions error:&error];
         if (ordinary) {
             ordinaryLayerPipeline = [device newComputePipelineStateWithFunction:
@@ -1114,8 +1111,7 @@ struct MetalRenderBackend::Impl
         if(ordinaryLayerPipeline && device.readWriteTextureSupport == MTLReadWriteTextureTier2) {
             // These kernels read only their own destination pixel, into registers,
             // before overwriting it. Aliased sources still require region snapshots.
-            std::string inPlaceSource("#define TVP_LAYER_IN_PLACE 1\n");
-            inPlaceSource+=kMetalLayerShaders;
+            const std::string inPlaceSource=TVPBuildMetalLayerShaderSource("#define TVP_LAYER_IN_PLACE 1\n");
             id<MTLLibrary> inPlace=[device newLibraryWithSource:[NSString stringWithUTF8String:inPlaceSource.c_str()]
                                                       options:ordinaryOptions error:&error];
             if(inPlace) ordinaryInPlacePipeline=[device newComputePipelineStateWithFunction:
@@ -1126,8 +1122,7 @@ struct MetalRenderBackend::Impl
         if(@available(macOS 11.0,iOS 14.0,tvOS 14.0,*)) {
             if([device supportsFamily:MTLGPUFamilyApple4] &&
                 SDL_GetHintBoolean("MIKAGE_METAL_LAYER_TILE_RENDERER",true)) {
-                std::string source("#define TVP_LAYER_FRAMEBUFFER_FETCH 1\n");
-                source+=kMetalLayerShaders;
+                const std::string source=TVPBuildMetalLayerShaderSource("#define TVP_LAYER_FRAMEBUFFER_FETCH 1\n");
                 auto tileLibrary=[device newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()]
                                                      options:ordinaryOptions error:&error];
                 if(tileLibrary) {
@@ -1694,10 +1689,14 @@ bool MetalRenderBackend::RequestLayerTextureRegionRead(void* handle, const TVPLa
 bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,void* target,const TVPLayerRect& dst,
                                          void* source,const TVPLayerRect& src,int sampling) {
     @autoreleasepool {
+        const auto* traits=TVPGetLayerOperationTraits(operation.kind);
+        // Reject unknown/Count and multi-source kinds before any GPU encoding.
+        // Their dedicated entry points retain their own validation and binding.
+        if(!traits || traits->backendInputCount>1) return false;
         auto& p=*impl_; auto* t=p.Find(target); auto* s=p.Find(source);
         int kind=static_cast<int>(operation.kind);
-        bool needsSource=kind<5 || (kind>=8 && kind<=10) || (kind>=15 && kind<=26);
-        if(!p.ordinaryLayerPipeline || !t || t->bytesPerPixel!=4 || kind==0 || (needsSource && !s) ||
+        bool needsSource=TVPLayerOperationNeedsSource(operation.kind);
+        if(!p.ordinaryLayerPipeline || !t || t->bytesPerPixel!=4 || (needsSource && !s) ||
             dst.Width()<=0 || dst.Height()<=0 || sampling<0 || sampling>1) return false;
         if(needsSource && (src.Width()==0 || src.Height()==0 || std::min(src.left,src.right)<0 ||
             std::min(src.top,src.bottom)<0 || std::max(src.left,src.right)>s->width || std::max(src.top,src.bottom)>s->height)) return false;
@@ -1741,7 +1740,7 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
             if(p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
             return true;
         }
-        bool overwrite=kind==1 || kind==4 || kind==5 || kind==19 || kind==20;
+        bool overwrite=!TVPLayerOperationReadsTarget(operation.kind);
         bool tile=p.ordinaryRenderPipeline!=nil;
         bool inPlace=tile || p.ordinaryInPlacePipeline!=nil;
         id<MTLTexture> snapshot=nil, sourceTexture=s ? s->texture : p.ordinaryDummy;

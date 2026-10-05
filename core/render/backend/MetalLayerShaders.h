@@ -1,4 +1,6 @@
 #pragma once
+#include <string>
+#include "../LayerOperationShaderDefinitions.h"
 
 // Integer byte formulas from the software RenderManager/tvpgl routines. This
 // library is compiled separately: a Layer failure never disables presentation.
@@ -124,11 +126,11 @@ uint layerPremulPixel(uint d, uint s, int opa, uint flags) {
 uint layerPsPixel(uint d, uint s, int kind, int opa, uint flags) {
     uint alpha = s >> 24;
     if (opa != 255) alpha = (alpha * uint(opa)) >> 8;
-    if (kind == 24 || kind == 25) {
+    if (kind == TVP_LAYER_KIND_PsScreen || kind == TVP_LAYER_KIND_PsColorDodge5) {
         uint result=0;
         for(uint shift=0;shift<24;shift+=8) {
             uint dc=(d>>shift)&255u, sc=(s>>shift)&255u, color;
-            if(kind==24) color=dc+(((sc-((dc*sc)>>8))*alpha)>>8);
+            if(kind==TVP_LAYER_KIND_PsScreen) color=dc+(((sc-((dc*sc)>>8))*alpha)>>8);
             else {
                 sc=(sc*alpha)>>8;
                 color=255u-sc<=dc ? 255u : dc*255u/(255u-sc);
@@ -137,7 +139,7 @@ uint layerPsPixel(uint d, uint s, int kind, int opa, uint flags) {
         }
         return result | ((flags & 1u)!=0 ? d & 0xff000000u : 0u);
     }
-    if (kind == 16) {
+    if (kind == TVP_LAYER_KIND_PsMul) {
         s = (((((d >> 16) & 255u) * (s & 0x00ff0000u)) & 0xff000000u) |
              ((((d >> 8) & 255u) * (s & 0x0000ff00u)) & 0x00ff0000u) |
              (((d & 255u) * (s & 255u)))) >> 8;
@@ -145,7 +147,7 @@ uint layerPsPixel(uint d, uint s, int kind, int opa, uint flags) {
         uint blended = 0;
         for (uint shift = 0; shift < 24; shift += 8) {
             uint dc = (d >> shift) & 255u, sc = (s >> shift) & 255u;
-            if (kind == 18) { uint swap = dc; dc = sc; sc = swap; }
+            if (kind == TVP_LAYER_KIND_PsHardLight) { uint swap = dc; dc = sc; sc = swap; }
             // Production software enables TVPPS_USE_OVERLAY_TABLE: divide by
             // 255, rather than the approximate >>7 non-table implementation.
             uint product = sc * dc * 2u / 255u;
@@ -176,12 +178,12 @@ uint layerAddPixel(uint d,uint s,int opa,uint flags) {
     return result | (alpha<<24);
 }
 uint layerMaskPixel(uint d, uint s, int kind) {
-    if (kind == 20) {
+    if (kind == TVP_LAYER_KIND_GrayScale) {
         uint gray = ((s & 255u) * 19u + ((s >> 8) & 255u) * 183u + ((s >> 16) & 255u) * 54u) >> 8;
         return (s & 0xff000000u) | gray * 0x010101u;
     }
     uint alpha = s & 255u;
-    if (kind == 22) { uint product = (d >> 24) * (s >> 24); alpha = (product + (product >> 7)) >> 8; }
+    if (kind == TVP_LAYER_KIND_MultiplyAlpha) { uint product = (d >> 24) * (s >> 24); alpha = (product + (product >> 7)) >> 8; }
     return (d & 0xffffffu) | (alpha << 24);
 }
 int4 layerPixel(int4 d,int4 s,int4 color,int kind,int opa,int flags,const device uchar* tables) {
@@ -190,63 +192,63 @@ int4 layerPixel(int4 d,int4 s,int4 color,int kind,int opa,int flags,const device
     bool full=opa==255 && (flags&8)!=0;
     int4 result=int4(0);
     switch (kind) {
-        case 1: result = s; break;
-        case 2: result = int4(s.rgb, d.a); break;
-        case 3: result = int4(d.rgb, s.a); break;
-        case 4: result = int4(s.rgb, 255); break;
-        case 5: result = color; break;
-        case 6: result = int4(color.rgb, d.a); break;
-        case 7: result = int4(d.rgb, opa); break;
-        case 8:
-        case 9:
-        case 10:
-        case 11: {
+        case TVP_LAYER_KIND_Copy: result = s; break;
+        case TVP_LAYER_KIND_CopyColor: result = int4(s.rgb, d.a); break;
+        case TVP_LAYER_KIND_CopyMask: result = int4(d.rgb, s.a); break;
+        case TVP_LAYER_KIND_CopyOpaque: result = int4(s.rgb, 255); break;
+        case TVP_LAYER_KIND_Fill: result = color; break;
+        case TVP_LAYER_KIND_FillColor: result = int4(color.rgb, d.a); break;
+        case TVP_LAYER_KIND_FillMask: result = int4(d.rgb, opa); break;
+        case TVP_LAYER_KIND_Alpha:
+        case TVP_LAYER_KIND_ConstAlpha:
+        case TVP_LAYER_KIND_ColorMap:
+        case TVP_LAYER_KIND_FillBlend: {
             int alpha;
-            if (kind == 9 || kind == 11) alpha = opa;
+            if (kind == TVP_LAYER_KIND_ConstAlpha || kind == TVP_LAYER_KIND_FillBlend) alpha = opa;
             else {
-                alpha = kind == 10 ? s.r : s.a;
+                alpha = kind == TVP_LAYER_KIND_ColorMap ? s.r : s.a;
                 if (!full) alpha = (alpha * opa) >> 8;
             }
-            int3 rgb = kind == 10 || kind == 11 ? color.rgb : s.rgb;
+            int3 rgb = kind == TVP_LAYER_KIND_ColorMap || kind == TVP_LAYER_KIND_FillBlend ? color.rgb : s.rgb;
             if (straightDestination) {
                 uint index = uint((alpha << 8) + d.a);
                 int ratio = int(tables[index]);
-                result = int4(d.rgb + (((rgb - d.rgb) * ratio) >> 8), kind == 11 ? 255 - (((255-d.a)*(255-alpha))>>8) : int(tables[65536 + index]));
+                result = int4(d.rgb + (((rgb - d.rgb) * ratio) >> 8), kind == TVP_LAYER_KIND_FillBlend ? 255 - (((255-d.a)*(255-alpha))>>8) : int(tables[65536 + index]));
             } else if (premultipliedDestination) {
-                int3 premul = kind == 9 ? rgb : (rgb * alpha) >> 8;
+                int3 premul = kind == TVP_LAYER_KIND_ConstAlpha ? rgb : (rgb * alpha) >> 8;
                 int3 output = min(((d.rgb * (255 - alpha)) >> 8) + premul, int3(255));
                 int da = d.a + alpha - ((d.a * alpha) >> 8);
                 da -= da >> 8;
                 result = int4(output, da);
             } else {
-                result = int4(kind == 11 ? ((d.rgb * (255-alpha) + rgb * alpha)>>8) : d.rgb + (((rgb - d.rgb) * alpha) >> 8), hold ? d.a : 0);
+                result = int4(kind == TVP_LAYER_KIND_FillBlend ? ((d.rgb * (255-alpha) + rgb * alpha)>>8) : d.rgb + (((rgb - d.rgb) * alpha) >> 8), hold ? d.a : 0);
             }
             break;
         }
-        case 12:
+        case TVP_LAYER_KIND_RemoveConstOpacity:
             // TVPRemoveConstOpacity: RGB is preserved exactly; alpha uses the
             // software byte formula A * (255 - strength) >> 8.
             result = int4(d.rgb, (d.a * (255 - opa)) >> 8);
             break;
-        case 15:
+        case TVP_LAYER_KIND_AdditiveAlpha:
             result = layerUnpack(layerPremulPixel(layerPack(d), layerPack(s), opa, uint(flags)));
             break;
-        case 16:
-        case 17:
-        case 18:
-        case 24:
-        case 25:
+        case TVP_LAYER_KIND_PsMul:
+        case TVP_LAYER_KIND_PsOverlay:
+        case TVP_LAYER_KIND_PsHardLight:
+        case TVP_LAYER_KIND_PsScreen:
+        case TVP_LAYER_KIND_PsColorDodge5:
             result = layerUnpack(layerPsPixel(layerPack(d), layerPack(s), kind, opa, uint(flags)));
             break;
-        case 26:
+        case TVP_LAYER_KIND_Add:
             result = layerUnpack(layerAddPixel(layerPack(d), layerPack(s), opa, uint(flags)));
             break;
-        case 19:
+        case TVP_LAYER_KIND_AlphaToAdditiveAlpha:
             result = layerUnpack(layerAlphaToPremulPixel(layerPack(s)));
             break;
-        case 20:
-        case 21:
-        case 22:
+        case TVP_LAYER_KIND_GrayScale:
+        case TVP_LAYER_KIND_CopyBlueToAlpha:
+        case TVP_LAYER_KIND_MultiplyAlpha:
             result = layerUnpack(layerMaskPixel(layerPack(d), layerPack(s), kind));
             break;
     }
@@ -265,7 +267,7 @@ kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
     int2 xy = p.clip.xy + int2(tid);
     if (any(xy >= p.clip.zw)) return;
     int kind = p.operation.x, opa = p.operation.y, flags = p.operation.z;
-    bool overwrite = kind == 1 || kind == 4 || kind == 5 || kind == 19 || kind == 20;
+    bool overwrite = !layerReadsTarget(kind);
     int4 d = int4(0), s = int4(0), color = p.color;
     if (!overwrite) {
 #ifdef TVP_LAYER_IN_PLACE
@@ -276,7 +278,7 @@ kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
         d = layerBytes(snapshot, xy - p.clip.xy);
 #endif
     }
-    if (kind < 5 || (kind >= 8 && kind <= 10) || (kind >= 15 && kind <= 26))
+    if (layerNeedsSource(kind))
         s = layerSample(source, p, xy);
     int4 result=layerPixel(d,s,color,kind,opa,flags,tables);
     target.write(float4(result) / 255.0,uint2(xy));
@@ -298,7 +300,7 @@ fragment LayerRasterColor ordinaryLayerFragment(LayerRasterVertex in [[stage_in]
     int2 xy=int2(in.position.xy);
     int kind=p.operation.x;
     int4 s=int4(0);
-    if(kind<5 || (kind>=8 && kind<=10) || (kind>=15 && kind<=26)) s=layerSample(source,p,xy);
+    if(layerNeedsSource(kind)) s=layerSample(source,p,xy);
     int4 d=int4(round(previous*255.0));
     return {float4(layerPixel(d,s,p.color,kind,p.operation.y,p.operation.z,tables))/255.0};
 }
@@ -444,3 +446,7 @@ kernel void univTransLayer(uint2 tid [[thread_position_in_grid]],
     target.write(float4(layerUnpack(out)) / 255.0, uint2(xy));
 }
 )MSL";
+
+inline std::string TVPBuildMetalLayerShaderSource(const char* options = "") {
+    return std::string(options) + TVP_LAYER_OPERATION_MSL_DEFINITIONS + kMetalLayerShaders;
+}
