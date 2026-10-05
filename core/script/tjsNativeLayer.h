@@ -8,6 +8,7 @@
 #include "TVPEvent.h"
 #include "ObjectList.h"
 #include "tjsNative.h"
+#include <cstdint>
 
 namespace krkrsdl3 { class iTVPRenderBackend; }
 
@@ -167,6 +168,9 @@ class tTJSNI_BaseLayer : public tTJSNativeInstance,
 protected:
     iTJSDispatch2* Owner;
     tTJSVariantClosure ActionOwner;
+    // Stable native-instance identity for deferred input. This avoids keeping
+    // the TJS owner alive merely to detect stale/recycled layer pointers.
+    uint64_t LifetimeID;
 
     //---------------------------------------------- object lifetime stuff --
 public:
@@ -176,6 +180,7 @@ public:
     void Invalidate() override;
 
     iTJSDispatch2* GetOwnerNoAddRef() const { return Owner; }
+    uint64_t GetLifetimeID() const { return LifetimeID; }
 
     tTJSVariantClosure GetActionOwnerNoAddRef() const { return ActionOwner; }
 
