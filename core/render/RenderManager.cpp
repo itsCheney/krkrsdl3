@@ -1,5 +1,6 @@
 #include "tjsCommHead.h"
 #include "RenderManager.h"
+#include "LayerPerspectiveGeometry.h"
 #include <climits>
 #include <algorithm>
 
@@ -357,65 +358,6 @@ inline void GetAffineTransform(
 // Rearranged:
 //   a*src_x + b*src_y + c - g*src_x*dst_x - h*src_y*dst_x = dst_x
 //   d*src_x + e*src_y + f - g*src_x*dst_y - h*src_y*dst_y = dst_y
-inline bool GetPerspectiveTransform(
-    const double* srcX, const double* srcY,
-    const double* dstX, const double* dstY,
-    double* mat8) // [a,b,c,d,e,f,g,h] for matrix [[a,b,c],[d,e,f],[g,h,1]]
-{
-    // Set up 8x8 linear system
-    // Actually solve using the standard technique: 
-    // We have 8 unknowns. Form matrix equation and solve via Gaussian elimination.
-    
-    double M[8][9]; // augmented matrix
-    for (int i = 0; i < 4; ++i)
-    {
-        int r = i * 2;
-        // Equation for dst_x
-        M[r][0] = srcX[i];  M[r][1] = srcY[i];  M[r][2] = 1.0;
-        M[r][3] = 0.0;      M[r][4] = 0.0;      M[r][5] = 0.0;
-        M[r][6] = -srcX[i] * dstX[i]; M[r][7] = -srcY[i] * dstX[i];
-        M[r][8] = dstX[i];
-        // Equation for dst_y
-        M[r+1][0] = 0.0;    M[r+1][1] = 0.0;    M[r+1][2] = 0.0;
-        M[r+1][3] = srcX[i]; M[r+1][4] = srcY[i]; M[r+1][5] = 1.0;
-        M[r+1][6] = -srcX[i] * dstY[i]; M[r+1][7] = -srcY[i] * dstY[i];
-        M[r+1][8] = dstY[i];
-    }
-
-    // Gaussian elimination with partial pivoting
-    for (int col = 0; col < 8; ++col)
-    {
-        // Find pivot
-        int maxRow = col;
-        double maxVal = fabs(M[col][col]);
-        for (int row = col + 1; row < 8; ++row)
-        {
-            double v = fabs(M[row][col]);
-            if (v > maxVal) { maxVal = v; maxRow = row; }
-        }
-        if (maxVal < 1e-15) return false; // singular
-        if (maxRow != col) std::swap(M[col], M[maxRow]);
-
-        // Eliminate rows below
-        for (int row = col + 1; row < 8; ++row)
-        {
-            double factor = M[row][col] / M[col][col];
-            for (int j = col; j <= 8; ++j)
-                M[row][j] -= factor * M[col][j];
-        }
-    }
-
-    // Back substitution
-    for (int row = 7; row >= 0; --row)
-    {
-        double sum = M[row][8];
-        for (int j = row + 1; j < 8; ++j)
-            sum -= M[row][j] * mat8[j];
-        mat8[row] = sum / M[row][row];
-    }
-    return true;
-}
-
 // ======================================================================
 // Warp image using affine transform (inverse mapping)
 // mat6 = [a,b,c,d,e,f] transforms src->dst: dst_x = a*src_x + b*src_y + c
@@ -478,42 +420,13 @@ inline void WarpAffineRGBA(
 //                    dst_y = (d*src_x + e*src_y + f) / (g*src_x + h*src_y + 1)
 // We compute inverse by solving per-pixel
 // ======================================================================
-inline void WarpPerspectiveRGBA(
-    const uint8_t* src, int srcW, int srcH, int srcPitch,
-    uint8_t* dst, int dstW, int dstH, int dstPitch,
-    const double* mat8, // [a,b,c,d,e,f,g,h]
-    int mode)
+inline void WarpPerspectiveInverseRGBA(
+    const uint8_t* src,int srcW,int srcH,int srcPitch,
+    uint8_t* dst,int dstW,int dstH,int dstPitch,const double* inverse,int mode)
 {
-    // For perspective transform, we iterate over destination pixels
-    // and compute source coordinates using the inverse transform.
-    // The inverse perspective transform is another perspective transform.
-    // We compute it by inverting the 3x3 matrix.
-    
-    double a = mat8[0], b = mat8[1], c = mat8[2];
-    double d = mat8[3], e = mat8[4], f = mat8[5];
-    double g = mat8[6], h = mat8[7];
-    
-    // Build 3x3 matrix: [[a,b,c],[d,e,f],[g,h,1]]
-    // Invert it
-    double det = a*(e*1 - f*h) - b*(d*1 - f*g) + c*(d*h - e*g);
-    if (fabs(det) < 1e-15)
-    {
-        memset(dst, 0, dstPitch * dstH);
-        return;
-    }
-    double invDet = 1.0 / det;
-    
-    // Inverse matrix
-    double invA = (e * 1 - f * h) * invDet;
-    double invB = (c * h - b * 1) * invDet;
-    double invC = (b * f - c * e) * invDet;
-    double invD = (f * g - d * 1) * invDet;
-    double invE = (a * 1 - c * g) * invDet;
-    double invF = (c * d - a * f) * invDet;
-    double invG = (d * h - e * g) * invDet;
-    double invH = (b * g - a * h) * invDet;
-    double invI = (a * e - b * d) * invDet;
-    
+    const double invA=inverse[0],invB=inverse[1],invC=inverse[2];
+    const double invD=inverse[3],invE=inverse[4],invF=inverse[5];
+    const double invG=inverse[6],invH=inverse[7],invI=inverse[8];
     for (int y = 0; y < dstH; ++y)
     {
         uint8_t* dline = dst + y * dstPitch;
@@ -531,7 +444,7 @@ inline void WarpPerspectiveRGBA(
             }
             float sx = (float)((invA * cx + invB * cy + invC) / denom);
             float sy = (float)((invD * cx + invE * cy + invF) / denom);
-            if (sx < 0.5f || sx >= srcW - 0.5f || sy < 0.5f || sy >= srcH - 0.5f)
+            if (!std::isfinite(sx) || !std::isfinite(sy) || sx < 0.5f || sx >= srcW - 0.5f || sy < 0.5f || sy >= srcH - 0.5f)
             {
                 *(uint32_t*)dline = 0;
                 dline += 4;
@@ -549,6 +462,14 @@ inline void WarpPerspectiveRGBA(
     }
 }
 
+inline void WarpPerspectiveRGBA(
+    const uint8_t* src,int srcW,int srcH,int srcPitch,
+    uint8_t* dst,int dstW,int dstH,int dstPitch,const double* forward,int mode)
+{
+    double inverse[9];
+    if(!InvertPerspectiveTransform(forward,inverse)) { memset(dst,0,size_t(dstPitch)*dstH);return; }
+    WarpPerspectiveInverseRGBA(src,srcW,srcH,srcPitch,dst,dstW,dstH,dstPitch,inverse,mode);
+}
 } // namespace TVPImageUtils
 
 //---------------------------------------------------------------------------
@@ -2915,6 +2836,7 @@ class tTVPSoftwareRenderManager : public iTVPRenderManager
     };
 
     tTVPBBStretchType StretchType;
+    bool negativePerspectiveStretch = false;
 
     iTVPTexture2D* tempTexture;
 
@@ -3272,6 +3194,7 @@ public:
         switch (id)
         {
             case eParameters::StretchType:
+                negativePerspectiveStretch = Value < 0;
                 StretchType = (tTVPBBStretchType)Value;
                 if (StretchType >= sizeof(stretchMode) / sizeof(stretchMode[0]))
                 {
@@ -4983,105 +4906,37 @@ public:
                                     const tTVPPointD* pttar /*quad*/,
                                     const tRenderTexQuadArray& textures) override
     {
-        assert(textures.size() == 1);
-        for (int i = 0; i < textures.size(); ++i)
+        if(nQuads<0 || !target || !method || textures.size()!=1 || !textures[0].first ||
+           target->GetFormat()!=TVPTextureFormat::RGBA || textures[0].first->GetFormat()!=TVPTextureFormat::RGBA || negativePerspectiveStretch)
+            TVPThrowExceptionMessage(TJS_N("Invalid perspective geometry"));
+        tTVPRect clip;
+        if(nQuads==0 || !TVPIntersectRect(&clip,rcclip,tTVPRect(0,0,target->GetWidth(),target->GetHeight()))) return;
+        if(!pttar || !textures[0].second) TVPThrowExceptionMessage(TJS_N("Invalid perspective geometry"));
+        iTVPTexture2D* src=textures[0].first;
+        std::vector<TVPLayerPerspectiveQuad> quads(size_t(nQuads),TVPLayerPerspectiveQuad{});
+        for(int i=0;i<nQuads;++i)
+            if(!layer_perspective::PrepareQuad(pttar+i*4,textures[0].second+i*4,src->GetWidth(),src->GetHeight(),
+                    TVPLayerRect{clip.left,clip.top,clip.right,clip.bottom},quads[i]))
+                TVPThrowExceptionMessage(TJS_N("Invalid perspective geometry"));
+        // Validate every quad before decompression, allocation or target writes.
+        src->GetScanLineForRead(0);
+        for(const auto& quad:quads)
         {
-            textures[i].first->GetScanLineForRead(0); // prepare pixel data for compressed texture
-        }
-        iTVPTexture2D* dst = target;
-        const tTVPPointD* dstpt = pttar;
-        iTVPTexture2D* src = textures[0].first;
-        const tTVPPointD* srcpt = textures[0].second;
-        for (int i = 0; i < nQuads; ++i)
-        {
-            bool isSrcRect = // route for square rect
-                isDoubleEqual(srcpt[0].y, srcpt[1].y) && isDoubleEqual(srcpt[1].x, srcpt[3].x) &&
-                isDoubleEqual(srcpt[0].x, srcpt[2].x) && isDoubleEqual(srcpt[2].y, srcpt[3].y) &&
-                isDoubleEqual(dstpt[0].y, dstpt[1].y) && isDoubleEqual(dstpt[1].x, dstpt[3].x) &&
-                isDoubleEqual(dstpt[0].x, dstpt[2].x) && isDoubleEqual(dstpt[2].y, dstpt[3].y);
-            bool processed = false;
-
-            if (isSrcRect)
-                do
-                {
-                    tTVPRect dstrect(dstpt[0].x, dstpt[0].y, dstpt[2].x, dstpt[2].y);
-                    tTVPRect refrect(srcpt[0].x, srcpt[0].y, srcpt[2].x, srcpt[2].y);
-                    if (dstrect.left > dstrect.right || dstrect.top > dstrect.bottom ||
-                        refrect.left > refrect.right || refrect.top > refrect.bottom)
-                        break;
-                    const tTVPRect& cr = rcclip;
-
-                    if (refrect.right < refrect.left && dstrect.right < dstrect.left)
-                    {
-                        std::swap(refrect.left, refrect.right);
-                        std::swap(dstrect.left, dstrect.right);
-                    }
-                    if (refrect.bottom < refrect.top && dstrect.bottom < dstrect.top)
-                    {
-                        std::swap(refrect.bottom, refrect.top);
-                        std::swap(dstrect.bottom, dstrect.top);
-                    }
-                    tTVPRect rcdest;
-                    if (TVPIntersectRect(&rcdest, cr, dstrect))
-                    {
-                        tjs_int dw = dstrect.get_width(), dh = dstrect.get_height();
-                        tjs_int rw = refrect.get_width(), rh = refrect.get_height();
-
-                        if (rcdest.left > dstrect.left)
-                        {
-                            refrect.left += (float)rw / dw * (rcdest.left - dstrect.left);
-                        }
-                        if (rcdest.right < dstrect.right)
-                        {
-                            refrect.right -= (float)rw / dw * (dstrect.right - rcdest.right);
-                        }
-                        if (rcdest.top > dstrect.top)
-                        {
-                            refrect.top += (float)rh / dh * (rcdest.top - dstrect.top);
-                        }
-                        if (rcdest.bottom < dstrect.bottom)
-                        {
-                            refrect.bottom -= (float)rh / dh * (dstrect.bottom - rcdest.bottom);
-                        }
-                        OperateRect(method, target, rcdest, src, refrect);
-                        processed = true;
-                    }
-                } while (false);
-            if (!processed)
-            {
-                const uint8_t* sdata;
-                int spitch = src->GetPitch();
-                sdata = (const uint8_t*)src->GetPixelData();
-                int dst_img_w = rcclip.get_width(), dst_img_h = rcclip.get_height();
-                size_t dstPitch = (dst_img_w * 4 + 7) & ~7;
-                uint8_t* dstData = new uint8_t[dstPitch * dst_img_h];
-                int src_img_w = src->GetWidth(), src_img_h = src->GetHeight();
-
-                // upper-left, upper-right, bottom-right, bottom-left
-                double pts_src_x[4] = { srcpt[0].x, srcpt[1].x + 1, srcpt[3].x + 1, srcpt[2].x };
-                double pts_src_y[4] = { srcpt[0].y, srcpt[1].y, srcpt[3].y + 1, srcpt[2].y + 1 };
-                double pts_dst_x[4] = { dstpt[0].x - rcclip.left, dstpt[1].x - rcclip.left, dstpt[3].x - rcclip.left, dstpt[2].x - rcclip.left };
-                double pts_dst_y[4] = { dstpt[0].y - rcclip.top, dstpt[1].y - rcclip.top, dstpt[3].y - rcclip.top, dstpt[2].y - rcclip.top };
-
-                double perspMat[8];
-                TVPImageUtils::GetPerspectiveTransform(pts_src_x, pts_src_y, pts_dst_x, pts_dst_y, perspMat);
-                TVPImageUtils::WarpPerspectiveRGBA(
-                    sdata, src_img_w, src_img_h, spitch,
-                    dstData, dst_img_w, dst_img_h, (int)dstPitch,
-                    perspMat, stretchMode[StretchType]);
-
-                iTVPTexture2D* tmp = new tTVPSoftwareTexture2D_static(
-                    dstData, (int)dstPitch, dst_img_w, dst_img_h, TVPTextureFormat::RGBA);
-                tTVPRect rc(0, 0, dst_img_w, dst_img_h);
-
-                ((tTVPRenderMethod_Software*)method)
-                    ->DoRender(target, rcclip, target, rcclip, tmp, rc, nullptr, rc);
-                tmp->Release();
-                delete[] dstData;
+            if(quad.rectangle) {
+                if(quad.destination.Width()<=0 || quad.destination.Height()<=0) continue;
+                OperateRect(method,target,tTVPRect(quad.destination.left,quad.destination.top,quad.destination.right,quad.destination.bottom),
+                    src,tTVPRect(quad.source.left,quad.source.top,quad.source.right,quad.source.bottom));
+                continue;
             }
-
-            dstpt += 4;
-            srcpt += 4;
+            const int width=clip.get_width(),height=clip.get_height();
+            const size_t pitch=(size_t(width)*4+7)&~size_t(7);
+            std::vector<uint8_t> pixels(pitch*height);
+            TVPImageUtils::WarpPerspectiveInverseRGBA(static_cast<const uint8_t*>(src->GetPixelData()),src->GetWidth(),src->GetHeight(),src->GetPitch(),
+                pixels.data(),width,height,int(pitch),quad.inverse,StretchType==0?0:1);
+            iTVPTexture2D* tmp=new tTVPSoftwareTexture2D_static(pixels.data(),int(pitch),width,height,TVPTextureFormat::RGBA);
+            tTVPRect rect(0,0,width,height);
+            ((tTVPRenderMethod_Software*)method)->DoRender(target,clip,target,clip,tmp,rect,nullptr,rect);
+            tmp->Release();
         }
     }
 };

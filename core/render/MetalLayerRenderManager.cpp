@@ -9,6 +9,7 @@
 #include "PointReadTrace.h"
 #include "LayerTriangleTrace.h"
 #include "LayerAffineGeometry.h"
+#include "LayerPerspectiveGeometry.h"
 #include "AsyncAlphaTileCache.h"
 #include "../../plugins/emoteplayer/emoteperformance.h"
 #include "tjsDebug.h"
@@ -1019,7 +1020,78 @@ public:
             }
         }
     }
+    bool GPUPerspective(iTVPRenderMethod* method,iTVPTexture2D* target,iTVPTexture2D* source,
+                        const std::vector<TVPLayerPerspectiveQuad>& quads,const tTVPRect& affected) {
+        auto* t=dynamic_cast<LayerTexture*>(target);
+        if(!session || !t || !t->Belongs(session)) return Reject(TVPLayerGPURejectReason::TargetUnavailable);
+        if(t->IsCPUResident()) return Reject(TVPLayerGPURejectReason::TargetCPUResident);
+        if(stretch<0 || stretch>2) return Reject(TVPLayerGPURejectReason::UnsupportedStretch);
+        if(quads.size()>TVP_LAYER_PERSPECTIVE_MAX_QUADS) return Reject(TVPLayerGPURejectReason::InvalidGeometry);
+        TVPLayerOperation op;
+        if(!method || !method->DescribeGpuOperation(op)) return RejectMethod(TVPLayerGPURejectReason::UnsupportedMethod,method);
+        if(op.kind!=TVPLayerOperationKind::Copy && (op.opacity<0 || op.opacity>255))
+            return Reject(TVPLayerGPURejectReason::InvalidOpacity);
+        const auto* traits=TVPGetLayerOperationTraits(op.kind);
+        if(!traits || !TVPLayerOperationSupportsPerspective(op)) return Reject(TVPLayerGPURejectReason::UnsupportedKind);
+        auto* s=dynamic_cast<LayerTexture*>(source);
+        if(!s || !s->Belongs(session)) return RejectSource(method,source);
+        if(s==t) for(const auto& q:quads) if(q.rectangle && q.clip.Width()>0 && q.clip.Height()>0 &&
+           (q.source.left!=q.destination.left || q.source.top!=q.destination.top ||
+            q.source.right!=q.destination.right || q.source.bottom!=q.destination.bottom))
+            return Reject(TVPLayerGPURejectReason::PerspectiveAlias);
+        if(op.kind!=TVPLayerOperationKind::Copy && !session->tablesReady) {
+            if(!session->backend->SetLayerAlphaTables(TVPOpacityOnOpacityTable,TVPNegativeMulTable))
+                return Reject(TVPLayerGPURejectReason::AlphaTables);
+            session->tablesReady=true;
+        }
+        if((traits->parameterResources&TVP_LAYER_RESOURCE_PS_TABLES) && !session->psTablesReady) {
+            if(!session->backend->SetLayerPsTables(TVPGetPsBlendTable(0),TVPGetPsBlendTable(1),TVPGetPsBlendTable(2)))
+                return Reject(TVPLayerGPURejectReason::PsTables);
+            session->psTablesReady=true;
+        }
+        if(!session->backend->OperateLayerPerspective(op,t->GetTextureHandle(),quads.data(),quads.size(),
+                                                      s->GetTextureHandle(),stretch==0?0:1))
+            return Reject(TVPLayerGPURejectReason::BackendFailure);
+        t->InvalidateCPUCacheRegion(affected,TVPLayerOperationPreservesAlpha(op,s==t));
+        ++session->stats.gpuOperations;
+        return true;
+    }
     void OperatePerspective(iTVPRenderMethod* method,int count,iTVPTexture2D* target,iTVPTexture2D* reference,const tTVPRect& clip,const tTVPPointD* points,const tRenderTexQuadArray& inputs) override {
+        // Validate the entire call before acquiring pixels or encoding its first
+        // quad. A late malformed quad must not replay an already written prefix.
+        if(count<0 || !method || !target || inputs.size()!=1 ||
+           !inputs[0].first || (count>0 && (!points || !inputs[0].second))) {
+            Reject(inputs.size()!=1?TVPLayerGPURejectReason::MultipleInputs:TVPLayerGPURejectReason::InvalidGeometry);
+            TVPThrowExceptionMessage(TJS_N("Perspective requires a method, target and one complete quad input."));
+        }
+        if(target->GetFormat()!=TVPTextureFormat::RGBA || inputs[0].first->GetFormat()!=TVPTextureFormat::RGBA) {
+            Reject(TVPLayerGPURejectReason::SourceFormat);
+            TVPThrowExceptionMessage(TJS_N("Perspective requires RGBA source and target textures."));
+        }
+        if(stretch<0) {
+            Reject(TVPLayerGPURejectReason::UnsupportedStretch);
+            TVPThrowExceptionMessage(TJS_N("Perspective requires a nonnegative StretchType."));
+        }
+        if(!count) return;
+        const tTVPRect bounded(std::max(0,clip.left),std::max(0,clip.top),
+            std::min(int(target->GetWidth()),clip.right),std::min(int(target->GetHeight()),clip.bottom));
+        if(bounded.get_width()<=0 || bounded.get_height()<=0) return;
+        std::vector<TVPLayerPerspectiveQuad> quads(static_cast<std::size_t>(count));
+        tTVPRect affected; bool written=false;
+        for(int i=0;i<count;++i) {
+            if(!layer_perspective::PrepareQuad(points+std::size_t(i)*4,inputs[0].second+std::size_t(i)*4,
+                    inputs[0].first->GetWidth(),inputs[0].first->GetHeight(),Rect(bounded),quads[i])) {
+                Reject(TVPLayerGPURejectReason::InvalidGeometry);
+                TVPThrowExceptionMessage(TJS_N("Perspective coordinates must be finite and define a nonsingular mapping."));
+            }
+            const auto& r=quads[i].clip;
+            if(r.Width()<=0 || r.Height()<=0) continue;
+            if(!written) {affected=tTVPRect(r.left,r.top,r.right,r.bottom);written=true;}
+            else affected=tTVPRect(std::min(affected.left,r.left),std::min(affected.top,r.top),
+                                  std::max(affected.right,r.right),std::max(affected.bottom,r.bottom));
+        }
+        if(!written) return;
+        if(GPUPerspective(method,target,inputs[0].first,quads,affected)) return;
         Reject(TVPLayerGPURejectReason::Perspective);
         krkrsdl3::layer_work::SourceScope source(method ? method->GetName().c_str() : "fallback.perspective");
         krkrsdl3::layer_work::StageScope work(krkrsdl3::layer_work::Stage::Software);
@@ -1028,8 +1100,8 @@ public:
         auto* referenceView=views.Get(reference,TVPLayerFallbackReadbackRole::Reference);
         for(size_t i=0;i<inputs.size();++i)
             textures.emplace_back(views.Get(inputs[i].first,TVPLayerFallbackReadbackRole::Source),inputs[i].second);
-        Software()->OperatePerspective(method,count,targetView,referenceView,clip,points,tRenderTexQuadArray(textures.data(),textures.size()));
-        if(target) target->MarkCPUModified(); if(session) ++session->stats.cpuFallbacks;
+        Software()->OperatePerspective(method,count,targetView,referenceView,bounded,points,tRenderTexQuadArray(textures.data(),textures.size()));
+        target->MarkCPUModified(affected); if(session) ++session->stats.cpuFallbacks;
     }
 };
 LayerManager& Manager() { static auto* manager=new LayerManager; return *manager; }

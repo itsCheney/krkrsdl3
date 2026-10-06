@@ -1,5 +1,6 @@
 #include "MetalRenderBackend.h"
 #include "MetalLayerShaders.h"
+#include "../LayerPerspectiveGeometry.h"
 #include "MetalStageDiagnostics.h"
 #include "PointReadTrace.h"
 
@@ -369,6 +370,9 @@ struct MetalRenderBackend::Impl
     id<MTLTexture> ordinaryRenderTarget = nil, ordinaryRenderSource = nil;
     id<MTLComputePipelineState> dualSourceLayerPipeline = nil;
     id<MTLComputePipelineState> univTransLayerPipeline = nil, affineCopyPipeline = nil, affineBlendPipeline = nil;
+    id<MTLComputePipelineState> perspectivePipeline = nil;
+    // Whole-batch transaction: intermediate quads never write the real target.
+    id<MTLTexture> perspectiveWorkTarget = nil, perspectiveTargetSnapshot = nil, perspectiveSourceSnapshot = nil;
     // Valid bindings for affine kinds whose branches do not read any tables.
     // Keep this separate so a dummy cannot satisfy a required alpha-table supply.
     id<MTLBuffer> affineDummyTables = nil;
@@ -1136,6 +1140,8 @@ struct MetalRenderBackend::Impl
                                   [ordinary newFunctionWithName:@"affineCopyLayer"] error:&error];
             affineBlendPipeline = [device newComputePipelineStateWithFunction:
                                    [ordinary newFunctionWithName:@"affineBlendLayer"] error:&error];
+            perspectivePipeline = [device newComputePipelineStateWithFunction:
+                                   [ordinary newFunctionWithName:@"perspectiveLayer"] error:&error];
             univTransLayerPipeline = [device newComputePipelineStateWithFunction:
                                       [ordinary newFunctionWithName:@"univTransLayer"] error:&error];
             boxBlurRowsPipeline = [device newComputePipelineStateWithFunction:
@@ -1178,6 +1184,8 @@ struct MetalRenderBackend::Impl
             "GPU Layer affine Copy unavailable; software fallback retained: %s", error.localizedDescription.UTF8String);
         if (!affineBlendPipeline) SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
             "GPU Layer affine blends unavailable; software fallback retained: %s", error.localizedDescription.UTF8String);
+        if (!perspectivePipeline) SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
+            "GPU Layer perspective unavailable; software fallback retained: %s", error.localizedDescription.UTF8String);
         if (!dualSourceLayerPipeline) SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
             "GPU Layer dual-source pipeline unavailable; SD transitions use software fallback: %s",
             error.localizedDescription.UTF8String);
@@ -2018,6 +2026,147 @@ bool MetalRenderBackend::OperateLayerAffine(const TVPLayerOperation& operation,v
         if(p.diagnosticSampled) ++p.diagnosticWorkload.layerDispatches;
         [e endEncoding];
         if(++p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
+        return true;
+    }
+}
+bool MetalRenderBackend::OperateLayerPerspective(const TVPLayerOperation& operation,void* target,
+                                                const TVPLayerPerspectiveQuad* quads,size_t count,
+                                                void* source,int sampling) {
+    @autoreleasepool {
+        // Bound both the host parameter array and this indivisible GPU batch.
+        constexpr size_t maxQuads=TVP_LAYER_PERSPECTIVE_MAX_QUADS;
+        if(!TVPLayerOperationSupportsPerspective(operation) || sampling<0 || sampling>1 || count>maxQuads)
+            return false;
+        if(count==0) return true;
+        auto& p=*impl_; auto* t=p.Find(target); auto* s=p.Find(source);
+        if(!quads || !p.perspectivePipeline || !t || !s || !t->texture || !s->texture ||
+           t->bytesPerPixel!=4 || s->bytesPerPixel!=4 ||
+           t->texture.pixelFormat!=MTLPixelFormatRGBA8Unorm || s->texture.pixelFormat!=MTLPixelFormatRGBA8Unorm)
+            return false;
+        const auto* traits=TVPGetLayerOperationTraits(operation.kind);
+        constexpr uint32_t resources=TVP_LAYER_RESOURCE_ALPHA_TABLES | TVP_LAYER_RESOURCE_PS_TABLES;
+        if(traits->parameterResources&~resources) return false;
+        const bool copy=operation.kind==TVPLayerOperationKind::Copy;
+        const bool needsPsTables=(traits->parameterResources&TVP_LAYER_RESOURCE_PS_TABLES)!=0;
+        if((TVPLayerOperationNeedsAlphaTables(operation) && (!p.alphaTables || p.alphaTables.length<131072)) ||
+           (needsPsTables && (!p.psTables || p.psTables.length!=Impl::kPsTablesBytes))) return false;
+        struct LayerParameters { simd_int4 destination,source,clip,operation,color; };
+        struct PerspectiveParameters { LayerParameters rect; simd_float4 high[3],low[3]; simd_int4 shape; };
+        static_assert(sizeof(PerspectiveParameters)==192, "Perspective MSL parameter layout must match");
+        std::array<PerspectiveParameters,maxQuads> parameters{};
+        TVPLayerRect commitRegion{t->width,t->height,0,0};
+        size_t active=0;
+        auto inBounds=[](const TVPLayerRect& r,int width,int height) {
+            return r.left>=0 && r.top>=0 && r.right>=r.left && r.bottom>=r.top &&
+                   r.right<=width && r.bottom<=height;
+        };
+        auto sameRect=[](const TVPLayerRect& a,const TVPLayerRect& b) {
+            return a.left==b.left && a.top==b.top && a.right==b.right && a.bottom==b.bottom;
+        };
+        // Validate the complete batch before any encoder, copy or target write.
+        // A later bad quad must never leave an earlier quad's output behind.
+        for(size_t i=0;i<count;++i) {
+            const auto& q=quads[i]; const auto& clip=q.clip;
+            if(!inBounds(clip,t->width,t->height)) return false;
+            // An off-target rectangular shortcut has no samples or writes;
+            // its empty destination/source fields need no further validation.
+            if(clip.Width()==0 || clip.Height()==0) continue;
+            auto& params=parameters[i];
+            params.rect.clip={clip.left,clip.top,clip.right,clip.bottom};
+            params.rect.operation={static_cast<int>(operation.kind),operation.opacity,static_cast<int>(operation.flags),sampling};
+            params.rect.color={int(operation.color&255),int((operation.color>>8)&255),int((operation.color>>16)&255),int(operation.color>>24)};
+            params.shape.x=q.rectangle ? 1 : 0;
+            if(q.rectangle) {
+                const auto& dst=q.destination; const auto& src=q.source;
+                if(!inBounds(src,s->width,s->height) || src.Width()<=0 || src.Height()<=0 ||
+                   dst.left < -1000000 || dst.top < -1000000 || dst.right>1000000 || dst.bottom>1000000 ||
+                   int64_t(dst.right)-dst.left<=0 || int64_t(dst.bottom)-dst.top<=0 ||
+                   clip.left<dst.left || clip.top<dst.top || clip.right>dst.right || clip.bottom>dst.bottom ||
+                   (s==t && !sameRect(src,dst))) return false;
+                params.rect.destination={dst.left,dst.top,dst.right,dst.bottom};
+                params.rect.source={src.left,src.top,src.right,src.bottom};
+            } else {
+                if(!layer_perspective::ValidateInverse(q.inverse)) return false;
+                for(double value:q.inverse) if(std::abs(value)>1000000) return false;
+                const auto* m=q.inverse;
+                for(int j=0;j<9;++j) {
+                    params.high[j/3][j%3]=float(m[j]);
+                    params.low[j/3][j%3]=float(m[j]-double(params.high[j/3][j%3]));
+                }
+            }
+            ++active;
+            commitRegion.left=std::min(commitRegion.left,clip.left);
+            commitRegion.top=std::min(commitRegion.top,clip.top);
+            commitRegion.right=std::max(commitRegion.right,clip.right);
+            commitRegion.bottom=std::max(commitRegion.bottom,clip.bottom);
+        }
+        if(!active) return true;
+        if(!p.alphaTables && !p.affineDummyTables)
+            p.affineDummyTables=[p.device newBufferWithLength:131072 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> alphaBuffer=p.alphaTables ? p.alphaTables : p.affineDummyTables;
+        if(!alphaBuffer) return false;
+        id<MTLBuffer> psBuffer=needsPsTables ? p.psTables : alphaBuffer;
+        auto fullTarget=[&](id<MTLTexture>& texture) {
+            if(!texture || texture.width!=NSUInteger(t->width) || texture.height!=NSUInteger(t->height))
+                texture=p.Texture(t->width,t->height);
+            return texture!=nil;
+        };
+        if(!fullTarget(p.perspectiveWorkTarget) || (!copy && !fullTarget(p.perspectiveTargetSnapshot)) ||
+           (s==t && !fullTarget(p.perspectiveSourceSnapshot))) return false;
+        id<MTLTexture> work=p.perspectiveWorkTarget;
+        // Default tracked textures and sequential encoders order reuse across
+        // quads, batches and earlier pending Layer work on the same queue.
+        auto initial=p.Blit(); if(!initial) return false;
+        [initial copyFromTexture:t->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                 sourceSize:MTLSizeMake(t->width,t->height,1) toTexture:work destinationSlice:0
+                 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+        TVPRecordMetalLayerRectSnapshot(uint64_t(t->width)*t->height*4);
+        [initial endEncoding];
+        for(size_t i=0;i<count;++i) {
+            const auto& clip=quads[i].clip;
+            if(clip.Width()==0 || clip.Height()==0) continue;
+            id<MTLTexture> sourceTexture=s==t ? p.perspectiveSourceSnapshot : s->texture;
+            id<MTLTexture> snapshot=copy ? sourceTexture : p.perspectiveTargetSnapshot;
+            if(!copy || s==t) {
+                auto blit=p.Blit(); if(!blit) return false;
+                if(!copy) {
+                    [blit copyFromTexture:work sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(clip.left,clip.top,0)
+                          sourceSize:MTLSizeMake(clip.Width(),clip.Height(),1) toTexture:snapshot destinationSlice:0
+                          destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+                    TVPRecordMetalLayerRectSnapshot(uint64_t(clip.Width())*clip.Height()*4);
+                }
+                if(s==t) {
+                    // The next quad samples the output of preceding quads, but
+                    // completes its own warp before mixing into that output.
+                    [blit copyFromTexture:work sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                          sourceSize:MTLSizeMake(t->width,t->height,1) toTexture:sourceTexture destinationSlice:0
+                          destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+                    TVPRecordMetalLayerRectSnapshot(uint64_t(t->width)*t->height*4);
+                }
+                [blit endEncoding];
+            }
+            auto e=p.Compute(); if(!e) return false;
+            [e setComputePipelineState:p.perspectivePipeline];
+            [e setBytes:&parameters[i] length:sizeof(PerspectiveParameters) atIndex:0];
+            [e setBuffer:alphaBuffer offset:0 atIndex:1]; [e setBuffer:alphaBuffer offset:0 atIndex:2];
+            [e setBuffer:psBuffer offset:0 atIndex:3];
+            [e setTexture:sourceTexture atIndex:0]; [e setTexture:snapshot atIndex:1]; [e setTexture:work atIndex:2];
+            [e dispatchThreads:MTLSizeMake(clip.Width(),clip.Height(),1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+            if(p.diagnosticSampled) {
+                ++p.diagnosticWorkload.layerDispatches;
+                p.diagnosticWorkload.RecordKindPixels(static_cast<int>(operation.kind),uint64_t(clip.Width())*clip.Height());
+            }
+            [e endEncoding];
+        }
+        // This is the only write to the caller's target. One bounding-region
+        // copy also preserves gaps from the original target in the work image.
+        auto commit=p.Blit(); if(!commit) return false;
+        [commit copyFromTexture:work sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(commitRegion.left,commitRegion.top,0)
+                sourceSize:MTLSizeMake(commitRegion.Width(),commitRegion.Height(),1) toTexture:t->texture destinationSlice:0
+                destinationLevel:0 destinationOrigin:MTLOriginMake(commitRegion.left,commitRegion.top,0)];
+        [commit endEncoding];
+        p.transientOps+=2+active*2;
+        if(p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
         return true;
     }
 }

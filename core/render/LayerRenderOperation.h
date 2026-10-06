@@ -72,7 +72,8 @@ enum TVPLayerGeometry : uint32_t {
     TVP_LAYER_GEOMETRY_AFFINE_COPY_SUBSET = 2,
     // Prepared quad sampling followed by the ordinary pixel blend. Geometry,
     // rectangle overlap and resource checks remain at the execution boundary.
-    TVP_LAYER_GEOMETRY_AFFINE_BLEND_SUBSET = 4
+    TVP_LAYER_GEOMETRY_AFFINE_BLEND_SUBSET = 4,
+    TVP_LAYER_GEOMETRY_PERSPECTIVE_SUBSET = 8
 };
 struct TVPLayerOperationTraits {
     TVPLayerOperationKind kind;
@@ -137,6 +138,12 @@ inline constexpr bool TVPLayerOperationSupportsAffine(const TVPLayerOperation& o
     return (traits->geometries & TVP_LAYER_GEOMETRY_AFFINE_BLEND_SUBSET) &&
         !(op.flags & ~flags) && op.opacity >= 0 && op.opacity <= 255;
 }
+inline constexpr bool TVPLayerOperationSupportsPerspective(const TVPLayerOperation& op) {
+    const auto* traits = TVPGetLayerOperationTraits(op.kind);
+    return traits && (traits->geometries & TVP_LAYER_GEOMETRY_PERSPECTIVE_SUBSET) &&
+        TVPLayerOperationSupportsAffine(op);
+}
+inline constexpr std::size_t TVP_LAYER_PERSPECTIVE_MAX_QUADS = 256;
 // P1A's software blend/ApplySelf wrappers do not define mirrored source
 // rectangles. Preserve earlier kinds' routing and keep new domains explicit.
 inline constexpr bool TVPLayerOperationRequiresForwardSource(TVPLayerOperationKind kind) {
@@ -183,6 +190,14 @@ struct TVPLayerRect
 struct TVPLayerAffineCopy {
     TVPLayerRect clip, sourceCrop;
     double inverse[6] = {}; // source x/y = a*x + b*y + c, destination centers
+};
+// Quad order is LT, RT, LB, RB. A warp uses the full source texture and an
+// inverse homography on clip-relative destination pixel centers. Rectangular
+// shortcuts retain the software's integer rect adjustment and sample rules.
+struct TVPLayerPerspectiveQuad {
+    TVPLayerRect clip, destination, source;
+    bool rectangle = false;
+    double inverse[9] = {};
 };
 // Why a GPU->CPU readback happened. Readbacks are synchronous and dominate
 // main-thread time, so attribution matters more than the total: the same byte
@@ -235,6 +250,7 @@ enum class TVPLayerGPURejectReason
     PsTables,
     // Rectangular affine shortcuts can retain software scanline ordering.
     AffineAlias,
+    PerspectiveAlias,
     Count
 };
 struct TVPLayerRenderStats

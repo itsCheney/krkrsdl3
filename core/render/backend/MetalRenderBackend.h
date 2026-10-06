@@ -104,6 +104,8 @@ public:
                           void*, const TVPLayerRect&, int) override;
     bool OperateLayerAffine(const TVPLayerOperation&, void*, const TVPLayerAffineCopy&,
                             void*, int) override;
+    bool OperateLayerPerspective(const TVPLayerOperation&, void*, const TVPLayerPerspectiveQuad*,
+                                 size_t, void*, int) override;
     bool OperateLayerRectDualSource(const TVPLayerOperation&, void*, const TVPLayerRect&,
                                     void*, const TVPLayerRect&,
                                     void*, const TVPLayerRect&) override;

@@ -214,6 +214,11 @@ public:
     // Supported methods/flags are declared by TVPLayerOperationSupportsAffine.
     virtual bool OperateLayerAffine(const TVPLayerOperation&, void*, const TVPLayerAffineCopy&,
                                     void*, int) { return false; }
+    // Batch is ordered and transactional: false leaves the real target intact.
+    // Each aliased warp sees the result of preceding quads in this batch.
+    virtual bool OperateLayerPerspective(const TVPLayerOperation&, void*,
+                                         const TVPLayerPerspectiveQuad*, std::size_t,
+                                         void*, int) { return false; }
     // Two-source ordinary Layer operation. Kept separate from OperateLayerRect
     // so existing backends do not need to change their single-source ABI.
     virtual bool OperateLayerRectDualSource(const TVPLayerOperation&, void*, const TVPLayerRect&,

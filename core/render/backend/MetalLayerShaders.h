@@ -127,6 +127,54 @@ struct AffineBlendParameters {
     AffineParameters affine;
     int4 operation; // kind, opacity, flags, reserved
 };
+// Keep numerator/denominator low parts until after division. Rounding each
+// linear expression to float before the ratio changes half-pixel decisions.
+AffinePair perspectiveLinearPair(float ah,float al,float bh,float bl,float ch,float cl,float x,float y) {
+    AffinePair sum=affineAdd(affineMultiply(ah,al,x),affineMultiply(bh,bl,y));
+    return affineAdd(sum,{ch,cl});
+}
+float perspectiveCoordinate(float ah,float al,float bh,float bl,float ch,float cl,
+                            float gh,float gl,float hh,float hl,float ih,float il,float x,float y) {
+    AffinePair n=perspectiveLinearPair(ah,al,bh,bl,ch,cl,x,y);
+    AffinePair d=perspectiveLinearPair(gh,gl,hh,hl,ih,il,x,y);
+    // Compare the compensated value with the software double threshold before
+    // rounding it to float; otherwise values just below the pole guard escape.
+    AffinePair absolute=d.high<0 ? AffinePair{-d.high,-d.low} : d;
+    if(absolute.high<1e-12f || (absolute.high==1e-12f && absolute.low<3.9958028e-21f)) return -1.0f;
+    float q=n.high/d.high;
+    AffinePair product=affineMultiply(d.high,d.low,q);
+    AffinePair remainder=affineAdd(n,{-product.high,-product.low});
+    return q+(remainder.high+remainder.low)/d.high;
+}
+struct PerspectiveParameters {
+    LayerParameters rect;
+    float4 high[3],low[3];
+    int4 shape; // rectangle shortcut, remaining fields reserved
+};
+int4 perspectiveSample(texture2d<float,access::read> source,
+                       constant PerspectiveParameters& p,uint2 tid,int2 xy) {
+    if(p.shape.x!=0) return layerSample(source,p.rect,xy);
+    float x=float(tid.x)+0.5f,y=float(tid.y)+0.5f;
+    float2 point;
+    point.x=perspectiveCoordinate(p.high[0].x,p.low[0].x,p.high[0].y,p.low[0].y,p.high[0].z,p.low[0].z,
+        p.high[2].x,p.low[2].x,p.high[2].y,p.low[2].y,p.high[2].z,p.low[2].z,x,y);
+    point.y=perspectiveCoordinate(p.high[1].x,p.low[1].x,p.high[1].y,p.low[1].y,p.high[1].z,p.low[1].z,
+        p.high[2].x,p.low[2].x,p.high[2].y,p.low[2].y,p.high[2].z,p.low[2].z,x,y);
+    int2 size=int2(source.get_width(),source.get_height());
+    int4 result=int4(0);
+    if(all(point>=float2(0.5)) && all(point<float2(size)-0.5)) {
+        if(p.rect.operation.w==0) result=layerBytes(source,clamp(int2(point+0.5),int2(0),size-1));
+        else {
+            int2 a=clamp(int2(point),int2(0),max(size-2,int2(0)));
+            int2 b=min(a+1,size-1);
+            float2 f=select(point-float2(a),float2(0),size==int2(1));
+            int4 c00=layerBytes(source,a),c10=layerBytes(source,int2(b.x,a.y));
+            int4 c01=layerBytes(source,int2(a.x,b.y)),c11=layerBytes(source,b);
+            for(int c=0;c<4;++c) result[c]=affineBilinearByte(f.x,f.y,c00[c],c10[c],c01[c],c11[c]);
+        }
+    }
+    return result;
+}
 uint layerPack(int4 c) {
     return (uint(c.r) & 255u) | ((uint(c.g) & 255u) << 8) |
            ((uint(c.b) & 255u) << 16) | ((uint(c.a) & 255u) << 24);
@@ -417,6 +465,22 @@ kernel void affineBlendLayer(uint2 tid [[thread_position_in_grid]],
     int4 d=layerBytes(snapshot,int2(tid));
     int4 s=affineBlendSample(source,p.affine,tid);
     int4 result=layerPixel(d,s,int4(0),p.operation.x,p.operation.y,p.operation.z,tables,gamma,psTables);
+    target.write(float4(result)/255.0,uint2(xy));
+}
+kernel void perspectiveLayer(uint2 tid [[thread_position_in_grid]],
+                             constant PerspectiveParameters& p [[buffer(0)]],
+                             const device uchar* tables [[buffer(1)]],
+                             const device uchar* gamma [[buffer(2)]],
+                             const device uchar* psTables [[buffer(3)]],
+                             texture2d<float,access::read> source [[texture(0)]],
+                             texture2d<float,access::read> snapshot [[texture(1)]],
+                             texture2d<float,access::write> target [[texture(2)]]) {
+    int2 xy=p.rect.clip.xy+int2(tid);
+    if(any(xy>=p.rect.clip.zw)) return;
+    int4 d=int4(0);
+    if(layerReadsTarget(p.rect.operation.x)) d=layerBytes(snapshot,int2(tid));
+    int4 s=perspectiveSample(source,p,tid,xy);
+    int4 result=layerPixel(d,s,p.rect.color,p.rect.operation.x,p.rect.operation.y,p.rect.operation.z,tables,gamma,psTables);
     target.write(float4(result)/255.0,uint2(xy));
 }
 kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
