@@ -873,32 +873,61 @@ public:
         if(target) target->MarkCPUModified(fallbackDst);
         if(session) ++session->stats.cpuFallbacks;
     }
-    bool GPUAffineCopy(iTVPRenderMethod* method,int count,iTVPTexture2D* target,
+    bool GPUAffine(iTVPRenderMethod* method,int count,iTVPTexture2D* target,
                        const tTVPRect& clip,const tTVPPointD* points,const tRenderTexQuadArray& inputs) {
         auto* t=dynamic_cast<LayerTexture*>(target);
-        if(!session || !t || !t->Belongs(session) || t->IsCPUResident() ||
-           count!=2 || inputs.size()!=1 || stretch<0 || stretch>2) return false;
+        if(!session || !t || !t->Belongs(session)) return Reject(TVPLayerGPURejectReason::TargetUnavailable);
+        if(t->IsCPUResident()) return Reject(TVPLayerGPURejectReason::TargetCPUResident);
+        if(count!=2) return Reject(TVPLayerGPURejectReason::InvalidGeometry);
+        if(inputs.size()!=1) return RejectMethod(TVPLayerGPURejectReason::MultipleInputs,method,inputs.size());
+        if(stretch<0 || stretch>2) return Reject(TVPLayerGPURejectReason::UnsupportedStretch);
         auto* s=dynamic_cast<LayerTexture*>(inputs[0].first);
         TVPLayerOperation op;
-        if(!method || !method->DescribeGpuOperation(op) || op.kind!=TVPLayerOperationKind::Copy || op.flags ||
-           !s || !s->Belongs(session) || t->GetFormat()!=TVPTextureFormat::RGBA ||
-           s->GetFormat()!=TVPTextureFormat::RGBA) return false;
+        if(!method || !method->DescribeGpuOperation(op)) return RejectMethod(TVPLayerGPURejectReason::UnsupportedMethod,method);
+        const auto* traits=TVPGetLayerOperationTraits(op.kind);
+        if(!traits) return Reject(TVPLayerGPURejectReason::UnsupportedKind);
+        if(op.kind!=TVPLayerOperationKind::Copy && (op.opacity<0 || op.opacity>255))
+            return Reject(TVPLayerGPURejectReason::InvalidOpacity);
+        if(!TVPLayerOperationSupportsAffine(op)) return Reject(TVPLayerGPURejectReason::UnsupportedKind);
+        if(!s || !s->Belongs(session)) return RejectSource(method,inputs[0].first);
+        if(t->GetFormat()!=TVPTextureFormat::RGBA || s->GetFormat()!=TVPTextureFormat::RGBA)
+            return Reject(TVPLayerGPURejectReason::SourceFormat);
         TVPLayerAffineCopy affine;
         // The software warp uses clip-relative coordinates. Require a clip
         // already inside the target; LayerBitmap clamps it before dispatch.
-        if(clip.left<0 || clip.top<0 || clip.right>int(t->GetWidth()) || clip.bottom>int(t->GetHeight())) return false;
-        if(!layer_affine::Prepare(points,inputs[0].second,s->GetWidth(),s->GetHeight(),Rect(clip),affine)) return false;
+        if(clip.left<0 || clip.top<0 || clip.right>int(t->GetWidth()) || clip.bottom>int(t->GetHeight()))
+            return Reject(TVPLayerGPURejectReason::InvalidGeometry);
+        if(!layer_affine::Prepare(points,inputs[0].second,s->GetWidth(),s->GetHeight(),Rect(clip),affine))
+            return Reject(TVPLayerGPURejectReason::InvalidGeometry);
         const auto* srcpt=inputs[0].second;
         const auto close=[](double a,double b) { return std::abs(a-b)<0.001; };
         const bool rectangle=close(points[0].y,points[1].y) && close(points[1].x,points[5].x) &&
                              close(points[0].x,points[2].x) && close(points[2].y,points[5].y);
+        // WarpAffine builds its complete temporary before DoRender reads target.
+        // It ignores reference, including COW callers with a distinct old image.
+        // The rectangular shortcut instead retains scanline overlap semantics.
+        const bool copy=op.kind==TVPLayerOperationKind::Copy;
+        auto resources=[&]() {
+            if(copy) return true;
+            if(!session->tablesReady) {
+                if(!session->backend->SetLayerAlphaTables(TVPOpacityOnOpacityTable,TVPNegativeMulTable))
+                    return Reject(TVPLayerGPURejectReason::AlphaTables);
+                session->tablesReady=true;
+            }
+            if((traits->parameterResources&TVP_LAYER_RESOURCE_PS_TABLES) && !session->psTablesReady) {
+                if(!session->backend->SetLayerPsTables(TVPGetPsBlendTable(0),TVPGetPsBlendTable(1),TVPGetPsBlendTable(2)))
+                    return Reject(TVPLayerGPURejectReason::PsTables);
+                session->psTablesReady=true;
+            }
+            return true;
+        };
         tTVPRect affected=clip;
         if(rectangle) {
             tTVPRect dst(points[0].x,points[0].y,points[5].x,points[5].y);
             tTVPRect src(srcpt[0].x,srcpt[0].y,srcpt[5].x,srcpt[5].y);
             // Mirrored axis-aligned quads use the old fixed-point scanline
             // rasterizer. Keep that distinct behavior in software for now.
-            if(dst.get_width()<=0 || dst.get_height()<=0) return false;
+            if(dst.get_width()<=0 || dst.get_height()<=0) return Reject(TVPLayerGPURejectReason::InvalidGeometry);
             if(!TVPIntersectRect(&affected,clip,dst)) affected=tTVPRect(0,0,0,0);
             if(affected.get_width()>0 && affected.get_height()>0) {
                 const int dw=dst.get_width(),dh=dst.get_height(),sw=src.get_width(),sh=src.get_height();
@@ -906,13 +935,20 @@ public:
                 if(affected.top!=dst.top) src.top+=(float)sh/dh*(affected.top-dst.top);
                 if(affected.right!=dst.right) src.right-=(float)sw/dw*(dst.right-affected.right);
                 if(affected.bottom!=dst.bottom) src.bottom-=(float)sh/dh*(dst.bottom-affected.bottom);
-                if(src.get_width()<=0 || src.get_height()<=0) return false;
-                if(!session->backend->OperateLayerRect(op,t->GetTextureHandle(),Rect(affected),s->GetTextureHandle(),Rect(src),stretch==0?0:1)) return false;
+                if(src.get_width()<=0 || src.get_height()<=0) return Reject(TVPLayerGPURejectReason::InvalidGeometry);
+                if(!copy && s==t && (src.left!=affected.left || src.top!=affected.top ||
+                   src.right!=affected.right || src.bottom!=affected.bottom))
+                    return Reject(TVPLayerGPURejectReason::AffineAlias);
+                if(!resources()) return false;
+                if(!session->backend->OperateLayerRect(op,t->GetTextureHandle(),Rect(affected),s->GetTextureHandle(),Rect(src),stretch==0?0:1))
+                    return Reject(TVPLayerGPURejectReason::BackendFailure);
             }
         } else if(clip.get_width()>0 && clip.get_height()>0) {
-            if(!session->backend->OperateLayerAffine(op,t->GetTextureHandle(),affine,s->GetTextureHandle(),stretch==0?0:1)) return false;
+            if(!resources()) return false;
+            if(!session->backend->OperateLayerAffine(op,t->GetTextureHandle(),affine,s->GetTextureHandle(),stretch==0?0:1))
+                return Reject(TVPLayerGPURejectReason::BackendFailure);
         } else affected=tTVPRect(0,0,0,0);
-        t->InvalidateCPUCacheRegion(affected);
+        t->InvalidateCPUCacheRegion(affected,TVPLayerOperationPreservesAlpha(op,s==t));
         ++session->stats.gpuOperations;
         if(triangle_trace::Enabled()) {
             ++session->triangles.stats.gpuCalls;
@@ -921,7 +957,7 @@ public:
         return true;
     }
     void OperateTriangles(iTVPRenderMethod* method,int count,iTVPTexture2D* target,iTVPTexture2D* reference,const tTVPRect& clip,const tTVPPointD* points,const tRenderTexQuadArray& inputs) override {
-        if(GPUAffineCopy(method,count,target,clip,points,inputs)) return;
+        if(GPUAffine(method,count,target,clip,points,inputs)) return;
         Reject(TVPLayerGPURejectReason::Triangles);
         krkrsdl3::layer_work::SourceScope source(method ? method->GetName().c_str() : "fallback.triangles");
         krkrsdl3::layer_work::StageScope work(krkrsdl3::layer_work::Stage::Software);

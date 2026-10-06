@@ -97,6 +97,36 @@ kernel void affineCopyLayer(uint2 tid [[thread_position_in_grid]],
     // Software Copy replaces the full clip, including transparent warp border.
     target.write(float4(result)/255.0,uint2(xy));
 }
+// Affine blends sample the same software warp as Copy, then apply the ordinary
+// byte blend independently. A transparent warp border is still a source pixel
+// and must participate in the blend over the entire clip.
+int4 affineBlendSample(texture2d<float,access::read> source,
+                       constant AffineParameters& p,uint2 tid) {
+    float x=float(tid.x)+0.5, y=float(tid.y)+0.5;
+    float2 point;
+    point.x=affineCoordinate(p.high[0].x,p.low[0].x,p.high[0].y,p.low[0].y,p.high[0].z,p.low[0].z,x,y);
+    point.y=affineCoordinate(p.high[1].x,p.low[1].x,p.high[1].y,p.low[1].y,p.high[1].z,p.low[1].z,x,y);
+    int2 size=p.crop.zw-p.crop.xy;
+    int4 result=int4(0);
+    if(all(point>=float2(0.5)) && all(point<float2(size)-0.5)) {
+        if(p.sampling.x==0) result=layerBytes(source,p.crop.xy+clamp(int2(point+0.5),int2(0),size-1));
+        else {
+            int2 a=clamp(int2(point),int2(0),max(size-2,int2(0)));
+            int2 b=min(a+1,size-1);
+            float2 f=select(point-float2(a),float2(0),size==int2(1));
+            int4 c00=layerBytes(source,p.crop.xy+a);
+            int4 c10=layerBytes(source,p.crop.xy+int2(b.x,a.y));
+            int4 c01=layerBytes(source,p.crop.xy+int2(a.x,b.y));
+            int4 c11=layerBytes(source,p.crop.xy+b);
+            for(int c=0;c<4;++c) result[c]=affineBilinearByte(f.x,f.y,c00[c],c10[c],c01[c],c11[c]);
+        }
+    }
+    return result;
+}
+struct AffineBlendParameters {
+    AffineParameters affine;
+    int4 operation; // kind, opacity, flags, reserved
+};
 uint layerPack(int4 c) {
     return (uint(c.r) & 255u) | ((uint(c.g) & 255u) << 8) |
            ((uint(c.b) & 255u) << 16) | ((uint(c.a) & 255u) << 24);
@@ -373,6 +403,21 @@ int4 layerPixel(int4 d,int4 s,int4 color,int kind,int opa,int flags,const device
             break;
     }
     return result & int4(255);
+}
+kernel void affineBlendLayer(uint2 tid [[thread_position_in_grid]],
+                             constant AffineBlendParameters& p [[buffer(0)]],
+                             const device uchar* tables [[buffer(1)]],
+                             const device uchar* gamma [[buffer(2)]],
+                             const device uchar* psTables [[buffer(3)]],
+                             texture2d<float,access::read> source [[texture(0)]],
+                             texture2d<float,access::read> snapshot [[texture(1)]],
+                             texture2d<float,access::write> target [[texture(2)]]) {
+    int2 xy=p.affine.clip.xy+int2(tid);
+    if(any(xy>=p.affine.clip.zw)) return;
+    int4 d=layerBytes(snapshot,int2(tid));
+    int4 s=affineBlendSample(source,p.affine,tid);
+    int4 result=layerPixel(d,s,int4(0),p.operation.x,p.operation.y,p.operation.z,tables,gamma,psTables);
+    target.write(float4(result)/255.0,uint2(xy));
 }
 kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
                           constant LayerParameters& p [[buffer(0)]],

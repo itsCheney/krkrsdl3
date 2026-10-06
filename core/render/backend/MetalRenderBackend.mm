@@ -368,7 +368,10 @@ struct MetalRenderBackend::Impl
     id<MTLRenderCommandEncoder> ordinaryRenderEncoder = nil;
     id<MTLTexture> ordinaryRenderTarget = nil, ordinaryRenderSource = nil;
     id<MTLComputePipelineState> dualSourceLayerPipeline = nil;
-    id<MTLComputePipelineState> univTransLayerPipeline = nil, affineCopyPipeline = nil;
+    id<MTLComputePipelineState> univTransLayerPipeline = nil, affineCopyPipeline = nil, affineBlendPipeline = nil;
+    // Valid bindings for affine kinds whose branches do not read any tables.
+    // Keep this separate so a dummy cannot satisfy a required alpha-table supply.
+    id<MTLBuffer> affineDummyTables = nil;
     id<MTLComputePipelineState> boxBlurRowsPipeline = nil, boxBlurColumnsPipeline = nil;
     id<MTLBuffer> boxBlurSums = nil;
     id<MTLRenderCommandEncoder> activeMeshEncoder = nil;
@@ -1131,6 +1134,8 @@ struct MetalRenderBackend::Impl
                                        [ordinary newFunctionWithName:@"dualSourceLayer"] error:&error];
             affineCopyPipeline = [device newComputePipelineStateWithFunction:
                                   [ordinary newFunctionWithName:@"affineCopyLayer"] error:&error];
+            affineBlendPipeline = [device newComputePipelineStateWithFunction:
+                                   [ordinary newFunctionWithName:@"affineBlendLayer"] error:&error];
             univTransLayerPipeline = [device newComputePipelineStateWithFunction:
                                       [ordinary newFunctionWithName:@"univTransLayer"] error:&error];
             boxBlurRowsPipeline = [device newComputePipelineStateWithFunction:
@@ -1171,6 +1176,8 @@ struct MetalRenderBackend::Impl
             "GPU Layer initialization failed; software composition retained: %s", error.localizedDescription.UTF8String);
         if (!affineCopyPipeline) SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
             "GPU Layer affine Copy unavailable; software fallback retained: %s", error.localizedDescription.UTF8String);
+        if (!affineBlendPipeline) SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
+            "GPU Layer affine blends unavailable; software fallback retained: %s", error.localizedDescription.UTF8String);
         if (!dualSourceLayerPipeline) SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
             "GPU Layer dual-source pipeline unavailable; SD transitions use software fallback: %s",
             error.localizedDescription.UTF8String);
@@ -1904,12 +1911,16 @@ bool MetalRenderBackend::OperateLayerAffine(const TVPLayerOperation& operation,v
     @autoreleasepool {
         auto& p=*impl_; auto* t=p.Find(target); auto* s=p.Find(source);
         const auto& clip=affine.clip; const auto& crop=affine.sourceCrop;
-        if(!p.affineCopyPipeline || !t || !s || t->bytesPerPixel!=4 || s->bytesPerPixel!=4 ||
-           operation.kind!=TVPLayerOperationKind::Copy || operation.flags || sampling<0 || sampling>1 ||
+        const bool copy=operation.kind==TVPLayerOperationKind::Copy;
+        if(!copy && (clip.right<clip.left || clip.bottom<clip.top ||
+                     crop.right<=crop.left || crop.bottom<=crop.top)) return false;
+        if(!TVPLayerOperationSupportsAffine(operation) || !(copy ? p.affineCopyPipeline : p.affineBlendPipeline) ||
+           !t || !s || !t->texture || !s->texture || t->bytesPerPixel!=4 || s->bytesPerPixel!=4 || sampling<0 || sampling>1 ||
            clip.left<0 || clip.top<0 || clip.right>t->width || clip.bottom>t->height ||
            crop.left<0 || crop.top<0 || crop.right>s->width || crop.bottom>s->height ||
            crop.Width()<=0 || crop.Height()<=0) return false;
         for(double value:affine.inverse) if(!std::isfinite(value) || std::abs(value)>1000000) return false;
+        if(!copy && affine.inverse[0]*affine.inverse[4]-affine.inverse[1]*affine.inverse[3]==0) return false;
         if(clip.Width()<=0 || clip.Height()<=0) return true;
         struct AffineParameters { simd_int4 clip,crop; simd_float4 high[2],low[2]; simd_int4 sampling; } params{};
         params.clip={clip.left,clip.top,clip.right,clip.bottom};
@@ -1919,6 +1930,71 @@ bool MetalRenderBackend::OperateLayerAffine(const TVPLayerOperation& operation,v
             params.low[i/3][i%3]=float(affine.inverse[i]-double(params.high[i/3][i%3]));
         }
         params.sampling.x=sampling;
+        if(!copy) {
+            const auto* traits=TVPGetLayerOperationTraits(operation.kind);
+            constexpr uint32_t resources=TVP_LAYER_RESOURCE_ALPHA_TABLES | TVP_LAYER_RESOURCE_PS_TABLES;
+            if((traits->parameterResources&~resources) ||
+               t->texture.pixelFormat!=MTLPixelFormatRGBA8Unorm || s->texture.pixelFormat!=MTLPixelFormatRGBA8Unorm)
+                return false;
+            const bool needsPsTables=(traits->parameterResources&TVP_LAYER_RESOURCE_PS_TABLES)!=0;
+            if((TVPLayerOperationNeedsAlphaTables(operation) && (!p.alphaTables || p.alphaTables.length<131072)) ||
+               (needsPsTables && (!p.psTables || p.psTables.length!=Impl::kPsTablesBytes))) return false;
+            // Resolve all allocations and bindings before encoding any copies or
+            // target writes. Supplied tables are immutable buffers retained by
+            // the command buffer; unused branches receive a separate dummy.
+            if(!p.alphaTables && !p.affineDummyTables)
+                p.affineDummyTables=[p.device newBufferWithLength:131072 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> alphaBuffer=p.alphaTables ? p.alphaTables : p.affineDummyTables;
+            if(!alphaBuffer) return false;
+            id<MTLBuffer> psBuffer=needsPsTables ? p.psTables : alphaBuffer;
+            if(!p.ordinarySnapshot || p.ordinarySnapshot.width!=NSUInteger(clip.Width()) ||
+               p.ordinarySnapshot.height!=NSUInteger(clip.Height()))
+                p.ordinarySnapshot=p.Texture(clip.Width(),clip.Height());
+            id<MTLTexture> snapshot=p.ordinarySnapshot;
+            if(!snapshot) return false;
+            id<MTLTexture> sourceTexture=s->texture;
+            if(s==t) {
+                if(!p.ordinarySourceSnapshot || p.ordinarySourceSnapshot.width!=NSUInteger(crop.Width()) ||
+                   p.ordinarySourceSnapshot.height!=NSUInteger(crop.Height()))
+                    p.ordinarySourceSnapshot=p.Texture(crop.Width(),crop.Height());
+                sourceTexture=p.ordinarySourceSnapshot;
+                if(!sourceTexture) return false;
+                params.crop={0,0,crop.Width(),crop.Height()};
+            }
+            struct AffineBlendParameters { AffineParameters affine; simd_int4 operation; } blendParams{};
+            blendParams.affine=params;
+            blendParams.operation={static_cast<int>(operation.kind),operation.opacity,static_cast<int>(operation.flags),0};
+            auto blit=p.Blit(); if(!blit) return false;
+            // The previous destination is always the target, never reference.
+            [blit copyFromTexture:t->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(clip.left,clip.top,0)
+                  sourceSize:MTLSizeMake(clip.Width(),clip.Height(),1) toTexture:snapshot destinationSlice:0
+                  destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+            TVPRecordMetalLayerRectSnapshot(uint64_t(clip.Width())*clip.Height()*4);
+            if(s==t) {
+                // Software finishes the warp before blending; preserve every
+                // sampled source byte for an overlapping self operation.
+                [blit copyFromTexture:s->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(crop.left,crop.top,0)
+                      sourceSize:MTLSizeMake(crop.Width(),crop.Height(),1) toTexture:sourceTexture destinationSlice:0
+                      destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+                TVPRecordMetalLayerRectSnapshot(uint64_t(crop.Width())*crop.Height()*4);
+            }
+            [blit endEncoding];
+            auto e=p.Compute(); if(!e) return false;
+            [e setComputePipelineState:p.affineBlendPipeline];
+            [e setBytes:&blendParams length:sizeof(blendParams) atIndex:0];
+            [e setBuffer:alphaBuffer offset:0 atIndex:1];
+            [e setBuffer:alphaBuffer offset:0 atIndex:2];
+            [e setBuffer:psBuffer offset:0 atIndex:3];
+            [e setTexture:sourceTexture atIndex:0]; [e setTexture:snapshot atIndex:1]; [e setTexture:t->texture atIndex:2];
+            [e dispatchThreads:MTLSizeMake(clip.Width(),clip.Height(),1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+            if(p.diagnosticSampled) {
+                ++p.diagnosticWorkload.layerDispatches;
+                p.diagnosticWorkload.RecordKindPixels(static_cast<int>(operation.kind),uint64_t(clip.Width())*clip.Height());
+            }
+            [e endEncoding];
+            if(++p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
+            return true;
+        }
         id<MTLTexture> sourceTexture=s->texture;
         // Copy ignores reference/destination alpha. Only source-target aliases
         // need a snapshot, taken on the GPU before any destination writes.

@@ -209,6 +209,9 @@ public:
                                                const std::shared_ptr<AsyncLayerReadback>&) { return false; }
     virtual bool OperateLayerRect(const TVPLayerOperation&, void*, const TVPLayerRect&,
                                   void*, const TVPLayerRect&, int) { return false; }
+    // Prepared software warp subset: source snapshot on alias, then blend the
+    // previous target over the full clip (including transparent warp borders).
+    // Supported methods/flags are declared by TVPLayerOperationSupportsAffine.
     virtual bool OperateLayerAffine(const TVPLayerOperation&, void*, const TVPLayerAffineCopy&,
                                     void*, int) { return false; }
     // Two-source ordinary Layer operation. Kept separate from OperateLayerRect

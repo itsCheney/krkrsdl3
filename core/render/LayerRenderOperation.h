@@ -69,7 +69,10 @@ enum TVPLayerParameterResources : uint32_t {
 enum TVPLayerGeometry : uint32_t {
     TVP_LAYER_GEOMETRY_RECT = 1,
     // Copy/flags=0 only, subject to the existing affine Prepare/clip checks.
-    TVP_LAYER_GEOMETRY_AFFINE_COPY_SUBSET = 2
+    TVP_LAYER_GEOMETRY_AFFINE_COPY_SUBSET = 2,
+    // Prepared quad sampling followed by the ordinary pixel blend. Geometry,
+    // rectangle overlap and resource checks remain at the execution boundary.
+    TVP_LAYER_GEOMETRY_AFFINE_BLEND_SUBSET = 4
 };
 struct TVPLayerOperationTraits {
     TVPLayerOperationKind kind;
@@ -123,6 +126,16 @@ inline constexpr bool TVPLayerOperationNeedsSource(TVPLayerOperationKind kind) {
 inline constexpr bool TVPLayerOperationReadsTarget(TVPLayerOperationKind kind) {
     const auto* traits = TVPGetLayerOperationTraits(kind);
     return traits && traits->readsTarget;
+}
+inline constexpr bool TVPLayerOperationSupportsAffine(const TVPLayerOperation& op) {
+    const auto* traits = TVPGetLayerOperationTraits(op.kind);
+    if (!traits) return false;
+    if (traits->geometries & TVP_LAYER_GEOMETRY_AFFINE_COPY_SUBSET)
+        return op.flags == 0;
+    constexpr uint32_t flags = TVP_LAYER_HOLD_ALPHA | TVP_LAYER_DEST_ALPHA |
+        TVP_LAYER_DEST_PREMULTIPLIED | TVP_LAYER_FULL_OPACITY_BRANCH;
+    return (traits->geometries & TVP_LAYER_GEOMETRY_AFFINE_BLEND_SUBSET) &&
+        !(op.flags & ~flags) && op.opacity >= 0 && op.opacity <= 255;
 }
 // P1A's software blend/ApplySelf wrappers do not define mirrored source
 // rectangles. Preserve earlier kinds' routing and keep new domains explicit.
@@ -220,6 +233,8 @@ enum class TVPLayerGPURejectReason
     Triangles,
     Perspective,
     PsTables,
+    // Rectangular affine shortcuts can retain software scanline ordering.
+    AffineAlias,
     Count
 };
 struct TVPLayerRenderStats
