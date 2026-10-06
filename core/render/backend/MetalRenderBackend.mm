@@ -2106,7 +2106,7 @@ bool MetalRenderBackend::OperateLayerPerspective(const TVPLayerOperation& operat
         id<MTLBuffer> alphaBuffer=p.alphaTables ? p.alphaTables : p.affineDummyTables;
         if(!alphaBuffer) return false;
         id<MTLBuffer> psBuffer=needsPsTables ? p.psTables : alphaBuffer;
-        auto fullTarget=[&](id<MTLTexture>& texture) {
+        auto fullTarget=[&](id<MTLTexture> __strong& texture) {
             if(!texture || texture.width!=NSUInteger(t->width) || texture.height!=NSUInteger(t->height))
                 texture=p.Texture(t->width,t->height);
             return texture!=nil;
