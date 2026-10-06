@@ -376,6 +376,12 @@ struct MetalRenderBackend::Impl
     id<MTLComputeCommandEncoder> ordinaryEncoder = nil;
     id<MTLTexture> ordinaryBoundSource = nil, ordinaryBoundTarget = nil;
     id<MTLBuffer> alphaTables = nil;
+    // Immutable source-major 256x256 byte tables: soft-light, dodge, burn.
+    // A changed supply replaces the whole buffer; previously encoded commands
+    // keep their retained old resource rather than observing a live rewrite.
+    id<MTLBuffer> psTables = nil;
+    static constexpr size_t kPsTableBytes = 65536;
+    static constexpr size_t kPsTablesBytes = 3*kPsTableBytes;
     struct GammaLUTCache {
         std::shared_ptr<const TVPLayerGammaLUT> snapshot;
         id<MTLBuffer> buffer = nil;
@@ -1548,6 +1554,30 @@ bool MetalRenderBackend::SetLayerAlphaTables(const uint8_t* opacity, const uint8
         return true;
     }
 }
+bool MetalRenderBackend::SetLayerPsTables(const uint8_t* softLight, const uint8_t* colorDodge,
+                                          const uint8_t* colorBurn) {
+    @autoreleasepool {
+        if(!softLight || !colorDodge || !colorBurn || !SupportsLayerOperations()) return false;
+        auto& p=*impl_;
+        if(p.psTables && p.psTables.length==Impl::kPsTablesBytes) {
+            const auto* previous=static_cast<const uint8_t*>(p.psTables.contents);
+            if(!std::memcmp(previous,softLight,Impl::kPsTableBytes) &&
+               !std::memcmp(previous+Impl::kPsTableBytes,colorDodge,Impl::kPsTableBytes) &&
+               !std::memcmp(previous+2*Impl::kPsTableBytes,colorBurn,Impl::kPsTableBytes)) return true;
+        }
+        id<MTLBuffer> buffer=[p.device newBufferWithLength:Impl::kPsTablesBytes
+                                                    options:MTLResourceStorageModeShared];
+        if(!buffer) return false;
+        auto* bytes=static_cast<uint8_t*>(buffer.contents);
+        std::memcpy(bytes,softLight,Impl::kPsTableBytes);
+        std::memcpy(bytes+Impl::kPsTableBytes,colorDodge,Impl::kPsTableBytes);
+        std::memcpy(bytes+2*Impl::kPsTableBytes,colorBurn,Impl::kPsTableBytes);
+        p.psTables=buffer;
+        ++p.parameterUploadStats.psTableUploads;
+        p.parameterUploadStats.psTableUploadedBytes+=Impl::kPsTablesBytes;
+        return true;
+    }
+}
 void* MetalRenderBackend::CreateLayerTexture(int w, int h, TVPLayerTextureFormat format) {
     @autoreleasepool {
         auto& p = *impl_;
@@ -1731,6 +1761,8 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
            (src.Width()<=0 || src.Height()<=0)) return false;
         const bool gamma=operation.kind==TVPLayerOperationKind::AdjustGamma;
         if(gamma && !operation.gammaLUT) return false;
+        const bool needsPsTables=(traits->parameterResources&TVP_LAYER_RESOURCE_PS_TABLES)!=0;
+        if(needsPsTables && !p.psTables) return false;
         if(needsSource && (src.Width()==0 || src.Height()==0 || std::min(src.left,src.right)<0 ||
             std::min(src.top,src.bottom)<0 || std::max(src.left,src.right)>s->width || std::max(src.top,src.bottom)>s->height)) return false;
         // R8 masks have no software-compatible resize/mirror path. Keep the
@@ -1822,11 +1854,15 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
         // Metal validation still needs a valid buffer(2). Reuse the existing
         // >=768-byte alpha-table buffer without another allocation or upload.
         if(!gammaBuffer) gammaBuffer=p.alphaTables;
+        // Non-table operations do not read PS bytes, but the shared dynamic
+        // shader signature still requires a valid buffer(3) binding.
+        id<MTLBuffer> psBuffer=needsPsTables ? p.psTables : p.alphaTables;
         if(tile) {
             auto e=p.OrdinaryRender(t->texture);
             [e setVertexBytes:&params length:sizeof(params) atIndex:0];
             [e setFragmentBytes:&params length:sizeof(params) atIndex:0];
             [e setFragmentBuffer:gammaBuffer offset:0 atIndex:2];
+            [e setFragmentBuffer:psBuffer offset:0 atIndex:3];
             if(p.ordinaryRenderSource!=sourceTexture) {
                 [e setFragmentTexture:sourceTexture atIndex:0]; p.ordinaryRenderSource=sourceTexture;
             }
@@ -1842,6 +1878,7 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
         id<MTLComputeCommandEncoder> e=inPlace ? p.OrdinaryCompute() : p.Compute(); if(!e) return false;
         [e setBytes:&params length:sizeof(params) atIndex:0];
         [e setBuffer:gammaBuffer offset:0 atIndex:2];
+        [e setBuffer:psBuffer offset:0 atIndex:3];
         if(inPlace) {
             if(p.ordinaryBoundSource!=sourceTexture) { [e setTexture:sourceTexture atIndex:0]; p.ordinaryBoundSource=sourceTexture; }
             if(p.ordinaryBoundTarget!=t->texture) { [e setTexture:t->texture atIndex:2]; p.ordinaryBoundTarget=t->texture; }

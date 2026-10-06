@@ -86,6 +86,7 @@ struct Session {
     std::unordered_map<std::string,uint64_t> unsupportedMethods;
     TriangleInterval triangles;
     bool tablesReady = false;
+    bool psTablesReady = false;
     TVPLayerParameterUploadStats parameterBaseline;
     unsigned sourceRejectionReports=0;
     explicit Session(iTVPRenderBackend* b) : backend(b), parameterBaseline(b->GetLayerParameterUploadStats()) {}
@@ -780,6 +781,11 @@ public:
             session->tablesReady=true;
         }
         void* sh=source?source->GetTextureHandle():nullptr;
+        if((traits->parameterResources&TVP_LAYER_RESOURCE_PS_TABLES) && !session->psTablesReady) {
+            if(!session->backend->SetLayerPsTables(TVPGetPsBlendTable(0),TVPGetPsBlendTable(1),TVPGetPsBlendTable(2)))
+                return Reject(TVPLayerGPURejectReason::PsTables);
+            session->psTablesReady=true;
+        }
         if(!session->backend->OperateLayerRect(op,t->GetTextureHandle(),Rect(dst),sh,Rect(src),stretch==0?0:1))
             return Reject(TVPLayerGPURejectReason::BackendFailure);
         // Only plain HDA blending preserves destination alpha. The _d/_a
@@ -1030,6 +1036,8 @@ TVPLayerRenderStats TVPGetMetalLayerRenderStats() {
     const auto parameters=session->backend->GetLayerParameterUploadStats();
     stats.gammaLUTUploads=parameters.gammaLUTUploads-session->parameterBaseline.gammaLUTUploads;
     stats.gammaLUTUploadedBytes=parameters.gammaLUTUploadedBytes-session->parameterBaseline.gammaLUTUploadedBytes;
+    stats.psTableUploads=parameters.psTableUploads-session->parameterBaseline.psTableUploads;
+    stats.psTableUploadedBytes=parameters.psTableUploadedBytes-session->parameterBaseline.psTableUploadedBytes;
     return stats;
 }
 

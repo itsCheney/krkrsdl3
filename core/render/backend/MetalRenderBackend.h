@@ -87,6 +87,7 @@ public:
     bool SupportsLayerTileRendering() const;
     bool IsLayerTileRenderingActive() const;
     bool SetLayerAlphaTables(const uint8_t*, const uint8_t*) override;
+    bool SetLayerPsTables(const uint8_t*, const uint8_t*, const uint8_t*) override;
     void* CreateLayerTexture(int, int, TVPLayerTextureFormat) override;
     void DestroyLayerTexture(void*) override;
     bool UpdateLayerTexture(void*, const uint8_t*, int, const TVPLayerRect&) override;

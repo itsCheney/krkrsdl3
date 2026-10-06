@@ -40,6 +40,8 @@ struct TVPLayerParameterUploadStats
 {
     uint64_t gammaLUTUploads = 0;
     uint64_t gammaLUTUploadedBytes = 0;
+    uint64_t psTableUploads = 0;
+    uint64_t psTableUploadedBytes = 0;
 };
 struct TVPLayerOperation
 {
@@ -61,7 +63,8 @@ enum class TVPLayerAliasRule {
 enum TVPLayerParameterResources : uint32_t {
     TVP_LAYER_RESOURCE_ALPHA_TABLES = 1,
     // Gamma has an owned per-call LUT; image upload counters exclude it.
-    TVP_LAYER_RESOURCE_GAMMA_LUT = 2
+    TVP_LAYER_RESOURCE_GAMMA_LUT = 2,
+    TVP_LAYER_RESOURCE_PS_TABLES = 4
 };
 enum TVPLayerGeometry : uint32_t {
     TVP_LAYER_GEOMETRY_RECT = 1,
@@ -130,6 +133,12 @@ inline constexpr bool TVPLayerOperationRequiresForwardSource(TVPLayerOperationKi
         case TVPLayerOperationKind::Lighten: case TVPLayerOperationKind::Screen:
         case TVPLayerOperationKind::RemoveOpacity: case TVPLayerOperationKind::AdditiveAlphaToAlpha:
         case TVPLayerOperationKind::AlphaSD: return true;
+        case TVPLayerOperationKind::PsAlpha: case TVPLayerOperationKind::PsAdd:
+        case TVPLayerOperationKind::PsSub: case TVPLayerOperationKind::PsSoftLight:
+        case TVPLayerOperationKind::PsColorDodge: case TVPLayerOperationKind::PsColorBurn:
+        case TVPLayerOperationKind::PsLighten: case TVPLayerOperationKind::PsDarken:
+        case TVPLayerOperationKind::PsDiff: case TVPLayerOperationKind::PsDiff5:
+        case TVPLayerOperationKind::PsExclusion: return true;
         default: return false;
     }
 }
@@ -210,6 +219,7 @@ enum class TVPLayerGPURejectReason
     BackendFailure,
     Triangles,
     Perspective,
+    PsTables,
     Count
 };
 struct TVPLayerRenderStats
@@ -230,4 +240,6 @@ struct TVPLayerRenderStats
     uint64_t pointCacheMisses = 0;
     uint64_t gammaLUTUploads = 0;
     uint64_t gammaLUTUploadedBytes = 0;
+    uint64_t psTableUploads = 0;
+    uint64_t psTableUploadedBytes = 0;
 };

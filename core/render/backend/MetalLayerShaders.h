@@ -249,7 +249,35 @@ uint layerGammaPixel(uint d,uint flags,const device uchar* gamma) {
     }
     return result;
 }
-int4 layerPixel(int4 d,int4 s,int4 color,int kind,int opa,int flags,const device uchar* tables,const device uchar* gamma) {
+uint layerPsP1BPixel(uint d,uint s,int kind,int opa,uint flags,const device uchar* psTables) {
+    uint alpha=s>>24;
+    if(opa!=255) alpha=(alpha*uint(opa))>>8;
+    uint result=0;
+    for(uint shift=0;shift<24;shift+=8) {
+        int dc=int((d>>shift)&255u),sc=int((s>>shift)&255u),blended=sc,color;
+        if(kind==TVP_LAYER_KIND_PsAdd) blended=min(255,dc+sc);
+        else if(kind==TVP_LAYER_KIND_PsSub) blended=max(0,dc+sc-255);
+        else if(kind==TVP_LAYER_KIND_PsLighten) blended=max(dc,sc);
+        else if(kind==TVP_LAYER_KIND_PsDarken) blended=min(dc,sc);
+        else if(kind==TVP_LAYER_KIND_PsDiff) blended=max(dc,sc)-min(dc,sc);
+        else if(kind==TVP_LAYER_KIND_PsSoftLight || kind==TVP_LAYER_KIND_PsColorDodge || kind==TVP_LAYER_KIND_PsColorBurn) {
+            uint offset=kind==TVP_LAYER_KIND_PsSoftLight ? 0u :
+                        kind==TVP_LAYER_KIND_PsColorDodge ? 65536u : 131072u;
+            blended=int(psTables[offset+uint(sc)*256u+uint(dc)]);
+        }
+        if(kind==TVP_LAYER_KIND_PsDiff5) {
+            // Legacy 5.x fades SOURCE first, then takes the absolute difference.
+            sc=(sc*int(alpha))>>8;
+            color=max(dc,sc)-min(dc,sc);
+        } else if(kind==TVP_LAYER_KIND_PsExclusion) {
+            // Match the active packed functor's >>7 product, not /255.
+            color=dc+(((sc-((dc*sc)>>7))*int(alpha))>>8);
+        } else color=dc+(((blended-dc)*int(alpha))>>8);
+        result|=(uint(color)&255u)<<shift;
+    }
+    return result|((flags&1u)!=0 ? d&0xff000000u : 0u);
+}
+int4 layerPixel(int4 d,int4 s,int4 color,int kind,int opa,int flags,const device uchar* tables,const device uchar* gamma,const device uchar* psTables) {
     bool hold=(flags&1)!=0, straightDestination=(flags&2)!=0;
     bool premultipliedDestination=(flags&4)!=0;
     bool full=opa==255 && (flags&8)!=0;
@@ -303,6 +331,19 @@ int4 layerPixel(int4 d,int4 s,int4 color,int kind,int opa,int flags,const device
         case TVP_LAYER_KIND_PsColorDodge5:
             result = layerUnpack(layerPsPixel(layerPack(d), layerPack(s), kind, opa, uint(flags)));
             break;
+        case TVP_LAYER_KIND_PsAlpha:
+        case TVP_LAYER_KIND_PsAdd:
+        case TVP_LAYER_KIND_PsSub:
+        case TVP_LAYER_KIND_PsSoftLight:
+        case TVP_LAYER_KIND_PsColorDodge:
+        case TVP_LAYER_KIND_PsColorBurn:
+        case TVP_LAYER_KIND_PsLighten:
+        case TVP_LAYER_KIND_PsDarken:
+        case TVP_LAYER_KIND_PsDiff:
+        case TVP_LAYER_KIND_PsDiff5:
+        case TVP_LAYER_KIND_PsExclusion:
+            result=layerUnpack(layerPsP1BPixel(layerPack(d),layerPack(s),kind,opa,uint(flags),psTables));
+            break;
         case TVP_LAYER_KIND_Add:
             result = layerUnpack(layerAddPixel(layerPack(d), layerPack(s), opa, uint(flags)));
             break;
@@ -337,6 +378,7 @@ kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
                           constant LayerParameters& p [[buffer(0)]],
                           const device uchar* tables [[buffer(1)]],
                           const device uchar* gamma [[buffer(2)]],
+                          const device uchar* psTables [[buffer(3)]],
                           texture2d<float, access::read> source [[texture(0)]],
                           texture2d<float, access::read> snapshot [[texture(1)]],
 #ifdef TVP_LAYER_IN_PLACE
@@ -360,7 +402,7 @@ kernel void ordinaryLayer(uint2 tid [[thread_position_in_grid]],
     }
     if (layerNeedsSource(kind))
         s = layerSample(source, p, xy);
-    int4 result=layerPixel(d,s,color,kind,opa,flags,tables,gamma);
+    int4 result=layerPixel(d,s,color,kind,opa,flags,tables,gamma,psTables);
     target.write(float4(result) / 255.0,uint2(xy));
 }
 #ifdef TVP_LAYER_FRAMEBUFFER_FETCH
@@ -377,13 +419,14 @@ fragment LayerRasterColor ordinaryLayerFragment(LayerRasterVertex in [[stage_in]
     float4 previous [[color(0), raster_order_group(0)]],
     constant LayerParameters& p [[buffer(0)]],const device uchar* tables [[buffer(1)]],
     const device uchar* gamma [[buffer(2)]],
+    const device uchar* psTables [[buffer(3)]],
     texture2d<float,access::read> source [[texture(0)]]) {
     int2 xy=int2(in.position.xy);
     int kind=p.operation.x;
     int4 s=int4(0);
     if(layerNeedsSource(kind)) s=layerSample(source,p,xy);
     int4 d=int4(round(previous*255.0));
-    return {float4(layerPixel(d,s,p.color,kind,p.operation.y,p.operation.z,tables,gamma))/255.0};
+    return {float4(layerPixel(d,s,p.color,kind,p.operation.y,p.operation.z,tables,gamma,psTables))/255.0};
 }
 #endif
 

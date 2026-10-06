@@ -187,6 +187,8 @@ public:
     virtual bool SupportsLayerOperations() const { return false; }
     virtual TVPLayerParameterUploadStats GetLayerParameterUploadStats() const { return {}; }
     virtual bool SetLayerAlphaTables(const uint8_t*, const uint8_t*) { return false; }
+    virtual bool SetLayerPsTables(const uint8_t* softLight, const uint8_t* colorDodge,
+                                  const uint8_t* colorBurn) { return false; }
     virtual void* CreateLayerTexture(int, int, TVPLayerTextureFormat) { return nullptr; }
     virtual void DestroyLayerTexture(void*) {}
     virtual bool UpdateLayerTexture(void*, const uint8_t*, int, const TVPLayerRect&) { return false; }
