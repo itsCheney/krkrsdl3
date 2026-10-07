@@ -136,7 +136,9 @@ class tTVPScopedTexturePixels {
     void* pixels = nullptr;
     bool write = false;
     tTVPRect written{0,0,0,0};
-    char origin[48]{};
+    // Keep one byte beyond the 47-byte diagnostic name limit so delayed
+    // acquisition/release can report oversize names instead of merging them.
+    char origin[49]{};
 public:
     tTVPScopedTexturePixels() = default;
     tTVPScopedTexturePixels(const tTVPScopedTexturePixels&) = delete;
@@ -150,7 +152,7 @@ public:
     }
     void Acquire(iTVPTexture2D* value,bool forWrite,const char* caller="native.layerPixels",bool overwrite=false) {
         Reset(); if(!value) return;
-        std::snprintf(origin,sizeof(origin),"%s",caller);
+        std::snprintf(origin,sizeof(origin),"%s",caller ? caller : "unattributed");
         krkrsdl3::layer_work::SourceScope scope(origin);
         value->AddCPUAccessRef();
         try { pixels=forWrite ? (overwrite ? value->LockCPUWriteForOverwrite() : value->LockCPUWrite()) : value->LockCPURead(); }

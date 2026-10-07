@@ -105,6 +105,7 @@ class LayerTexture final : public iTVPTexture2D {
     unsigned locks = 0;
     unsigned scopedWrites = 0;
     char uploadOrigin[48]="initial", rawWriteOrigin[48]="script.rawWrite";
+    bool uploadOriginOversize=false, rawWriteOriginOversize=false;
     // Union of CPU writes since the last upload; meaningful only while dirty.
     tTVPRect damage;
     // Damage outstanding when the current write lease opened. A lease widens
@@ -229,7 +230,9 @@ class LayerTexture final : public iTVPTexture2D {
         if(r.get_width()<=0 || r.get_height()<=0) return;
         const char* caller=krkrsdl3::layer_work::source;
         if(!std::strcmp(caller,"unattributed")) caller="bitmap.cpuWrite";
+        const bool oversize=std::strlen(caller)>=sizeof(uploadOrigin) || (dirty && uploadOriginOversize);
         if(dirty && std::strcmp(uploadOrigin,caller)) caller="mixed";
+        uploadOriginOversize=oversize;
         std::snprintf(uploadOrigin,sizeof(uploadOrigin),"%s",caller);
         InvalidatePointCache(&r,false,point_trace::Invalidation::CPUWrite,"cpu.write");
         if(!dirty) { damage=r; dirty=true; return; }
@@ -241,7 +244,8 @@ class LayerTexture final : public iTVPTexture2D {
         if(valid) return false;
         if(!session->backend || !handle) throw std::runtime_error("GPU Layer read without a session");
         int pitch=0;
-        const bool diagnostics=krkrsdl3::layer_work::enabled.load(std::memory_order_relaxed);
+        const auto diagnosticEpoch=krkrsdl3::layer_work::CaptureGeneration();
+        const bool diagnostics=diagnosticEpoch!=0;
         const auto started=diagnostics ? krkrsdl3::layer_work::Now() : 0;
         if(!session->backend->ReadLayerTexture(handle,pixels,pitch) || pitch!=GetPitch())
             throw std::runtime_error("GPU Layer readback failed");
@@ -249,7 +253,7 @@ class LayerTexture final : public iTVPTexture2D {
         const char* origin=krkrsdl3::layer_work::source;
         if(!std::strcmp(origin,"unattributed")) origin=categories[static_cast<int>(source)];
         if(diagnostics) krkrsdl3::layer_work::Record(false,textureID,Width,Height,Bytes(),
-            krkrsdl3::layer_work::Now()-started,session->backend->GetLastReadbackWaitNanoseconds(),false,origin);
+            krkrsdl3::layer_work::Now()-started,session->backend->GetLastReadbackWaitNanoseconds(),false,origin,diagnosticEpoch);
         session->stats.readbackBytes+=Bytes(); session->stats.cpuCacheBytes+=Bytes(); valid=true;
         const int index=static_cast<int>(source);
         session->stats.readbackBytesBySource[index]+=Bytes();
@@ -368,6 +372,8 @@ public:
     void* GetPersistentCPUData(bool write) override {
         Read(TVPLayerReadbackSource::Persistent); if(!pinned) { pinned=true; ++session->stats.pinnedCPUTextures; }
         if(write) {
+            rawWriteOriginOversize=std::strlen(krkrsdl3::layer_work::source)>=sizeof(rawWriteOrigin) ||
+                (writeLeased && rawWriteOriginOversize);
             std::snprintf(rawWriteOrigin,sizeof(rawWriteOrigin),"%s",
                 std::strcmp(krkrsdl3::layer_work::source,"unattributed") ? krkrsdl3::layer_work::source : "script.rawWrite");
             if(!writeLeased) { leaseHadDamage=dirty; leaseDamage=damage; writeLeased=true; }
@@ -410,7 +416,8 @@ public:
             Read(TVPLayerReadbackSource::Pixels);
             const int bpp=format==TVPTextureFormat::Gray ? 1 : 4;
             const auto* source=pixels.data()+size_t(damage.top)*GetPitch()+size_t(damage.left)*bpp;
-            const auto started=krkrsdl3::layer_work::enabled.load(std::memory_order_relaxed) ? krkrsdl3::layer_work::Now() : 0;
+            const auto diagnosticEpoch=krkrsdl3::layer_work::CaptureGeneration();
+            const auto started=diagnosticEpoch ? krkrsdl3::layer_work::Now() : 0;
             if(!session->backend->UpdateLayerTexture(handle,source,GetPitch(),Rect(damage)))
                 throw std::runtime_error("GPU Layer upload failed");
             // A caller may query then modify an outstanding CPU write pointer.
@@ -419,7 +426,8 @@ public:
             session->stats.uploadedBytes+=size_t(damage.get_width())*bpp*damage.get_height();
             krkrsdl3::layer_work::Record(true,textureID,Width,Height,size_t(damage.get_width())*bpp*damage.get_height(),
                 started ? krkrsdl3::layer_work::Now()-started : 0,0,writeLeased || scopedWrites,
-                writeLeased ? rawWriteOrigin : uploadOrigin);
+                writeLeased ? rawWriteOrigin : uploadOrigin,diagnosticEpoch,
+                writeLeased ? rawWriteOriginOversize : uploadOriginOversize);
             dirty=false; leaseHadDamage=false;
         }
         return handle;
@@ -476,13 +484,14 @@ public:
                 std::memcpy(pixels.data()+size_t(y+r.top)*GetPitch()+r.left*bpp,source+size_t(y)*pitch,bytes);
             MarkDirty(r); return;
         }
-        const auto started=krkrsdl3::layer_work::enabled.load(std::memory_order_relaxed) ? krkrsdl3::layer_work::Now() : 0;
+        const auto diagnosticEpoch=krkrsdl3::layer_work::CaptureGeneration();
+        const auto started=diagnosticEpoch ? krkrsdl3::layer_work::Now() : 0;
         if(!session->backend->UpdateLayerTexture(handle,source,pitch,Rect(r)))
             throw std::runtime_error("GPU Layer update failed");
         session->stats.uploadedBytes+=size_t(bytes)*r.get_height();
         krkrsdl3::layer_work::Record(true,textureID,Width,Height,size_t(bytes)*r.get_height(),
             started ? krkrsdl3::layer_work::Now()-started : 0,0,false,
-            std::strcmp(krkrsdl3::layer_work::source,"unattributed") ? krkrsdl3::layer_work::source : "bitmap.update");
+            std::strcmp(krkrsdl3::layer_work::source,"unattributed") ? krkrsdl3::layer_work::source : "bitmap.update",diagnosticEpoch);
         InvalidateCPUCacheRegion(r,false,point_trace::Invalidation::GPUUpdate,"texture.update");
     }
     uint32_t ReadPoint(int x,int y,bool alphaOnly) {
@@ -524,6 +533,7 @@ public:
             }
         };
         if(handle && session->backend) {
+            const auto diagnosticEpoch=krkrsdl3::layer_work::CaptureGeneration();
             std::vector<uint8_t> sample; int pitch=0;
             const TVPLayerRect region{x,y,x+1,y+1};
             const bool read=session->backend->ReadLayerTextureRegion(handle,region,sample,pitch);
@@ -537,7 +547,7 @@ public:
                 session->stats.readbackBytesBySource[index]+=bpp;
                 ++session->stats.readbackCountBySource[index];
                 krkrsdl3::layer_work::Record(false,textureID,Width,Height,bpp,trace.wallNS,trace.gpuWaitNS,
-                    false,"bitmap.point");
+                    false,"bitmap.point",diagnosticEpoch);
                 uint32_t value=0;
                 if(format==TVPTextureFormat::Gray) value=sample[0];
                 else std::memcpy(&value,sample.data(),4);
