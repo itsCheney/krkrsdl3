@@ -159,9 +159,11 @@ public:
         previous=transitionScope;transitionScope=this;
         epoch=CaptureGeneration();frame=frameID ? frameID : tick;
         if(!epoch) return;
-        valid=TransitionString(record.requested,sizeof(record.requested),requested,191) &
-              TransitionString(record.effective,sizeof(record.effective),effective,191) &
-              TransitionString(record.metadata,sizeof(record.metadata),metadata,511);
+        // Populate all fields even when an earlier field is oversized.
+        const bool requestedValid=TransitionString(record.requested,sizeof(record.requested),requested,191);
+        const bool effectiveValid=TransitionString(record.effective,sizeof(record.effective),effective,191);
+        const bool metadataValid=TransitionString(record.metadata,sizeof(record.metadata),metadata,511);
+        valid=requestedValid && effectiveValid && metadataValid;
         const int dimensions[]={canvasW,canvasH,src1W,src1H,src2W,src2H,outputW,outputH};
         std::copy_n(dimensions,8,record.dimensions);record.firstTick=record.lastTick=tick;
         std::strcpy(record.reason,"provider.cpu");
