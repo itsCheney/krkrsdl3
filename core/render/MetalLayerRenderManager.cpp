@@ -1,6 +1,7 @@
 #include "tjsCommHead.h"
 #include "RenderManager.h"
 #include "MetalLayerRenderManager.h"
+#include "LayerTransitionGeometry.h"
 #include "LayerBitmap.h"
 #include "TVPCompositor.h"
 #include "TVPMsg.h"
@@ -323,6 +324,7 @@ public:
     TVPTextureFormat::e GetFormat() const override { return format; }
     tjs_int GetPitch() const override { return Width*(format==TVPTextureFormat::Gray ? 1 : 4); }
     bool IsCPUResident() const override { return pinned || !handle || scopedWrites; }
+    bool HasCPUAccess() const { return pinned || locks || writeLeased || scopedWrites; }
     bool IsStatic() override { return readonly && !pinned; }
     bool IsOpaque() override { return false; }
     const void* GetScanLineForRead(tjs_uint y) override { Read(TVPLayerReadbackSource::Pixels); return pixels.data()+size_t(y)*GetPitch(); }
@@ -595,6 +597,12 @@ public:
     iTVPRenderManager* Software() { return TVPGetSoftwareRenderManager(); }
     bool Reject(TVPLayerGPURejectReason reason) {
         if(session) ++session->stats.gpuRejectCountByReason[static_cast<int>(reason)];
+        static constexpr const char* names[]={"render.targetUnavailable","render.cpuResident","render.inputs",
+            "render.method","render.stretch","render.opacity","render.sourceUnavailable","render.format",
+            "render.geometry","render.kind","render.alphaTables","render.backendFailure","render.triangles",
+            "render.perspective","render.psTables","render.affineAlias","render.perspectiveAlias"};
+        static_assert(sizeof(names)/sizeof(*names)==size_t(TVPLayerGPURejectReason::Count));
+        krkrsdl3::layer_work::RecordTransitionResult(false,names[static_cast<int>(reason)],0);
         return false;
     }
     bool RejectSource(iTVPRenderMethod* method,iTVPTexture2D* texture) {
@@ -852,7 +860,11 @@ public:
                 TVPThrowExceptionMessage(TJS_N("RemoveOpacity requires equal-size, in-bounds R8 mask rectangles without mirroring."));
             }
         }
-        if(GPU(method,target,reference,dst,inputs)) return;
+        if(GPU(method,target,reference,dst,inputs)) {
+            krkrsdl3::layer_work::RecordTransitionResult(true,"render.gpu",
+                dst.get_width()>0 && dst.get_height()>0 ? uint64_t(dst.get_width())*dst.get_height() : 0);
+            return;
+        }
         tTVPRect fallbackDst=dst;
         TVPLayerOperation op;
         const bool univTrans=target && inputs.size()==3 && method->DescribeGpuOperation(op) &&
@@ -1147,6 +1159,58 @@ void TVPUnbindMetalLayerRenderManager() {
     manager.session->backend=nullptr; manager.session.reset();
 }
 bool TVPMetalLayerCompositionActive() { return bool(Manager().session); }
+bool TVPHasMetalLayerTransitionSupport() {
+    const auto& session=Manager().session;
+    return session && session->backend && session->backend->SupportsLayerTransitions();
+}
+TVPLayerTransitionResult TVPTryMetalLayerTransition(const TVPLayerTransitionOperation& operation,
+        iTVPTexture2D* target,iTVPTexture2D* source1,iTVPTexture2D* source2) {
+    using Result=TVPLayerTransitionResult;
+    const auto& p=operation.params;
+    const uint64_t pixels=p.width>0 && p.height>0 ? uint64_t(p.width)*p.height : 0;
+    auto fail=[&](Result r,const char* reason) {
+        krkrsdl3::layer_work::RecordTransitionResult(false,reason,pixels); return r;
+    };
+    if(p.kind<=0 || p.kind>=int(TVPLayerTransitionKind::Count)) return fail(Result::Unsupported,"unsupportedKind");
+    auto& session=Manager().session;
+    if(!session || !session->backend || !session->backend->SupportsLayerTransitions())
+        return fail(Result::PipelineUnavailable,"pipelineUnavailable");
+    auto* t=dynamic_cast<LayerTexture*>(target);
+    auto* s1=dynamic_cast<LayerTexture*>(source1);
+    auto* s2=dynamic_cast<LayerTexture*>(source2);
+    if(!t || !s1 || !s2 || !t->Belongs(session) || !s1->Belongs(session) || !s2->Belongs(session))
+        return fail(Result::InvalidResource,"sessionOrResource");
+    if(t->GetFormat()!=TVPTextureFormat::RGBA || s1->GetFormat()!=TVPTextureFormat::RGBA ||
+       s2->GetFormat()!=TVPTextureFormat::RGBA) return fail(Result::InvalidResource,"format");
+    if(t==s1 || t==s2) return fail(Result::Alias,"targetAlias");
+    if(t->IsCPUResident() || s1->IsCPUResident() || s2->IsCPUResident() ||
+       t->HasCPUAccess() || s1->HasCPUAccess() || s2->HasCPUAccess()) return fail(Result::CPUAccess,"cpuLease");
+    const auto checked=layer_transition::Validate(operation,t->GetWidth(),t->GetHeight(),
+        s1->GetWidth(),s1->GetHeight(),s2->GetWidth(),s2->GetHeight(),false);
+    if(checked!=Result::Applied) return fail(checked,checked==Result::InvalidGeometry ? "geometry" :
+        checked==Result::AllocationFailed ? "parameterBudget" : "parameters");
+    if(!pixels) { krkrsdl3::layer_work::RecordTransitionResult(false,"passthrough",0); return Result::Applied; }
+    if(p.kind==int(TVPLayerTransitionKind::Wave) && p.flags==1 && !session->tablesReady) {
+        if(!session->backend->SetLayerAlphaTables(TVPOpacityOnOpacityTable,TVPNegativeMulTable))
+            return fail(Result::AllocationFailed,"alphaTables");
+        session->tablesReady=true;
+    }
+    // Dirty CPU damage is uploaded by the existing texture transaction. A full
+    // overwrite skips fetching/uploading the destination's discarded old pixels.
+    const bool full=p.destLeft==0 && p.destTop==0 && p.width==int(t->GetWidth()) && p.height==int(t->GetHeight());
+    void* th=full ? t->GetTextureHandleForOverwrite() : t->GetTextureHandleForRegionWrite();
+    void* h1=s1->GetTextureHandle(); void* h2=s2->GetTextureHandle();
+    if(!th || !h1 || !h2) return fail(Result::InvalidResource,"textureHandle");
+    if(!session->backend->OperateLayerTransition(operation,th,h1,h2)) {
+        const auto result=session->backend->LastLayerTransitionResult();
+        return fail(result,result==Result::AllocationFailed ? "allocationFailed" :
+            result==Result::InvalidGeometry ? "geometry" : result==Result::InvalidParameters ? "parameters" :
+            result==Result::Unsupported ? "unsupportedKind" : result==Result::Alias ? "targetAlias" : "backendRejected");
+    }
+    t->CommitGPURegionWrite(tTVPRect(p.destLeft,p.destTop,p.destLeft+p.width,p.destTop+p.height));
+    krkrsdl3::layer_work::RecordTransitionResult(true,"gpu",pixels);
+    return Result::Applied;
+}
 TVPLayerRenderStats TVPGetMetalLayerRenderStats() {
     const auto& session=Manager().session;
     if(!session) return {};

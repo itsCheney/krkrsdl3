@@ -17,6 +17,7 @@
 #include "RenderManager.h"
 #include "PointReadTrace.h"
 #include "LayerTriangleTrace.h"
+#include "LayerWorkDiagnostics.h"
 #include "FontRasterizer.h"
 #include "LayerManager.h"
 #include "MetalLayerRenderManager.h"
@@ -6299,6 +6300,8 @@ void tTJSNI_BaseLayer::BeforeCompletion()
                 TransTick = GetTransTick();
             }
             er = DivisibleTransHandler->StartProcess(TransTick);
+            if(krkrsdl3::layer_work::enabled.load(std::memory_order_relaxed))
+                TransDiagnosticFrame=krkrsdl3::layer_work::nextTransitionFrame.fetch_add(1,std::memory_order_relaxed);
             if (er != TJS_S_TRUE)
                 StopTransitionByHandler();
         }
@@ -7616,6 +7619,19 @@ void tTJSNI_BaseLayer::StartTransition(const ttstr& name,
         // find transition handler
         pro = TVPFindTransHandlerProvider(name);
         // this may raise an exception
+        TransDiagnosticRequested.clear();TransDiagnosticProvider.clear();TransDiagnosticFrame=0;
+        TransDiagnosticCanvasWidth=withchildren ? GetWidth() : MainImage->GetWidth();
+        TransDiagnosticCanvasHeight=withchildren ? GetHeight() : MainImage->GetHeight();
+        if(krkrsdl3::layer_work::enabled.load(std::memory_order_relaxed)) {
+            // Observation must not change provider lifetime or error handling.
+            try {
+                TransDiagnosticRequested=name.AsStdString();
+                const tjs_char* providerName=nullptr;
+                if(TJS_SUCCEEDED(pro->GetName(&providerName)) && providerName)
+                    TransDiagnosticProvider=ttstr(providerName).AsStdString();
+                else TransDiagnosticProvider="provider.nameUnavailable";
+            } catch(...) {TransDiagnosticProvider="provider.nameUnavailable";}
+        }
 
         // check selfupdate member of 'options'
         tTJSVariant var;
@@ -7751,6 +7767,7 @@ void tTJSNI_BaseLayer::StartTransition(const ttstr& name,
         // set flag
         InTransition = true;
         TransCompEventPrevented = false;
+        RecordTransitionLifecycle("begin");
 
         // update
         Update(true);
@@ -7776,6 +7793,7 @@ void tTJSNI_BaseLayer::InternalStopTransition()
     // stop transition
     if (InTransition)
     {
+        RecordTransitionLifecycle("end");
         InTransition = false;
         TransCompEventPrevented = false;
 
@@ -7964,6 +7982,15 @@ void tTJSNI_BaseLayer::DoDivisibleTransition(iTVPBaseBitmap* dest,
     data.DestLeft = dx;
     data.DestTop = dy;
 
+    krkrsdl3::layer_work::TransitionScope transition(
+        TransDiagnosticRequested.empty() ? "request.notCaptured" : TransDiagnosticRequested.c_str(),
+        TransDiagnosticProvider.empty() ? "provider.notCaptured" : TransDiagnosticProvider.c_str(),
+        TransDiagnosticCanvasWidth,TransDiagnosticCanvasHeight,
+        MainImage->GetWidth(),MainImage->GetHeight(),
+        TransSrc ? TransSrc->MainImage->GetWidth() : 0,TransSrc ? TransSrc->MainImage->GetHeight() : 0,
+        dest->GetWidth(),dest->GetHeight(),TransTick,TransDiagnosticFrame);
+    transition.SetPixels(uint64_t(std::max(data.Width,0))*uint64_t(std::max(data.Height,0)));
+
     // process
     {
         tTVPTransitionCPUOutputScope output(data);
@@ -8085,6 +8112,14 @@ void tTJSNI_BaseLayer::tTransDrawable::DrawCompleted(const tTVPRect& destrect,
         data.DestTop = TargetRect.top;
     }
 
+    krkrsdl3::layer_work::TransitionScope transition(
+        Owner->TransDiagnosticRequested.empty() ? "request.notCaptured" : Owner->TransDiagnosticRequested.c_str(),
+        Owner->TransDiagnosticProvider.empty() ? "provider.notCaptured" : Owner->TransDiagnosticProvider.c_str(),
+        Owner->TransDiagnosticCanvasWidth,Owner->TransDiagnosticCanvasHeight,
+        src1bmp->GetWidth(),src1bmp->GetHeight(),src ? src->GetWidth() : 0,src ? src->GetHeight() : 0,
+        dest->GetWidth(),dest->GetHeight(),Owner->TransTick,Owner->TransDiagnosticFrame);
+    transition.SetPixels(uint64_t(std::max(data.Width,0))*uint64_t(std::max(data.Height,0)));
+
     try
     {
         {
@@ -8120,6 +8155,21 @@ void tTJSNI_BaseLayer::tTransDrawable::DrawCompleted(const tTVPRect& destrect,
         tTVPTempBitmapHolder::FreeTemp();
 }
 //---------------------------------------------------------------------------
+void tTJSNI_BaseLayer::RecordTransitionLifecycle(const char* stage)
+{
+    if(!krkrsdl3::layer_work::enabled.load(std::memory_order_relaxed)) return;
+    try {
+        using krkrsdl3::layer_work::JSONString;
+        const auto text=std::string("transition.lifecycle {\"stage\":")+JSONString(stage)+
+            ",\"requested\":"+JSONString(TransDiagnosticRequested.c_str())+
+            ",\"effective\":"+JSONString(TransDiagnosticProvider.c_str())+
+            ",\"canvas\":["+std::to_string(TransDiagnosticCanvasWidth)+","+std::to_string(TransDiagnosticCanvasHeight)+"]"+
+            ",\"withChildren\":"+(TransWithChildren ? "true" : "false")+
+            ",\"tick\":"+std::to_string(TransTick)+",\"frame\":"+std::to_string(TransDiagnosticFrame)+"}";
+        TVPAddLog(ttstr(text.c_str()));
+    } catch(...) { /* Diagnostics never replace transition errors. */ }
+}
+
 tjs_uint64 tTJSNI_BaseLayer::GetTransTick()
 {
     if (!UseTransTickCallback)

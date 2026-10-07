@@ -9,6 +9,7 @@
 #include "ObjectList.h"
 #include "tjsNative.h"
 #include <cstdint>
+#include <string>
 
 namespace krkrsdl3 { class iTVPRenderBackend; }
 
@@ -1057,6 +1058,10 @@ private:
 private:
     iTVPDivisibleTransHandler* DivisibleTransHandler;
     iTVPGiveUpdateTransHandler* GiveUpdateTransHandler;
+    std::string TransDiagnosticRequested,TransDiagnosticProvider;
+    int TransDiagnosticCanvasWidth=0,TransDiagnosticCanvasHeight=0;
+    tjs_uint64 TransDiagnosticFrame=0;
+    void RecordTransitionLifecycle(const char* stage);
 
     tTJSNI_BaseLayer* TransDest; // transition destination
     iTJSDispatch2* TransDestObj;

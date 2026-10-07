@@ -25,6 +25,7 @@
 #include "TVPSystem.h"
 #include "TVPDebug.h"
 #include "RenderManager.h"
+#include "LayerWorkDiagnostics.h"
 #include "Platform.h"
 #include "tjsUtils.h"
 
@@ -552,6 +553,15 @@ protected:
 
     tTVPTransBlender Blender;
 
+    // Private implementation detail, not part of iTVPDivisibleTransHandler's
+    // plugin ABI. Capture normalized immutable inputs only while observing.
+    virtual void RecordDiagnosticMetadata() {
+        char text[128];
+        std::snprintf(text,sizeof(text),"{\"time\":%llu,\"layerType\":%d}",
+            static_cast<unsigned long long>(Time),int(DestLayerType));
+        krkrsdl3::layer_work::SetTransitionMetadata(text);
+    }
+
 #ifdef TVP_TRANS_SHOW_FPS
     tjs_int Count;
     tjs_uint32 ProcessTick;
@@ -778,6 +788,10 @@ tjs_error tTVPCrossFadeTransHandler::Process(
     /*in,out*/ tTVPDivisibleData* data)
 {
     // process divided region of the entire layer bitmap
+    if(krkrsdl3::layer_work::enabled.load(std::memory_order_relaxed) && krkrsdl3::layer_work::transitionScope) {
+        try {RecordDiagnosticMetadata();}
+        catch(...) {krkrsdl3::layer_work::SetTransitionMetadata("{\"metadata\":\"unavailable\"}");}
+    }
 
 #ifdef TVP_TRANS_SHOW_FPS
     BlendTick = TVPGetRoughTickCount32();
@@ -785,6 +799,7 @@ tjs_error tTVPCrossFadeTransHandler::Process(
 
     if (Phase == 0)
     {
+        krkrsdl3::layer_work::RecordTransitionResult(false,"passthrough",uint64_t(data->Width)*uint64_t(data->Height));
         // completely source 1
         data->Dest = data->Src1;
         data->DestLeft = data->Src1Left;
@@ -792,6 +807,7 @@ tjs_error tTVPCrossFadeTransHandler::Process(
     }
     else if (Phase == PhaseMax)
     {
+        krkrsdl3::layer_work::RecordTransitionResult(false,"passthrough",uint64_t(data->Width)*uint64_t(data->Height));
         // completety source 2
         data->Dest = data->Src2;
         data->DestLeft = data->Src2Left;
@@ -839,6 +855,15 @@ class tTVPUniversalTransHandler : public tTVPCrossFadeTransHandler
 
     tjs_int Vague;
     iTVPScanLineProvider* Rule;
+
+    void RecordDiagnosticMetadata() override {
+        tjs_int width=0,height=0;
+        if(Rule) {Rule->GetWidth(&width);Rule->GetHeight(&height);}
+        char text[192];
+        std::snprintf(text,sizeof(text),"{\"time\":%llu,\"layerType\":%d,\"vague\":%d,\"ruleSize\":[%d,%d]}",
+            static_cast<unsigned long long>(Time),int(DestLayerType),int(Vague),width,height);
+        krkrsdl3::layer_work::SetTransitionMetadata(text);
+    }
 
 public:
     tTVPUniversalTransHandler(iTVPSimpleOptionProvider* options,
@@ -965,6 +990,13 @@ class tTVPScrollTransHandler : public tTVPCrossFadeTransHandler
 
     tTVPScrollTransFrom From;
     tTVPScrollTransStay Stay;
+
+    void RecordDiagnosticMetadata() override {
+        char text[160];
+        std::snprintf(text,sizeof(text),"{\"time\":%llu,\"layerType\":%d,\"from\":%d,\"stay\":%d}",
+            static_cast<unsigned long long>(Time),int(DestLayerType),int(From),int(Stay));
+        krkrsdl3::layer_work::SetTransitionMetadata(text);
+    }
 
 public:
     tTVPScrollTransHandler(iTVPSimpleOptionProvider* options,

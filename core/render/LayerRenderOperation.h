@@ -42,6 +42,8 @@ struct TVPLayerParameterUploadStats
     uint64_t gammaLUTUploadedBytes = 0;
     uint64_t psTableUploads = 0;
     uint64_t psTableUploadedBytes = 0;
+    uint64_t transitionParameterUploads = 0;
+    uint64_t transitionParameterUploadedBytes = 0;
 };
 struct TVPLayerOperation
 {

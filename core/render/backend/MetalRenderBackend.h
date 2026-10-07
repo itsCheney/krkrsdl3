@@ -83,6 +83,9 @@ public:
     bool IsHardware() const override { return true; }
     void FetchInfo() override;
     bool SupportsLayerOperations() const override;
+    bool SupportsLayerTransitions() const override;
+    bool OperateLayerTransition(const TVPLayerTransitionOperation&, void*, void*, void*) override;
+    TVPLayerTransitionResult LastLayerTransitionResult() const override;
     TVPLayerParameterUploadStats GetLayerParameterUploadStats() const override;
     bool SupportsLayerTileRendering() const;
     bool IsLayerTileRenderingActive() const;

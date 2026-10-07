@@ -8,6 +8,10 @@
 #include <math.h>
 #include "wave.h"
 #include "common.h"
+#include <cmath>
+#include <cstdio>
+#include "metaltransition.h"
+#include <new>
 
 //---------------------------------------------------------------------------
 /*
@@ -186,6 +190,38 @@ tjs_error tTVPWaveTransHandler::Process(tTVPDivisibleData* data)
     // このメソッドは通常、画面更新一回につき複数回呼ばれる
 
     // data には領域や画像に関する情報が入っている
+
+    TVPSetTransitionMetadata("{\"time\":%llu,\"maxh\":%d,\"maxomega\":%.17g,\"wavetype\":%d,\"alpha\":%d,\"bgcolor1\":%u,\"bgcolor2\":%u}", static_cast<unsigned long long>(Time), MaxH, MaxOmega, WaveType, int(LayerType), BGColor1, BGColor2);
+    if (TVPHasDivisibleMetalTransitionSupport(data))
+    {
+        TVPLayerTransitionOperation operation;
+        bool parametersReady = false;
+        try
+        {
+            auto &p = operation.params;
+            p.kind = static_cast<int>(TVPLayerTransitionKind::Wave);
+            p.frameWidth = Width; p.frameHeight = Height; p.ratio = BlendRatio;
+            p.flags = LayerType == ltAlpha ? 1u : LayerType == ltAddAlpha ? 2u : 0u;
+            p.color = CurBGColor;
+            // Preserve the original per-Process rad origin and repeated addition.
+            std::vector<std::int32_t> rows(data->Height);
+            double angle = data->Top * CurOmega + CurRadStart;
+            for (int n = 0; n < data->Height; ++n, angle += CurOmega)
+                rows[n] = static_cast<tjs_int>(sin(angle) * CurH);
+            operation.rows = TVPMakeTransitionBytes(rows.data(), rows.size() * sizeof(rows[0]));
+            parametersReady = true;
+        }
+        catch (const std::bad_alloc &) {
+            krkrsdl3::layer_work::RecordTransitionResult(false, "allocationFailed",
+                static_cast<uint64_t>(data->Width) * static_cast<uint64_t>(data->Height));
+            /* Original software path needs no row buffer. */
+        }
+        // Once encoding begins, exceptions must propagate to the engine. A
+        // post-dispatch allocation failure must never replay this ROI on CPU.
+        if (parametersReady &&
+            TVPTryDivisibleMetalTransition(operation, data) == TVPLayerTransitionResult::Applied)
+            return TJS_S_OK;
+    }
 
     // 初期パラメータを計算
     double rad = data->Top * CurOmega + CurRadStart; // 角度
@@ -366,6 +402,9 @@ public:
         if (TJS_SUCCEEDED(options->GetValue(TJS_N("wavetype"), &tmp)))
             if (tmp.Type() != tvtVoid)
                 wavetype = (tjs_int)tmp;
+
+        if (!src1w || !src1h || wavetype < 0 || wavetype > 2 || !std::isfinite(maxomega))
+            TVPThrowExceptionMessage(TJS_N("wave requires nonempty images, wavetype 0..2 and finite maxomega"));
 
         // オブジェクトを作成
         *handler = new tTVPWaveTransHandler(time, layertype, src1w, src1h, maxh, maxomega, bgcolor1,

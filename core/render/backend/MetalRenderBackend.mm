@@ -1,5 +1,8 @@
 #include "MetalRenderBackend.h"
 #include "MetalLayerShaders.h"
+#include "MetalTransitionShaders.h"
+#include "../LayerTransitionGeometry.h"
+#include "../LayerWorkDiagnostics.h"
 #include "../LayerPerspectiveGeometry.h"
 #include "MetalStageDiagnostics.h"
 #include "PointReadTrace.h"
@@ -371,6 +374,75 @@ struct MetalRenderBackend::Impl
     id<MTLComputePipelineState> dualSourceLayerPipeline = nil;
     id<MTLComputePipelineState> univTransLayerPipeline = nil, affineCopyPipeline = nil, affineBlendPipeline = nil;
     id<MTLComputePipelineState> perspectivePipeline = nil;
+    id<MTLComputePipelineState> transitionPipeline = nil;
+    TVPLayerTransitionResult transitionResult=TVPLayerTransitionResult::PipelineUnavailable;
+    id<MTLBuffer> transitionDummy = nil;
+    struct TransitionCache {
+        std::shared_ptr<const TVPLayerTransitionBytes> bytes;
+        uint64_t version=0,used=0;
+        int category=0,kind=0,frameWidth=0,frameHeight=0,blockSize=0,mapWidth=0,mapHeight=0;
+        id<MTLBuffer> buffer=nil;
+    };
+    std::vector<TransitionCache> transitionCaches;
+    std::shared_ptr<const TVPLayerTransitionBytes> transitionRows;
+    uint64_t transitionRowsVersion=0;
+    id<MTLBuffer> transitionRowsBuffer=nil;
+    id<MTLCommandBuffer> transitionRowsCommands=nil;
+    uint64_t transitionCacheClock=0;
+    size_t transitionCacheBytes=0;
+    bool TransitionCached(const std::shared_ptr<const TVPLayerTransitionBytes>& bytes,uint64_t version,
+                          int category,const TVPLayerTransitionParams& params) const {
+        for(const auto& c:transitionCaches) if(c.bytes==bytes && c.version==version && c.category==category && c.kind==params.kind &&
+            c.frameWidth==params.frameWidth && c.frameHeight==params.frameHeight &&
+            c.blockSize==params.blockSize && c.mapWidth==params.mapWidth && c.mapHeight==params.mapHeight) return true;
+        return false;
+    }
+    id<MTLBuffer> TransitionBuffer(const std::shared_ptr<const TVPLayerTransitionBytes>& bytes,
+        uint64_t version,int category,const TVPLayerTransitionParams& params) {
+        if(!bytes || bytes->empty()) {
+            if(!transitionDummy) transitionDummy=[device newBufferWithLength:32 options:MTLResourceStorageModeShared];
+            return transitionDummy;
+        }
+        if(bytes->size()>layer_transition::MaxParameterBytes) return nil;
+        if(category==2) {
+            id<MTLCommandBuffer> commandBuffer=Commands();
+            if(transitionRows==bytes && transitionRowsVersion==version && transitionRowsCommands==commandBuffer)
+                return transitionRowsBuffer;
+            id<MTLBuffer> buffer=AcquireStaging(bytes->size());
+            if(!buffer) return nil;
+            std::memcpy(buffer.contents,bytes->data(),bytes->size());
+            transitionRows=bytes;transitionRowsVersion=version;
+            transitionRowsBuffer=buffer;transitionRowsCommands=commandBuffer;
+            ++parameterUploadStats.transitionParameterUploads;
+            parameterUploadStats.transitionParameterUploadedBytes+=bytes->size();
+            krkrsdl3::layer_work::RecordTransitionParameters(1,bytes->size());
+            transientBytes+=bytes->size();
+            return buffer;
+        }
+        for(auto& c:transitionCaches) if(c.bytes==bytes && c.version==version && c.category==category && c.kind==params.kind &&
+            c.frameWidth==params.frameWidth && c.frameHeight==params.frameHeight &&
+            c.blockSize==params.blockSize && c.mapWidth==params.mapWidth && c.mapHeight==params.mapHeight) {
+            c.used=++transitionCacheClock; return c.buffer;
+        }
+        id<MTLBuffer> buffer=[device newBufferWithBytes:bytes->data() length:bytes->size()
+                                              options:MTLResourceStorageModeShared];
+        if(!buffer) return nil;
+        while(!transitionCaches.empty() && (transitionCaches.size()>=4 ||
+              transitionCacheBytes+bytes->size()>layer_transition::MaxParameterBytes)) {
+            auto old=std::min_element(transitionCaches.begin(),transitionCaches.end(),
+                [](const auto& a,const auto& b){return a.used<b.used;});
+            transitionCacheBytes-=old->bytes->size(); transitionCaches.erase(old);
+        }
+        TransitionCache c; c.bytes=bytes;c.version=version;c.used=++transitionCacheClock;c.category=category;c.kind=params.kind;
+        c.frameWidth=params.frameWidth;c.frameHeight=params.frameHeight;c.blockSize=params.blockSize;
+        c.mapWidth=params.mapWidth;c.mapHeight=params.mapHeight;c.buffer=buffer;
+        transitionCaches.push_back(std::move(c)); transitionCacheBytes+=bytes->size();
+        ++parameterUploadStats.transitionParameterUploads;
+        parameterUploadStats.transitionParameterUploadedBytes+=bytes->size();
+        krkrsdl3::layer_work::RecordTransitionParameters(1,bytes->size());
+        transientBytes+=bytes->size();
+        return buffer;
+    }
     // Whole-batch transaction: intermediate quads never write the real target.
     id<MTLTexture> perspectiveWorkTarget = nil, perspectiveTargetSnapshot = nil, perspectiveSourceSnapshot = nil;
     // Valid bindings for affine kinds whose branches do not read any tables.
@@ -1129,6 +1201,13 @@ struct MetalRenderBackend::Impl
         MTLCompileOptions* ordinaryOptions = [MTLCompileOptions new];
         ordinaryOptions.fastMathEnabled = NO;
         const std::string ordinarySource=TVPBuildMetalLayerShaderSource();
+        const std::string transitionSource=TVPBuildMetalTransitionShaderSource();
+        id<MTLLibrary> transitions=[device newLibraryWithSource:[NSString stringWithUTF8String:transitionSource.c_str()]
+                                                      options:ordinaryOptions error:&error];
+        if(transitions) transitionPipeline=[device newComputePipelineStateWithFunction:
+            [transitions newFunctionWithName:@"extransLayer"] error:&error];
+        if(!transitionPipeline) SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,"Metal extrans unavailable; CPU handlers retained: %s",
+                                           error.localizedDescription.UTF8String);
         id<MTLLibrary> ordinary = [device newLibraryWithSource:[NSString stringWithUTF8String:ordinarySource.c_str()]
                                                       options:ordinaryOptions error:&error];
         if (ordinary) {
@@ -1566,6 +1645,7 @@ bool MetalRenderBackend::SetLayerAlphaTables(const uint8_t* opacity, const uint8
         if (!impl_->alphaTables) return false;
         std::memcpy(impl_->alphaTables.contents, opacity, 65536);
         std::memcpy(static_cast<uint8_t*>(impl_->alphaTables.contents)+65536, negative, 65536);
+        krkrsdl3::layer_work::RecordTransitionParameters(1,131072);
         return true;
     }
 }
@@ -2167,6 +2247,57 @@ bool MetalRenderBackend::OperateLayerPerspective(const TVPLayerOperation& operat
         [commit endEncoding];
         p.transientOps+=2+active*2;
         if(p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
+        return true;
+    }
+}
+bool MetalRenderBackend::SupportsLayerTransitions() const {
+    return impl_ && impl_->transitionPipeline;
+}
+TVPLayerTransitionResult MetalRenderBackend::LastLayerTransitionResult() const {
+    return impl_ ? impl_->transitionResult : TVPLayerTransitionResult::PipelineUnavailable;
+}
+bool MetalRenderBackend::OperateLayerTransition(const TVPLayerTransitionOperation& operation,
+        void* target,void* source1,void* source2) {
+    @autoreleasepool {
+        auto& p=*impl_; const auto& q=operation.params;
+        auto* t=p.Find(target);auto* s1=p.Find(source1);auto* s2=p.Find(source2);
+        auto fail=[&](TVPLayerTransitionResult result) {p.transitionResult=result;return false;};
+        if(!p.transitionPipeline) return fail(TVPLayerTransitionResult::PipelineUnavailable);
+        if(!t || !s1 || !s2 || t->bytesPerPixel!=4 || s1->bytesPerPixel!=4 || s2->bytesPerPixel!=4)
+            return fail(TVPLayerTransitionResult::InvalidResource);
+        if(t==s1 || t==s2) return fail(TVPLayerTransitionResult::Alias);
+        const bool cached=p.TransitionCached(operation.table,operation.tableVersion,1,q);
+        auto valid=layer_transition::Validate(operation,t->width,t->height,s1->width,s1->height,s2->width,s2->height,!cached);
+        if(valid!=TVPLayerTransitionResult::Applied) return fail(valid);
+        if(!q.width || !q.height) {p.transitionResult=TVPLayerTransitionResult::Applied;return true;}
+        if(q.kind==int(TVPLayerTransitionKind::Wave) && q.flags==1 && !p.alphaTables)
+            return fail(TVPLayerTransitionResult::InvalidParameters);
+        // These snapshots are immutable and command buffers retain them after
+        // cache eviction. No buffer is rewritten while GPU work can observe it.
+        id<MTLBuffer> rows=nil,table=nil,dummy=nil;
+        id<MTLComputeCommandEncoder> e=nil;
+        try {
+            rows=p.TransitionBuffer(operation.rows,operation.rowsVersion,2,q);
+            table=p.TransitionBuffer(operation.table,operation.tableVersion,1,q);
+            dummy=p.TransitionBuffer(nullptr,0,0,q);
+            if(!rows || !table || !dummy) return fail(TVPLayerTransitionResult::AllocationFailed);
+            e=p.Compute();
+        } catch(const std::bad_alloc&) {return fail(TVPLayerTransitionResult::AllocationFailed);}
+        if(!e) return fail(TVPLayerTransitionResult::PipelineUnavailable);
+        [e setComputePipelineState:p.transitionPipeline];
+        [e setBytes:&q length:sizeof(q) atIndex:0];
+        ++p.parameterUploadStats.transitionParameterUploads;
+        p.parameterUploadStats.transitionParameterUploadedBytes+=sizeof(q);
+        krkrsdl3::layer_work::RecordTransitionParameters(1,sizeof(q));
+        [e setBuffer:rows offset:0 atIndex:1];[e setBuffer:table offset:0 atIndex:2];
+        [e setBuffer:p.alphaTables ? p.alphaTables : dummy offset:0 atIndex:3];
+        [e setTexture:s1->texture atIndex:0];[e setTexture:s2->texture atIndex:1];[e setTexture:t->texture atIndex:2];
+        [e dispatchThreads:MTLSizeMake(q.width,q.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+        if(p.diagnosticSampled) ++p.diagnosticWorkload.layerDispatches;
+        [e endEncoding];
+        p.transitionResult=TVPLayerTransitionResult::Applied;
+        // The normal submission budget remains the only flush trigger.
+        if(++p.transientOps>=Impl::kSubmissionOpBudget || p.transientBytes>=Impl::kSubmissionBudget) p.Submit();
         return true;
     }
 }

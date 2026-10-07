@@ -4,6 +4,8 @@
 #define rotatebaseH
 
 #include "tjsCommHead.h"
+#include "LayerTransition.h"
+#include <string>
 
 //---------------------------------------------------------------------------
 struct tPoint
@@ -54,6 +56,10 @@ protected:
     tjs_int BGColor;      // 背景色
     tjs_int Phase;        // アニメーションのフェーズ
     bool First;           // 一番最初の呼び出しかどうか
+
+    std::string TransitionMetadata;
+    TVPLayerTransitionKind TransitionKind = TVPLayerTransitionKind::Unsupported;
+    std::shared_ptr<const TVPLayerTransitionBytes> MetalRows;
 
     tRotateDrawData* DrawData; // 描画用データ
 
