@@ -1,6 +1,8 @@
 #include "ncbind/ncbind.hpp"
 #include "ScopedLayerPixels.h"
 #include "LayerShrinkGeometry.h"
+#include "CPUConsumerTrace.h"
+#include "PointReadTrace.h"
 #include "LayerBitmap.h"
 #include <cmath>
 #include <climits>
@@ -152,6 +154,9 @@ struct ShrinkCopy : public LayerUtils
     {
         if (numparams < 9)
             return TJS_E_BADPARAMCOUNT;
+        krkrsdl3::cpu_consumer_trace::ConsumerScope consumer("Layer.shrinkCopy",
+            krkrsdl3::cpu_consumer_trace::Access::Write,"native.shrinkCopy",reinterpret_cast<uintptr_t>(dst));
+        krkrsdl3::point_trace::WriterScope writer("Layer.shrinkCopy");
         krkrsdl3::layer_work::ShrinkScope profile("shrinkCopy");
         for(int i=5;i<9;++i) if(!ShrinkIntegerInRange(param[i]->AsInteger())) return TJS_E_INVALIDPARAM;
         ShrinkCopy inst(dst, param[0]->AsReal(), param[1]->AsReal(), param[2]->AsReal(),
@@ -172,6 +177,7 @@ struct ShrinkCopy : public LayerUtils
             krkrsdl3::layer_work::RecordShrinkResult(false,"invalidParameter",0);
             return TJS_E_INVALIDPARAM;
         }
+        krkrsdl3::cpu_consumer_trace::MarkShrinkSuccess();
         return TJS_S_OK;
     }
 
@@ -614,6 +620,9 @@ struct LimitedShrink : public LayerUtils
     {
         if (numparams < 2)
             return TJS_E_BADPARAMCOUNT;
+        krkrsdl3::cpu_consumer_trace::ConsumerScope consumer("Layer.shrinkCopyFast",
+            krkrsdl3::cpu_consumer_trace::Access::Write,"native.shrinkCopy",reinterpret_cast<uintptr_t>(dst));
+        krkrsdl3::point_trace::WriterScope writer("Layer.shrinkCopyFast");
         krkrsdl3::layer_work::ShrinkScope profile("shrinkCopyFast");
         if(!ShrinkIntegerInRange(param[1]->AsInteger()) ||
            (numparams>=3 && !ShrinkIntegerInRange(param[2]->AsInteger()))) return TJS_E_INVALIDPARAM;
@@ -633,6 +642,7 @@ struct LimitedShrink : public LayerUtils
             krkrsdl3::layer_work::RecordShrinkResult(false,"invalidParameter",0);
             return TJS_E_INVALIDPARAM;
         }
+        krkrsdl3::cpu_consumer_trace::MarkShrinkSuccess();
         return TJS_S_OK;
     }
 

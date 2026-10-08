@@ -165,14 +165,15 @@ struct layerExBase_GL
     GeometryT _clipLeft, _clipTop, _clipWidth, _clipHeight;
     DispatchT _obj;
     tTVPScopedLayerPixels _pixels;
+    virtual tTVPScopedLayerPixels& currentPixelAccess() { return _pixels; }
     const char* _pixelCaller="layerExBase";
     void setPixelCaller(const char* name) { _pixelCaller=name; }
-    void finishPixels() { _pixels.Reset(); _buffer=nullptr; }
+    virtual void finishPixels() { currentPixelAccess().Reset(); _buffer=nullptr; _pitch=0; }
     class PixelCall {
         layerExBase_GL& owner;
         bool owns;
     public:
-        PixelCall(layerExBase_GL& value,const char* caller):owner(value),owns(!value._pixels.Data()) {
+        PixelCall(layerExBase_GL& value,const char* caller):owner(value),owns(!value.currentPixelAccess().Data()) {
             if(owns) {
                 owner.setPixelCaller(caller);
                 try { owner.reset(); }
@@ -184,7 +185,9 @@ struct layerExBase_GL
         PixelCall& operator=(const PixelCall&)=delete;
     };
 
-    layerExBase_GL(DispatchT obj) : _obj(obj)
+    // Existing extensions keep their eager writable construction. LayerExDraw
+    // opts in because constructing its script facade does not touch pixels.
+    layerExBase_GL(DispatchT obj, bool metadataOnly=false) : _obj(obj)
     {
         tjs_error hr;
         hr = obj->NativeInstanceSupport(TJS_NIS_GETINSTANCE, tTJSNC_Layer::ClassID,
@@ -193,27 +196,35 @@ struct layerExBase_GL
             TVPThrowExceptionMessage(TJS_N("Not Layer"));
         _buffer = nullptr;
         _pitch = 0;
-        reset();
+        if(metadataOnly) refreshMetadata(); else reset();
     }
 
-    virtual void reset()
+    void refreshMetadata()
     {
-        _pixels.Reset();
         _width = (GeometryT)_this->GetImageWidth();
         _height = (GeometryT)_this->GetImageHeight();
-        if (TVPIsSoftwareRenderManager() || TVPMetalLayerCompositionActive())
-        {
-            _pixels.Acquire(_obj,true,_pixelCaller);
-            _buffer = (BufferT)_pixels.Data();
-            _pitch = (PitchT)_pixels.Pitch();
-        }
         _clipLeft = (GeometryT)_this->GetClipLeft();
         _clipTop = (GeometryT)_this->GetClipTop();
         _clipWidth = (GeometryT)_this->GetClipWidth();
         _clipHeight = (GeometryT)_this->GetClipHeight();
+    }
+
+    virtual void reset()
+    {
+        auto& pixels=currentPixelAccess();
+        pixels.Reset();
+        _buffer = nullptr;
+        _pitch = 0;
+        refreshMetadata();
+        if (TVPIsSoftwareRenderManager() || TVPMetalLayerCompositionActive())
+        {
+            pixels.Acquire(_obj,true,_pixelCaller);
+            _buffer = (BufferT)pixels.Data();
+            _pitch = (PitchT)pixels.Pitch();
+        }
         // Some native operations bypass the clip (raster copies/record redraw).
         // Derived operations may narrow this only when their writes are known.
-        _pixels.Written(tTVPRect(0,0,_width,_height));
+        pixels.Written(tTVPRect(0,0,_width,_height));
     }
     virtual void redraw()
     {

@@ -3,11 +3,13 @@
 #include "TVPStorage.h"
 #include "TVPFont.h"
 #include "PlatformFile.h"
+#include "CPUConsumerTrace.h"
 #include <vector>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <optional>
 
 #define NCB_MODULE_NAME TJS_N("layerExDraw.dll")
 
@@ -1256,7 +1258,7 @@ void LayerExDraw::updateRect(RectF& rect)
 }
 
 LayerExDraw::LayerExDraw(DispatchT obj)
-  : layerExBase_GL(obj),
+  : layerExBase_GL(obj, true),
     width(-1),
     height(-1),
     pitch(0),
@@ -1280,33 +1282,143 @@ LayerExDraw::LayerExDraw(DispatchT obj)
 LayerExDraw::~LayerExDraw()
 {
     destroyRecord();
+    destroyCanvas();
+    finishPixels();
+}
+
+void LayerExDraw::destroyCanvas()
+{
+    // Unknown software identities retain the exact texture independently of a
+    // pixel lock; Metal uses its stable resource ID without retaining GPU data.
     if (canvas)
         plutovg_canvas_destroy(canvas);
     if (surface)
         plutovg_surface_destroy(surface);
+    canvas = nullptr;
+    surface = nullptr;
+    if (canvasTexture) canvasTexture->ReleaseCPUAccessRef();
+    canvasTexture = nullptr;
+    canvasTextureID = 0;
+    canvasHasTextureID = false;
+    buffer = nullptr;
+    pitch = 0;
+}
+
+void LayerExDraw::finishPixels()
+{
+    // Cached surface data is only used after reset validates a new lease.
+    layerExBase_GL::finishPixels();
+}
+
+class LayerExDraw::InvocationPixels
+{
+    LayerExDraw& owner;
+    tTVPScopedLayerPixels pixels;
+    std::optional<PixelCall> call;
+    tTVPScopedLayerPixels* previous;
+    bool suspended=false;
+    struct State
+    {
+        GeometryT width,height,clipLeft,clipTop,clipWidth,clipHeight;
+        BufferT buffer;
+        PitchT pitch;
+        GeometryT nativeWidth,nativeHeight,nativeClipLeft,nativeClipTop,nativeClipWidth,nativeClipHeight;
+        BufferT nativeBuffer;
+        PitchT nativePitch;
+        plutovg_surface_t* surface;
+        plutovg_canvas_t* canvas;
+        iTVPTexture2D* texture;
+        uint64_t textureID;
+        bool hasTextureID;
+        const char* caller;
+    } saved;
+    void Restore()
+    {
+        owner.width=saved.width;owner.height=saved.height;owner.buffer=saved.buffer;owner.pitch=saved.pitch;
+        owner.clipLeft=saved.clipLeft;owner.clipTop=saved.clipTop;owner.clipWidth=saved.clipWidth;owner.clipHeight=saved.clipHeight;
+        owner._width=saved.nativeWidth;owner._height=saved.nativeHeight;owner._buffer=saved.nativeBuffer;owner._pitch=saved.nativePitch;
+        owner._clipLeft=saved.nativeClipLeft;owner._clipTop=saved.nativeClipTop;
+        owner._clipWidth=saved.nativeClipWidth;owner._clipHeight=saved.nativeClipHeight;
+        owner.surface=saved.surface;owner.canvas=saved.canvas;owner.canvasTexture=saved.texture;
+        owner.canvasTextureID=saved.textureID;owner.canvasHasTextureID=saved.hasTextureID;
+        owner._pixelCaller=saved.caller;owner.invocationPixels=previous;
+    }
+public:
+    explicit InvocationPixels(LayerExDraw& value):owner(value),previous(value.invocationPixels)
+    {
+        auto& active=owner.currentPixelAccess();
+        if(active.Data())
+        {
+            // Registered/user reentry is a new target boundary. An internal
+            // record redraw uses PixelCall directly and shares the outer lease.
+            krkrsdl3::layer_work::SourceScope origin("layerExDraw.write");
+            auto* current=owner._this->GetMainImageTextureForCPUAccess(true);
+            if(current==active.Texture())
+            {
+                owner.refreshMetadata();owner.reset();return;
+            }
+            saved={owner.width,owner.height,owner.clipLeft,owner.clipTop,owner.clipWidth,owner.clipHeight,
+                owner.buffer,owner.pitch,owner._width,owner._height,owner._clipLeft,owner._clipTop,
+                owner._clipWidth,owner._clipHeight,owner._buffer,owner._pitch,owner.surface,owner.canvas,
+                owner.canvasTexture,owner.canvasTextureID,owner.canvasHasTextureID,owner._pixelCaller};
+            suspended=true;owner.invocationPixels=&pixels;
+            owner.canvas=nullptr;owner.surface=nullptr;owner.canvasTexture=nullptr;
+            owner.canvasTextureID=0;owner.canvasHasTextureID=false;owner.buffer=nullptr;owner.pitch=0;
+        }
+        try { call.emplace(owner,"layerExDraw.write"); }
+        catch(...)
+        {
+            if(suspended) { owner.destroyCanvas();Restore(); }
+            throw;
+        }
+    }
+    ~InvocationPixels()
+    {
+        call.reset();
+        if(suspended) { owner.destroyCanvas();Restore(); }
+    }
+};
+
+GdipImage* LayerExDraw::getImageForBridge()
+{
+    krkrsdl3::cpu_consumer_trace::ConsumerScope consumer("imageBridge",
+        krkrsdl3::cpu_consumer_trace::Access::Write,"bridge",(uintptr_t)_obj,true);
+    InvocationPixels pixels(*this);
+    return new GdipImage(surface);
 }
 
 void LayerExDraw::reset()
 {
-    layerExBase_GL::reset();
-    if (!(canvas && width == _width && height == _height && pitch == _pitch && buffer == _buffer))
+    // A nested record redraw must not unlock and reacquire its caller's lease.
+    // Revalidate the surface against the exact held texture after COW or
+    // replacement, together with current data, pitch, geometry and clip.
+    auto& pixels=currentPixelAccess();
+    if (!pixels.Data()) layerExBase_GL::reset();
+    if (pixels.Data())
     {
-        if (canvas)
-        {
-            plutovg_canvas_destroy(canvas);
-            canvas = NULL;
-        }
-        if (surface)
-        {
-            plutovg_surface_destroy(surface);
-            surface = NULL;
-        }
+        _width = (GeometryT)pixels.Width();
+        _height = (GeometryT)pixels.Height();
+    }
+    uint64_t textureID=0, version=0;
+    const bool hasTextureID = pixels.Texture() && pixels.Texture()->GetContentKey(textureID,version);
+    const bool sameTexture = hasTextureID ? canvasHasTextureID && canvasTextureID==textureID :
+        !canvasHasTextureID && canvasTexture==pixels.Texture();
+    if (!(canvas && sameTexture && width == _width && height == _height && pitch == _pitch && buffer == _buffer))
+    {
+        destroyCanvas();
         width = _width;
         height = _height;
         pitch = _pitch;
         buffer = _buffer;
         if (buffer && width > 0 && height > 0)
         {
+            canvasHasTextureID = hasTextureID;
+            canvasTextureID = textureID;
+            if(!hasTextureID)
+            {
+                canvasTexture = pixels.Texture();
+                canvasTexture->AddCPUAccessRef();
+            }
             surface = plutovg_surface_create_for_data(buffer, width, height, pitch);
             canvas = plutovg_canvas_create(surface);
             plutovg_canvas_set_operator(canvas, PLUTOVG_OPERATOR_SRC_OVER);
@@ -1981,7 +2093,8 @@ RectF LayerExDraw::drawImageAffine(GdipImage* src, tjs_real sleft, tjs_real stop
 void LayerExDraw::createRecord()
 {
     destroyRecord();
-    metaGraphics = new GdipImage(width, height);
+    refreshMetadata();
+    metaGraphics = new GdipImage(_width, _height);
 }
 
 void LayerExDraw::recreateRecord()
@@ -2047,6 +2160,8 @@ GdipImage* LayerExDraw::getRecordImage()
     {
         // This method is also reached through a raw callback that bypasses the
         // normal per-call native getter. Reacquire pixels before using canvas.
+        krkrsdl3::cpu_consumer_trace::ConsumerScope consumer("getRecordImage",
+            krkrsdl3::cpu_consumer_trace::Access::Write, "native", (uintptr_t)_obj, true);
         PixelCall pixels(*this,"layerExDraw.record");
         image = metaGraphics->Clone();
         if (image)
@@ -2749,9 +2864,71 @@ NCB_REGISTER_CLASS(GdiPlus)
 }
 
 // ------------------------------------------------------- LayerExDraw hook
+template<>
+struct ncbInvocationPolicy<LayerExDraw>
+{
+    static constexpr bool Enabled = true;
+    struct Scope
+    {
+        krkrsdl3::cpu_consumer_trace::ConsumerScope consumer;
+        std::optional<LayerExDraw::InvocationPixels> pixels;
+        static LayerExDraw* Instance(iTJSDispatch2* object)
+        {
+            LayerExDraw* value = ncbInstanceAdaptor<LayerExDraw>::GetNativeInstance(object);
+            if(!value)
+            {
+                std::unique_ptr<LayerExDraw> created(new LayerExDraw(object));
+                if(!ncbInstanceAdaptor<LayerExDraw>::SetAdaptorWithNativeInstance(object,created.get()))
+                    TVPThrowExceptionMessage(TJS_N("Cannot attach LayerExDraw"));
+                value = created.release();
+            }
+            return value;
+        }
+        static bool Metadata(const char* name,ncbInvocationKind kind,LayerExDraw* value)
+        {
+            if(kind==ncbInvocationKind::Raw || kind==ncbInvocationKind::Bridge) return false;
+            if(kind==ncbInvocationKind::Get || kind==ncbInvocationKind::Set)
+                return !strcmp(name,"updateWhenDraw") || !strcmp(name,"smoothingMode") ||
+                    !strcmp(name,"textRenderingHint") || !strcmp(name,"record");
+            if(!strcmp(name,"measureString") || !strcmp(name,"measureStringInternal")) return true;
+            const char* transforms[]={"setViewTransform","resetViewTransform","rotateViewTransform",
+                "scaleViewTransform","translateViewTransform","setTransform","resetTransform",
+                "rotateTransform","scaleTransform","translateTransform"};
+            for(const char* transform:transforms)
+                if(!strcmp(name,transform)) return !value->getRecord();
+            return false;
+        }
+        static const char* Entry(ncbInvocationKind kind)
+        {
+            switch(kind)
+            {
+                case ncbInvocationKind::Get: return "get";
+                case ncbInvocationKind::Set: return "set";
+                case ncbInvocationKind::Raw: return "raw";
+                case ncbInvocationKind::Bridge: return "bridge";
+                default: return "method";
+            }
+        }
+        Scope(const char* name,ncbInvocationKind kind,iTJSDispatch2* object)
+          : Scope(name,kind,object,
+                kind==ncbInvocationKind::Raw || kind==ncbInvocationKind::Bridge ?
+                    ncbInstanceAdaptor<LayerExDraw>::GetNativeInstance(object) : Instance(object)) {}
+        Scope(const char* name,ncbInvocationKind kind,iTJSDispatch2* object,LayerExDraw* value)
+          : consumer(name,
+                Metadata(name,kind,value) ? krkrsdl3::cpu_consumer_trace::Access::Metadata :
+                    krkrsdl3::cpu_consumer_trace::Access::Write,Entry(kind),(uintptr_t)object)
+        {
+            // Raw callbacks and bridge getters historically only look up an
+            // existing instance. Let their original missing-instance path run.
+            if(!value) return;
+            if(Metadata(name,kind,value)) value->refreshMetadata();
+            else pixels.emplace(*value);
+        }
+    };
+};
+
 NCB_GET_INSTANCE_HOOK(LayerExDraw)
 {
-    ClassT* pixelsOwner=nullptr;
     NCB_INSTANCE_GETTER(objthis)
     {
         ClassT* obj = GetNativeInstance(objthis);
@@ -2760,12 +2937,8 @@ NCB_GET_INSTANCE_HOOK(LayerExDraw)
             obj = new ClassT(objthis);
             SetNativeInstance(objthis, obj);
         }
-        pixelsOwner=obj;
-        obj->setPixelCaller("layerExDraw.write");
-        obj->reset();
         return obj;
     }
-    ~NCB_GET_INSTANCE_HOOK_CLASS() { if(pixelsOwner) pixelsOwner->finishPixels(); }
 };
 
 #define LAYEREX_METHOD(type, name) \

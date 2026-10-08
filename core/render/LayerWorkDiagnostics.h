@@ -118,7 +118,15 @@ inline void AddShrinkMetrics(ShrinkMetrics& to,const ShrinkMetrics& from) {
     KRKR_SHRINK_ADD(uploadCalls);KRKR_SHRINK_ADD(uploadBytes);KRKR_SHRINK_ADD(uploadWallNS);KRKR_SHRINK_ADD(uploadWaitNS);
 #undef KRKR_SHRINK_ADD
 }
+// Native-only detail budgets share exactly the existing work-profile window.
+// They do not enter Summary or the C/Swift bridge.
+struct CPUConsumerBudget {
+    uint64_t reads=0,readExceeded=0,callers=0,callerExceeded=0;
+    uint64_t producers=0,producerExceeded=0,oversize=0;
+};
+inline void (*cpuConsumerWindowTaken)(const CPUConsumerBudget&,uint64_t)=nullptr;
 struct Profile { std::array<Timing,size_t(Stage::Count)> stages{};
+    CPUConsumerBudget cpuConsumerBudget;
     std::array<Transfer,64> transfers{}; size_t size=0;
     Transfer overflow[2]{};
     std::array<OriginTransfer,OriginCapacity> origins{}; size_t originSize=protectedOrigins.size()*2;
@@ -491,9 +499,12 @@ inline std::string OriginMetrics(const OriginTransfer& value) {
 inline Summary Take() {
     Profile captured;
     Summary out;
+    uint64_t capturedGeneration=0;
     { std::lock_guard<std::mutex> lock(mutex); captured=profile; profile=Profile{};
+      capturedGeneration=generation.load(std::memory_order_relaxed);
       const auto now=Now(); out.intervalNS=started && now>=started ? now-started : 0;
       started=enabled.load(std::memory_order_relaxed) ? now : 0; }
+    if(cpuConsumerWindowTaken) cpuConsumerWindowTaken(captured.cpuConsumerBudget,capturedGeneration);
     out.decodedFrames=captured.decodedFrames; out.decodedBytes=captured.decodedBytes;
     out.frameSampleCount=captured.frameSampleCount;out.frameSamplesDropped=captured.frameSamplesDropped;
     out.frameIntervalNS=captured.frameIntervalNS;out.frameCpuWallNS=captured.frameCpuWallNS;

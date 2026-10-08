@@ -823,6 +823,11 @@ protected:
 
     plutovg_surface_t* surface;
     plutovg_canvas_t* canvas;
+    iTVPTexture2D* canvasTexture = nullptr;
+    uint64_t canvasTextureID = 0;
+    bool canvasHasTextureID = false;
+    tTVPScopedLayerPixels* invocationPixels = nullptr;
+    void destroyCanvas();
 
     // Transform
     plutovg_matrix_t transform;
@@ -834,6 +839,8 @@ protected:
     TextRenderingHint textRenderingHint;
 
 public:
+    class InvocationPixels;
+    tTVPScopedLayerPixels& currentPixelAccess() override { return invocationPixels ? *invocationPixels : _pixels; }
     int getSmoothingMode() { return (int)smoothingMode; }
     void setSmoothingMode(int mode) { smoothingMode = (SmoothingMode)mode; }
     int getTextRenderingHint() { return (int)textRenderingHint; }
@@ -849,8 +856,9 @@ public:
     void setUpdateWhenDraw(int updateWhenDraw) { this->updateWhenDraw = updateWhenDraw != 0; }
     int getUpdateWhenDraw() { return updateWhenDraw ? 1 : 0; }
 
-    inline operator GdipImage*() const { return new GdipImage(surface); }
-    inline operator const GdipImage*() const { return new GdipImage(surface); }
+    GdipImage* getImageForBridge();
+    inline operator GdipImage*() const { return const_cast<LayerExDraw*>(this)->getImageForBridge(); }
+    inline operator const GdipImage*() const { return const_cast<LayerExDraw*>(this)->getImageForBridge(); }
 
     template<class T>
     struct BridgeFunctor
@@ -862,6 +870,7 @@ public:
     LayerExDraw(DispatchT obj);
     ~LayerExDraw();
     virtual void reset();
+    void finishPixels() override;
 
 protected:
     void updateViewTransform();

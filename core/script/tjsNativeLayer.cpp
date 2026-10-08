@@ -18,6 +18,7 @@
 #include "PointReadTrace.h"
 #include "LayerTriangleTrace.h"
 #include "LayerWorkDiagnostics.h"
+#include "CPUConsumerTrace.h"
 #include "FontRasterizer.h"
 #include "LayerManager.h"
 #include "MetalLayerRenderManager.h"
@@ -2681,6 +2682,8 @@ void tTJSNI_BaseLayer::IndependProvinceImage(bool copy)
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::SaveLayerImage(const ttstr& name, const ttstr& type)
 {
+    krkrsdl3::cpu_consumer_trace::ConsumerScope consumer("Layer.saveLayerImage",
+        krkrsdl3::cpu_consumer_trace::Access::Read,"SaveLayerImage",reinterpret_cast<uintptr_t>(this),true);
     if (!MainImage)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
 
@@ -10703,6 +10706,8 @@ TJS_END_NATIVE_PROP_DECL(imageTop)
 //----------------------------------------------------------------------
 TJS_BEGIN_NATIVE_PROP_DECL(imageWidth){TJS_BEGIN_NATIVE_PROP_GETTER{
     TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Layer);
+    krkrsdl3::cpu_consumer_trace::ConsumerScope consumer("Layer.imageWidth",
+        krkrsdl3::cpu_consumer_trace::Access::Metadata,"native.get",reinterpret_cast<uintptr_t>(_this),true);
 *result = (tjs_int64)_this->GetImageWidth();
 return TJS_S_OK;
 }
@@ -10720,6 +10725,8 @@ TJS_END_NATIVE_PROP_DECL(imageWidth)
 //----------------------------------------------------------------------
 TJS_BEGIN_NATIVE_PROP_DECL(imageHeight){TJS_BEGIN_NATIVE_PROP_GETTER{
     TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Layer);
+    krkrsdl3::cpu_consumer_trace::ConsumerScope consumer("Layer.imageHeight",
+        krkrsdl3::cpu_consumer_trace::Access::Metadata,"native.get",reinterpret_cast<uintptr_t>(_this),true);
 *result = (tjs_int64)_this->GetImageHeight();
 return TJS_S_OK;
 }
@@ -11267,6 +11274,8 @@ TJS_END_NATIVE_PROP_DECL(neutralColor)
 //----------------------------------------------------------------------
 TJS_BEGIN_NATIVE_PROP_DECL(hasImage){TJS_BEGIN_NATIVE_PROP_GETTER{
     TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Layer);
+    krkrsdl3::cpu_consumer_trace::ConsumerScope consumer("Layer.hasImage",
+        krkrsdl3::cpu_consumer_trace::Access::Metadata,"native.get",reinterpret_cast<uintptr_t>(_this),true);
 *result = (tjs_int)(bool)_this->GetHasImage();
 return TJS_S_OK;
 }
@@ -11284,6 +11293,8 @@ TJS_END_NATIVE_PROP_DECL(hasImage)
 //----------------------------------------------------------------------
 TJS_BEGIN_NATIVE_PROP_DECL(mainImageBuffer){TJS_BEGIN_NATIVE_PROP_GETTER{
     TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Layer);
+    krkrsdl3::cpu_consumer_trace::ConsumerScope consumer("Layer.mainImageBuffer",
+        krkrsdl3::cpu_consumer_trace::Access::Read,"native.get",reinterpret_cast<uintptr_t>(_this),true);
 ;
 *result = (tTVInteger) reinterpret_cast<tjs_intptr_t>(_this->GetMainImagePixelBuffer());
 return TJS_S_OK;
@@ -11296,6 +11307,8 @@ TJS_END_NATIVE_PROP_DECL(mainImageBuffer)
 //----------------------------------------------------------------------
 TJS_BEGIN_NATIVE_PROP_DECL(mainImageBufferForWrite){TJS_BEGIN_NATIVE_PROP_GETTER{
     TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Layer);
+    krkrsdl3::cpu_consumer_trace::ConsumerScope consumer("Layer.mainImageBufferForWrite",
+        krkrsdl3::cpu_consumer_trace::Access::Write,"native.get",reinterpret_cast<uintptr_t>(_this),true);
 ;
 *result = (tTVInteger) reinterpret_cast<tjs_intptr_t>(_this->GetMainImagePixelBufferForWrite());
 return TJS_S_OK;
@@ -11308,6 +11321,8 @@ TJS_END_NATIVE_PROP_DECL(mainImageBufferForWrite)
 //----------------------------------------------------------------------
 TJS_BEGIN_NATIVE_PROP_DECL(mainImageBufferPitch){TJS_BEGIN_NATIVE_PROP_GETTER{
     TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Layer);
+    krkrsdl3::cpu_consumer_trace::ConsumerScope consumer("Layer.mainImageBufferPitch",
+        krkrsdl3::cpu_consumer_trace::Access::Metadata,"native.get",reinterpret_cast<uintptr_t>(_this),true);
 ;
 *result = _this->GetMainImagePixelBufferPitch();
 return TJS_S_OK;

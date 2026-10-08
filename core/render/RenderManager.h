@@ -161,6 +161,8 @@ public:
     }
     void Written(const tTVPRect& region) { written=region; }
     void* Data() const { return pixels; }
+    // Borrowed identity of the exact acquired texture; valid only while held.
+    iTVPTexture2D* Texture() const { return texture; }
     int Pitch() const { return texture ? texture->GetPitch() : 0; }
     unsigned Width() const { return texture ? texture->GetWidth() : 0; }
     unsigned Height() const { return texture ? texture->GetHeight() : 0; }

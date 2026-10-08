@@ -1,6 +1,7 @@
 #include "LayerExBase.h"
 #include "TVPMsg.h"
 #include "TVPSystem.h"
+#include "CPUConsumerTrace.h"
 
 int NI_LayerExBase::classId;
 
@@ -115,6 +116,8 @@ static tjs_int64 getPropValue(iTJSDispatch2* dispatch, iTJSDispatch2* layerobj)
 
 void NI_LayerExBase::reset(iTJSDispatch2* layerobj)
 {
+    krkrsdl3::cpu_consumer_trace::ConsumerScope consumer("LayerExBase.reset",
+        krkrsdl3::cpu_consumer_trace::Access::Write,"native.layerExBase",reinterpret_cast<uintptr_t>(layerobj),true);
     _width = (int)getPropValue(_widthProp, layerobj);
     _height = (int)getPropValue(_heightProp, layerobj);
     _pixels.Acquire(layerobj,true,"layerExBase.write");

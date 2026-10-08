@@ -9,6 +9,7 @@
 #include "gl/tvpgl.h"
 #include "Platform.h"
 #include "PointReadTrace.h"
+#include "CPUConsumerTrace.h"
 #include "LayerTriangleTrace.h"
 #include "LayerAffineGeometry.h"
 #include "LayerPerspectiveGeometry.h"
@@ -80,8 +81,11 @@ struct TriangleInterval {
     uint64_t sources[static_cast<int>(triangle_trace::Source::Count)] = {};
 };
 class LayerTexture;
+bool CaptureCPUProducer(void* texture,krkrsdl3::cpu_consumer_trace::Producer& result);
+void LogCPUConsumer(const char* message) {TVPConsoleLog("%s",message);}
 std::string fallbackReason;
 struct Session {
+    const uint64_t diagnosticID=krkrsdl3::cpu_consumer_trace::nextSession.fetch_add(1,std::memory_order_relaxed);
     iTVPRenderBackend* backend;
     TVPLayerRenderStats stats;
     std::set<LayerTexture*> textures;
@@ -92,7 +96,9 @@ struct Session {
     bool psTablesReady = false;
     TVPLayerParameterUploadStats parameterBaseline;
     unsigned sourceRejectionReports=0;
-    explicit Session(iTVPRenderBackend* b) : backend(b), parameterBaseline(b->GetLayerParameterUploadStats()) {}
+    explicit Session(iTVPRenderBackend* b) : backend(b), parameterBaseline(b->GetLayerParameterUploadStats()) {
+        krkrsdl3::cpu_consumer_trace::SetCallbacks(LogCPUConsumer,CaptureCPUProducer);
+    }
 };
 TVPLayerRect Rect(const tTVPRect& r) { return {r.left,r.top,r.right,r.bottom}; }
 class LayerTexture final : public iTVPTexture2D {
@@ -248,14 +254,31 @@ class LayerTexture final : public iTVPTexture2D {
         int pitch=0;
         const auto diagnosticEpoch=krkrsdl3::layer_work::CaptureGeneration();
         const bool diagnostics=diagnosticEpoch!=0;
+        auto consumer=krkrsdl3::cpu_consumer_trace::BeginRead(diagnosticEpoch,session->diagnosticID);
+        if(consumer.epoch) {
+            consumer.textureID=textureID;consumer.contentVersion=contentVersion;
+            consumer.width=Width;consumer.height=Height;consumer.lastWriter=lastWrite.writer;
+            consumer.lastWrite[0]=lastWriteRect.left;consumer.lastWrite[1]=lastWriteRect.top;
+            consumer.lastWrite[2]=lastWriteRect.right;consumer.lastWrite[3]=lastWriteRect.bottom;
+        }
         const auto started=diagnostics ? krkrsdl3::layer_work::Now() : 0;
         if(!session->backend->ReadLayerTexture(handle,pixels,pitch) || pitch!=GetPitch())
             throw std::runtime_error("GPU Layer readback failed");
         constexpr const char* categories[]={"bitmap.lock","fallback","script.rawPointer","bitmap.scanline","session.detach","bitmap.point"};
         const char* origin=krkrsdl3::layer_work::source;
         if(!std::strcmp(origin,"unattributed")) origin=categories[static_cast<int>(source)];
-        if(diagnostics) krkrsdl3::layer_work::Record(false,textureID,Width,Height,Bytes(),
-            krkrsdl3::layer_work::Now()-started,session->backend->GetLastReadbackWaitNanoseconds(),false,origin,diagnosticEpoch);
+        if(diagnostics) {
+            const auto wallNS=krkrsdl3::layer_work::Now()-started;
+            const auto waitNS=session->backend->GetLastReadbackWaitNanoseconds();
+            krkrsdl3::layer_work::Record(false,textureID,Width,Height,Bytes(),wallNS,waitNS,false,origin,diagnosticEpoch);
+            consumer.source=origin;consumer.bytes=Bytes();consumer.wallNS=wallNS;consumer.waitNS=waitNS;
+            if(krkrsdl3::cpu_consumer_trace::ReportRead(consumer)) {
+                try {
+                    const auto stack=TJSGetStackTraceString(4,TJS_N(" | ")).AsStdString();
+                    krkrsdl3::cpu_consumer_trace::ReportCaller(consumer,stack.c_str());
+                } catch(...) {krkrsdl3::cpu_consumer_trace::ReportCaller(consumer,nullptr);}
+            }
+        }
         session->stats.readbackBytes+=Bytes(); session->stats.cpuCacheBytes+=Bytes(); valid=true;
         const int index=static_cast<int>(source);
         session->stats.readbackBytesBySource[index]+=Bytes();
@@ -263,6 +286,7 @@ class LayerTexture final : public iTVPTexture2D {
         return true;
     }
 public:
+    uint64_t DiagnosticSessionID() const {return session->diagnosticID;}
     LayerTexture(std::shared_ptr<Session> s,unsigned w,unsigned h,TVPTextureFormat::e f,bool ro)
         : iTVPTexture2D(w,h),session(std::move(s)),format(f),readonly(ro) {
         handle=session->backend->CreateLayerTexture(w,h,f==TVPTextureFormat::Gray ? TVPLayerTextureFormat::R8 : TVPLayerTextureFormat::RGBA8);
@@ -344,6 +368,10 @@ public:
     void UnlockCPUWrite(const tTVPRect& written) override {
         if(!scopedWrites) return;
         MarkDirty(written); --scopedWrites; UnlockCPU();
+        const auto* consumer=krkrsdl3::cpu_consumer_trace::Current();
+        if(krkrsdl3::cpu_consumer_trace::IsShrinkMethod(consumer) && consumer->shrinkSucceeded &&
+           written.get_width()>0 && written.get_height()>0)
+            krkrsdl3::cpu_consumer_trace::ReportShrinkOutput(this,written.left,written.top,written.right,written.bottom);
     }
     void* LockCPUWriteForOverwrite() override {
         if(pinned || writeLeased || locks) return LockCPUWrite();
@@ -578,6 +606,12 @@ public:
 
 // Borrowed software views exist only during a fallback call. The software
 // manager owns neither their pixels nor their lifetime; aliasing is preserved.
+bool CaptureCPUProducer(void* texture,krkrsdl3::cpu_consumer_trace::Producer& result) {
+    auto* t=dynamic_cast<LayerTexture*>(static_cast<iTVPTexture2D*>(texture));
+    if(!t || !t->GetContentKey(result.textureID,result.contentVersion)) return false;
+    result.sessionID=t->DiagnosticSessionID();result.width=t->GetWidth();result.height=t->GetHeight();
+    return true;
+}
 class CPUViews {
     std::unordered_map<iTVPTexture2D*,std::unique_ptr<iTVPTexture2D>> views;
 public:
@@ -1214,6 +1248,7 @@ TVPLayerShrinkResult TVPTryMetalLayerShrink(const TVPLayerShrinkOperation& opera
     }
     t->CommitGPURegionWrite(tTVPRect(rect.left,rect.top,rect.right,rect.bottom));
     krkrsdl3::layer_work::RecordShrinkResult(true,"gpu",pixels,t==s ? "selfSafe" : nullptr);
+    krkrsdl3::cpu_consumer_trace::ReportShrinkOutput(t,rect.left,rect.top,rect.right,rect.bottom);
     return Result::Applied;
 }
 TVPLayerTransitionResult TVPTryMetalLayerTransition(const TVPLayerTransitionOperation& operation,

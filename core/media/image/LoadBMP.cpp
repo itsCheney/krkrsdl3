@@ -7,6 +7,7 @@
 #include "TVPScript.h"
 
 #include "RenderManager.h"
+#include "CPUConsumerTrace.h"
 
 #include "tjsDictionary.h"
 
@@ -495,6 +496,8 @@ void TVPSaveTextureAsBMP(tTJSBinaryStream* dst,
                          const ttstr& mode,
                          iTJSDispatch2* meta)
 {
+    krkrsdl3::cpu_consumer_trace::ConsumerScope consumer("Image.saveBMP",
+        krkrsdl3::cpu_consumer_trace::Access::Read,"TVPSaveTextureAsBMP",reinterpret_cast<uintptr_t>(bmp),true);
     tjs_int pixelbytes;
 
     if (bmp->GetFormat() == TVPTextureFormat::Gray)

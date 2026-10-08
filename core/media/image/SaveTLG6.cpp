@@ -6,6 +6,7 @@
 #include "LayerBitmap.h"
 #include "TVPStorage.h"
 #include "SaveTLG.h"
+#include "CPUConsumerTrace.h"
 #include "UtilStreams.h"
 
 #include "tjsDictionary.h"
@@ -1077,6 +1078,8 @@ static void TLG6InitializeColorFilterCompressor(SlideCompressor& c)
 // int ftfreq[256] = {0};
 void SaveTLG6(tTJSBinaryStream* stream, const iTVPBaseBitmap* bmp, bool is24)
 {
+    krkrsdl3::cpu_consumer_trace::ConsumerScope consumer("Image.saveTLG6",
+        krkrsdl3::cpu_consumer_trace::Access::Read,"SaveTLG6",reinterpret_cast<uintptr_t>(bmp),true);
     tTJSBinaryStream* out = stream;
 
     // DWORD medstart, medend;
