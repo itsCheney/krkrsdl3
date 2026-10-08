@@ -498,6 +498,9 @@ public:
     const void* GetMainImagePixelBuffer() const;
     // Internal native access; raw TJS properties keep their persistent contract.
     iTVPTexture2D* GetMainImageTextureForCPUAccess(bool write);
+    // Internal COW preparation without acquiring pixels or marking a failed
+    // span transaction as an image modification. Commit marks it separately.
+    iTVPTexture2D* GetMainImageTextureForSpanComposite();
     void* GetMainImagePixelBufferForWrite();
     // For callers that replace every pixel of the layer. Skips the GPU readback
     // that GetMainImagePixelBufferForWrite performs to preserve existing content.

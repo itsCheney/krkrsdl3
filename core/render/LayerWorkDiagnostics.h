@@ -123,6 +123,7 @@ inline void AddShrinkMetrics(ShrinkMetrics& to,const ShrinkMetrics& from) {
 struct CPUConsumerBudget {
     uint64_t reads=0,readExceeded=0,callers=0,callerExceeded=0;
     uint64_t producers=0,producerExceeded=0,oversize=0;
+    uint64_t spanRoutes=0,spanRouteExceeded=0;
 };
 inline void (*cpuConsumerWindowTaken)(const CPUConsumerBudget&,uint64_t)=nullptr;
 struct Profile { std::array<Timing,size_t(Stage::Count)> stages{};

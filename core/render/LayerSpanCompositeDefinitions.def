@@ -1,0 +1,5 @@
+TVP_LAYER_SPAN(Unsupported,0)
+TVP_LAYER_SPAN(SolidSource,1)
+TVP_LAYER_SPAN(SolidSourceOver,2)
+TVP_LAYER_SPAN(ArraySourceOver,3)
+TVP_LAYER_SPAN_COUNT(4)

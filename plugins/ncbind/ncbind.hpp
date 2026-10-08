@@ -24,6 +24,11 @@ struct ncbInvocationPolicy
     static constexpr bool Enabled = false;
     struct Scope { Scope(const char*, ncbInvocationKind, iTJSDispatch2*) {} };
 };
+// Raw preflight is separately opt in: existing policies retain their eager
+// lease-before-conversion ordering, including user-defined converter callbacks.
+template<class Policy,class=void> struct ncbHasRawPreflight : std::false_type {};
+template<class Policy> struct ncbHasRawPreflight<Policy,
+    std::void_t<decltype(Policy::RawPreflight)>> : std::bool_constant<Policy::RawPreflight> {};
 
 ////////////////////////////////////////
 // ログ出力用マクロ
@@ -1505,6 +1510,8 @@ private:
         template<typename ResultT>
         inline bool SetResult(ResultT r, DefsT::Tag<ResultT> const&, DefsT::BoolTag<false> const&)
         {
+            if constexpr(ncbHasRawPreflight<ncbInvocationPolicy<typename TraitsT::ClassT>>::value)
+                if(ncbInvocationPolicy<typename TraitsT::ClassT>::CaptureResult(r)) return true;
             if (_result)
                 _rconv(*_result, r); // ncbToVariantConvertor で返り値に変換
             return true;
@@ -1516,6 +1523,8 @@ private:
                               DefsT::Tag<ResultT> const& tag,
                               DefsT::BoolTag<true> const&)
         {
+            if constexpr(ncbHasRawPreflight<ncbInvocationPolicy<typename TraitsT::ClassT>>::value)
+                if(ncbInvocationPolicy<typename TraitsT::ClassT>::CaptureResult(r)) return true;
             if (_result)
                 _rconv(*_result, r, tag);
             return true;
@@ -2490,6 +2499,9 @@ public:
         if(type!=nitMethod) return dispatch->FuncCall(flag,nullptr,hint,result,count,params,object);
         if(!object) return TJS_E_NATIVECLASSCRASH;
         if(count<minArgs) return TJS_E_BADPARAMCOUNT;
+        if constexpr(ncbHasRawPreflight<ncbInvocationPolicy<ClassT>>::value)
+            return ncbInvocationPolicy<ClassT>::InvokeFuncCall(name.c_str(),kind,dispatch,
+                flag,hint,result,count,params,object);
         typename ncbInvocationPolicy<ClassT>::Scope scope(name.c_str(),kind,object);
         return dispatch->FuncCall(flag,nullptr,hint,result,count,params,object);
     }

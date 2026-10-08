@@ -3019,6 +3019,11 @@ iTVPTexture2D* tTJSNI_BaseLayer::GetMainImageTextureForCPUAccess(bool write)
     return MainImage->GetTexture();
 }
 //---------------------------------------------------------------------------
+iTVPTexture2D* tTJSNI_BaseLayer::GetMainImageTextureForSpanComposite()
+{
+    return MainImage ? MainImage->GetTextureForRender(true,nullptr) : nullptr;
+}
+//---------------------------------------------------------------------------
 void* tTJSNI_BaseLayer::GetMainImagePixelBufferForWrite()
 {
     if (!MainImage)

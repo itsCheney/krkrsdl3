@@ -2,6 +2,8 @@
 #include "MetalLayerShaders.h"
 #include "MetalTransitionShaders.h"
 #include "MetalShrinkShaders.h"
+#include "MetalSpanCompositeShaders.h"
+#include "../LayerSpanCompositeGeometry.h"
 #include "../LayerShrinkGeometry.h"
 #include "../LayerTransitionGeometry.h"
 #include "../LayerWorkDiagnostics.h"
@@ -382,6 +384,9 @@ struct MetalRenderBackend::Impl
     id<MTLBuffer> shrinkSums=nil;
     id<MTLTexture> shrinkOutput=nil;
     TVPLayerShrinkResult shrinkResult=TVPLayerShrinkResult::BackendFailure;
+    id<MTLComputePipelineState> spanCompositePipeline=nil;
+    id<MTLBuffer> spanPrevious=nil,spanOutput=nil;
+    TVPLayerSpanCompositeResult spanCompositeResult=TVPLayerSpanCompositeResult::BackendFailure;
     id<MTLBuffer> transitionDummy = nil;
     struct TransitionCache {
         std::shared_ptr<const TVPLayerTransitionBytes> bytes;
@@ -1206,6 +1211,13 @@ struct MetalRenderBackend::Impl
         }
         MTLCompileOptions* ordinaryOptions = [MTLCompileOptions new];
         ordinaryOptions.fastMathEnabled = NO;
+        const std::string spanSource=TVPBuildMetalSpanCompositeShaderSource();
+        id<MTLLibrary> spanLibrary=[device newLibraryWithSource:[NSString stringWithUTF8String:spanSource.c_str()]
+                                                      options:ordinaryOptions error:&error];
+        if(spanLibrary) spanCompositePipeline=[device newComputePipelineStateWithFunction:
+            [spanLibrary newFunctionWithName:@"compositeLayerSpans"] error:&error];
+        if(!spanCompositePipeline) SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
+            "Metal plutovg span composition unavailable; CPU path retained: %s",error.localizedDescription.UTF8String);
         const std::string ordinarySource=TVPBuildMetalLayerShaderSource();
         for(bool wide:{false,true}) {
             if(wide && ![device supportsFamily:MTLGPUFamilyApple3]) continue;
@@ -2272,6 +2284,96 @@ bool MetalRenderBackend::OperateLayerPerspective(const TVPLayerOperation& operat
     }
 }
 bool MetalRenderBackend::SupportsLayerShrinks() const {return impl_ && impl_->shrinkHorizontal32 && impl_->shrinkVertical32;}
+bool MetalRenderBackend::SupportsLayerSpanComposition() const {return impl_ && impl_->spanCompositePipeline;}
+TVPLayerSpanCompositeResult MetalRenderBackend::LastLayerSpanCompositeResult() const {
+    return impl_ ? impl_->spanCompositeResult : TVPLayerSpanCompositeResult::BackendFailure;
+}
+bool MetalRenderBackend::OperateLayerSpanComposite(const TVPLayerSpanCompositePacket& packet,void* target) {
+    @autoreleasepool {
+        using Result=TVPLayerSpanCompositeResult;
+        auto& p=*impl_;p.spanCompositeResult=Result::BackendFailure;
+        auto fail=[&](Result result){p.spanCompositeResult=result;return false;};
+        auto* t=p.Find(target);
+        if(!t || t->bytesPerPixel!=4 || t->texture.pixelFormat!=MTLPixelFormatRGBA8Unorm) return fail(Result::Resource);
+        auto valid=TVPLayerSpanCompositeGeometry::Validate(packet,t->width,t->height);
+        if(valid!=Result::Applied) return fail(valid);
+        if(packet.spans.empty()) {p.spanCompositeResult=Result::Applied;return true;}
+        if(!p.spanCompositePipeline) return fail(Result::BackendFailure);
+        const auto& rc=packet.destination;
+        const uint32_t width=uint32_t(rc.Width()),height=uint32_t(rc.Height());
+        const size_t rowBytes=size_t(TVPLayerSpanCompositeGeometry::ScratchRowBytes(packet));
+        const size_t scratchBytes=rowBytes*height;
+        struct Params {int32_t left,top;uint32_t width,height,rowWords,reserved;};
+        static_assert(sizeof(Params)==TVPLayerSpanCompositeGeometry::UniformBytes,"span uniform ABI");
+        const Params params{rc.left,rc.top,width,height,uint32_t(rowBytes/4),0};
+        const size_t sourcesOffset=packet.spans.size()*sizeof(TVPLayerSpan);
+        const size_t rowsOffset=sourcesOffset+packet.sourcePixels.size()*4;
+        const size_t entriesOffset=rowsOffset+packet.rowOffsets.size()*4;
+        const size_t bytes=entriesOffset+packet.rowEntries.size()*4;
+        id<MTLBuffer> parameters=nil;
+        id<MTLBlitCommandEncoder> snapshot=nil,commit=nil;
+        id<MTLComputeCommandEncoder> compute=nil;
+        bool parametersBound=false;
+        struct PendingRelease {
+            std::vector<id<MTLBuffer>>& pending;id<MTLBuffer> __strong& buffer;bool& bound;
+            ~PendingRelease() {if(buffer && !bound) pending.erase(std::remove(pending.begin(),pending.end(),buffer),pending.end());}
+        } release{p.stagingPending,parameters,parametersBound};
+        try {
+            // All resources and immutable parameter snapshots precede target
+            // mutation. Encoders retain bound buffers through normal submission.
+            parameters=p.AcquireStaging(bytes);
+            if(!parameters) return fail(Result::ParameterBudget);
+            if(!TVPLayerSpanCompositeGeometry::StagedBudgetFits(parameters.length,scratchBytes))
+                return fail(Result::ParameterBudget);
+            auto* data=static_cast<uint8_t*>(parameters.contents);
+            std::memcpy(data,packet.spans.data(),sourcesOffset);
+            if(!packet.sourcePixels.empty()) std::memcpy(data+sourcesOffset,packet.sourcePixels.data(),packet.sourcePixels.size()*4);
+            std::memcpy(data+rowsOffset,packet.rowOffsets.data(),packet.rowOffsets.size()*4);
+            std::memcpy(data+entriesOffset,packet.rowEntries.data(),packet.rowEntries.size()*4);
+            if(!p.spanPrevious || p.spanPrevious.length!=scratchBytes)
+                p.spanPrevious=[p.device newBufferWithLength:scratchBytes options:MTLResourceStorageModePrivate];
+            if(!p.spanOutput || p.spanOutput.length!=scratchBytes)
+                p.spanOutput=[p.device newBufferWithLength:scratchBytes options:MTLResourceStorageModePrivate];
+            if(!p.spanPrevious || !p.spanOutput) return fail(Result::ParameterBudget);
+            snapshot=p.Blit();if(!snapshot) return fail(Result::BackendFailure);
+            [snapshot copyFromTexture:t->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(rc.left,rc.top,0)
+                sourceSize:MTLSizeMake(width,height,1) toBuffer:p.spanPrevious destinationOffset:0
+                destinationBytesPerRow:rowBytes destinationBytesPerImage:scratchBytes];
+            [snapshot endEncoding];snapshot=nil;++p.transientOps;
+            compute=p.Compute();if(!compute) return fail(Result::BackendFailure);
+            [compute setComputePipelineState:p.spanCompositePipeline];
+            [compute setBytes:&params length:sizeof(params) atIndex:0];
+            parametersBound=true;
+            [compute setBuffer:parameters offset:0 atIndex:1];
+            [compute setBuffer:parameters offset:sourcesOffset atIndex:2];
+            [compute setBuffer:parameters offset:rowsOffset atIndex:3];
+            [compute setBuffer:parameters offset:entriesOffset atIndex:4];
+            [compute setBuffer:p.spanPrevious offset:0 atIndex:5];
+            [compute setBuffer:p.spanOutput offset:0 atIndex:6];
+            [compute dispatchThreadgroups:MTLSizeMake((width+7)/8,(height+7)/8,1)
+                threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+            [compute endEncoding];compute=nil;
+            p.transientBytes+=bytes+sizeof(params);++p.transientOps;
+            if(p.diagnosticSampled) ++p.diagnosticWorkload.layerDispatches;
+            commit=p.Blit();if(!commit) return fail(Result::BackendFailure);
+        } catch(const std::bad_alloc&) {
+            if(snapshot) [snapshot endEncoding];if(compute) [compute endEncoding];
+            return fail(Result::ParameterBudget);
+        } catch(...) {
+            if(snapshot) [snapshot endEncoding];if(compute) [compute endEncoding];
+            return fail(Result::BackendFailure);
+        }
+        // The first real-target write is the commit point. Any later failure
+        // propagates; facade invalidates caches and prevents CPU replay.
+        p.spanCompositeResult=Result::Applied;
+        [commit copyFromBuffer:p.spanOutput sourceOffset:0 sourceBytesPerRow:rowBytes sourceBytesPerImage:scratchBytes
+            sourceSize:MTLSizeMake(width,height,1) toTexture:t->texture destinationSlice:0 destinationLevel:0
+            destinationOrigin:MTLOriginMake(rc.left,rc.top,0)];
+        [commit endEncoding];++p.transientOps;
+        if(p.transientBytes>=Impl::kSubmissionBudget || p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
+        return true;
+    }
+}
 bool MetalRenderBackend::SupportsLayerShrink64() const {return impl_ && impl_->shrinkHorizontal64 && impl_->shrinkVertical64;}
 TVPLayerShrinkResult MetalRenderBackend::LastLayerShrinkResult() const {return impl_?impl_->shrinkResult:TVPLayerShrinkResult::BackendFailure;}
 bool MetalRenderBackend::OperateLayerShrink(const TVPLayerShrinkOperation& operation,void* target,void* source) {

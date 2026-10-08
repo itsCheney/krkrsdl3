@@ -783,6 +783,7 @@ class Path
     bool figureStarted = false;
 
 public:
+    const plutovg_path_t* spanCapturePath() const { return path; }
     Path();
     virtual ~Path();
     void startFigure();
@@ -840,6 +841,10 @@ protected:
 
 public:
     class InvocationPixels;
+    class InvocationSpanCapture;
+    InvocationSpanCapture* invocationCapture = nullptr;
+    bool spanCaptureStateSafe() const;
+    bool spanCaptureTargetAliased() const;
     tTVPScopedLayerPixels& currentPixelAccess() override { return invocationPixels ? *invocationPixels : _pixels; }
     int getSmoothingMode() { return (int)smoothingMode; }
     void setSmoothingMode(int mode) { smoothingMode = (SmoothingMode)mode; }
@@ -851,6 +856,7 @@ protected:
     std::string cvName;
     bool updateWhenDraw;
     void updateRect(RectF& rect);
+    void deferCapturedUpdate(const RectF& rect);
 
 public:
     void setUpdateWhenDraw(int updateWhenDraw) { this->updateWhenDraw = updateWhenDraw != 0; }

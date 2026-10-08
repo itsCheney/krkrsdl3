@@ -90,6 +90,9 @@ public:
     bool SupportsLayerShrink64() const override;
     bool OperateLayerShrink(const TVPLayerShrinkOperation&, void*, void*) override;
     TVPLayerShrinkResult LastLayerShrinkResult() const override;
+    bool SupportsLayerSpanComposition() const override;
+    bool OperateLayerSpanComposite(const TVPLayerSpanCompositePacket&,void*) override;
+    TVPLayerSpanCompositeResult LastLayerSpanCompositeResult() const override;
     TVPLayerParameterUploadStats GetLayerParameterUploadStats() const override;
     bool SupportsLayerTileRendering() const;
     bool IsLayerTileRenderingActive() const;

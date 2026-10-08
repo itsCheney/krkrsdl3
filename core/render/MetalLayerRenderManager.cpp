@@ -3,6 +3,7 @@
 #include "MetalLayerRenderManager.h"
 #include "LayerTransitionGeometry.h"
 #include "LayerShrinkGeometry.h"
+#include "LayerSpanCompositeGeometry.h"
 #include "LayerBitmap.h"
 #include "TVPCompositor.h"
 #include "TVPMsg.h"
@@ -1201,6 +1202,41 @@ bool TVPHasMetalLayerTransitionSupport() {
 bool TVPHasMetalLayerShrinkSupport() {
     const auto& s=Manager().session;
     return s && s->backend && s->backend->SupportsLayerShrinks();
+}
+bool TVPHasMetalLayerSpanCompositionSupport() {
+    const auto& s=Manager().session;
+    return s && s->backend && s->backend->SupportsLayerSpanComposition();
+}
+TVPLayerSpanCompositeResult TVPTryMetalLayerSpanComposite(
+        const TVPLayerSpanCompositePacket& packet,iTVPTexture2D* target) {
+    using Result=TVPLayerSpanCompositeResult;
+    auto& session=Manager().session;
+    if(!session || !session->backend || !session->backend->SupportsLayerSpanComposition()) return Result::BackendFailure;
+    auto* t=dynamic_cast<LayerTexture*>(target);
+    if(!t || !t->Belongs(session) || t->GetFormat()!=TVPTextureFormat::RGBA) return Result::Resource;
+    if(t->IsCPUResident() || t->HasCPUAccess()) return Result::CPUAccess;
+    auto checked=TVPLayerSpanCompositeGeometry::Validate(packet,t->GetWidth(),t->GetHeight());
+    if(checked!=Result::Applied) return checked;
+    if(packet.spans.empty()) return Result::Applied;
+    // Composition reads the old target even for a full ROI. Upload legitimate
+    // dirty CPU damage using the existing transaction; never acquire a CPU view.
+    void* handle=nullptr;
+    try {handle=t->GetTextureHandleForRegionWrite();}
+    catch(...) {return Result::BackendFailure;}
+    if(!handle) return Result::Resource;
+    const auto& r=packet.destination;
+    const tTVPRect written(r.left,r.top,r.right,r.bottom);
+    bool applied=false;
+    try {applied=session->backend->OperateLayerSpanComposite(packet,handle);}
+    catch(...) {
+        if(session->backend->LastLayerSpanCompositeResult()==Result::Applied)
+            t->CommitGPURegionWrite(written);
+        throw;
+    }
+    if(!applied) return session->backend->LastLayerSpanCompositeResult();
+    t->CommitGPURegionWrite(written);
+    ++session->stats.gpuOperations;
+    return Result::Applied;
 }
 TVPLayerShrinkResult TVPTryMetalLayerShrink(const TVPLayerShrinkOperation& operation,
         iTVPTexture2D* target,iTVPTexture2D* retainedSource) {

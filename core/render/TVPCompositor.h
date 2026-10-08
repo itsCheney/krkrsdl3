@@ -8,6 +8,7 @@
 #include "LayerRenderOperation.h"
 #include "LayerTransition.h"
 #include "LayerShrink.h"
+#include "LayerSpanComposite.h"
 #include "AsyncLayerReadback.h"
 
 //---------------------------------------------------------------------------
@@ -194,6 +195,9 @@ public:
     virtual bool SupportsLayerShrink64() const { return false; }
     virtual bool OperateLayerShrink(const TVPLayerShrinkOperation&, void*, void*) { return false; }
     virtual TVPLayerShrinkResult LastLayerShrinkResult() const { return TVPLayerShrinkResult::BackendFailure; }
+    virtual bool SupportsLayerSpanComposition() const { return false; }
+    virtual bool OperateLayerSpanComposite(const TVPLayerSpanCompositePacket&,void*) { return false; }
+    virtual TVPLayerSpanCompositeResult LastLayerSpanCompositeResult() const { return TVPLayerSpanCompositeResult::BackendFailure; }
     virtual TVPLayerParameterUploadStats GetLayerParameterUploadStats() const { return {}; }
     virtual bool SetLayerAlphaTables(const uint8_t*, const uint8_t*) { return false; }
     virtual bool SetLayerPsTables(const uint8_t* softLight, const uint8_t* colorDodge,

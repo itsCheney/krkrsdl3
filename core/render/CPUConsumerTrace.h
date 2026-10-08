@@ -173,6 +173,37 @@ struct Producer {
     int width=0,height=0;
 };
 inline bool (*captureProducer)(void*,Producer&)=nullptr;
+// Native-only, bounded route evidence for the C2B transaction. Packet and GPU
+// scratch bytes are separate from C0 pixel transfers; reporting never acquires
+// pixels, submits work or waits for the GPU.
+inline void ReportSpanRoute(const char* method,const char* route,const char* reason,
+        void* target,uint64_t spanCount,uint64_t sourceBytes,uint64_t parameterBytes,
+        uint64_t scratchBytes) noexcept {
+    if(!Enabled() || !context || !CurrentEpoch(context->epoch)) return;
+    try {
+        const auto c=*context;
+        if(!ValidLabel(method) || !ValidLabel(route) || !ValidLabel(reason)) {
+            RejectOversize(c.epoch);return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(layer_work::mutex);
+            if(!CurrentEpoch(c.epoch)) return;
+            auto& b=layer_work::profile.cpuConsumerBudget;
+            if(b.spanRoutes>=32) {++b.spanRouteExceeded;return;}
+            ++b.spanRoutes;
+        }
+        Producer p;
+        const bool identity=target && captureProducer && captureProducer(target,p);
+        const auto field=[&](uint64_t value) {return identity ? std::to_string(value) : std::string("null");};
+        Emit(c.epoch,"metal.layerSpan {\"phase\":\"route\",\"version\":1,\"generation\":"+
+            std::to_string(c.epoch)+",\"traceID\":"+std::to_string(c.traceID)+
+            ",\"method\":"+Label(method)+",\"route\":"+Label(route)+",\"reason\":"+Label(reason)+
+            ",\"sessionID\":"+field(p.sessionID)+",\"textureID\":"+field(p.textureID)+
+            ",\"contentVersion\":"+field(p.contentVersion)+",\"spanCount\":"+std::to_string(spanCount)+
+            ",\"sourceBytes\":"+std::to_string(sourceBytes)+",\"parameterBytes\":"+std::to_string(parameterBytes)+
+            ",\"scratchBytes\":"+std::to_string(scratchBytes)+'}');
+    } catch(...) {}
+}
 inline void ReportShrinkOutput(void* texture,int left,int top,int right,int bottom) noexcept {
     if(!Enabled() || !captureProducer || !context || !CurrentEpoch(context->epoch)) return;
     try {
@@ -190,13 +221,16 @@ inline void ReportShrinkOutput(void* texture,int left,int top,int right,int bott
     } catch(...) {}
 }
 inline void WindowTaken(const layer_work::CPUConsumerBudget& b,uint64_t epoch) {
-    if(!CurrentEpoch(epoch) || !(b.reads || b.producers || b.readExceeded || b.producerExceeded)) return;
+    if(!CurrentEpoch(epoch) || !(b.reads || b.producers || b.readExceeded || b.producerExceeded ||
+            b.spanRoutes || b.spanRouteExceeded)) return;
     try {
         Emit(epoch,"metal.cpuConsumer {\"phase\":\"budget\",\"generation\":"+std::to_string(epoch)+
             ",\"readRecords\":"+std::to_string(b.reads)+",\"readExceeded\":"+std::to_string(b.readExceeded)+
             ",\"callerRecords\":"+std::to_string(b.callers)+",\"callerExceeded\":"+std::to_string(b.callerExceeded)+
             ",\"producerRecords\":"+std::to_string(b.producers)+",\"producerExceeded\":"+std::to_string(b.producerExceeded)+
-            ",\"oversizeRecords\":"+std::to_string(b.oversize)+'}');
+            ",\"oversizeRecords\":"+std::to_string(b.oversize)+
+            ",\"spanRouteRecords\":"+std::to_string(b.spanRoutes)+
+            ",\"spanRouteExceeded\":"+std::to_string(b.spanRouteExceeded)+'}');
     } catch(...) {}
 }
 inline void SetCallbacks(void (*logger)(const char*),bool (*producer)(void*,Producer&)) {
