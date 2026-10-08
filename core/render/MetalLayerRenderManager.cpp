@@ -2,6 +2,7 @@
 #include "RenderManager.h"
 #include "MetalLayerRenderManager.h"
 #include "LayerTransitionGeometry.h"
+#include "LayerShrinkGeometry.h"
 #include "LayerBitmap.h"
 #include "TVPCompositor.h"
 #include "TVPMsg.h"
@@ -1162,6 +1163,58 @@ bool TVPMetalLayerCompositionActive() { return bool(Manager().session); }
 bool TVPHasMetalLayerTransitionSupport() {
     const auto& session=Manager().session;
     return session && session->backend && session->backend->SupportsLayerTransitions();
+}
+bool TVPHasMetalLayerShrinkSupport() {
+    const auto& s=Manager().session;
+    return s && s->backend && s->backend->SupportsLayerShrinks();
+}
+TVPLayerShrinkResult TVPTryMetalLayerShrink(const TVPLayerShrinkOperation& operation,
+        iTVPTexture2D* target,iTVPTexture2D* retainedSource) {
+    using Result=TVPLayerShrinkResult;
+    const auto& rect=operation.destination;
+    const int64_t w=int64_t(rect.right)-rect.left,h=int64_t(rect.bottom)-rect.top;
+    const uint64_t pixels=w>0 && h>0 ? uint64_t(w)*uint64_t(h) : 0;
+    auto failure=[&](Result result,const char* reason) {
+        krkrsdl3::layer_work::RecordShrinkResult(false,reason,pixels,
+            result==Result::AliasDependency ? "selfDependent" : nullptr); return result;
+    };
+    if(operation.kind!=TVPLayerShrinkKind::Area && operation.kind!=TVPLayerShrinkKind::Fast)
+        return failure(Result::Unsupported,"unsupportedKind");
+    auto& session=Manager().session;
+    if(!session || !session->backend || !session->backend->SupportsLayerShrinks()) return failure(Result::BackendFailure,"pipelineUnavailable");
+    auto* t=dynamic_cast<LayerTexture*>(target);auto* s=dynamic_cast<LayerTexture*>(retainedSource);
+    if(!t || !s || !t->Belongs(session) || !s->Belongs(session)) return failure(Result::Resource,"sessionOrResource");
+    if(t->GetFormat()!=TVPTextureFormat::RGBA || s->GetFormat()!=TVPTextureFormat::RGBA) return failure(Result::Resource,"format");
+    if(t->IsCPUResident() || s->IsCPUResident() || t->HasCPUAccess() || s->HasCPUAccess()) return failure(Result::CPUAccess,"cpuLease");
+    auto checked=TVPLayerShrinkGeometry::Validate(operation,t->GetWidth(),t->GetHeight(),s->GetWidth(),s->GetHeight(),t==s);
+    if(checked!=Result::Applied) return failure(checked,checked==Result::AliasDependency ? "aliasDependency" :
+        checked==Result::Arithmetic ? "arithmetic" : checked==Result::ParameterBudget ? "parameterBudget" : "geometry");
+    if(!pixels) {krkrsdl3::layer_work::RecordShrinkResult(false,"noop",0);return Result::Applied;}
+    if(operation.avgBits==64 && !TVPLayerShrinkGeometry::CanUse32(operation) && !session->backend->SupportsLayerShrink64())
+        return failure(Result::Arithmetic,"integerWidth");
+    const bool full=rect.left==0 && rect.top==0 && rect.right==int(t->GetWidth()) && rect.bottom==int(t->GetHeight());
+    // Upload necessary source CPU damage first; on real alias that is also the
+    // target's pre-operation input, which a full overwrite must not discard.
+    void* sh=s->GetTextureHandle();
+    void* th=full ? t->GetTextureHandleForOverwrite() : t->GetTextureHandleForRegionWrite();
+    if(!sh || !th) return failure(Result::Resource,"textureHandle");
+    bool applied=false;
+    try {applied=session->backend->OperateLayerShrink(operation,th,sh);}
+    catch(...) {
+        if(session->backend->LastLayerShrinkResult()==Result::Applied) {
+            t->CommitGPURegionWrite(tTVPRect(rect.left,rect.top,rect.right,rect.bottom));
+            krkrsdl3::layer_work::RecordShrinkResult(true,"postCommitFailure",pixels,t==s ? "selfSafe" : nullptr);
+        }
+        throw;
+    }
+    if(!applied) {
+        auto result=session->backend->LastLayerShrinkResult();
+        return failure(result,result==Result::AliasDependency ? "aliasDependency" : result==Result::Arithmetic ? "arithmetic" :
+            result==Result::ParameterBudget ? "parameterBudget" : result==Result::Geometry ? "geometry" : "backendFailure");
+    }
+    t->CommitGPURegionWrite(tTVPRect(rect.left,rect.top,rect.right,rect.bottom));
+    krkrsdl3::layer_work::RecordShrinkResult(true,"gpu",pixels,t==s ? "selfSafe" : nullptr);
+    return Result::Applied;
 }
 TVPLayerTransitionResult TVPTryMetalLayerTransition(const TVPLayerTransitionOperation& operation,
         iTVPTexture2D* target,iTVPTexture2D* source1,iTVPTexture2D* source2) {

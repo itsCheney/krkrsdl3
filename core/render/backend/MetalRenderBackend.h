@@ -86,6 +86,10 @@ public:
     bool SupportsLayerTransitions() const override;
     bool OperateLayerTransition(const TVPLayerTransitionOperation&, void*, void*, void*) override;
     TVPLayerTransitionResult LastLayerTransitionResult() const override;
+    bool SupportsLayerShrinks() const override;
+    bool SupportsLayerShrink64() const override;
+    bool OperateLayerShrink(const TVPLayerShrinkOperation&, void*, void*) override;
+    TVPLayerShrinkResult LastLayerShrinkResult() const override;
     TVPLayerParameterUploadStats GetLayerParameterUploadStats() const override;
     bool SupportsLayerTileRendering() const;
     bool IsLayerTileRenderingActive() const;

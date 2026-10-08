@@ -8231,6 +8231,42 @@ tTJSNI_Layer* tTJSNI_Layer::FromObject(iTJSDispatch2* obj)
 // tTJSNC_Layer : TJS Layer class
 //---------------------------------------------------------------------------
 tjs_uint32 tTJSNC_Layer::ClassID = -1;
+namespace {
+struct ShrinkLayerBindings {
+    tTJSNativeClassPropertyGetCallback hasImage=nullptr,width=nullptr,height=nullptr,pitch=nullptr;
+    tTJSNativeClassMethodCallback resize=nullptr;
+} shrinkLayerBindings;
+}
+bool TVPGetCanonicalShrinkLayer(iTJSDispatch2* object,bool resize,tTJSNI_BaseLayer*& layer)
+{
+    layer=nullptr;
+    // A raw lookup on the standard VM object cannot invoke script properties.
+    auto* standard=dynamic_cast<tTJSCustomObject*>(object);
+    if(!standard || !shrinkLayerBindings.hasImage ||
+       TJS_FAILED(standard->NativeInstanceSupport(TJS_NIS_GETINSTANCE,tTJSNC_Layer::ClassID,
+                 reinterpret_cast<iTJSNativeInstance**>(&layer))) || !layer) return false;
+    const auto property=[&](const tjs_char* name,tTJSNativeClassPropertyGetCallback callback) {
+        tTJSVariant value;
+        if(TJS_FAILED(standard->tTJSCustomObject::PropGet(TJS_IGNOREPROP,name,nullptr,&value,object)) ||
+           value.Type()!=tvtObject) return false;
+        const auto closure=value.AsObjectClosureNoAddRef();
+        const auto* native=dynamic_cast<tTJSNativeClassProperty*>(closure.Object);
+        return native && closure.ObjThis==object && native->GetGetterCallback()==callback;
+    };
+    if(!property(TJS_N("hasImage"),shrinkLayerBindings.hasImage) ||
+       !property(TJS_N("imageWidth"),shrinkLayerBindings.width) ||
+       !property(TJS_N("imageHeight"),shrinkLayerBindings.height) ||
+       !property(TJS_N("mainImageBufferPitch"),shrinkLayerBindings.pitch)) return false;
+    if(resize) {
+        tTJSVariant value;
+        if(TJS_FAILED(standard->tTJSCustomObject::PropGet(TJS_IGNOREPROP,TJS_N("setImageSize"),nullptr,&value,object)) ||
+           value.Type()!=tvtObject) return false;
+        const auto closure=value.AsObjectClosureNoAddRef();
+        const auto* native=dynamic_cast<tTJSNativeClassMethod*>(closure.Object);
+        if(!native || closure.ObjThis!=object || native->GetCallback()!=shrinkLayerBindings.resize) return false;
+    }
+    return true;
+}
 tTJSNC_Layer::tTJSNC_Layer()
   : tTJSNativeClass(TJS_N("Layer")){
         // registration of native members
@@ -11349,6 +11385,9 @@ TJS_END_NATIVE_STATIC_METHOD_DECL(/*func. name*/ fetchImageSize)
 
 //----------------------------------------------------------------------
 
+// Store callback identities only, never VM objects (which belong to a session).
+shrinkLayerBindings={NCM_hasImage::Get,NCM_imageWidth::Get,NCM_imageHeight::Get,
+                     NCM_mainImageBufferPitch::Get,NCM_setImageSize::Process};
 TJS_END_NATIVE_MEMBERS
 }
 //---------------------------------------------------------------------------

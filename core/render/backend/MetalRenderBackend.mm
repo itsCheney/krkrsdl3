@@ -1,6 +1,8 @@
 #include "MetalRenderBackend.h"
 #include "MetalLayerShaders.h"
 #include "MetalTransitionShaders.h"
+#include "MetalShrinkShaders.h"
+#include "../LayerShrinkGeometry.h"
 #include "../LayerTransitionGeometry.h"
 #include "../LayerWorkDiagnostics.h"
 #include "../LayerPerspectiveGeometry.h"
@@ -376,6 +378,10 @@ struct MetalRenderBackend::Impl
     id<MTLComputePipelineState> perspectivePipeline = nil;
     id<MTLComputePipelineState> transitionPipeline = nil;
     TVPLayerTransitionResult transitionResult=TVPLayerTransitionResult::PipelineUnavailable;
+    id<MTLComputePipelineState> shrinkHorizontal32=nil,shrinkVertical32=nil,shrinkHorizontal64=nil,shrinkVertical64=nil;
+    id<MTLBuffer> shrinkSums=nil;
+    id<MTLTexture> shrinkOutput=nil;
+    TVPLayerShrinkResult shrinkResult=TVPLayerShrinkResult::BackendFailure;
     id<MTLBuffer> transitionDummy = nil;
     struct TransitionCache {
         std::shared_ptr<const TVPLayerTransitionBytes> bytes;
@@ -1201,6 +1207,21 @@ struct MetalRenderBackend::Impl
         MTLCompileOptions* ordinaryOptions = [MTLCompileOptions new];
         ordinaryOptions.fastMathEnabled = NO;
         const std::string ordinarySource=TVPBuildMetalLayerShaderSource();
+        for(bool wide:{false,true}) {
+            if(wide && ![device supportsFamily:MTLGPUFamilyApple3]) continue;
+            const std::string shrinkSource=TVPBuildMetalShrinkShaderSource(wide);
+            id<MTLLibrary> shrinkLibrary=[device newLibraryWithSource:[NSString stringWithUTF8String:shrinkSource.c_str()]
+                                                            options:ordinaryOptions error:&error];
+            id<MTLComputePipelineState> horizontal=nil,vertical=nil;
+            if(shrinkLibrary) {
+                horizontal=[device newComputePipelineStateWithFunction:[shrinkLibrary newFunctionWithName:@"shrinkHorizontalLayer"] error:&error];
+                vertical=[device newComputePipelineStateWithFunction:[shrinkLibrary newFunctionWithName:@"shrinkVerticalLayer"] error:&error];
+            }
+            if(wide) {shrinkHorizontal64=horizontal;shrinkVertical64=vertical;}
+            else {shrinkHorizontal32=horizontal;shrinkVertical32=vertical;}
+            if(!horizontal || !vertical) SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
+                "Metal shrink %u-bit pipeline unavailable; CPU path retained: %s",wide?64u:32u,error.localizedDescription.UTF8String);
+        }
         const std::string transitionSource=TVPBuildMetalTransitionShaderSource();
         id<MTLLibrary> transitions=[device newLibraryWithSource:[NSString stringWithUTF8String:transitionSource.c_str()]
                                                       options:ordinaryOptions error:&error];
@@ -2247,6 +2268,104 @@ bool MetalRenderBackend::OperateLayerPerspective(const TVPLayerOperation& operat
         [commit endEncoding];
         p.transientOps+=2+active*2;
         if(p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
+        return true;
+    }
+}
+bool MetalRenderBackend::SupportsLayerShrinks() const {return impl_ && impl_->shrinkHorizontal32 && impl_->shrinkVertical32;}
+bool MetalRenderBackend::SupportsLayerShrink64() const {return impl_ && impl_->shrinkHorizontal64 && impl_->shrinkVertical64;}
+TVPLayerShrinkResult MetalRenderBackend::LastLayerShrinkResult() const {return impl_?impl_->shrinkResult:TVPLayerShrinkResult::BackendFailure;}
+bool MetalRenderBackend::OperateLayerShrink(const TVPLayerShrinkOperation& operation,void* target,void* source) {
+    @autoreleasepool {
+        auto& p=*impl_;auto* t=p.Find(target);auto* s=p.Find(source);
+        p.shrinkResult=TVPLayerShrinkResult::BackendFailure;
+        struct PendingRelease {
+            std::vector<id<MTLBuffer>>& pending;
+            id<MTLBuffer> x=nil,y=nil;
+            bool xBound=false,yBound=false;
+            void DiscardUnused() noexcept {
+                pending.erase(std::remove_if(pending.begin(),pending.end(),[&](id<MTLBuffer> b) {
+                    return (b==x && !xBound) || (b==y && !yBound);
+                }),pending.end());
+            }
+            ~PendingRelease() {DiscardUnused();}
+        } release{p.stagingPending};
+        auto fail=[&](TVPLayerShrinkResult result){
+            p.shrinkResult=result;release.DiscardUnused();
+            // Failed scratch work still consumes the normal encoding budget.
+            if(p.transientBytes>=Impl::kSubmissionBudget || p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
+            return false;
+        };
+        if(!t || !s || t->bytesPerPixel!=4 || s->bytesPerPixel!=4) return fail(TVPLayerShrinkResult::Resource);
+        auto valid=TVPLayerShrinkGeometry::Validate(operation,t->width,t->height,s->width,s->height,t==s);
+        if(valid!=TVPLayerShrinkResult::Applied) return fail(valid);
+        const auto& rc=operation.destination;const int w=rc.Width(),h=rc.Height();
+        if(!w || !h) {p.shrinkResult=TVPLayerShrinkResult::Applied;return true;}
+        const bool wide=operation.avgBits==64 && !TVPLayerShrinkGeometry::CanUse32(operation);
+        auto horizontal=wide?p.shrinkHorizontal64:p.shrinkHorizontal32;
+        auto vertical=wide?p.shrinkVertical64:p.shrinkVertical32;
+        if(!horizontal || !vertical) return fail(wide?TVPLayerShrinkResult::Arithmetic:TVPLayerShrinkResult::BackendFailure);
+        struct PackedAxis32 {int32_t base,step;uint32_t ta,tc,ba,bc,total;};
+        static_assert(sizeof(PackedAxis32)==28 && sizeof(TVPLayerShrinkAxis)==48,"shrink axis ABI");
+        struct Params {int32_t kind,width,height,sourceTop,sourceRows;uint32_t hu,vu;};
+        static_assert(sizeof(Params)==28,"shrink uniform ABI");
+        const Params params{int(operation.kind),w,h,operation.sourceTop,operation.sourceRows,operation.hu,operation.vu};
+        const size_t axisBytes=wide?48:28;
+        const size_t parameterBytes=(size_t(w)+h)*axisBytes+2*sizeof(params);
+        const size_t sumBytes=size_t(w)*operation.sourceRows*(wide?32:16);
+        const size_t outputBytes=size_t(w)*h*4;
+        const uint64_t temporaryBytes=uint64_t(sumBytes)+outputBytes;
+        if(temporaryBytes+parameterBytes>TVPLayerShrinkGeometry::ParameterBudget) return fail(TVPLayerShrinkResult::ParameterBudget);
+        id<MTLBuffer> x=nil,y=nil;id<MTLComputeCommandEncoder> first=nil;
+        try {
+            x=p.AcquireStaging(size_t(w)*axisBytes);release.x=x;
+            y=p.AcquireStaging(size_t(h)*axisBytes);release.y=y;
+            if(!x || !y) return fail(TVPLayerShrinkResult::ParameterBudget);
+            const auto pack=[&](id<MTLBuffer> buffer,const std::vector<TVPLayerShrinkAxis>& list) {
+                if(wide) std::memcpy(buffer.contents,list.data(),list.size()*48);
+                else for(size_t i=0;i<list.size();++i) {
+                    const auto& a=list[i];const PackedAxis32 packed{a.base,a.step,uint32_t(a.ta),uint32_t(a.tc),uint32_t(a.ba),uint32_t(a.bc),uint32_t(a.total)};
+                    std::memcpy(static_cast<uint8_t*>(buffer.contents)+i*28,&packed,28);
+                }
+            };
+            pack(x,*operation.horizontal);pack(y,*operation.vertical);
+            // Reuse scratch only within the checked joint budget. Previously
+            // bound buffers/textures stay alive through their command buffers.
+            if(!p.shrinkSums || p.shrinkSums.length!=sumBytes)
+                p.shrinkSums=[p.device newBufferWithLength:sumBytes options:MTLResourceStorageModePrivate];
+            if(!p.shrinkOutput || p.shrinkOutput.width!=NSUInteger(w) || p.shrinkOutput.height!=NSUInteger(h))
+                p.shrinkOutput=p.Texture(w,h);
+            if(!p.shrinkSums || !p.shrinkOutput) return fail(TVPLayerShrinkResult::ParameterBudget);
+            first=p.Compute();
+        } catch(const std::bad_alloc&) {return fail(TVPLayerShrinkResult::ParameterBudget);}
+        if(!first) return fail(TVPLayerShrinkResult::BackendFailure);
+        id<MTLBlitCommandEncoder> commit=nil;
+        try {
+        [first setComputePipelineState:horizontal];[first setBytes:&params length:sizeof(params) atIndex:0];
+        [first setBuffer:x offset:0 atIndex:1];[first setBuffer:p.shrinkSums offset:0 atIndex:2];[first setTexture:s->texture atIndex:0];
+        release.xBound=true;
+        [first dispatchThreadgroups:MTLSizeMake((w+7)/8,(operation.sourceRows+7)/8,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];[first endEncoding];
+        krkrsdl3::layer_work::RecordShrinkParameters(2,size_t(w)*axisBytes+sizeof(params),temporaryBytes);
+        p.transientBytes+=size_t(w)*axisBytes+sizeof(params);++p.transientOps;
+        if(p.diagnosticSampled) ++p.diagnosticWorkload.layerDispatches;
+        id<MTLComputeCommandEncoder> second=p.Compute();if(!second) return fail(TVPLayerShrinkResult::BackendFailure);
+        [second setComputePipelineState:vertical];[second setBytes:&params length:sizeof(params) atIndex:0];
+        [second setBuffer:x offset:0 atIndex:1];[second setBuffer:y offset:0 atIndex:2];[second setBuffer:p.shrinkSums offset:0 atIndex:3];
+        [second setTexture:p.shrinkOutput atIndex:0];
+        release.yBound=true;
+        [second dispatchThreadgroups:MTLSizeMake((w+7)/8,(h+7)/8,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];[second endEncoding];
+        krkrsdl3::layer_work::RecordShrinkParameters(2,size_t(h)*axisBytes+sizeof(params));
+        p.transientBytes+=size_t(h)*axisBytes+sizeof(params);++p.transientOps;
+        if(p.diagnosticSampled) ++p.diagnosticWorkload.layerDispatches;
+        commit=p.Blit();if(!commit) return fail(TVPLayerShrinkResult::BackendFailure);
+        } catch(const std::bad_alloc&) {return fail(TVPLayerShrinkResult::ParameterBudget);}
+        [commit copyFromTexture:p.shrinkOutput sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+            sourceSize:MTLSizeMake(w,h,1) toTexture:t->texture destinationSlice:0 destinationLevel:0
+            destinationOrigin:MTLOriginMake(rc.left,rc.top,0)];[commit endEncoding];
+        p.shrinkResult=TVPLayerShrinkResult::Applied;
+        ++p.transientOps;
+        // Post-commit exceptions propagate. Returning false here would replay
+        // the CPU method over pixels that this operation already changed.
+        if(p.transientBytes>=Impl::kSubmissionBudget || p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
         return true;
     }
 }

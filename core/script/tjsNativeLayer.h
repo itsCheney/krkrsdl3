@@ -158,6 +158,10 @@ extern iTJSDispatch2* TVPGetObjectFrom_NI_BaseLayer(tTJSNI_BaseLayer* layer);
 //---------------------------------------------------------------------------
 class tTJSNI_BaseWindow;
 class tTVPBaseBitmap;
+class tTJSNI_BaseLayer;
+// Reads raw native member closures; no property getters or pixel leases run.
+bool TVPGetCanonicalShrinkLayer(iTJSDispatch2* object,bool resize,
+                               tTJSNI_BaseLayer*& layer);
 class tTVPLayerManager;
 class tTJSNI_BaseLayer : public tTJSNativeInstance,
                          public tTVPDrawable,

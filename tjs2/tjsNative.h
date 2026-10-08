@@ -90,6 +90,8 @@ protected:
 public:
     tTJSNativeClassMethod(tTJSNativeClassMethodCallback processfunc);
     ~tTJSNativeClassMethod();
+    // Identity inspection must not invoke the callback or add virtual ABI slots.
+    tTJSNativeClassMethodCallback GetCallback() const { return Process; }
 
     tjs_error IsInstanceOf(tjs_uint32 flag,
                            const tjs_char* membername,
@@ -161,6 +163,8 @@ public:
     tTJSNativeClassProperty(tTJSNativeClassPropertyGetCallback get,
                             tTJSNativeClassPropertySetCallback set);
     ~tTJSNativeClassProperty();
+    tTJSNativeClassPropertyGetCallback GetGetterCallback() const { return Get; }
+    tTJSNativeClassPropertySetCallback GetSetterCallback() const { return Set; }
 
     tjs_error IsInstanceOf(tjs_uint32 flag,
                            const tjs_char* membername,

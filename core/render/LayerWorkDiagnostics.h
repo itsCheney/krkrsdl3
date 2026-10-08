@@ -94,6 +94,30 @@ inline bool TransitionString(char* dest,size_t capacity,const char* value,size_t
     }
     std::memcpy(dest,value,size+1);return true;
 }
+// C1 rows aggregate calls by entrypoint, route reason and alias class only.
+// Geometry is the latest bounded description, never a cardinality key.
+inline constexpr size_t ShrinkCapacity=32, ShrinkJSONCapacity=65536, MaxReadWaitSamples=2048;
+struct ShrinkMetrics {
+    uint64_t gpuCalls=0,cpuCalls=0,noopCalls=0,pixels=0,wallNS=0,prepCPUNS=0;
+    uint64_t parameterUploads=0,parameterBytes=0,temporaryBytes=0;
+    uint64_t readCalls=0,readBytes=0,readWallNS=0,readWaitNS=0;
+    uint64_t uploadCalls=0,uploadBytes=0,uploadWallNS=0,uploadWaitNS=0;
+};
+struct ShrinkRecord {
+    char method[48]{},reason[64]{},aliasClass[48]{},metadata[256]{};
+    ShrinkMetrics metrics;
+};
+static_assert(ShrinkCapacity*(95+127+95+511+17*20+480)+2<ShrinkJSONCapacity,
+              "All bounded shrink rows must fit the C bridge");
+inline void AddShrinkMetrics(ShrinkMetrics& to,const ShrinkMetrics& from) {
+#define KRKR_SHRINK_ADD(field) to.field+=from.field
+    KRKR_SHRINK_ADD(gpuCalls);KRKR_SHRINK_ADD(cpuCalls);KRKR_SHRINK_ADD(noopCalls);KRKR_SHRINK_ADD(pixels);
+    KRKR_SHRINK_ADD(wallNS);KRKR_SHRINK_ADD(prepCPUNS);KRKR_SHRINK_ADD(parameterUploads);
+    KRKR_SHRINK_ADD(parameterBytes);KRKR_SHRINK_ADD(temporaryBytes);
+    KRKR_SHRINK_ADD(readCalls);KRKR_SHRINK_ADD(readBytes);KRKR_SHRINK_ADD(readWallNS);KRKR_SHRINK_ADD(readWaitNS);
+    KRKR_SHRINK_ADD(uploadCalls);KRKR_SHRINK_ADD(uploadBytes);KRKR_SHRINK_ADD(uploadWallNS);KRKR_SHRINK_ADD(uploadWaitNS);
+#undef KRKR_SHRINK_ADD
+}
 struct Profile { std::array<Timing,size_t(Stage::Count)> stages{};
     std::array<Transfer,64> transfers{}; size_t size=0;
     Transfer overflow[2]{};
@@ -107,6 +131,12 @@ struct Profile { std::array<Timing,size_t(Stage::Count)> stages{};
     std::array<TransitionRecord,TransitionCapacity> transitions{};size_t transitionSize=0;
     TransitionMetrics transitionOverflow;
     uint64_t transitionProfilesDropped=0,transitionCapacityRecords=0,transitionOversizeRecords=0;
+    std::array<ShrinkRecord,ShrinkCapacity> shrinks{};size_t shrinkSize=0;
+    ShrinkMetrics shrinkOverflow;
+    uint64_t shrinkProfilesDropped=0,shrinkCapacityRecords=0,shrinkOversizeRecords=0;
+    uint32_t shrinkReadWaitSampleCount=0;
+    std::array<uint64_t,MaxReadWaitSamples> shrinkReadWaitSamplesNS{};
+    uint64_t shrinkReadWaitSamplesDropped=0;
     Profile() {
         for(size_t i=0;i<protectedOrigins.size();++i) for(size_t direction=0;direction<2;++direction) {
             auto& origin=origins[i*2+direction]; origin.upload=direction!=0;
@@ -234,6 +264,83 @@ inline void RecordTransitionResult(bool gpu,const char* reason,uint64_t pixels,u
     if(transitionScope) transitionScope->Result(gpu,reason,pixels,calls,bytes);
 }
 inline void RecordTransitionParameters(uint64_t calls,uint64_t bytes) {if(transitionScope) transitionScope->Parameters(calls,bytes);}
+class ShrinkScope;
+inline thread_local ShrinkScope* shrinkScope=nullptr;
+class ShrinkScope {
+    ShrinkScope* previous=nullptr;
+    ShrinkRecord record;
+    uint64_t epoch=0,started=0;
+    bool valid=true,result=false;
+public:
+    explicit ShrinkScope(const char* method,const char* metadata="{}",const char* aliasClass="unknown") {
+        previous=shrinkScope;shrinkScope=this;epoch=CaptureGeneration();
+        if(!epoch) return;
+        started=Now();
+        const bool methodValid=TransitionString(record.method,sizeof(record.method),method,95);
+        const bool metadataValid=TransitionString(record.metadata,sizeof(record.metadata),metadata,511);
+        const bool aliasValid=TransitionString(record.aliasClass,sizeof(record.aliasClass),aliasClass,95);
+        valid=methodValid && metadataValid && aliasValid;std::strcpy(record.reason,"unclassified");
+    }
+    ShrinkScope(const ShrinkScope&)=delete;
+    ShrinkScope& operator=(const ShrinkScope&)=delete;
+    void SetMetadata(const char* value) {if(epoch) valid=TransitionString(record.metadata,sizeof(record.metadata),value,511) && valid;}
+    void SetAliasClass(const char* value) {if(epoch) valid=TransitionString(record.aliasClass,sizeof(record.aliasClass),value,95) && valid;}
+    bool MatchesEpoch(uint64_t value) const {return epoch!=0 && epoch==value;}
+    void PrepCPU(uint64_t ns) {if(epoch) record.metrics.prepCPUNS+=ns;}
+    void Result(bool gpu,const char* reason,uint64_t pixels,const char* aliasClass=nullptr) {
+        if(!epoch) return;
+        result=true;
+        record.metrics.gpuCalls=gpu ? 1 : 0;
+        record.metrics.noopCalls=!gpu && reason && !std::strcmp(reason,"noop") ? 1 : 0;
+        record.metrics.cpuCalls=!gpu && !record.metrics.noopCalls ? 1 : 0;
+        record.metrics.pixels=pixels;
+        valid=TransitionString(record.reason,sizeof(record.reason),reason,127) && valid;
+        if(aliasClass) SetAliasClass(aliasClass);
+    }
+    void Parameters(uint64_t calls,uint64_t bytes,uint64_t temporaryBytes) {
+        if(epoch) {record.metrics.parameterUploads+=calls;record.metrics.parameterBytes+=bytes;record.metrics.temporaryBytes+=temporaryBytes;}
+    }
+    void Transfer(bool upload,uint64_t bytes,uint64_t ns,uint64_t waitNS,uint64_t transferEpoch) {
+        if(!epoch || epoch!=transferEpoch) return;
+        auto& m=record.metrics;
+        if(upload) {++m.uploadCalls;m.uploadBytes+=bytes;m.uploadWallNS+=ns;m.uploadWaitNS+=waitNS;}
+        else {++m.readCalls;m.readBytes+=bytes;m.readWallNS+=ns;m.readWaitNS+=waitNS;}
+    }
+    ~ShrinkScope() {
+        shrinkScope=previous;
+        if(!epoch) return;
+        if(!result) record.metrics.cpuCalls=1;
+        record.metrics.wallNS=Now()-started;
+        std::lock_guard<std::mutex> lock(mutex);
+        if(!enabled.load(std::memory_order_relaxed) || epoch!=generation.load(std::memory_order_relaxed)) return;
+        ShrinkRecord* found=nullptr;
+        if(valid) {
+            for(size_t i=0;i<profile.shrinkSize;++i) {
+                auto& r=profile.shrinks[i];
+                if(!std::strcmp(r.method,record.method) && !std::strcmp(r.reason,record.reason) &&
+                   !std::strcmp(r.aliasClass,record.aliasClass)) {found=&r;break;}
+            }
+            if(!found && profile.shrinkSize<ShrinkCapacity) {
+                found=&profile.shrinks[profile.shrinkSize++];*found=record;found->metrics={};
+            }
+        }
+        if(found) {std::memcpy(found->metadata,record.metadata,sizeof(record.metadata));AddShrinkMetrics(found->metrics,record.metrics);}
+        else {
+            ++profile.shrinkProfilesDropped;
+            if(valid) ++profile.shrinkCapacityRecords;else ++profile.shrinkOversizeRecords;
+            AddShrinkMetrics(profile.shrinkOverflow,record.metrics);
+        }
+    }
+};
+inline void SetShrinkAliasClass(const char* value) {if(shrinkScope) shrinkScope->SetAliasClass(value);}
+inline void SetShrinkMetadata(const char* value) {if(shrinkScope) shrinkScope->SetMetadata(value);}
+inline void RecordShrinkPrepCPU(uint64_t ns) {if(shrinkScope) shrinkScope->PrepCPU(ns);}
+inline void RecordShrinkResult(bool gpu,const char* reason,uint64_t pixels,const char* aliasClass=nullptr) {
+    if(shrinkScope) shrinkScope->Result(gpu,reason,pixels,aliasClass);
+}
+inline void RecordShrinkParameters(uint64_t calls,uint64_t bytes,uint64_t temporaryBytes=0) {
+    if(shrinkScope) shrinkScope->Parameters(calls,bytes,temporaryBytes);
+}
 inline void ResetFrameHistory() {
     std::lock_guard<std::mutex> lock(mutex);
     lastFrameTimestamp=0; haveLastFrameTimestamp=false;
@@ -273,6 +380,15 @@ inline void Record(bool upload,uint64_t texture,int width,int height,uint64_t by
     std::lock_guard<std::mutex> lock(mutex);
     if(!enabled.load(std::memory_order_relaxed) || epoch!=generation.load(std::memory_order_relaxed)) return;
     if(transitionScope) transitionScope->Transfer(upload,bytes,ns,waitNS,epoch);
+    if(shrinkScope) shrinkScope->Transfer(upload,bytes,ns,waitNS,epoch);
+    // Record is called only after a successful transfer; cache hits/failed reads
+    // never reach this observation. Only current shrink reads are sampled;
+    // reuse the measured wait without new queries.
+    if(!upload && shrinkScope && shrinkScope->MatchesEpoch(epoch)) {
+        if(profile.shrinkReadWaitSampleCount<MaxReadWaitSamples)
+            profile.shrinkReadWaitSamplesNS[profile.shrinkReadWaitSampleCount++]=waitNS;
+        else ++profile.shrinkReadWaitSamplesDropped;
+    }
     Transfer* found=nullptr;
     for(size_t i=0;i<profile.size;++i) {
         auto& t=profile.transfers[i];
@@ -326,6 +442,10 @@ struct Summary {
     uint32_t transitionProfileVersion=1;
     std::string transitionProfiles="[]",transitionOverflow;
     uint64_t transitionProfilesDropped=0;
+    uint32_t shrinkProfileVersion=1,shrinkReadWaitSampleCount=0;
+    std::string shrinkProfiles="[]",shrinkOverflow;
+    uint64_t shrinkProfilesDropped=0,shrinkReadWaitSamplesDropped=0;
+    std::array<uint64_t,MaxReadWaitSamples> shrinkReadWaitSamplesNS{};
 };
 inline std::string TransitionMetricsJSON(const TransitionMetrics& m) {
     std::string out;
@@ -338,6 +458,21 @@ inline std::string TransitionMetricsJSON(const TransitionMetrics& m) {
     append("parameterUploads",m.parameterUploads);append("parameterBytes",m.parameterBytes);
     append("readCalls",m.readCalls);append("readBytes",m.readBytes);append("readWallNS",m.readWallNS);append("readWaitNS",m.readWaitNS);
     append("uploadCalls",m.uploadCalls);append("uploadBytes",m.uploadBytes);append("uploadWallNS",m.uploadWallNS);append("uploadWaitNS",m.uploadWaitNS);
+    return out;
+}
+inline std::string ShrinkMetricsJSON(const ShrinkMetrics& m) {
+    std::string out;
+    const auto append=[&](const char* key,uint64_t value) {
+        if(!out.empty()) out+=',';
+        out+=JSONString(key)+':'+std::to_string(value);
+    };
+#define KRKR_SHRINK_JSON(field) append(#field,m.field)
+    KRKR_SHRINK_JSON(gpuCalls);KRKR_SHRINK_JSON(cpuCalls);KRKR_SHRINK_JSON(noopCalls);KRKR_SHRINK_JSON(pixels);
+    KRKR_SHRINK_JSON(wallNS);KRKR_SHRINK_JSON(prepCPUNS);KRKR_SHRINK_JSON(parameterUploads);
+    KRKR_SHRINK_JSON(parameterBytes);KRKR_SHRINK_JSON(temporaryBytes);
+    KRKR_SHRINK_JSON(readCalls);KRKR_SHRINK_JSON(readBytes);KRKR_SHRINK_JSON(readWallNS);KRKR_SHRINK_JSON(readWaitNS);
+    KRKR_SHRINK_JSON(uploadCalls);KRKR_SHRINK_JSON(uploadBytes);KRKR_SHRINK_JSON(uploadWallNS);KRKR_SHRINK_JSON(uploadWaitNS);
+#undef KRKR_SHRINK_JSON
     return out;
 }
 inline std::string EncodeOrigin(const char* name) {
@@ -373,6 +508,19 @@ inline Summary Take() {
             TransitionMetricsJSON(t.metrics)+'}';
     }
     out.transitionProfiles+=']';
+    out.shrinkProfilesDropped=captured.shrinkProfilesDropped;
+    out.shrinkReadWaitSampleCount=captured.shrinkReadWaitSampleCount;
+    out.shrinkReadWaitSamplesNS=captured.shrinkReadWaitSamplesNS;
+    out.shrinkReadWaitSamplesDropped=captured.shrinkReadWaitSamplesDropped;
+    out.shrinkProfiles="[";
+    for(size_t i=0;i<captured.shrinkSize;++i) {
+        const auto& r=captured.shrinks[i];if(i) out.shrinkProfiles+=',';
+        out.shrinkProfiles+="{\"method\":"+JSONString(r.method)+",\"reason\":"+JSONString(r.reason)+
+            ",\"aliasClass\":"+JSONString(r.aliasClass)+",\"metadata\":"+JSONString(r.metadata)+','+ShrinkMetricsJSON(r.metrics)+'}';
+    }
+    out.shrinkProfiles+=']';
+    out.shrinkOverflow="{"+ShrinkMetricsJSON(captured.shrinkOverflow)+",\"capacityRecords\":"+
+        std::to_string(captured.shrinkCapacityRecords)+",\"oversizeRecords\":"+std::to_string(captured.shrinkOversizeRecords)+'}';
     out.transitionOverflow="{"+TransitionMetricsJSON(captured.transitionOverflow)+",\"capacityRecords\":"+
         std::to_string(captured.transitionCapacityRecords)+",\"oversizeRecords\":"+std::to_string(captured.transitionOversizeRecords)+'}';
     std::sort(captured.origins.begin(),captured.origins.begin()+captured.originSize,

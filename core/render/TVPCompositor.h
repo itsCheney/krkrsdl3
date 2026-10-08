@@ -7,6 +7,7 @@
 #include "PlatformView.h"
 #include "LayerRenderOperation.h"
 #include "LayerTransition.h"
+#include "LayerShrink.h"
 #include "AsyncLayerReadback.h"
 
 //---------------------------------------------------------------------------
@@ -189,6 +190,10 @@ public:
     virtual bool SupportsLayerTransitions() const { return false; }
     virtual bool OperateLayerTransition(const TVPLayerTransitionOperation&, void*, void*, void*) { return false; }
     virtual TVPLayerTransitionResult LastLayerTransitionResult() const { return TVPLayerTransitionResult::PipelineUnavailable; }
+    virtual bool SupportsLayerShrinks() const { return false; }
+    virtual bool SupportsLayerShrink64() const { return false; }
+    virtual bool OperateLayerShrink(const TVPLayerShrinkOperation&, void*, void*) { return false; }
+    virtual TVPLayerShrinkResult LastLayerShrinkResult() const { return TVPLayerShrinkResult::BackendFailure; }
     virtual TVPLayerParameterUploadStats GetLayerParameterUploadStats() const { return {}; }
     virtual bool SetLayerAlphaTables(const uint8_t*, const uint8_t*) { return false; }
     virtual bool SetLayerPsTables(const uint8_t* softLight, const uint8_t* colorDodge,
