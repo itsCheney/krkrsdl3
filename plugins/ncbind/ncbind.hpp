@@ -2523,6 +2523,14 @@ public:
             return item ? (new ncbPolicyDispatch(registeredName,item,entry,requiredArgs,canGet,canSet))->GetIMethod() : nullptr;
         return item;
     }
+    // GetName() returns the owning string type when registration names are
+    // supplied in a character width different from tjs_char. Preserve that
+    // conversion path before forwarding to the pointer-based constructor.
+    static iMethodT Wrap(const tTJSString& registeredName,iMethodT item,ncbInvocationKind entry,
+        int requiredArgs=0,bool canGet=true,bool canSet=true)
+    {
+        return Wrap(registeredName.c_str(),item,entry,requiredArgs,canGet,canSet);
+    }
 private:
     FlagsT GetFlags() const override { return flags; }
 };
