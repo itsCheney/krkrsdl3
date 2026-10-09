@@ -7,7 +7,7 @@
 // Native-only route decisions. Fixed dictionaries bound memory and output;
 // samples hold scalar identities, never textures, leases or script objects.
 namespace krkrsdl3::span_route {
-inline constexpr std::array<const char*,3> Methods{{"drawLine","drawPath","drawImageStretch"}};
+inline constexpr std::array<const char*,5> Methods{{"drawLine","drawPath","drawImageStretch","drawRectangle","clear"}};
 inline constexpr std::array<const char*,3> Routes{{"gpu","cpu","noop"}};
 inline constexpr std::array<const char*,25> Reasons{{
     "none","applied","arguments","appearanceType","pathType","imageType","numeric","paint","path",

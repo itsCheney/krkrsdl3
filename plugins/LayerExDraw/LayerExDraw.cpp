@@ -3237,7 +3237,7 @@ struct ncbInvocationPolicy<LayerExDraw>
         if(!value->spanCaptureStateSafe()) return "state";
         // NCBind accepts trailing arguments and converts only the signature
         // parameters. Keep the same minimum arity and leave extras untouched.
-        if(!strcmp(name,"drawLine")) {
+        if(!strcmp(name,"drawLine") || !strcmp(name,"drawRectangle")) {
             if(count<5) return "arguments";
             auto* appearance=DirectNative<Appearance>(params[0]);
             if(!appearance) return "appearanceType";
@@ -3301,7 +3301,7 @@ struct ncbInvocationPolicy<LayerExDraw>
         tjs_uint32 flag,tjs_uint32* hint,tTJSVariant* result,tjs_int count,tTJSVariant** params,iTJSDispatch2* object) {
 #if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
         const bool selected=kind==ncbInvocationKind::Method &&
-            (!strcmp(name,"drawLine") || !strcmp(name,"drawPath") || !strcmp(name,"drawImageStretch"));
+            (!strcmp(name,"drawLine") || !strcmp(name,"drawPath") || !strcmp(name,"drawImageStretch") || !strcmp(name,"drawRectangle"));
         if(selected && !PlainObject(object)) {
             krkrsdl3::cpu_consumer_trace::ConsumerScope consumer(name,
                 krkrsdl3::cpu_consumer_trace::Access::Write,"method",(uintptr_t)object);

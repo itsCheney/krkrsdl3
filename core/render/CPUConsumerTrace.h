@@ -256,7 +256,7 @@ inline bool EmitSpan(uint64_t epoch,const std::string& message) noexcept {
 inline void SpanWindowTaken(const span_route::Window& w,uint64_t epoch) noexcept {
     if(!CurrentEpoch(epoch)) return;
     try {
-        const auto base="\"version\":2,\"generation\":"+std::to_string(epoch)+",\"windowID\":"+std::to_string(w.id)+',';
+        const auto base="\"version\":3,\"generation\":"+std::to_string(epoch)+",\"windowID\":"+std::to_string(w.id)+',';
         size_t groups=0,samples=0;
         for(size_t i=0;i<w.groups.size();++i) if(w.groups[i].metrics.calls) {
             ++groups;
