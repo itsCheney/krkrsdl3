@@ -274,7 +274,7 @@ class LayerTexture final : public iTVPTexture2D {
             consumer.source=origin;consumer.bytes=Bytes();consumer.wallNS=wallNS;consumer.waitNS=waitNS;
             auto input=krkrsdl3::cpu_consumer_trace::ReadInput(consumer);
             krkrsdl3::layer_work::Record(false,textureID,Width,Height,Bytes(),wallNS,waitNS,false,origin,diagnosticEpoch,
-                false,consumer.epoch ? &input : nullptr);
+                false,&input);
             consumer.windowID=input.windowID;consumer.detailReserved=input.detail;consumer.callerReserved=input.caller;
             if(krkrsdl3::cpu_consumer_trace::ReportRead(consumer)) {
                 try {
@@ -1209,6 +1209,16 @@ bool TVPHasMetalLayerShrinkSupport() {
 bool TVPHasMetalLayerSpanCompositionSupport() {
     const auto& s=Manager().session;
     return s && s->backend && s->backend->SupportsLayerSpanComposition();
+}
+TVPLayerSpanCompositeResult TVPCheckMetalLayerCPUOverwrite(iTVPTexture2D* target) {
+    using Result=TVPLayerSpanCompositeResult;
+    auto& session=Manager().session;
+    if(!session || !session->backend) return Result::BackendFailure;
+    auto* texture=dynamic_cast<LayerTexture*>(target);
+    if(!texture || !texture->Belongs(session) || texture->GetFormat()!=TVPTextureFormat::RGBA)
+        return Result::Resource;
+    if(texture->HasCPUAccess()) return Result::CPUAccess;
+    return Result::Applied;
 }
 TVPLayerSpanCompositeResult TVPTryMetalLayerSpanComposite(
         const TVPLayerSpanCompositePacket& packet,iTVPTexture2D* target,bool* committed) {

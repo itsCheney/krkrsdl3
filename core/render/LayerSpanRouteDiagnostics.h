@@ -9,10 +9,11 @@
 namespace krkrsdl3::span_route {
 inline constexpr std::array<const char*,5> Methods{{"drawLine","drawPath","drawImageStretch","drawRectangle","clear"}};
 inline constexpr std::array<const char*,3> Routes{{"gpu","cpu","noop"}};
-inline constexpr std::array<const char*,25> Reasons{{
+inline constexpr std::array<const char*,28> Reasons{{
     "none","applied","arguments","appearanceType","pathType","imageType","numeric","paint","path",
     "source","borrowedSource","vectorSource","record","activeLease","targetAlias","state",
-    "backendUnavailable","target","resource","unsupported","geometry","budget","backend","sampling","nonNativeReceiver"}};
+    "backendUnavailable","target","resource","unsupported","geometry","budget","backend","sampling","nonNativeReceiver",
+    "fullOverwrite","partialOverwrite","resultObject"}};
 inline constexpr size_t ProtectedSamples=Methods.size()*Routes.size(), MaxSamples=32;
 inline constexpr size_t GroupCount=ProtectedSamples*Reasons.size();
 template<size_t N> inline size_t Find(const std::array<const char*,N>& names,const char* value) {

@@ -72,8 +72,8 @@ inline Read BeginRead(uint64_t epoch,uint64_t sessionID) {
 }
 // Both the raw and escaped UTF-8 bounds matter: control characters can expand
 // sixfold in JSON. Never cut a multibyte code point at a byte boundary.
-inline std::string BoundedUTF8(const char* input,size_t rawLimit,size_t escapedLimit) {
-    if(!input) return {};
+inline size_t BoundedUTF8Length(const char* input,size_t rawLimit,size_t escapedLimit) noexcept {
+    if(!input) return 0;
     size_t raw=0,escaped=0;
     while(input[raw]) {
         const auto lead=static_cast<unsigned char>(input[raw]);
@@ -92,14 +92,18 @@ inline std::string BoundedUTF8(const char* input,size_t rawLimit,size_t escapedL
         if(escaped+cost>escapedLimit) break;
         raw+=count;escaped+=cost;
     }
-    return std::string(input,raw);
+    return raw;
+}
+inline std::string BoundedUTF8(const char* input,size_t rawLimit,size_t escapedLimit) {
+    if(!input) return {};
+    return std::string(input,BoundedUTF8Length(input,rawLimit,escapedLimit));
 }
 inline std::string Label(const char* label) {
     return layer_work::JSONString(label ? label : "");
 }
-inline bool ValidLabel(const char* label) {
+inline bool ValidLabel(const char* label) noexcept {
     if(!label) return true;
-    return BoundedUTF8(label,48,48).size()==std::strlen(label);
+    return BoundedUTF8Length(label,48,48)==std::strlen(label);
 }
 inline bool CurrentEpoch(uint64_t epoch) {
     return epoch && Enabled() && epoch==layer_work::generation.load(std::memory_order_relaxed);
@@ -138,25 +142,25 @@ inline bool Emit(uint64_t epoch,const std::string& message) {
 }
 inline std::string IDs(const Read& read) {
     return "\"readID\":"+std::to_string(read.readID)+",\"traceID\":"+std::to_string(read.consumer.traceID)+
-        ",\"generation\":"+std::to_string(read.epoch)+",\"sessionID\":"+std::to_string(read.sessionID);
+        ",\"generation\":"+std::to_string(read.epoch)+",\"sessionID\":"+std::to_string(read.sessionID)+
+        (read.windowID ? ",\"windowID\":"+std::to_string(read.windowID) : "");
 }
-inline cpu_reads::Input ReadInput(const Read& r) {
-    return {r.consumer.method ? r.consumer.method : "unknown",r.consumer.nativeEntry ? r.consumer.nativeEntry : "unknown",
-        Name(r.consumer.access),r.source ? r.source : "unattributed",
+inline cpu_reads::Input ReadInput(const Read& r) noexcept {
+    return {r.consumer.method && *r.consumer.method ? r.consumer.method : "unknown",
+        r.consumer.nativeEntry && *r.consumer.nativeEntry ? r.consumer.nativeEntry : "unknown",
+        Name(r.consumer.access),r.source && *r.source ? r.source : "unattributed",
         ValidLabel(r.consumer.method) && ValidLabel(r.consumer.nativeEntry) && ValidLabel(r.source)};
 }
 inline bool ReportRead(const Read& r) noexcept {
     try {
         if(!CurrentEpoch(r.epoch)) return false;
-        const bool valid=ValidLabel(r.consumer.method) && ValidLabel(r.consumer.nativeEntry) &&
-            ValidLabel(r.source) && ValidLabel(Name(r.consumer.access));
+        const auto input=ReadInput(r);
         if(!r.windowID) {
             std::lock_guard<std::mutex> lock(layer_work::mutex);
             if(!CurrentEpoch(r.epoch)) return false;
             layer_work::profile.cpuConsumerBudget.readWindow.Record(
-                r.consumer.method ? r.consumer.method : "unknown",r.consumer.nativeEntry ? r.consumer.nativeEntry : "unknown",
-                Name(r.consumer.access),r.source ? r.source : "unattributed",
-                {1,r.bytes,r.wallNS,r.waitNS},valid);
+                input.method,input.entry,input.access,input.origin,
+                {1,r.bytes,r.wallNS,r.waitNS},input.valid);
         }
         bool caller=false;
         if(r.windowID) {
@@ -169,9 +173,9 @@ inline bool ReportRead(const Read& r) noexcept {
            !ValidLabel(r.source) || !ValidLabel(r.lastWriter)) {RejectOversize(r.epoch);return false;}
         std::string message="metal.cpuConsumer {\"phase\":\"read\","+IDs(r)+
             ",\"textureID\":"+std::to_string(r.textureID)+",\"contentVersion\":"+std::to_string(r.contentVersion)+
-            ",\"method\":"+Label(r.consumer.method)+",\"access\":"+Label(Name(r.consumer.access))+
-            ",\"nativeEntry\":"+Label(r.consumer.nativeEntry)+",\"owner\":"+std::to_string(r.consumer.owner)+
-            ",\"source\":"+Label(r.source)+",\"width\":"+std::to_string(r.width)+",\"height\":"+std::to_string(r.height)+
+            ",\"method\":"+Label(input.method)+",\"access\":"+Label(input.access)+
+            ",\"nativeEntry\":"+Label(input.entry)+",\"owner\":"+std::to_string(r.consumer.owner)+
+            ",\"source\":"+Label(input.origin)+",\"width\":"+std::to_string(r.width)+",\"height\":"+std::to_string(r.height)+
             ",\"lastWriter\":"+Label(r.lastWriter)+",\"lastWrite\":[";
         for(size_t i=0;i<4;++i) {if(i) message+=',';message+=std::to_string(r.lastWrite[i]);}
         message+="],\"lastSubmittedID\":null,\"renderFrame\":null,\"calls\":1,\"bytes\":"+std::to_string(r.bytes)+
@@ -182,6 +186,10 @@ inline bool ReportRead(const Read& r) noexcept {
 inline void ReportCaller(const Read& r,const char* stack) noexcept {
     try {
         if(!CurrentEpoch(r.epoch)) return;
+        if(r.windowID) {
+            std::lock_guard<std::mutex> lock(layer_work::mutex);
+            if(!CurrentEpoch(r.epoch) || r.windowID!=layer_work::profile.cpuConsumerBudget.spanWindow.id) return;
+        }
         const auto bounded=BoundedUTF8(stack,512,512);
         const bool available=!bounded.empty();
         Emit(r.epoch,"metal.cpuConsumer {\"phase\":\"caller\","+IDs(r)+

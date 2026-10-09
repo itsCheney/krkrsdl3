@@ -230,6 +230,8 @@ static tjs_error copyAlphaToProvince(tTJSVariant* result,
                                      tTJSVariant** param,
                                      iTJSDispatch2* lay)
 {
+    krkrsdl3::cpu_consumer_trace::ConsumerScope consumer("copyAlphaToProvince",
+        krkrsdl3::cpu_consumer_trace::Access::Read,"LayerExBTOA.copyAlphaToProvince",reinterpret_cast<uintptr_t>(lay));
     iTJSDispatch2* layerClass = getLayerClass();
 
     ReadRefT sbuf = 0;

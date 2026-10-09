@@ -1147,7 +1147,7 @@ GdipImage::~GdipImage()
 
 GdipImage* GdipImage::Clone()
 {
-    GdipImage* cloned = nullptr;
+    std::unique_ptr<GdipImage> cloned;
     if (type == 0)
     {
         if (_surface)
@@ -1155,28 +1155,36 @@ GdipImage* GdipImage::Clone()
             int w = plutovg_surface_get_width(_surface);
             int h = plutovg_surface_get_height(_surface);
             plutovg_surface_t* newSurf = plutovg_surface_create(w, h);
+            if(!newSurf) throw std::bad_alloc();
+            std::unique_ptr<plutovg_surface_t,void(*)(plutovg_surface_t*)> held(newSurf,plutovg_surface_destroy);
             // Copy pixel data
             unsigned char* src = plutovg_surface_get_data(_surface);
             unsigned char* dst = plutovg_surface_get_data(newSurf);
             int stride = plutovg_surface_get_stride(_surface);
             memcpy(dst, src, stride * h);
-            cloned = new GdipImage(newSurf);
-            plutovg_surface_destroy(newSurf); // GdipImage constructor references it
+            cloned.reset(new GdipImage(newSurf));
         }
     }
     else if (type == 1)
     {
-        cloned = new GdipImage(width, height);
+        cloned.reset(new GdipImage(width, height));
+        cloned->vectorGraph.reserve(vectorGraph.size());
         for (auto& info : vectorGraph)
         {
-            GdipImage::Info newInfo;
-            newInfo.app = info.app ? info.app->Clone() : nullptr;
-            newInfo.path = info.path ? plutovg_path_clone(info.path) : nullptr;
-            cloned->vectorGraph.push_back(newInfo);
+            std::unique_ptr<Appearance> app(info.app ? info.app->Clone() : nullptr);
+            std::unique_ptr<plutovg_path_t,void(*)(plutovg_path_t*)> path(
+#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
+                info.path ? plutovg_path_clone_checked(info.path) : nullptr,
+#else
+                info.path ? plutovg_path_clone(info.path) : nullptr,
+#endif
+                plutovg_path_destroy);
+            if(info.path && !path) throw std::bad_alloc();
+            cloned->vectorGraph.push_back({app.get(),path.get()});app.release();path.release();
         }
         cloned->transMtx = transMtx;
     }
-    return cloned;
+    return cloned.release();
 }
 
 RectF GdipImage::GetBounds()
@@ -1395,6 +1403,8 @@ class LayerExDraw::InvocationSpanCapture
     plutovg_canvas_t* capturedCanvas=nullptr;
     InvocationSpanCapture* previous;
     std::vector<GdipImage::Info> stagedRecord;
+    std::unique_ptr<GdipImage> replacementRecord;
+    bool fullUpdate=false;
     uint64_t recordBytes=0;
     plutovg_matrix_t recordTransform;
     struct State {
@@ -1504,11 +1514,52 @@ public:
         copy.release();copiedPath.release();recordBytes+=bytes;recordTransform=owner.transform;
     }
     void PublishRecord() noexcept {
+        if(replacementRecord) {delete owner.metaGraphics;owner.metaGraphics=replacementRecord.release();}
         if(stagedRecord.empty()) return;
         for(auto& info:stagedRecord) {
             owner.metaGraphics->vectorGraph.push_back(info);info={nullptr,nullptr};
         }
         owner.metaGraphics->transMtx=recordTransform;stagedRecord.clear();
+    }
+    void StageClear(tjs_uint32 argb) {
+        fullUpdate=true;
+        if(owner.metaGraphics) {
+            replacementRecord.reset(new GdipImage(owner._width,owner._height));
+            replacementRecord->bgColor=argb;recordBytes=sizeof(GdipImage);
+        }
+    }
+    bool FullOverwrite() const {
+        const auto& p=sink.packet;
+        if(p.destination.left || p.destination.top || p.destination.right!=owner.width || p.destination.bottom!=owner.height)
+            return false;
+        for(int y=0;y<owner.height;++y) {
+            int64_t x=0;
+            for(uint32_t i=p.rowOffsets[size_t(y)];i<p.rowOffsets[size_t(y)+1];++i) {
+                const auto& s=p.spans[p.rowEntries[i]];
+                if(s.kind!=uint32_t(TVPLayerSpanKind::SolidSource) || s.coverage!=255 || s.x!=x) return false;
+                x+=s.length;
+            }
+            if(x!=owner.width) return false;
+        }
+        return true;
+    }
+    bool CommitCPUOverwrite(iTVPTexture2D* target) {
+        // All validation/allocation precedes the first output write. Once the
+        // lease succeeds, this fill cannot fail; commit/update errors propagate.
+        if(target->GetPitch()!=owner.width*4 || target->GetWidth()!=owner.width || target->GetHeight()!=owner.height)
+            return false;
+        tTVPScopedTexturePixels pixels;
+        try {pixels.Acquire(target,true,"layerExDraw.write",true);}
+        catch(...) {return false;}
+        krkrsdl3::cpu_consumer_trace::ReportSpanRoute("clear","cpu","fullOverwrite",target,
+            sink.packet.spans.size(),0,0,0);
+        for(const auto& s:sink.packet.spans) {
+            auto* row=reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(pixels.Data())+size_t(s.y)*pixels.Pitch());
+            std::fill_n(row+s.x,s.length,s.solid);
+        }
+        pixels.Written(tTVPRect(0,0,owner.width,owner.height));
+        Commit(target);
+        return true;
     }
     TVPLayerSpanCompositeResult Prepare() {
         if(!installed) return TVPLayerSpanCompositeResult::Resource;
@@ -1556,7 +1607,8 @@ public:
         owner.canvasHasTextureID=target->GetContentKey(owner.canvasTextureID,version);
         if(!owner.canvasHasTextureID) { owner.canvasTexture=target;target->AddCPUAccessRef(); }
         owner._this->SetImageModified(true);
-        if(hasUpdate) owner.updateRect(update);
+        if(fullUpdate) owner._this->Update();
+        else if(hasUpdate) owner.updateRect(update);
     }
 };
 void LayerExDraw::deferCapturedUpdate(const RectF& rect) {
@@ -1564,6 +1616,9 @@ void LayerExDraw::deferCapturedUpdate(const RectF& rect) {
 }
 void LayerExDraw::stageCapturedRecord(const Appearance* app,const plutovg_path_t* path) {
     invocationCapture->StageRecord(app,path);
+}
+void LayerExDraw::stageCapturedClear(tjs_uint32 argb) {
+    invocationCapture->StageClear(argb);
 }
 bool LayerExDraw::spanCaptureStateSafe() const {
     // Escaped GdipImage(surface) objects retain the live CPU allocation. Keep
@@ -1751,6 +1806,9 @@ void LayerExDraw::clear(tjs_uint32 argb)
     plutovg_canvas_fill_rect(canvas, 0, 0, (float)width, (float)height);
     plutovg_canvas_restore(canvas);
 
+#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
+    if(invocationCapture) {stageCapturedClear(argb);return;}
+#endif
     if (metaGraphics)
     {
         createRecord();
@@ -1850,10 +1908,17 @@ RectF LayerExDraw::_drawPath(const Appearance* app, const plutovg_path_t* path)
             else
 #endif
             {
-            GdipImage::Info info;
-            info.app = app->Clone();
-            info.path = plutovg_path_clone(path);
-            metaGraphics->vectorGraph.push_back(info);
+            std::unique_ptr<Appearance> copiedApp(app->Clone());
+            std::unique_ptr<plutovg_path_t,void(*)(plutovg_path_t*)> copiedPath(
+#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
+                plutovg_path_clone_checked(path),
+#else
+                plutovg_path_clone(path),
+#endif
+                plutovg_path_destroy);
+            if(!copiedPath) throw std::bad_alloc();
+            metaGraphics->vectorGraph.push_back({copiedApp.get(),copiedPath.get()});
+            copiedApp.release();copiedPath.release();
             metaGraphics->transMtx = transform;
             }
         }
@@ -3237,7 +3302,12 @@ struct ncbInvocationPolicy<LayerExDraw>
         if(!value->spanCaptureStateSafe()) return "state";
         // NCBind accepts trailing arguments and converts only the signature
         // parameters. Keep the same minimum arity and leave extras untouched.
-        if(!strcmp(name,"drawLine") || !strcmp(name,"drawRectangle")) {
+        if(!strcmp(name,"clear")) {
+            if(count<1) return "arguments";
+            if(params[0]->Type()!=tvtInteger &&
+                (params[0]->Type()!=tvtReal || !std::isfinite(params[0]->AsReal()) || std::abs(params[0]->AsReal())>4294967295.0))
+                return "numeric";
+        } else if(!strcmp(name,"drawLine") || !strcmp(name,"drawRectangle")) {
             if(count<5) return "arguments";
             auto* appearance=DirectNative<Appearance>(params[0]);
             if(!appearance) return "appearanceType";
@@ -3301,7 +3371,7 @@ struct ncbInvocationPolicy<LayerExDraw>
         tjs_uint32 flag,tjs_uint32* hint,tTJSVariant* result,tjs_int count,tTJSVariant** params,iTJSDispatch2* object) {
 #if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
         const bool selected=kind==ncbInvocationKind::Method &&
-            (!strcmp(name,"drawLine") || !strcmp(name,"drawPath") || !strcmp(name,"drawImageStretch") || !strcmp(name,"drawRectangle"));
+            (!strcmp(name,"drawLine") || !strcmp(name,"drawPath") || !strcmp(name,"drawImageStretch") || !strcmp(name,"drawRectangle") || !strcmp(name,"clear"));
         if(selected && !PlainObject(object)) {
             krkrsdl3::cpu_consumer_trace::ConsumerScope consumer(name,
                 krkrsdl3::cpu_consumer_trace::Access::Write,"method",(uintptr_t)object);
@@ -3312,6 +3382,9 @@ struct ncbInvocationPolicy<LayerExDraw>
                 krkrsdl3::cpu_consumer_trace::Access::Write,"method",(uintptr_t)object);
             LayerExDraw* value=Scope::Instance(object);
             const char* reason=Preflight(name,count,params,value);
+            // Releasing an existing object result can run script finalizers.
+            // Keep their historical lease/conversion order on the legacy route.
+            if(!reason && !strcmp(name,"clear") && result && result->Type()==tvtObject) reason="resultObject";
             if(!reason && !TVPHasMetalLayerSpanCompositionSupport()) reason="backendUnavailable";
             if(!reason) {
                 // COW happens through the native renderer, before capture and
@@ -3330,8 +3403,10 @@ struct ncbInvocationPolicy<LayerExDraw>
                         // Typed completion captures RectF before any boxing.
                         // Result constructors run exactly once after commit,
                         // or once inside the sole legacy CPU replay.
-                        if(capture.installed) hr=dispatch->FuncCall(flag,nullptr,hint,
-                            nullptr,count,params,object);
+                        if(capture.installed) {
+                            if(!strcmp(name,"clear") && result) result->Clear();
+                            hr=dispatch->FuncCall(flag,nullptr,hint,nullptr,count,params,object);
+                        }
                     } catch(...) { capture.sink.failed=true; }
                     auto status=TVPLayerSpanCompositeResult::Resource;
                     if(TJS_SUCCEEDED(hr)) {
@@ -3339,11 +3414,26 @@ struct ncbInvocationPolicy<LayerExDraw>
                         catch(const std::bad_alloc&) {status=TVPLayerSpanCompositeResult::ParameterBudget;}
                         catch(const std::length_error&) {status=TVPLayerSpanCompositeResult::ParameterBudget;}
                     }
-                    if(status==TVPLayerSpanCompositeResult::Applied && !capture.sink.packet.spans.empty()) {
+                    if(status==TVPLayerSpanCompositeResult::Applied && !strcmp(name,"clear")) {
+                        if(!capture.FullOverwrite()) {status=TVPLayerSpanCompositeResult::Geometry;reason="partialOverwrite";}
+                        else {
+                            status=TVPCheckMetalLayerCPUOverwrite(target);
+                            if(status==TVPLayerSpanCompositeResult::Applied) {
+                                if(capture.CommitCPUOverwrite(target)) return hr;
+                                status=TVPLayerSpanCompositeResult::Resource;
+                            }
+                        }
+                    } else if(status==TVPLayerSpanCompositeResult::Applied && !capture.sink.packet.spans.empty()) {
                         bool committed=false;
                         try {status=TVPTryMetalLayerSpanComposite(capture.sink.packet,target,&committed);}
                         catch(...) {
-                            if(committed) {capture.PublishRecord();value->_this->SetImageModified(true);throw;}
+                            if(committed) {
+                                const auto& p=capture.sink.packet;
+                                krkrsdl3::cpu_consumer_trace::ReportSpanRoute(name,"gpu","none",target,p.spans.size(),p.sourcePixels.size()*4,
+                                    TVPLayerSpanCompositeGeometry::ParameterBytes(p),TVPLayerSpanCompositeGeometry::ScratchRowBytes(p)*
+                                    uint64_t(p.destination.bottom-p.destination.top)*2);
+                                capture.PublishRecord();value->_this->SetImageModified(true);throw;
+                            }
                             status=TVPLayerSpanCompositeResult::BackendFailure;
                         }
                     }
@@ -3361,7 +3451,7 @@ struct ncbInvocationPolicy<LayerExDraw>
                         }
                         return hr;
                     }
-                    reason=capture.SamplingFailed()?"sampling":Rejection(status);
+                    if(!reason) reason=capture.SamplingFailed()?"sampling":Rejection(status);
                 }
             }
             krkrsdl3::cpu_consumer_trace::ReportSpanRoute(name,"cpu",reason,nullptr,0,0,0,0);

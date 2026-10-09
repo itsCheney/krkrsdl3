@@ -6,7 +6,7 @@ namespace krkrsdl3::cpu_reads {
 inline constexpr size_t Capacity=64;
 inline constexpr std::array<const char*,8> ProtectedMethods{{
     "drawImageStretch","drawPath","drawLine","drawRectangle","clear",
-    "alphaToProvince","Layer.saveLayerImage","getRecordImage"}};
+    "copyAlphaToProvince","Layer.saveLayerImage","getRecordImage"}};
 struct Metrics {uint64_t calls=0,bytes=0,wallNS=0,waitNS=0;};
 struct Input {
     const char* method;const char* entry;const char* access;const char* origin;
@@ -38,7 +38,8 @@ struct Window {
     void Record(const char* m,const char* e,const char* a,const char* o,const Metrics& value,bool labelsValid) {
         if(!Accumulate(totals,value)) overflow=true;
         if(!labelsValid) {
-            if(!Accumulate(oversizeOverflow,value) || !span_route::Add(oversizeRecords,1)) overflow=true;
+            if(!Accumulate(oversizeOverflow,value)) overflow=true;
+            if(!span_route::Add(oversizeRecords,1)) overflow=true;
             return;
         }
         size_t slot=Capacity;
@@ -51,7 +52,8 @@ struct Window {
                 if(!groups[i].used) {slot=i;break;}
         }
         if(slot==Capacity) {
-            if(!Accumulate(capacityOverflow,value) || !span_route::Add(capacityRecords,1)) overflow=true;
+            if(!Accumulate(capacityOverflow,value)) overflow=true;
+            if(!span_route::Add(capacityRecords,1)) overflow=true;
             return;
         }
         auto& g=groups[slot];

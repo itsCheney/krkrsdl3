@@ -27,6 +27,8 @@ enum class TVPLayerSpanCompositeResult : uint32_t {
 };
 class iTVPTexture2D;
 bool TVPHasMetalLayerSpanCompositionSupport();
+// Read-only eligibility check; does not acquire pixels or touch a GPU handle.
+TVPLayerSpanCompositeResult TVPCheckMetalLayerCPUOverwrite(iTVPTexture2D* target);
 // False/rejected work never changes destination pixels. Post-commit exceptions
 // propagate after invalidating texture caches, so callers must not replay them.
 TVPLayerSpanCompositeResult TVPTryMetalLayerSpanComposite(
