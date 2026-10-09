@@ -857,6 +857,7 @@ protected:
     bool updateWhenDraw;
     void updateRect(RectF& rect);
     void deferCapturedUpdate(const RectF& rect);
+    void stageCapturedRecord(const Appearance* app,const plutovg_path_t* path);
 
 public:
     void setUpdateWhenDraw(int updateWhenDraw) { this->updateWhenDraw = updateWhenDraw != 0; }

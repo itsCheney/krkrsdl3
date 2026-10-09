@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <memory>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -116,7 +117,7 @@ struct SoftBrush
 
     SoftBrush* Clone() const
     {
-        SoftBrush* b = new SoftBrush();
+        std::unique_ptr<SoftBrush> b(new SoftBrush());
         b->type = type;
         b->solidColor = solidColor;
         if (texSurface)
@@ -131,7 +132,7 @@ struct SoftBrush
         {
             b->gradient = new GradientData(*gradient);
         }
-        return b;
+        return b.release();
     }
 
     // Apply this brush as the current paint on a canvas
@@ -259,11 +260,14 @@ struct SoftPen
 
     SoftPen* Clone() const
     {
-        SoftPen* p;
+        std::unique_ptr<SoftPen> p;
         if (brush)
-            p = new SoftPen(brush->Clone(), strokeWidth);
+        {
+            std::unique_ptr<SoftBrush> cloned(brush->Clone());
+            p.reset(new SoftPen(cloned.get(), strokeWidth));cloned.release();
+        }
         else
-            p = new SoftPen(color, strokeWidth);
+            p.reset(new SoftPen(color, strokeWidth));
         p->lineCap = lineCap;
         p->lineJoin = lineJoin;
         p->miterLimit = miterLimit;
@@ -272,10 +276,24 @@ struct SoftPen
         p->startCapType = startCapType;
         p->endCapType = endCapType;
         if (startCapPath)
+        {
+#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
+            p->startCapPath = plutovg_path_clone_checked(startCapPath);
+#else
             p->startCapPath = plutovg_path_clone(startCapPath);
+#endif
+            if(!p->startCapPath) throw std::bad_alloc();
+        }
         if (endCapPath)
+        {
+#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
+            p->endCapPath = plutovg_path_clone_checked(endCapPath);
+#else
             p->endCapPath = plutovg_path_clone(endCapPath);
-        return p;
+#endif
+            if(!p->endCapPath) throw std::bad_alloc();
+        }
+        return p.release();
     }
 
     // Apply stroke style to canvas

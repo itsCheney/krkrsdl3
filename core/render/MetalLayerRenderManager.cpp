@@ -1211,7 +1211,8 @@ bool TVPHasMetalLayerSpanCompositionSupport() {
     return s && s->backend && s->backend->SupportsLayerSpanComposition();
 }
 TVPLayerSpanCompositeResult TVPTryMetalLayerSpanComposite(
-        const TVPLayerSpanCompositePacket& packet,iTVPTexture2D* target) {
+        const TVPLayerSpanCompositePacket& packet,iTVPTexture2D* target,bool* committed) {
+    if(committed) *committed=false;
     using Result=TVPLayerSpanCompositeResult;
     auto& session=Manager().session;
     if(!session || !session->backend || !session->backend->SupportsLayerSpanComposition()) return Result::BackendFailure;
@@ -1232,11 +1233,14 @@ TVPLayerSpanCompositeResult TVPTryMetalLayerSpanComposite(
     bool applied=false;
     try {applied=session->backend->OperateLayerSpanComposite(packet,handle);}
     catch(...) {
-        if(session->backend->LastLayerSpanCompositeResult()==Result::Applied)
+        if(session->backend->LastLayerSpanCompositeResult()==Result::Applied) {
+            if(committed) *committed=true;
             t->CommitGPURegionWrite(written);
+        }
         throw;
     }
     if(!applied) return session->backend->LastLayerSpanCompositeResult();
+    if(committed) *committed=true;
     t->CommitGPURegionWrite(written);
     ++session->stats.gpuOperations;
     return Result::Applied;

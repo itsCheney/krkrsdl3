@@ -30,4 +30,4 @@ bool TVPHasMetalLayerSpanCompositionSupport();
 // False/rejected work never changes destination pixels. Post-commit exceptions
 // propagate after invalidating texture caches, so callers must not replay them.
 TVPLayerSpanCompositeResult TVPTryMetalLayerSpanComposite(
-    const TVPLayerSpanCompositePacket&,iTVPTexture2D* target);
+    const TVPLayerSpanCompositePacket&,iTVPTexture2D* target,bool* committed=nullptr);

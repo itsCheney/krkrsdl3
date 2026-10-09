@@ -326,13 +326,13 @@ Appearance::~Appearance()
 
 Appearance* Appearance::Clone() const
 {
-    Appearance* newItm = new Appearance();
+    std::unique_ptr<Appearance> newItm(new Appearance());
+    newItm->drawInfos.reserve(drawInfos.size());
     for (const auto& itm : drawInfos)
     {
-        DrawInfo newdraw(itm);
-        newItm->drawInfos.push_back(newdraw);
+        newItm->drawInfos.emplace_back(itm);
     }
-    return newItm;
+    return newItm.release();
 }
 
 void Appearance::clear()
@@ -1394,6 +1394,9 @@ class LayerExDraw::InvocationSpanCapture
     plutovg_surface_t* capturedSurface=nullptr;
     plutovg_canvas_t* capturedCanvas=nullptr;
     InvocationSpanCapture* previous;
+    std::vector<GdipImage::Info> stagedRecord;
+    uint64_t recordBytes=0;
+    plutovg_matrix_t recordTransform;
     struct State {
         GeometryT width,height,clipLeft,clipTop,clipWidth,clipHeight;
         BufferT buffer; PitchT pitch;
@@ -1455,12 +1458,58 @@ public:
         owner.invocationCapture=this;current=this;installed=true;
     }
     ~InvocationSpanCapture() {
+        for(auto& info:stagedRecord) {delete info.app;if(info.path) plutovg_path_destroy(info.path);}
         if(installed) Restore();
         if(capturedCanvas) plutovg_canvas_destroy(capturedCanvas);
         if(capturedSurface) plutovg_surface_destroy(capturedSurface);
     }
     bool Failed() const { return !installed || sink.failed || plutovg_canvas_span_capture_failed(capturedCanvas); }
     bool SamplingFailed() const { return installed && !sink.failed && plutovg_canvas_span_capture_failed(capturedCanvas); }
+    static uint64_t CloneBytes(const Appearance* app,const plutovg_path_t* path) {
+        constexpr uint64_t limit=TVPLayerSpanCompositeGeometry::ParameterBudget;
+        uint64_t bytes=sizeof(Appearance)+sizeof(GdipImage::Info);
+        const auto add=[&](uint64_t count,uint64_t size) {
+            if(count>(limit-bytes)/size) throw std::length_error("record budget");
+            bytes+=count*size;
+        };
+        const auto pathBytes=[&](const plutovg_path_t* p) {
+            if(!p) return;
+            const plutovg_path_element_t* elements=nullptr;
+            const int n=plutovg_path_get_elements(p,&elements);
+            if(n<0) throw std::length_error("record path");
+            add(uint64_t(n),sizeof(plutovg_path_element_t));add(1,256);
+        };
+        pathBytes(path);add(app->drawInfos.size(),sizeof(Appearance::DrawInfo));
+        const auto brushBytes=[&](const SoftBrush* b) {
+            if(!b) return;
+            add(1,sizeof(SoftBrush));
+            if(b->gradient) {add(1,sizeof(SoftBrush::GradientData));add(b->gradient->stops.size(),sizeof(plutovg_gradient_stop_t));}
+        };
+        for(const auto& d:app->drawInfos) if(d.info) {
+            if(d.type==0) {const auto* p=static_cast<const SoftPen*>(d.info);
+                add(1,sizeof(SoftPen));add(p->dashArray.size(),sizeof(float));
+                brushBytes(p->brush);pathBytes(p->startCapPath);pathBytes(p->endCapPath);
+            } else brushBytes(static_cast<const SoftBrush*>(d.info));
+        }
+        return bytes;
+    }
+    void StageRecord(const Appearance* app,const plutovg_path_t* path) {
+        uint64_t bytes=0;
+        try {bytes=CloneBytes(app,path);} catch(const std::length_error&) {sink.failed=true;return;}
+        if(bytes>TVPLayerSpanCompositeGeometry::ParameterBudget-recordBytes) {sink.failed=true;return;}
+        std::unique_ptr<Appearance> copy(app->Clone());
+        std::unique_ptr<plutovg_path_t,void(*)(plutovg_path_t*)> copiedPath(plutovg_path_clone_checked(path),plutovg_path_destroy);
+        if(!copy || !copiedPath) throw std::bad_alloc();
+        stagedRecord.push_back({copy.get(),copiedPath.get()});
+        copy.release();copiedPath.release();recordBytes+=bytes;recordTransform=owner.transform;
+    }
+    void PublishRecord() noexcept {
+        if(stagedRecord.empty()) return;
+        for(auto& info:stagedRecord) {
+            owner.metaGraphics->vectorGraph.push_back(info);info={nullptr,nullptr};
+        }
+        owner.metaGraphics->transMtx=recordTransform;stagedRecord.clear();
+    }
     TVPLayerSpanCompositeResult Prepare() {
         if(!installed) return TVPLayerSpanCompositeResult::Resource;
         if(sink.failed) return TVPLayerSpanCompositeResult::ParameterBudget;
@@ -1476,9 +1525,26 @@ public:
                 p.destination.bottom=std::max(p.destination.bottom,s.y+1);
             }
         }
-        return TVPLayerSpanCompositeGeometry::PrepareRows(p,owner.width,owner.height);
+        const auto status=TVPLayerSpanCompositeGeometry::PrepareRows(p,owner.width,owner.height);
+        if(status!=TVPLayerSpanCompositeResult::Applied) return status;
+        const auto gpuBytes=TVPLayerSpanCompositeGeometry::ParameterBytes(p)+
+            TVPLayerSpanCompositeGeometry::ScratchRowBytes(p)*uint64_t(p.destination.bottom-p.destination.top)*2;
+        const auto vectorBytes=uint64_t(stagedRecord.capacity())*sizeof(GdipImage::Info);
+        if(vectorBytes>TVPLayerSpanCompositeGeometry::ParameterBudget-gpuBytes) return TVPLayerSpanCompositeResult::ParameterBudget;
+        const auto available=TVPLayerSpanCompositeGeometry::ParameterBudget-gpuBytes-vectorBytes;
+        if(recordBytes>available) return TVPLayerSpanCompositeResult::ParameterBudget;
+        if(!stagedRecord.empty()) {
+            auto& graph=owner.metaGraphics->vectorGraph;
+            if(stagedRecord.size()>graph.max_size()-graph.size()) return TVPLayerSpanCompositeResult::ParameterBudget;
+            const auto size=graph.size()+stagedRecord.size();
+            if(size>graph.capacity() && size>(available-recordBytes)/sizeof(GdipImage::Info))
+                return TVPLayerSpanCompositeResult::ParameterBudget;
+            graph.reserve(size);
+        }
+        return status;
     }
     void Commit(iTVPTexture2D* target) {
+        PublishRecord();
         const GeometryT left=owner.clipLeft,top=owner.clipTop,cw=owner.clipWidth,ch=owner.clipHeight;
         Restore();owner.destroyCanvas();owner.refreshMetadata();
         owner.surface=capturedSurface;owner.canvas=capturedCanvas;
@@ -1495,6 +1561,9 @@ public:
 };
 void LayerExDraw::deferCapturedUpdate(const RectF& rect) {
     invocationCapture->update=rect;invocationCapture->hasUpdate=true;
+}
+void LayerExDraw::stageCapturedRecord(const Appearance* app,const plutovg_path_t* path) {
+    invocationCapture->StageRecord(app,path);
 }
 bool LayerExDraw::spanCaptureStateSafe() const {
     // Escaped GdipImage(surface) objects retain the live CPU allocation. Keep
@@ -1776,11 +1845,17 @@ RectF LayerExDraw::_drawPath(const Appearance* app, const plutovg_path_t* path)
 
         if (metaGraphics)
         {
+#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
+            if(invocationCapture) stageCapturedRecord(app,path);
+            else
+#endif
+            {
             GdipImage::Info info;
             info.app = app->Clone();
             info.path = plutovg_path_clone(path);
             metaGraphics->vectorGraph.push_back(info);
             metaGraphics->transMtx = transform;
+            }
         }
 
         plutovg_matrix_t drawMatrix;
@@ -3054,7 +3129,7 @@ struct ncbInvocationPolicy<LayerExDraw>
                 "scaleViewTransform","translateViewTransform","setTransform","resetTransform",
                 "rotateTransform","scaleTransform","translateTransform"};
             for(const char* transform:transforms)
-                if(!strcmp(name,transform)) return !value->getRecord();
+                if(!strcmp(name,transform)) return !value->getRecord() || !strstr(transform,"ViewTransform");
             return false;
         }
         static const char* Entry(ncbInvocationKind kind)
@@ -3157,7 +3232,6 @@ struct ncbInvocationPolicy<LayerExDraw>
         return true;
     }
     static const char* Preflight(const char* name,tjs_int count,tTJSVariant** params,LayerExDraw* value) {
-        if(value->getRecord()) return "record";
         if(value->invocationCapture || value->currentPixelAccess().Data()) return "activeLease";
         if(value->spanCaptureTargetAliased()) return "targetAlias";
         if(!value->spanCaptureStateSafe()) return "state";
@@ -3259,9 +3333,20 @@ struct ncbInvocationPolicy<LayerExDraw>
                         if(capture.installed) hr=dispatch->FuncCall(flag,nullptr,hint,
                             nullptr,count,params,object);
                     } catch(...) { capture.sink.failed=true; }
-                    auto status=TJS_SUCCEEDED(hr) ? capture.Prepare() : TVPLayerSpanCompositeResult::Resource;
-                    if(status==TVPLayerSpanCompositeResult::Applied && !capture.sink.packet.spans.empty())
-                        status=TVPTryMetalLayerSpanComposite(capture.sink.packet,target);
+                    auto status=TVPLayerSpanCompositeResult::Resource;
+                    if(TJS_SUCCEEDED(hr)) {
+                        try {status=capture.Prepare();}
+                        catch(const std::bad_alloc&) {status=TVPLayerSpanCompositeResult::ParameterBudget;}
+                        catch(const std::length_error&) {status=TVPLayerSpanCompositeResult::ParameterBudget;}
+                    }
+                    if(status==TVPLayerSpanCompositeResult::Applied && !capture.sink.packet.spans.empty()) {
+                        bool committed=false;
+                        try {status=TVPTryMetalLayerSpanComposite(capture.sink.packet,target,&committed);}
+                        catch(...) {
+                            if(committed) {capture.PublishRecord();value->_this->SetImageModified(true);throw;}
+                            status=TVPLayerSpanCompositeResult::BackendFailure;
+                        }
+                    }
                     if(status==TVPLayerSpanCompositeResult::Applied) {
                         const auto& p=capture.sink.packet;
                         krkrsdl3::cpu_consumer_trace::ReportSpanRoute(name,p.spans.empty()?"noop":"gpu","none",target,
