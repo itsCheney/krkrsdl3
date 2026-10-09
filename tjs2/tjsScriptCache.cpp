@@ -15,6 +15,7 @@
 #include "tjsScriptCache.h"
 #include "tjsScriptBlock.h"
 #include "tjsByteCodeLoader.h"
+#include "tjsKnownByteCodeCompatibility.h"
 
 #define TJS_SCRIPT_CACHE_MAX 64
 
@@ -235,6 +236,11 @@ void tTJSScriptCache::LoadByteCode(const tjs_uint8* buff,
     tTJSScriptBlock* blk = NULL;
     try
     {
+        std::vector<uint8_t> compatibilityCopy;
+        if(known_bytecode::TryApplyKnownCompatibility(name,buff,len,compatibilityCopy)) {
+            buff=compatibilityCopy.data();
+            try {Owner->OutputToConsole(TJS_N("compat.bytecode hsvcpick optionalDirectButton applied"));} catch(...) {}
+        }
         blk = loader->ReadByteCode(Owner, name, buff, len);
         if (blk != NULL)
         {

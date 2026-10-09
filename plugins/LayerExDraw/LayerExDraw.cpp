@@ -3159,14 +3159,16 @@ struct ncbInvocationPolicy<LayerExDraw>
         if(value->invocationCapture || value->currentPixelAccess().Data()) return "activeLease";
         if(value->spanCaptureTargetAliased()) return "targetAlias";
         if(!value->spanCaptureStateSafe()) return "state";
+        // NCBind accepts trailing arguments and converts only the signature
+        // parameters. Keep the same minimum arity and leave extras untouched.
         if(!strcmp(name,"drawLine")) {
-            if(count!=5) return "arguments";
+            if(count<5) return "arguments";
             auto* appearance=DirectNative<Appearance>(params[0]);
             if(!appearance) return "appearanceType";
             if(!Paints(appearance)) return "paint";
             for(int i=1;i<5;++i) if(!Numeric(params[i])) return "numeric";
         } else if(!strcmp(name,"drawPath")) {
-            if(count!=2) return "arguments";
+            if(count<2) return "arguments";
             auto* path=DirectNative<Path>(params[1]);
             auto* appearance=DirectNative<Appearance>(params[0]);
             if(!appearance) return "appearanceType";
@@ -3174,7 +3176,7 @@ struct ncbInvocationPolicy<LayerExDraw>
             if(!path) return "pathType";
             if(!PathData(path->spanCapturePath())) return "path";
         } else {
-            if(count!=9) return "arguments";
+            if(count<9) return "arguments";
             auto* src=ImageNative(params[4]);
             if(!src) return "imageType";
             if(src->type!=0) return "vectorSource";
