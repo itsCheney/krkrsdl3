@@ -101,6 +101,10 @@ public:
     void* CreateLayerTexture(int, int, TVPLayerTextureFormat) override;
     void DestroyLayerTexture(void*) override;
     bool UpdateLayerTexture(void*, const uint8_t*, int, const TVPLayerRect&) override;
+    bool OperateLayerGlyph(const TVPLayerOperation&,void*,const TVPLayerRect&,
+        const uint8_t*,int,int,int,int,TVPLayerGlyphUploadInfo&) override;
+    void ResetLayerGlyphResources() override;
+    void RecordLayerGlyphRejection(layer_upload::GlyphReject) override;
     bool CopyTargetToLayerTexture(void*, void*) override;
     bool CopyTargetToLayerTextureRegion(void*, void*, const TVPLayerRect&) override;
     bool ReadLayerTexture(void*, std::vector<uint8_t>&, int&) override;

@@ -565,6 +565,27 @@ struct MetalRenderBackend::Impl
     // fails these stay here and attach to the next submission instead, so they
     // are never handed out while an open command buffer still references them.
     std::vector<id<MTLBuffer>> stagingPending;
+    id<MTLBlitCommandEncoder> uploadEncoder=nil;
+    id<MTLBuffer> uploadArena=nil;
+    layer_upload::ArenaLayout uploadLayout;
+    size_t uploadArenaBytes=0;
+    struct GlyphPage {
+        void* handle=nullptr;
+        id<MTLCommandBuffer> owner=nil;
+        uint64_t serial=0,textureID=0;
+        bool sealed=false;
+        unsigned reservations=0;
+        size_t bytes=0;
+        layer_upload::AtlasLayout layout;
+    };
+    std::vector<GlyphPage> glyphPages;
+    struct RetiredGlyphPage { id<MTLCommandBuffer> owner=nil;size_t bytes=0; };
+    std::vector<RetiredGlyphPage> retiredGlyphPages;
+    size_t glyphAtlasBytes=0;
+    layer_upload::Counters uploadCounters;
+    uint64_t nextUploadReportNS=0;
+    uint64_t uploadEpoch=point_trace::NextTextureID();
+    bool* glyphWriteMarker=nullptr;
     static constexpr size_t kStagingPoolBytes = 64 * 1024 * 1024;
     size_t stagingPoolBytes = 0;
 
@@ -608,7 +629,7 @@ struct MetalRenderBackend::Impl
             it = stagingInFlight.erase(it);
         }
     }
-    id<MTLBuffer> AcquireStaging(size_t length)
+    id<MTLBuffer> AcquireStaging(size_t length,size_t maximumLength=std::numeric_limits<size_t>::max())
     {
         if (!length) return nil;
         DrainStaging();
@@ -616,7 +637,7 @@ struct MetalRenderBackend::Impl
         // cannot starve the common small-upload path.
         size_t best = stagingPool.size();
         for (size_t i = 0; i < stagingPool.size(); ++i)
-            if (stagingPool[i].length >= length &&
+            if (stagingPool[i].length >= length && stagingPool[i].length <= maximumLength &&
                 (best == stagingPool.size() || stagingPool[i].length < stagingPool[best].length))
                 best = i;
         id<MTLBuffer> buffer = nil;
@@ -631,11 +652,126 @@ struct MetalRenderBackend::Impl
         stagingPending.push_back(buffer);
         return buffer;
     }
+    struct UploadSlice { id<MTLBuffer> buffer=nil; size_t offset=0; };
+    UploadSlice AcquireUpload(size_t length) {
+        // Commands must exist before choosing a command-owned arena. A preceding
+        // budget Submit resets the active slice without recycling in-flight bytes.
+        Commands();
+        size_t offset=0;
+        if(uploadArena && uploadLayout.Allocate(length,offset)) return {uploadArena,offset};
+        if(uploadArenaBytes<=layer_upload::ArenaBudget-layer_upload::ArenaBytes) {
+            auto buffer=AcquireStaging(layer_upload::ArenaBytes,layer_upload::ArenaBytes);
+            if(buffer) {
+                uploadArena=buffer;uploadLayout={};uploadArenaBytes+=layer_upload::ArenaBytes;
+                ++uploadCounters.arenaPages;
+                if(uploadLayout.Allocate(length,offset)) return {buffer,offset};
+            }
+        }
+        ++uploadCounters.arenaFallbacks;
+        return {AcquireStaging(length,layer_upload::TinyBytes),0};
+    }
+    void EndUpload(const char* reason) {
+        if(!uploadEncoder) return;
+        [uploadEncoder endEncoding];uploadEncoder=nil;
+        if(!std::strcmp(reason,"render")) ++uploadCounters.flushRender;
+        else if(!std::strcmp(reason,"compute")) ++uploadCounters.flushCompute;
+        else if(!std::strcmp(reason,"submit")) ++uploadCounters.flushSubmit;
+        else if(!std::strcmp(reason,"destroy")) ++uploadCounters.flushDestroy;
+        else ++uploadCounters.flushBlit;
+    }
+    id<MTLBlitCommandEncoder> UploadBlit() {
+        if(uploadEncoder) return uploadEncoder;
+        EndMesh();EndOrdinary();
+        auto buffer=Commands();
+        uploadEncoder=diagnosticStages ? diagnosticStages->Blit(buffer) : [buffer blitCommandEncoder];
+        if(uploadEncoder) {
+            ++uploadCounters.uploadBatches;TVPRecordMetalBlitEncoder();
+            if(diagnosticSampled) {
+                diagnosticWorkload.stages|=metal_diagnostics::Workload::Blit;
+                ++diagnosticWorkload.blitEncoders;
+            }
+        }
+        return uploadEncoder;
+    }
+    void ReportUploads(bool final=false) {
+        const auto now=SDL_GetTicksNS();
+        if((!final && now<nextUploadReportNS) || !SDL_GetHintBoolean("MIKAGE_METAL_DIAGNOSTICS",false)) return;
+        nextUploadReportNS=now+1000000000ULL;
+        const auto& c=uploadCounters;
+        // Cumulative, fixed-width totals; all calls are counted, no per-glyph
+        // logging. CPU times exclude Commands()' in-flight semaphore wait.
+        SDL_Log("metal.tinyUploads version=1 epoch=%llu final=%d id=%llu glyphCalls=%llu glyphApplied=%llu glyphBytes=%llu "
+            "glyphPrepNS=%llu glyphEncodeNS=%llu rejectDomain=%llu rejectTarget=%llu rejectOpacity=%llu "
+            "rejectSize=%llu rejectTables=%llu rejectShared=%llu rejectCapacity=%llu rejectBackend=%llu "
+            "uploadCalls=%llu uploadBytes=%llu uploadBatches=%llu arenaPages=%llu arenaFallbacks=%llu "
+            "uploadPrepNS=%llu uploadEncodeNS=%llu atlasBytes=%llu atlasPeakBytes=%llu "
+            "flushRender=%llu flushCompute=%llu flushBlit=%llu flushSubmit=%llu flushDestroy=%llu",
+            (unsigned long long)uploadEpoch,int(final),(unsigned long long)commandSerial,
+            (unsigned long long)c.glyphCalls,(unsigned long long)c.glyphApplied,
+            (unsigned long long)c.glyphBytes,(unsigned long long)c.glyphPrepNS,(unsigned long long)c.glyphEncodeNS,
+            (unsigned long long)c.glyphRejected[0],(unsigned long long)c.glyphRejected[1],
+            (unsigned long long)c.glyphRejected[2],(unsigned long long)c.glyphRejected[3],
+            (unsigned long long)c.glyphRejected[4],(unsigned long long)c.glyphRejected[5],
+            (unsigned long long)c.glyphRejected[6],(unsigned long long)c.glyphRejected[7],
+            (unsigned long long)c.uploadCalls,(unsigned long long)c.uploadBytes,(unsigned long long)c.uploadBatches,
+            (unsigned long long)c.arenaPages,(unsigned long long)c.arenaFallbacks,
+            (unsigned long long)c.uploadPrepNS,(unsigned long long)c.uploadEncodeNS,
+            (unsigned long long)glyphAtlasBytes,(unsigned long long)c.atlasPeakBytes,
+            (unsigned long long)c.flushRender,(unsigned long long)c.flushCompute,(unsigned long long)c.flushBlit,
+            (unsigned long long)c.flushSubmit,(unsigned long long)c.flushDestroy);
+    }
+    void DrainGlyphPages() {
+        for(auto it=retiredGlyphPages.begin();it!=retiredGlyphPages.end();) {
+            if(!Retired(it->owner)) {++it;continue;}
+            glyphAtlasBytes-=it->bytes;it=retiredGlyphPages.erase(it);
+        }
+    }
+    GlyphPage* ReserveGlyph(int width,int height,int& left,int& top,const char*& reason) {
+        if(width<=0 || height<=0 || width>layer_upload::AtlasSide || height>layer_upload::AtlasSide) {
+            reason="size";return nullptr;
+        }
+        // Shared textures are an Apple GPU capability, not simply a claim that
+        // CPU and GPU share RAM (which is also true on some Intel Macs).
+        if(!SDL_GetHintBoolean("MIKAGE_METAL_GLYPH_ATLAS",true) || ![device supportsFamily:MTLGPUFamilyApple1]) {
+            reason="sharedUnavailable";return nullptr;
+        }
+        auto buffer=Commands();
+        DrainGlyphPages();
+        for(auto& page:glyphPages) {
+            if(!layer_upload::CanAppend(page.serial,commandSerial,page.sealed)) {
+                if(!layer_upload::CanRecycle(Retired(page.owner),page.reservations)) continue;
+                page.layout={};page.owner=buffer;page.serial=commandSerial;page.sealed=false;
+            }
+            if(page.layout.Allocate(width,height,left,top)) return &page;
+        }
+        if(glyphAtlasBytes>=layer_upload::AtlasBudget) {reason="capacity";return nullptr;}
+        auto descriptor=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+            width:layer_upload::AtlasSide height:layer_upload::AtlasSide mipmapped:NO];
+        descriptor.storageMode=MTLStorageModeShared;descriptor.usage=MTLTextureUsageShaderRead;
+        auto texture=[device newTextureWithDescriptor:descriptor];
+        if(!texture) {reason="sharedUnavailable";return nullptr;}
+        const size_t bytes=std::max(size_t(texture.allocatedSize),size_t(layer_upload::AtlasSide)*layer_upload::AtlasSide);
+        if(bytes>layer_upload::AtlasBudget-glyphAtlasBytes) {reason="capacity";return nullptr;}
+        auto resource=std::make_unique<Resource>();resource->texture=texture;
+        resource->width=resource->height=layer_upload::AtlasSide;resource->bytesPerPixel=1;resource->target=true;
+        GlyphPage page;page.handle=resource.get();page.owner=buffer;page.serial=commandSerial;page.bytes=bytes;
+        page.textureID=point_trace::NextTextureID();
+        if(!page.layout.Allocate(width,height,left,top)) {reason="size";return nullptr;}
+        glyphPages.reserve(glyphPages.size()+1);
+        // Reset must be able to transfer every active page to retirement without
+        // allocating, and unsubmitted retained textures still consume the cap.
+        retiredGlyphPages.reserve(retiredGlyphPages.size()+glyphPages.size()+1);
+        resources.emplace(page.handle,std::move(resource));
+        glyphPages.push_back(std::move(page));glyphAtlasBytes+=bytes;
+        uploadCounters.atlasPeakBytes=std::max(uploadCounters.atlasPeakBytes,uint64_t(glyphAtlasBytes));
+        return &glyphPages.back();
+    }
 
     ~Impl()
     {
         @autoreleasepool {
             Submit(true);
+            ReportUploads(true);
             windows.clear();
             resources.clear();
             destinationSnapshot = nil;
@@ -809,6 +945,7 @@ struct MetalRenderBackend::Impl
         activeMeshTarget = nil;
     }
     id<MTLBlitCommandEncoder> Blit() {
+        EndUpload("blit");
         EndMesh(); EndOrdinary();
         auto buffer = Commands();
         auto encoder = diagnosticStages ? diagnosticStages->Blit(buffer) : [buffer blitCommandEncoder];
@@ -822,6 +959,7 @@ struct MetalRenderBackend::Impl
         return encoder;
     }
     id<MTLComputeCommandEncoder> Compute() {
+        EndUpload("compute");
         EndMesh(); EndOrdinary();
         auto buffer = Commands();
         auto encoder = diagnosticStages ? diagnosticStages->Compute(buffer, false) : [buffer computeCommandEncoder];
@@ -835,6 +973,7 @@ struct MetalRenderBackend::Impl
         return encoder;
     }
     id<MTLComputeCommandEncoder> OrdinaryCompute() {
+        EndUpload("compute");
         EndMesh();
         if(ordinaryRenderEncoder) EndOrdinary();
         if(!ordinaryEncoder) {
@@ -855,6 +994,7 @@ struct MetalRenderBackend::Impl
         return ordinaryEncoder;
     }
     id<MTLRenderCommandEncoder> OrdinaryRender(id<MTLTexture> target) {
+        EndUpload("render");
         EndMesh();
         if(ordinaryEncoder || ordinaryRenderTarget!=target) EndOrdinary();
         if(!ordinaryRenderEncoder) {
@@ -873,9 +1013,11 @@ struct MetalRenderBackend::Impl
     }
     bool Submit(bool wait = false)
     {
+        EndUpload("submit");
         EndMesh();
         EndOrdinary();
         if (commands) {
+            for(auto& page:glyphPages) if(page.owner==commands) page.sealed=true;
             lastSubmitted = commands;
             lastSubmittedSerial = commandSerial;
             if (currentRingPage >= 0) {
@@ -927,7 +1069,9 @@ struct MetalRenderBackend::Impl
             }
             [commands commit];
             TVPRecordMetalSubmit();
+            ReportUploads();
             commands = nil;
+            uploadArena=nil;uploadLayout={};uploadArenaBytes=0;
             diagnosticStages.reset();
             diagnosticSampled = false;
             transientBytes = 0;
@@ -955,6 +1099,7 @@ struct MetalRenderBackend::Impl
     id<MTLRenderCommandEncoder> Pass(id<MTLTexture> texture, bool clear,
         metal_diagnostics::Workload::Stage stage = metal_diagnostics::Workload::OtherRender)
     {
+        EndUpload("render");
         EndMesh();
         EndOrdinary();
         MTLRenderPassDescriptor* p = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -998,6 +1143,7 @@ struct MetalRenderBackend::Impl
     }
     void Destroy(void* handle, bool target)
     {
+        EndUpload("destroy");
         Resource* r = Find(handle);
         if (!r || r->target != target) return;
         if (current == r) current = nullptr;
@@ -1725,18 +1871,122 @@ bool MetalRenderBackend::UpdateLayerTexture(void* handle, const uint8_t* pixels,
         auto& p=*impl_; auto* r=p.Find(handle);
         if (!r || !pixels || rc.left<0 || rc.top<0 || rc.right>r->width || rc.bottom>r->height ||
             rc.Width()<=0 || rc.Height()<=0 || pitch<rc.Width()*r->bytesPerPixel) return false;
-        size_t bytes=rc.Width()*r->bytesPerPixel, row=(bytes+255)&~size_t(255);
-        id<MTLBuffer> staging=p.AcquireStaging(row*rc.Height());
+        size_t row=0,length=0;
+        if(!layer_upload::UploadSize(rc.Width(),rc.Height(),r->bytesPerPixel,row,length)) return false;
+        const size_t bytes=size_t(rc.Width())*r->bytesPerPixel;
+        const bool tiny=length<=layer_upload::TinyBytes && SDL_GetHintBoolean("MIKAGE_METAL_TINY_UPLOAD_BATCHING",true);
+        const auto started=SDL_GetTicksNS(),waitBefore=p.queueWaitAccumNS;
+        Impl::UploadSlice slice=tiny ? p.AcquireUpload(length) : Impl::UploadSlice{p.AcquireStaging(length),0};
+        id<MTLBuffer> staging=slice.buffer;
         if (!staging) return false;
-        for(int y=0;y<rc.Height();++y) std::memcpy(static_cast<uint8_t*>(staging.contents)+y*row,pixels+y*pitch,bytes);
-        id<MTLBlitCommandEncoder> e=p.Blit(); if(!e) return false;
-        [e copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:row sourceBytesPerImage:row*rc.Height()
+        for(int y=0;y<rc.Height();++y) std::memcpy(static_cast<uint8_t*>(staging.contents)+slice.offset+size_t(y)*row,pixels+size_t(y)*pitch,bytes);
+        const auto copied=SDL_GetTicksNS();
+        id<MTLBlitCommandEncoder> e=tiny ? p.UploadBlit() : p.Blit(); if(!e) return false;
+        [e copyFromBuffer:staging sourceOffset:slice.offset sourceBytesPerRow:row sourceBytesPerImage:length
               sourceSize:MTLSizeMake(rc.Width(),rc.Height(),1) toTexture:r->texture destinationSlice:0 destinationLevel:0
               destinationOrigin:MTLOriginMake(rc.left,rc.top,0)];
-        [e endEncoding]; p.transientBytes+=row*rc.Height();
+        if(!tiny) [e endEncoding];
+        if(tiny) {
+            auto& c=p.uploadCounters;++c.uploadCalls;c.uploadBytes+=bytes*rc.Height();
+            const uint64_t blocked=p.queueWaitAccumNS-waitBefore;
+            c.uploadPrepNS+=copied-started>blocked ? copied-started-blocked : 0;
+            c.uploadEncodeNS+=SDL_GetTicksNS()-copied;
+        }
+        p.transientBytes+=length;
         if(p.transientBytes>=Impl::kSubmissionBudget || ++p.transientOps>=Impl::kSubmissionOpBudget)
             p.Submit();
         return true;
+    }
+}
+void MetalRenderBackend::RecordLayerGlyphRejection(layer_upload::GlyphReject reason) {
+    auto& c=impl_->uploadCounters;++c.glyphCalls;
+    const unsigned index=unsigned(reason)<unsigned(layer_upload::GlyphReject::Count) ? unsigned(reason) :
+        unsigned(layer_upload::GlyphReject::Backend);
+    ++c.glyphRejected[index];
+}
+void MetalRenderBackend::ResetLayerGlyphResources() {
+    auto& p=*impl_;p.EndUpload("destroy");p.EndOrdinary();
+    p.ReportUploads(true);
+    // Encoded commands retain the underlying textures. No GPU wait is needed,
+    // and newly bound sessions cannot acquire any of the old page wrappers.
+    for(const auto& page:p.glyphPages) {
+        if(Impl::Retired(page.owner)) p.glyphAtlasBytes-=page.bytes;
+        else p.retiredGlyphPages.push_back({page.owner,page.bytes});
+        p.resources.erase(page.handle);
+    }
+    p.glyphPages.clear();p.DrainGlyphPages();p.uploadCounters={};p.nextUploadReportNS=0;
+    p.uploadCounters.atlasPeakBytes=p.glyphAtlasBytes;
+    p.uploadEpoch=point_trace::NextTextureID();
+}
+bool MetalRenderBackend::OperateLayerGlyph(const TVPLayerOperation& operation,void* target,
+    const TVPLayerRect& dst,const uint8_t* pixels,int pitch,int width,int height,int sampling,
+    TVPLayerGlyphUploadInfo& upload) {
+    @autoreleasepool {
+        auto& p=*impl_;upload={};
+        const auto reject=[&](layer_upload::GlyphReject reason,const char* name) {
+            upload.reason=name;RecordLayerGlyphRejection(reason);return false;
+        };
+        auto* t=p.Find(target);
+        if(operation.kind!=TVPLayerOperationKind::ColorMap && operation.kind!=TVPLayerOperationKind::RemoveOpacity)
+            return reject(layer_upload::GlyphReject::Domain,"domain");
+        if(!t || t->bytesPerPixel!=4 || !p.ordinaryLayerPipeline)
+            return reject(layer_upload::GlyphReject::Target,"target");
+        if(operation.opacity<0 || operation.opacity>255)
+            return reject(layer_upload::GlyphReject::Opacity,"opacity");
+        if(!pixels || width<=0 || height<=0 || pitch<width || int64_t(dst.right)-dst.left!=width || int64_t(dst.bottom)-dst.top!=height ||
+            sampling<0 || sampling>1 || width>layer_upload::AtlasSide || height>layer_upload::AtlasSide)
+            return reject(layer_upload::GlyphReject::Size,"size");
+        if(!p.alphaTables) return reject(layer_upload::GlyphReject::Tables,"tables");
+        if(operation.kind==TVPLayerOperationKind::RemoveOpacity &&
+            (dst.left<0 || dst.top<0 || dst.right>t->width || dst.bottom>t->height))
+            return reject(layer_upload::GlyphReject::Size,"size");
+        if(dst.right<=0 || dst.bottom<=0 || dst.left>=t->width || dst.top>=t->height) {
+            ++p.uploadCounters.glyphCalls;++p.uploadCounters.glyphApplied;upload.reason="empty";return true;
+        }
+        const auto started=SDL_GetTicksNS(),waitBefore=p.queueWaitAccumNS;
+        int left=0,top=0;const char* reason="backendFailure";
+        Impl::GlyphPage* page=nullptr;
+        try {page=p.ReserveGlyph(width,height,left,top,reason);}
+        catch(const std::bad_alloc&) {return reject(layer_upload::GlyphReject::Backend,"allocation");}
+        if(!page) return reject(!std::strcmp(reason,"capacity") ? layer_upload::GlyphReject::Capacity :
+            !std::strcmp(reason,"size") ? layer_upload::GlyphReject::Size : layer_upload::GlyphReject::Shared,reason);
+        ++page->reservations;
+        struct Reservation { Impl::GlyphPage* page;~Reservation(){--page->reservations;} } reservation{page};
+        auto* source=p.Find(page->handle);
+        [source->texture replaceRegion:MTLRegionMake2D(left,top,width,height) mipmapLevel:0 withBytes:pixels bytesPerRow:pitch];
+        const auto copied=SDL_GetTicksNS();
+        upload.textureID=page->textureID;upload.width=upload.height=layer_upload::AtlasSide;
+        upload.bytes=uint64_t(width)*height;
+        struct WriteMarker {
+            Impl& p;bool* previous;
+            ~WriteMarker(){p.glyphWriteMarker=previous;}
+        } marker{p,p.glyphWriteMarker};
+        p.glyphWriteMarker=&upload.targetWritten;
+        // Account before the draw: its existing operation-budget Submit may
+        // retire the command buffer and reset transientBytes inside this call.
+        p.transientBytes+=upload.bytes;
+        bool recorded=false;
+        auto complete=[&] {
+            upload.reason="shared";recorded=true;
+            auto& c=p.uploadCounters;++c.glyphCalls;++c.glyphApplied;c.glyphBytes+=upload.bytes;
+            const uint64_t blocked=p.queueWaitAccumNS-waitBefore;
+            c.glyphPrepNS+=copied-started>blocked ? copied-started-blocked : 0;
+            c.glyphEncodeNS+=SDL_GetTicksNS()-copied;
+        };
+        try {
+            if(!OperateLayerRect(operation,target,dst,page->handle,{left,top,left+width,top+height},sampling))
+                return reject(layer_upload::GlyphReject::Backend,"backendFailure");
+            complete();
+            // The draw already accounts for its operation budget.
+            if(p.transientBytes>=Impl::kSubmissionBudget) p.Submit();
+            return true;
+        } catch(...) {
+            if(!recorded) {
+                if(upload.targetWritten) complete();
+                else reject(layer_upload::GlyphReject::Backend,"backendFailure");
+            }
+            throw;
+        }
     }
 }
 bool MetalRenderBackend::CopyTargetToLayerTexture(void* sourceHandle, void* destinationHandle) {
@@ -1995,6 +2245,7 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
                 [e setFragmentTexture:sourceTexture atIndex:0]; p.ordinaryRenderSource=sourceTexture;
             }
             [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+            if(p.glyphWriteMarker) *p.glyphWriteMarker=true;
             if(p.diagnosticSampled) {
                 ++p.diagnosticWorkload.layerDispatches;
                 p.diagnosticWorkload.Rect(kind,uint64_t(clip.Width())*clip.Height(),
@@ -2016,6 +2267,7 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
             [e setTexture:sourceTexture atIndex:0]; [e setTexture:snapshot ? snapshot : sourceTexture atIndex:1]; [e setTexture:t->texture atIndex:2];
         }
         [e dispatchThreads:MTLSizeMake(clip.Width(),clip.Height(),1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+        if(p.glyphWriteMarker) *p.glyphWriteMarker=true;
         if (p.diagnosticSampled) {
             ++p.diagnosticWorkload.layerDispatches;
             p.diagnosticWorkload.Rect(kind,uint64_t(clip.Width())*clip.Height(),

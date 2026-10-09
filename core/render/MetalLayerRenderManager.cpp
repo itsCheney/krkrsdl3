@@ -706,6 +706,64 @@ public:
         auto* cached=dynamic_cast<LayerTexture*>(texture);
         return session && cached && cached->Belongs(session) && !cached->IsCPUResident();
     }
+    void CompleteRectOperation(LayerTexture* target,const TVPLayerOperation& op,
+                               const tTVPRect& destination,bool sourceAliasesTarget) {
+        target->InvalidateCPUCacheRegion(destination,TVPLayerOperationPreservesAlpha(op,sourceAliasesTarget));
+        ++session->stats.gpuOperations;
+    }
+    bool TryBlendGlyph(iTVPRenderMethod* method,iTVPTexture2D* target,const tTVPRect& dst,
+                       const uint8_t* pixels,int pitch,int width,int height) override {
+        // Rejection here only declines the optional upload optimization. The
+        // ordinary path owns final route/fallback diagnostics and CPU semantics.
+        auto* t=dynamic_cast<LayerTexture*>(target);
+        TVPLayerOperation op;
+        using GlyphReject=krkrsdl3::layer_upload::GlyphReject;
+        auto decline=[&](GlyphReject reason) {
+            if(session && session->backend) session->backend->RecordLayerGlyphRejection(reason);
+            return false;
+        };
+        if(!session || !session->backend || !t || !t->Belongs(session) || t->IsCPUResident() ||
+           t->HasCPUAccess() || t->GetFormat()!=TVPTextureFormat::RGBA)
+            return decline(GlyphReject::Target);
+        if(!method || !method->DescribeGpuOperation(op) ||
+           (op.kind!=TVPLayerOperationKind::ColorMap && op.kind!=TVPLayerOperationKind::RemoveOpacity) || stretch<0)
+            return decline(GlyphReject::Domain);
+        if(op.opacity<0 || op.opacity>255) return decline(GlyphReject::Opacity);
+        if(!pixels || width<=0 || height<=0 || pitch<width ||
+           int64_t(dst.right)-dst.left!=width || int64_t(dst.bottom)-dst.top!=height)
+            return decline(GlyphReject::Size);
+        if(!session->tablesReady) {
+            if(!session->backend->SetLayerAlphaTables(TVPOpacityOnOpacityTable,TVPNegativeMulTable))
+                return decline(GlyphReject::Tables);
+            session->tablesReady=true;
+        }
+        const auto diagnosticEpoch=krkrsdl3::layer_work::CaptureGeneration();
+        const auto started=diagnosticEpoch ? krkrsdl3::layer_work::Now() : 0;
+        krkrsdl3::TVPLayerGlyphUploadInfo upload;
+        auto complete=[&] {
+            CompleteRectOperation(t,op,dst,false);
+            if(upload.bytes) {
+                session->stats.uploadedBytes+=upload.bytes;
+                krkrsdl3::layer_work::Record(true,upload.textureID,upload.width,upload.height,upload.bytes,
+                    started ? krkrsdl3::layer_work::Now()-started : 0,0,false,
+                    std::strcmp(krkrsdl3::layer_work::source,"unattributed") ? krkrsdl3::layer_work::source : "bitmap.update",
+                    diagnosticEpoch);
+            }
+            krkrsdl3::layer_work::RecordTransitionResult(true,"render.gpu",uint64_t(width)*height);
+        };
+        try {
+            if(!session->backend->OperateLayerGlyph(op,t->GetTextureHandle(),Rect(dst),pixels,pitch,
+                                                    width,height,stretch==0?0:1,upload))
+                return false;
+        } catch(...) {
+            // A post-encoding Submit can throw after the GPU target write. Keep
+            // its cache/transfer accounting, then propagate without replay.
+            if(upload.targetWritten) complete();
+            throw;
+        }
+        complete();
+        return true;
+    }
     bool GPU(iTVPRenderMethod* method,iTVPTexture2D* target,iTVPTexture2D* reference,tTVPRect dst,const tRenderTexRectArray& inputs) {
         auto* t=dynamic_cast<LayerTexture*>(target); TVPLayerOperation op;
         if(!session || !t || !t->Belongs(session)) return Reject(TVPLayerGPURejectReason::TargetUnavailable);
@@ -848,8 +906,7 @@ public:
             return Reject(TVPLayerGPURejectReason::BackendFailure);
         // Only plain HDA blending preserves destination alpha. The _d/_a
         // formulas can change it even if HOLD_ALPHA is also set.
-        const bool preservesAlpha=TVPLayerOperationPreservesAlpha(op,source==t);
-        t->InvalidateCPUCacheRegion(dst,preservesAlpha); ++session->stats.gpuOperations; return true;
+        CompleteRectOperation(t,op,dst,source==t); return true;
     }
     void OperateRect(iTVPRenderMethod* method,iTVPTexture2D* target,iTVPTexture2D* reference,const tTVPRect& dst,const tRenderTexRectArray& inputs) override {
         // Software's generic resize primitive assumes RGBA byte addressing.
@@ -1195,6 +1252,7 @@ void TVPUnbindMetalLayerRenderManager() {
     // Normally empty after RecycleProcess; survivors become safe software
     // textures instead of retaining a dead backend pointer across sessions.
     for(auto* texture:manager.session->textures) texture->Detach();
+    manager.session->backend->ResetLayerGlyphResources();
     manager.session->backend=nullptr; manager.session.reset();
 }
 bool TVPMetalLayerCompositionActive() { return bool(Manager().session); }

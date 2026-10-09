@@ -2547,7 +2547,20 @@ bool tTVPNativeBaseBitmap::InternalBlendText(tTVPCharacterData* data,
             GEMTHOD_OPA_CLR(ApplyColorMap);
         }
 
-        // blend to the texture
+        method->SetParameterOpa(opa_id, dtdata->opa);
+        method->SetParameterColor4B(clr_id, color);
+    }
+
+    auto* manager = TVPGetRenderManager();
+    auto* target = GetTextureForRender(method->IsBlendTarget(), &drect);
+    // Keep the existing cropped R8 bytes and immediate draw order. In particular,
+    // this optimization does not change the legacy left-clipping interpretation.
+    if (manager->TryBlendGlyph(method, target, drect, bp, pitch, w, h))
+        return true;
+
+    {
+        // The ordinary source remains the fallback for unsupported backends,
+        // CPU targets and bounded atlas allocation failures.
         if (_CharacterTexture && !GetRenderManager()->CanReuseCachedTexture(_CharacterTexture))
         {
             _CharacterTexture->Release();
@@ -2567,16 +2580,12 @@ bool tTVPNativeBaseBitmap::InternalBlendText(tTVPCharacterData* data,
         }
         _CharacterTexture->Update(bp, TVPTextureFormat::Gray, pitch, tTVPRect(0, 0, w, h));
 
-        method->SetParameterOpa(opa_id, dtdata->opa);
-        method->SetParameterColor4B(clr_id, color);
-
         pTexSrc = _CharacterTexture;
     }
 
     tRenderTexRectArray::Element src_tex[] = {
         tRenderTexRectArray::Element(pTexSrc, tTVPRect(0, 0, w, h))};
-    TVPGetRenderManager()->OperateRect(method, GetTextureForRender(method->IsBlendTarget(), &drect),
-                                       nullptr, drect, tRenderTexRectArray(src_tex));
+    manager->OperateRect(method, target, nullptr, drect, tRenderTexRectArray(src_tex));
     return true;
 }
 

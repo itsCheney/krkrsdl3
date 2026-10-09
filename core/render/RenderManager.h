@@ -322,6 +322,16 @@ public:
     virtual void SetParameterFloat(int id, float Value){};
 
     // -------------- operations ----------------
+    // Optional immediate R8 glyph path. Successful calls copy the borrowed pixels
+    // before returning; no caller address may be retained for later encoding.
+    // false promises no glyph target writes, so callers may use their ordinary
+    // scratch texture fallback. Exceptions must propagate without replaying it.
+    virtual bool TryBlendGlyph(iTVPRenderMethod* method,
+                              iTVPTexture2D* target,
+                              const tTVPRect& destination,
+                              const uint8_t* pixels,
+                              int pitch, int width, int height) { return false; }
+
     // dst x Tex1 x ... x TexN -> dst
     // referenced target texture would be used if target texture is required as source
     virtual void OperateRect(iTVPRenderMethod* method,

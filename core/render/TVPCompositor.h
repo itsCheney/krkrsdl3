@@ -10,6 +10,7 @@
 #include "LayerShrink.h"
 #include "LayerSpanComposite.h"
 #include "AsyncLayerReadback.h"
+#include "LayerUploadBatch.h"
 
 //---------------------------------------------------------------------------
 // TVPCompositor
@@ -18,6 +19,12 @@
 //---------------------------------------------------------------------------
 namespace krkrsdl3
 {
+struct TVPLayerGlyphUploadInfo {
+    uint64_t textureID=0, bytes=0;
+    int width=0,height=0;
+    const char* reason="unsupported";
+    bool targetWritten=false; // also observable if a post-encoding Submit throws
+};
 // GPU mesh-deformation input. Matrices are column-major and already include
 // inheritance/attach transforms. Keeping this representation renderer-neutral
 // lets plugins use an accelerated path without exposing their own types here.
@@ -205,6 +212,13 @@ public:
     virtual void* CreateLayerTexture(int, int, TVPLayerTextureFormat) { return nullptr; }
     virtual void DestroyLayerTexture(void*) {}
     virtual bool UpdateLayerTexture(void*, const uint8_t*, int, const TVPLayerRect&) { return false; }
+    // Copies the borrowed R8 bytes synchronously, then draws using the ordinary
+    // integer operator. False guarantees no glyph target write; exceptions must
+    // propagate without replay. Atlas resources never escape this backend.
+    virtual bool OperateLayerGlyph(const TVPLayerOperation&,void*,const TVPLayerRect&,
+        const uint8_t*,int,int,int,int,TVPLayerGlyphUploadInfo&) { return false; }
+    virtual void ResetLayerGlyphResources() {}
+    virtual void RecordLayerGlyphRejection(layer_upload::GlyphReject) {}
     // Fast full-surface copy from an offscreen render target into a Layer texture.
     // Backends that cannot guarantee identical RGBA8 dimensions return false.
     virtual bool CopyTargetToLayerTexture(void*, void*) { return false; }
