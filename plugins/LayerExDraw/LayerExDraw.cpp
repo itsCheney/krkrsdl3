@@ -1400,6 +1400,7 @@ class LayerExDraw::InvocationSpanCapture
         GeometryT nativeWidth,nativeHeight,nativeClipLeft,nativeClipTop,nativeClipWidth,nativeClipHeight;
         plutovg_surface_t* surface; plutovg_canvas_t* canvas;
         iTVPTexture2D* texture; uint64_t textureID; bool hasTextureID;
+        plutovg_matrix_t calcTransform;
     } saved;
     void Restore() {
         owner.width=saved.width;owner.height=saved.height;
@@ -1412,6 +1413,7 @@ class LayerExDraw::InvocationSpanCapture
         owner.surface=saved.surface;owner.canvas=saved.canvas;
         owner.canvasTexture=saved.texture;owner.canvasTextureID=saved.textureID;
         owner.canvasHasTextureID=saved.hasTextureID;
+        owner.calcTransform=saved.calcTransform;
         owner.invocationCapture=nullptr;
         current=previous;
     }
@@ -1425,7 +1427,7 @@ public:
         saved={owner.width,owner.height,owner.clipLeft,owner.clipTop,owner.clipWidth,owner.clipHeight,
             owner.buffer,owner.pitch,owner._width,owner._height,owner._clipLeft,owner._clipTop,
             owner._clipWidth,owner._clipHeight,owner.surface,owner.canvas,owner.canvasTexture,
-            owner.canvasTextureID,owner.canvasHasTextureID};
+            owner.canvasTextureID,owner.canvasHasTextureID,owner.calcTransform};
         owner.refreshMetadata();
         if(owner._width<=0 || owner._height<=0 || owner._width>=32768 || owner._height>=32768) { Restore();return; }
         capturedSurface=plutovg_surface_create_for_data(nullptr,owner._width,owner._height,owner._width*4);
@@ -3179,10 +3181,34 @@ struct ncbInvocationPolicy<LayerExDraw>
             if(count<9) return "arguments";
             auto* src=ImageNative(params[4]);
             if(!src) return "imageType";
-            if(src->type!=0) return "vectorSource";
-            if(!src->_surface) return "source";
-            if(!plutovg_surface_is_owned(src->_surface)) return "borrowedSource";
             for(int i=0;i<9;++i) if(i!=4 && !Numeric(params[i])) return "numeric";
+            if(src->type==0) {
+                if(!src->_surface) return "source";
+                if(!plutovg_surface_is_owned(src->_surface)) return "borrowedSource";
+            } else if(src->type==1) {
+                if(src->width<=0 || src->height<=0) return "source";
+                if(params[7]->AsReal()==0 || params[8]->AsReal()==0) return "geometry";
+                // No script callback occurs from this probe through capture.
+                // The argument owns the vector for that synchronous interval;
+                // the packet copies all sampled paint before GPU submission.
+                plutovg_matrix_t matrix,rect,temp;
+                plutovg_matrix_init(&matrix,float(params[2]->AsReal()/params[7]->AsReal()),0,0,
+                    float(params[3]->AsReal()/params[8]->AsReal()),float(params[0]->AsReal()),float(params[1]->AsReal()));
+                plutovg_matrix_init_scale(&rect,float(params[7]->AsReal()/src->GetWidth()),float(params[8]->AsReal()/src->GetHeight()));
+                plutovg_matrix_translate(&rect,float(-params[5]->AsReal()),float(-params[6]->AsReal()));
+                temp=matrix;plutovg_matrix_multiply(&matrix,&temp,&rect);
+                temp=matrix;plutovg_matrix_multiply(&matrix,&temp,&src->transMtx);
+                const float values[]={matrix.a,matrix.b,matrix.c,matrix.d,matrix.e,matrix.f};
+                for(float v:values) if(!std::isfinite(v) || std::abs(v)>1000000.f) return "state";
+                if((std::abs(matrix.a)+std::abs(matrix.c))*200000.f+std::abs(matrix.e)>1000000.f ||
+                   (std::abs(matrix.b)+std::abs(matrix.d))*200000.f+std::abs(matrix.f)>1000000.f) return "state";
+                if(src->vectorGraph.size()>TVPLayerSpanCompositeGeometry::MaxSpans) return "budget";
+                for(const auto& info:src->vectorGraph) {
+                    if(!info.app || !info.path || pathIsEmpty(info.path)) continue;
+                    if(!PathData(info.path)) return "path";
+                    if(!Paints(info.app)) return "paint";
+                }
+            } else return "vectorSource";
         }
         return nullptr;
     }

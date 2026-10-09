@@ -57,6 +57,8 @@ struct Read {
     const char* lastWriter="unknown";
     int width=0,height=0,lastWrite[4]{};
     uint64_t bytes=0,wallNS=0,waitNS=0;
+    uint64_t windowID=0;
+    bool detailReserved=false,callerReserved=false;
 };
 inline Read BeginRead(uint64_t epoch,uint64_t sessionID) {
     Read read;
@@ -138,10 +140,29 @@ inline std::string IDs(const Read& read) {
     return "\"readID\":"+std::to_string(read.readID)+",\"traceID\":"+std::to_string(read.consumer.traceID)+
         ",\"generation\":"+std::to_string(read.epoch)+",\"sessionID\":"+std::to_string(read.sessionID);
 }
+inline cpu_reads::Input ReadInput(const Read& r) {
+    return {r.consumer.method ? r.consumer.method : "unknown",r.consumer.nativeEntry ? r.consumer.nativeEntry : "unknown",
+        Name(r.consumer.access),r.source ? r.source : "unattributed",
+        ValidLabel(r.consumer.method) && ValidLabel(r.consumer.nativeEntry) && ValidLabel(r.source)};
+}
 inline bool ReportRead(const Read& r) noexcept {
     try {
+        if(!CurrentEpoch(r.epoch)) return false;
+        const bool valid=ValidLabel(r.consumer.method) && ValidLabel(r.consumer.nativeEntry) &&
+            ValidLabel(r.source) && ValidLabel(Name(r.consumer.access));
+        if(!r.windowID) {
+            std::lock_guard<std::mutex> lock(layer_work::mutex);
+            if(!CurrentEpoch(r.epoch)) return false;
+            layer_work::profile.cpuConsumerBudget.readWindow.Record(
+                r.consumer.method ? r.consumer.method : "unknown",r.consumer.nativeEntry ? r.consumer.nativeEntry : "unknown",
+                Name(r.consumer.access),r.source ? r.source : "unattributed",
+                {1,r.bytes,r.wallNS,r.waitNS},valid);
+        }
         bool caller=false;
-        if(!Reserve(r.epoch,false,caller)) return false;
+        if(r.windowID) {
+            std::lock_guard<std::mutex> lock(layer_work::mutex);
+            if(!CurrentEpoch(r.epoch) || r.windowID!=layer_work::profile.cpuConsumerBudget.spanWindow.id || !r.detailReserved) return false;
+        } else if(!Reserve(r.epoch,false,caller)) return false;
         // An oversized native name is rejected, never shortened to a prefix
         // that could falsely match a different C0 transfer origin or method.
         if(!ValidLabel(r.consumer.method) || !ValidLabel(r.consumer.nativeEntry) ||
@@ -155,7 +176,7 @@ inline bool ReportRead(const Read& r) noexcept {
         for(size_t i=0;i<4;++i) {if(i) message+=',';message+=std::to_string(r.lastWrite[i]);}
         message+="],\"lastSubmittedID\":null,\"renderFrame\":null,\"calls\":1,\"bytes\":"+std::to_string(r.bytes)+
             ",\"wallNS\":"+std::to_string(r.wallNS)+",\"waitNS\":"+std::to_string(r.waitNS)+'}';
-        return Emit(r.epoch,message) && ReserveCaller(r.epoch);
+        return Emit(r.epoch,message) && (r.windowID ? r.callerReserved : ReserveCaller(r.epoch));
     } catch(...) {return false;}
 }
 inline void ReportCaller(const Read& r,const char* stack) noexcept {
@@ -258,8 +279,41 @@ inline void SpanWindowTaken(const span_route::Window& w,uint64_t epoch) noexcept
             ",\"overflow\":"+(w.overflow ? "true" : "false")+'}');
     } catch(...) {}
 }
+inline std::string ReadMetricsJSON(const cpu_reads::Metrics& m) {
+    return "\"calls\":"+std::to_string(m.calls)+",\"bytes\":"+std::to_string(m.bytes)+
+        ",\"wallNS\":"+std::to_string(m.wallNS)+",\"waitNS\":"+std::to_string(m.waitNS);
+}
+inline void ReadWindowTaken(const layer_work::CPUConsumerBudget& b,uint64_t epoch) noexcept {
+    if(!CurrentEpoch(epoch)) return;
+    try {
+        const auto base="\"version\":2,\"generation\":"+std::to_string(epoch)+
+            ",\"windowID\":"+std::to_string(b.spanWindow.id)+',';
+        size_t groups=0;
+        for(size_t i=0;i<b.readWindow.groups.size();++i) {
+            const auto& g=b.readWindow.groups[i];if(!g.used) continue;
+            ++groups;
+            Emit(epoch,"metal.cpuConsumerAggregate {\"phase\":\"aggregate\","+base+
+                "\"groupIndex\":"+std::to_string(i)+",\"method\":"+Label(g.method)+
+                ",\"nativeEntry\":"+Label(g.entry)+",\"access\":"+Label(g.access)+
+                ",\"source\":"+Label(g.origin)+','+ReadMetricsJSON(g.metrics)+'}');
+        }
+        Emit(epoch,"metal.cpuConsumerAggregate {\"phase\":\"overflow\","+base+
+            "\"reason\":\"capacity\","+ReadMetricsJSON(b.readWindow.capacityOverflow)+'}');
+        Emit(epoch,"metal.cpuConsumerAggregate {\"phase\":\"overflow\","+base+
+            "\"reason\":\"oversize\","+ReadMetricsJSON(b.readWindow.oversizeOverflow)+'}');
+        Emit(epoch,"metal.cpuConsumerAggregate {\"phase\":\"window\","+base+ReadMetricsJSON(b.readWindow.totals)+
+            ",\"aggregateRows\":"+std::to_string(groups)+",\"capacityRecords\":"+std::to_string(b.readWindow.capacityRecords)+
+            ",\"oversizeRecords\":"+std::to_string(b.readWindow.oversizeRecords)+
+            ",\"repeatedReads\":"+std::to_string(b.readWindow.repeatedReads)+
+            ",\"readRecords\":"+std::to_string(b.reads)+",\"readExceeded\":"+std::to_string(b.readExceeded)+
+            ",\"callerRecords\":"+std::to_string(b.callers)+",\"callerExceeded\":"+std::to_string(b.callerExceeded)+
+            ",\"producerRecords\":"+std::to_string(b.producers)+",\"producerExceeded\":"+std::to_string(b.producerExceeded)+
+            ",\"overflow\":"+(b.readWindow.overflow ? "true" : "false")+'}');
+    } catch(...) {}
+}
 inline void WindowTaken(const layer_work::CPUConsumerBudget& b,uint64_t epoch) {
     SpanWindowTaken(b.spanWindow,epoch);
+    ReadWindowTaken(b,epoch);
     if(!CurrentEpoch(epoch) || !(b.reads || b.producers || b.readExceeded || b.producerExceeded ||
             b.spanRoutes || b.spanRouteExceeded)) return;
     try {

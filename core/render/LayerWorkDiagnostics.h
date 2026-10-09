@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include "LayerSpanRouteDiagnostics.h"
+#include "CPUReadAggregation.h"
 
 // Bounded, opt-in diagnostics. Timings are inclusive wall time: script/load/
 // software scopes can contain each other and GPU waits, so never add them.
@@ -126,6 +127,7 @@ struct CPUConsumerBudget {
     uint64_t producers=0,producerExceeded=0,oversize=0;
     uint64_t spanRoutes=0,spanRouteExceeded=0;
     span_route::Window spanWindow;
+    cpu_reads::Window readWindow;
 };
 inline void (*cpuConsumerWindowTaken)(const CPUConsumerBudget&,uint64_t)=nullptr;
 struct Profile { std::array<Timing,size_t(Stage::Count)> stages{};
@@ -392,7 +394,7 @@ public:
 };
 inline void Record(bool upload,uint64_t texture,int width,int height,uint64_t bytes,
                    uint64_t ns=0,uint64_t waitNS=0,bool leased=false,const char* origin=nullptr,
-                   uint64_t epoch=RecordEpochSentinel,bool oversizeOrigin=false) {
+                   uint64_t epoch=RecordEpochSentinel,bool oversizeOrigin=false,cpu_reads::Input* consumer=nullptr) {
     if(epoch==RecordEpochSentinel) epoch=CaptureGeneration();
     if(!epoch) return;
     const char* rawName=origin ? origin : source;
@@ -403,6 +405,17 @@ inline void Record(bool upload,uint64_t texture,int width,int height,uint64_t by
     char name[48]{};std::memcpy(name,rawName,std::min(length,sizeof(name)-1));
     std::lock_guard<std::mutex> lock(mutex);
     if(!enabled.load(std::memory_order_relaxed) || epoch!=generation.load(std::memory_order_relaxed)) return;
+    if(!upload && consumer) {
+        auto& b=profile.cpuConsumerBudget;
+        b.readWindow.Record(consumer->method,consumer->entry,consumer->access,consumer->origin,
+            {1,bytes,ns,waitNS},consumer->valid);
+        consumer->windowID=b.spanWindow.id;
+        if(b.reads<32) {
+            ++b.reads;consumer->detail=true;
+            if(b.callers<8) {++b.callers;consumer->caller=true;}
+            else ++b.callerExceeded;
+        } else ++b.readExceeded;
+    }
     if(transitionScope) transitionScope->Transfer(upload,bytes,ns,waitNS,epoch);
     if(shrinkScope) shrinkScope->Transfer(upload,bytes,ns,waitNS,epoch);
     // Record is called only after a successful transfer; cache hits/failed reads

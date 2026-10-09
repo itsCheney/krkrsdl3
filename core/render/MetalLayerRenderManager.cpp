@@ -271,8 +271,11 @@ class LayerTexture final : public iTVPTexture2D {
         if(diagnostics) {
             const auto wallNS=krkrsdl3::layer_work::Now()-started;
             const auto waitNS=session->backend->GetLastReadbackWaitNanoseconds();
-            krkrsdl3::layer_work::Record(false,textureID,Width,Height,Bytes(),wallNS,waitNS,false,origin,diagnosticEpoch);
             consumer.source=origin;consumer.bytes=Bytes();consumer.wallNS=wallNS;consumer.waitNS=waitNS;
+            auto input=krkrsdl3::cpu_consumer_trace::ReadInput(consumer);
+            krkrsdl3::layer_work::Record(false,textureID,Width,Height,Bytes(),wallNS,waitNS,false,origin,diagnosticEpoch,
+                false,consumer.epoch ? &input : nullptr);
+            consumer.windowID=input.windowID;consumer.detailReserved=input.detail;consumer.callerReserved=input.caller;
             if(krkrsdl3::cpu_consumer_trace::ReportRead(consumer)) {
                 try {
                     const auto stack=TJSGetStackTraceString(4,TJS_N(" | ")).AsStdString();
