@@ -182,26 +182,24 @@ inline void ReportSpanRoute(const char* method,const char* route,const char* rea
     if(!Enabled() || !context || !CurrentEpoch(context->epoch)) return;
     try {
         const auto c=*context;
-        if(!ValidLabel(method) || !ValidLabel(route) || !ValidLabel(reason)) {
-            RejectOversize(c.epoch);return;
-        }
+        int slot=-1;uint64_t windowID=0;
         {
             std::lock_guard<std::mutex> lock(layer_work::mutex);
             if(!CurrentEpoch(c.epoch)) return;
             auto& b=layer_work::profile.cpuConsumerBudget;
-            if(b.spanRoutes>=32) {++b.spanRouteExceeded;return;}
-            ++b.spanRoutes;
+            slot=b.spanWindow.Record(method,route,reason,{1,spanCount,sourceBytes,parameterBytes,scratchBytes},c.traceID);
+            windowID=b.spanWindow.id;
         }
+        if(slot<0) return;
         Producer p;
-        const bool identity=target && captureProducer && captureProducer(target,p);
-        const auto field=[&](uint64_t value) {return identity ? std::to_string(value) : std::string("null");};
-        Emit(c.epoch,"metal.layerSpan {\"phase\":\"route\",\"version\":1,\"generation\":"+
-            std::to_string(c.epoch)+",\"traceID\":"+std::to_string(c.traceID)+
-            ",\"method\":"+Label(method)+",\"route\":"+Label(route)+",\"reason\":"+Label(reason)+
-            ",\"sessionID\":"+field(p.sessionID)+",\"textureID\":"+field(p.textureID)+
-            ",\"contentVersion\":"+field(p.contentVersion)+",\"spanCount\":"+std::to_string(spanCount)+
-            ",\"sourceBytes\":"+std::to_string(sourceBytes)+",\"parameterBytes\":"+std::to_string(parameterBytes)+
-            ",\"scratchBytes\":"+std::to_string(scratchBytes)+'}');
+        bool identity=false;
+        try {identity=target && captureProducer && captureProducer(target,p);} catch(...) {}
+        // A concurrent Take can already have emitted the admitted sample with
+        // unknown identity. Never attach old metadata to the following window.
+        std::lock_guard<std::mutex> lock(layer_work::mutex);
+        if(!CurrentEpoch(c.epoch) || layer_work::profile.cpuConsumerBudget.spanWindow.id!=windowID) return;
+        auto& sample=layer_work::profile.cpuConsumerBudget.spanWindow.samples[size_t(slot)];
+        sample.identity=identity;sample.sessionID=p.sessionID;sample.textureID=p.textureID;sample.contentVersion=p.contentVersion;
     } catch(...) {}
 }
 inline void ReportShrinkOutput(void* texture,int left,int top,int right,int bottom) noexcept {
@@ -220,7 +218,48 @@ inline void ReportShrinkOutput(void* texture,int left,int top,int right,int bott
             std::to_string(bottom)+"],\"width\":"+std::to_string(p.width)+",\"height\":"+std::to_string(p.height)+'}');
     } catch(...) {}
 }
+inline std::string SpanMetricsJSON(const span_route::Metrics& m) {
+    return "\"calls\":"+std::to_string(m.calls)+",\"spanCount\":"+std::to_string(m.spanCount)+
+        ",\"sourceBytes\":"+std::to_string(m.sourceBytes)+",\"parameterBytes\":"+std::to_string(m.parameterBytes)+
+        ",\"scratchBytes\":"+std::to_string(m.scratchBytes);
+}
+inline std::string SpanLabelsJSON(size_t group) {
+    const size_t pair=group/span_route::Reasons.size();
+    return "\"method\":"+Label(span_route::Methods[pair/span_route::Routes.size()])+
+        ",\"route\":"+Label(span_route::Routes[pair%span_route::Routes.size()])+
+        ",\"reason\":"+Label(span_route::Reasons[group%span_route::Reasons.size()]);
+}
+inline bool EmitSpan(uint64_t epoch,const std::string& message) noexcept {
+    try {return Emit(epoch,message);} catch(...) {return false;}
+}
+inline void SpanWindowTaken(const span_route::Window& w,uint64_t epoch) noexcept {
+    if(!CurrentEpoch(epoch)) return;
+    try {
+        const auto base="\"version\":2,\"generation\":"+std::to_string(epoch)+",\"windowID\":"+std::to_string(w.id)+',';
+        size_t groups=0,samples=0;
+        for(size_t i=0;i<w.groups.size();++i) if(w.groups[i].metrics.calls) {
+            ++groups;
+            EmitSpan(epoch,"metal.layerSpan {\"phase\":\"aggregate\","+base+SpanLabelsJSON(i)+','+
+                SpanMetricsJSON(w.groups[i].metrics)+'}');
+        }
+        for(size_t i=0;i<w.samples.size();++i) if(w.samples[i].used) {
+            ++samples;const auto& s=w.samples[i];
+            const auto identity=[&](uint64_t value){return s.identity ? std::to_string(value) : std::string("null");};
+            EmitSpan(epoch,"metal.layerSpan {\"phase\":\"sample\","+base+SpanLabelsJSON(s.group)+
+                ",\"sampleIndex\":"+std::to_string(i)+",\"traceID\":"+std::to_string(s.traceID)+
+                ",\"sessionID\":"+identity(s.sessionID)+",\"textureID\":"+identity(s.textureID)+
+                ",\"contentVersion\":"+identity(s.contentVersion)+','+SpanMetricsJSON(s.metrics)+'}');
+        }
+        EmitSpan(epoch,"metal.layerSpan {\"phase\":\"window\","+base+SpanMetricsJSON(w.totals)+
+            ",\"gpuCalls\":"+std::to_string(w.routes[0])+",\"cpuCalls\":"+std::to_string(w.routes[1])+
+            ",\"noopCalls\":"+std::to_string(w.routes[2])+",\"aggregateRows\":"+std::to_string(groups)+
+            ",\"samples\":"+std::to_string(samples)+",\"repeatedOmitted\":"+std::to_string(w.repeatedOmitted)+
+            ",\"capacityOmitted\":"+std::to_string(w.capacityOmitted)+",\"invalidRecords\":"+std::to_string(w.invalidRecords)+
+            ",\"overflow\":"+(w.overflow ? "true" : "false")+'}');
+    } catch(...) {}
+}
 inline void WindowTaken(const layer_work::CPUConsumerBudget& b,uint64_t epoch) {
+    SpanWindowTaken(b.spanWindow,epoch);
     if(!CurrentEpoch(epoch) || !(b.reads || b.producers || b.readExceeded || b.producerExceeded ||
             b.spanRoutes || b.spanRouteExceeded)) return;
     try {

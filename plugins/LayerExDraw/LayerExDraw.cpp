@@ -3086,9 +3086,15 @@ struct ncbInvocationPolicy<LayerExDraw>
     static bool PlainObject(iTJSDispatch2* object) {
         return object && typeid(*object)==typeid(tTJSCustomObject);
     }
-    template<class T> static T* Native(const tTJSVariant* value) {
+    template<class T> static T* DirectNative(const tTJSVariant* value) {
         if(!value || value->Type()!=tvtObject || !PlainObject(value->AsObjectNoAddRef())) return nullptr;
-        auto* wrapper=ncbInstanceAdaptor<GdipWrapper<T>>::GetNativeInstance(value->AsObjectNoAddRef());
+        // Appearance/Path use NCB_REGISTER_SUBCLASS and default NCBind
+        // boxing. A probe must not throw; legacy conversion owns errors.
+        return ncbInstanceAdaptor<T>::GetNativeInstance(value->AsObjectNoAddRef(),false);
+    }
+    static GdipImage* ImageNative(const tTJSVariant* value) {
+        if(!value || value->Type()!=tvtObject || !PlainObject(value->AsObjectNoAddRef())) return nullptr;
+        auto* wrapper=ncbInstanceAdaptor<GdipWrapper<GdipImage>>::GetNativeInstance(value->AsObjectNoAddRef(),false);
         return wrapper ? wrapper->getGdipObject() : nullptr;
     }
     static bool Numeric(const tTJSVariant* value) {
@@ -3154,16 +3160,27 @@ struct ncbInvocationPolicy<LayerExDraw>
         if(value->spanCaptureTargetAliased()) return "targetAlias";
         if(!value->spanCaptureStateSafe()) return "state";
         if(!strcmp(name,"drawLine")) {
-            if(count!=5 || !Paints(Native<Appearance>(params[0]))) return "arguments";
-            for(int i=1;i<5;++i) if(!Numeric(params[i])) return "arguments";
+            if(count!=5) return "arguments";
+            auto* appearance=DirectNative<Appearance>(params[0]);
+            if(!appearance) return "appearanceType";
+            if(!Paints(appearance)) return "paint";
+            for(int i=1;i<5;++i) if(!Numeric(params[i])) return "numeric";
         } else if(!strcmp(name,"drawPath")) {
-            auto* path=count==2 ? Native<Path>(params[1]) : nullptr;
-            if(count!=2 || !Paints(Native<Appearance>(params[0])) || !path || !PathData(path->spanCapturePath())) return "arguments";
+            if(count!=2) return "arguments";
+            auto* path=DirectNative<Path>(params[1]);
+            auto* appearance=DirectNative<Appearance>(params[0]);
+            if(!appearance) return "appearanceType";
+            if(!Paints(appearance)) return "paint";
+            if(!path) return "pathType";
+            if(!PathData(path->spanCapturePath())) return "path";
         } else {
             if(count!=9) return "arguments";
-            auto* src=Native<GdipImage>(params[4]);
-            if(!src || src->type!=0 || !src->_surface || !plutovg_surface_is_owned(src->_surface)) return "source";
-            for(int i=0;i<9;++i) if(i!=4 && !Numeric(params[i])) return "arguments";
+            auto* src=ImageNative(params[4]);
+            if(!src) return "imageType";
+            if(src->type!=0) return "vectorSource";
+            if(!src->_surface) return "source";
+            if(!plutovg_surface_is_owned(src->_surface)) return "borrowedSource";
+            for(int i=0;i<9;++i) if(i!=4 && !Numeric(params[i])) return "numeric";
         }
         return nullptr;
     }

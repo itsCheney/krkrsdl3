@@ -8,6 +8,7 @@
 #include <limits>
 #include <mutex>
 #include <string>
+#include "LayerSpanRouteDiagnostics.h"
 
 // Bounded, opt-in diagnostics. Timings are inclusive wall time: script/load/
 // software scopes can contain each other and GPU waits, so never add them.
@@ -124,6 +125,7 @@ struct CPUConsumerBudget {
     uint64_t reads=0,readExceeded=0,callers=0,callerExceeded=0;
     uint64_t producers=0,producerExceeded=0,oversize=0;
     uint64_t spanRoutes=0,spanRouteExceeded=0;
+    span_route::Window spanWindow;
 };
 inline void (*cpuConsumerWindowTaken)(const CPUConsumerBudget&,uint64_t)=nullptr;
 struct Profile { std::array<Timing,size_t(Stage::Count)> stages{};
@@ -155,6 +157,15 @@ struct Profile { std::array<Timing,size_t(Stage::Count)> stages{};
 };
 inline Profile profile;
 inline uint64_t started=0;
+inline uint64_t nextSpanWindowID=1;
+inline thread_local uint64_t lastSuccessfulProfileWindowID=0;
+inline thread_local uint64_t lastSuccessfulProfileGeneration=0;
+inline uint64_t AllocateSpanWindowID() {
+    if(!nextSpanWindowID) return 0;
+    const auto result=nextSpanWindowID;
+    nextSpanWindowID=result==std::numeric_limits<uint64_t>::max() ? 0 : result+1;
+    return result;
+}
 inline std::mutex mutex;
 inline uint64_t lastFrameTimestamp=0;
 inline bool haveLastFrameTimestamp=false;
@@ -167,6 +178,10 @@ inline void SetEnabled(bool value) {
     if(next==0 || next==RecordEpochSentinel) next=1;
     generation.store(next,std::memory_order_relaxed);
     profile=Profile{}; started=value ? Now() : 0;
+    if(value) {profile.cpuConsumerBudget.spanWindow.id=AllocateSpanWindowID();
+        profile.cpuConsumerBudget.spanWindow.overflow=!profile.cpuConsumerBudget.spanWindow.id;}
+    lastSuccessfulProfileWindowID=0;
+    lastSuccessfulProfileGeneration=0;
     lastFrameTimestamp=0; haveLastFrameTimestamp=false;
 }
 inline uint64_t CaptureGeneration() {
@@ -444,6 +459,8 @@ inline void RecordAMVFrame(uint64_t bytes) {
     ++profile.decodedFrames; profile.decodedBytes+=bytes;
 }
 struct Summary {
+    uint64_t spanRouteWindowID=0;
+    uint64_t spanRouteGeneration=0;
     std::string stages,transfers,transferOrigins,originOverflow;
     uint32_t workProfileVersion=2,frameSampleCount=0;
     std::array<uint64_t,MaxFrameSamples> frameIntervalNS{},frameCpuWallNS{};
@@ -504,7 +521,11 @@ inline Summary Take() {
     { std::lock_guard<std::mutex> lock(mutex); captured=profile; profile=Profile{};
       capturedGeneration=generation.load(std::memory_order_relaxed);
       const auto now=Now(); out.intervalNS=started && now>=started ? now-started : 0;
-      started=enabled.load(std::memory_order_relaxed) ? now : 0; }
+      started=enabled.load(std::memory_order_relaxed) ? now : 0;
+      if(started) {profile.cpuConsumerBudget.spanWindow.id=AllocateSpanWindowID();
+          profile.cpuConsumerBudget.spanWindow.overflow=!profile.cpuConsumerBudget.spanWindow.id;}
+      out.spanRouteWindowID=captured.cpuConsumerBudget.spanWindow.id;
+      out.spanRouteGeneration=capturedGeneration; }
     if(cpuConsumerWindowTaken) cpuConsumerWindowTaken(captured.cpuConsumerBudget,capturedGeneration);
     out.decodedFrames=captured.decodedFrames; out.decodedBytes=captured.decodedBytes;
     out.frameSampleCount=captured.frameSampleCount;out.frameSamplesDropped=captured.frameSamplesDropped;
