@@ -1300,6 +1300,16 @@ void TVPLoadGraphicProvince(
 //---------------------------------------------------------------------------
 // TVPLoadGraphic (to texture), return size
 //---------------------------------------------------------------------------
+static void TVPTagGraphicDiagnosticAsset(iTVPBaseBitmap* dest, const ttstr& normalizedName)
+{
+    if(!dest || !dest->GetTexture()) return;
+    try {
+        const auto name=normalizedName.AsStdString();
+        dest->GetTexture()->SetDiagnosticAsset(name.c_str());
+    } catch(...) {
+        // Diagnostic string allocation must not make a successful load fail.
+    }
+}
 int TVPLoadGraphic(iTVPBaseBitmap* dest,
                    const ttstr& name,
                    tjs_int32 keyidx,
@@ -1334,7 +1344,10 @@ int TVPLoadGraphic(iTVPBaseBitmap* dest,
             krkrsdl3::layer_work::StageScope hit(krkrsdl3::layer_work::Stage::ImageCacheHit);
             // found in cache
             if (dest)
+            {
                 ptr->GetObjectNoAddRef()->AssignToTexture(dest);
+                TVPTagGraphicDiagnosticAsset(dest,nname);
+            }
             if (provincename)
                 *provincename = ptr->GetObjectNoAddRef()->ProvinceName;
             if (metainfo)
@@ -1393,6 +1406,7 @@ int TVPLoadGraphic(iTVPBaseBitmap* dest,
             data.AssignToTexture(dest);
         }
         ret = bmp->GetWidth() * bmp->GetHeight() * bmp->GetBPP() / 8;
+        TVPTagGraphicDiagnosticAsset(dest,nname);
         bmp->Release(); bmp = nullptr;
     }
     catch (...)

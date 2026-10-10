@@ -124,6 +124,15 @@ class LayerTexture final : public iTVPTexture2D {
     tTVPRect leaseDamage;
     const uint64_t textureID = point_trace::NextTextureID();
     uint64_t contentVersion = 0;
+    krkrsdl3::layer_hotspot::Identity diagnosticOrigin;
+    void PublishDiagnosticIdentity() const noexcept {
+        try {
+            if(handle && session->backend)
+                session->backend->SetLayerDiagnosticIdentity(handle, DiagnosticIdentity());
+        } catch(...) {
+            // Diagnostics cannot turn an otherwise valid texture access into a failure.
+        }
+    }
     bool emoteAlphaEligible = false;
     krkrsdl3::AsyncAlphaTileCache alphaTiles;
     struct InvalidationInfo {
@@ -148,6 +157,7 @@ class LayerTexture final : public iTVPTexture2D {
                              const char* writer="external") {
         lastWrite = {reason, point_trace::CurrentWriter() ? point_trace::CurrentWriter() : writer,
                      ++contentVersion};
+        PublishDiagnosticIdentity();
         lastWriteRect = written ? *written : tTVPRect(0,0,Width,Height);
         for(auto& entry:pointCache) {
             if(written && (entry.x<written->left || entry.x>=written->right ||
@@ -291,10 +301,27 @@ class LayerTexture final : public iTVPTexture2D {
     }
 public:
     uint64_t DiagnosticSessionID() const {return session->diagnosticID;}
+    krkrsdl3::layer_hotspot::Identity DiagnosticIdentity() const override {
+        auto result=diagnosticOrigin;
+        result.session=session->diagnosticID; result.texture=textureID; result.version=contentVersion;
+        return result;
+    }
+    void SetDiagnosticAsset(const char* name) override {
+        // Origin is set by a successful image load, never by a composite writer.
+        if(!diagnosticOrigin.assetHash) krkrsdl3::layer_hotspot::SetAsset(diagnosticOrigin,name);
+        PublishDiagnosticIdentity();
+    }
+    void SetDiagnosticParent(const krkrsdl3::layer_hotspot::Identity& parent,
+                             const char* role,bool copiedContent) override {
+        krkrsdl3::layer_hotspot::SetParent(diagnosticOrigin,parent,role,copiedContent);
+        PublishDiagnosticIdentity();
+    }
     LayerTexture(std::shared_ptr<Session> s,unsigned w,unsigned h,TVPTextureFormat::e f,bool ro)
         : iTVPTexture2D(w,h),session(std::move(s)),format(f),readonly(ro) {
+        diagnosticOrigin=krkrsdl3::layer_hotspot::CreatedIdentity(session->diagnosticID,textureID);
         handle=session->backend->CreateLayerTexture(w,h,f==TVPTextureFormat::Gray ? TVPLayerTextureFormat::R8 : TVPLayerTextureFormat::RGBA8);
         if(!handle) throw std::runtime_error("GPU Layer texture allocation failed");
+        PublishDiagnosticIdentity();
         session->textures.insert(this); session->stats.gpuResidentBytes+=Bytes();
     }
     ~LayerTexture() override {
@@ -465,6 +492,7 @@ public:
                 writeLeased ? rawWriteOriginOversize : uploadOriginOversize);
             dirty=false; leaseHadDamage=false;
         }
+        PublishDiagnosticIdentity();
         return handle;
     }
     bool GetContentKey(uint64_t& identity,uint64_t& version) const override {
@@ -482,6 +510,7 @@ public:
         // A raw CPU address or active read/write lease can be observed outside
         // this call; replacing GPU contents behind it would violate that contract.
         if(!session->backend || !handle || pinned || locks || writeLeased) return nullptr;
+        PublishDiagnosticIdentity();
         return handle;
     }
     void CommitGPUOverwrite() override {
@@ -691,6 +720,7 @@ public:
     iTVPTexture2D* CreateTexture2D(TJS::tTJSBinaryStream* stream) override { return Software()->CreateTexture2D(stream); }
     iTVPTexture2D* CreateTexture2D(unsigned w,unsigned h,iTVPTexture2D* old) override {
         auto* t=CreateTexture2D(nullptr,0,w,h,old->GetFormat());
+        t->SetDiagnosticParent(old->DiagnosticIdentity(),"copy",true);
         tTVPRect r(0,0,std::min(w,old->GetWidth()),std::min(h,old->GetHeight()));
         std::pair<iTVPTexture2D*,tTVPRect> pair(old,r);
         OperateRect(GetRenderMethod("Copy"),t,nullptr,r,tRenderTexRectArray(&pair,1)); return t;

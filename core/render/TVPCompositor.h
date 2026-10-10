@@ -11,6 +11,7 @@
 #include "LayerSpanComposite.h"
 #include "AsyncLayerReadback.h"
 #include "LayerUploadBatch.h"
+#include "LayerHotspotContext.h"
 
 //---------------------------------------------------------------------------
 // TVPCompositor
@@ -211,6 +212,7 @@ public:
                                   const uint8_t* colorBurn) { return false; }
     virtual void* CreateLayerTexture(int, int, TVPLayerTextureFormat) { return nullptr; }
     virtual void DestroyLayerTexture(void*) {}
+    virtual void SetLayerDiagnosticIdentity(void*, const layer_hotspot::Identity&) {}
     virtual bool UpdateLayerTexture(void*, const uint8_t*, int, const TVPLayerRect&) { return false; }
     // Copies the borrowed R8 bytes synchronously, then draws using the ordinary
     // integer operator. False guarantees no glyph target write; exceptions must

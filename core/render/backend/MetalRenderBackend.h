@@ -99,6 +99,7 @@ public:
     bool SetLayerAlphaTables(const uint8_t*, const uint8_t*) override;
     bool SetLayerPsTables(const uint8_t*, const uint8_t*, const uint8_t*) override;
     void* CreateLayerTexture(int, int, TVPLayerTextureFormat) override;
+    void SetLayerDiagnosticIdentity(void*,const layer_hotspot::Identity&) override;
     void DestroyLayerTexture(void*) override;
     bool UpdateLayerTexture(void*, const uint8_t*, int, const TVPLayerRect&) override;
     bool OperateLayerGlyph(const TVPLayerOperation&,void*,const TVPLayerRect&,

@@ -2404,7 +2404,9 @@ void tTVPNativeBaseBitmap::IndependNoCopy()
     // indepent the bitmap, but not to copy the original bitmap
     if (!Bitmap->IsStatic() && Bitmap->IsIndependent())
         return;
+    const auto discarded=Bitmap->DiagnosticIdentity();
     Recreate();
+    Bitmap->SetDiagnosticParent(discarded,"discarded",false);
 }
 //---------------------------------------------------------------------------
 void tTVPNativeBaseBitmap::Recreate()

@@ -176,6 +176,7 @@ protected:
     // Stable native-instance identity for deferred input. This avoids keeping
     // the TJS owner alive merely to detect stale/recycled layer pointers.
     uint64_t LifetimeID;
+    const uint64_t LayerDiagnosticID;
 
     //---------------------------------------------- object lifetime stuff --
 public:
@@ -186,6 +187,7 @@ public:
 
     iTJSDispatch2* GetOwnerNoAddRef() const { return Owner; }
     uint64_t GetLifetimeID() const { return LifetimeID; }
+    uint64_t GetLayerDiagnosticID() const { return LayerDiagnosticID; }
 
     tTJSVariantClosure GetActionOwnerNoAddRef() const { return ActionOwner; }
 

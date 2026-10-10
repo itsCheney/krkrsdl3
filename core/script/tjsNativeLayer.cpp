@@ -359,6 +359,7 @@ bool TVPDefaultHoldAlpha = false;
 // object lifetime stuff
 //---------------------------------------------------------------------------
 tTJSNI_BaseLayer::tTJSNI_BaseLayer()
+    : LayerDiagnosticID(krkrsdl3::layer_hotspot::NextLayerID())
 {
     // creates bitmap holder
     tTVPTempBitmapHolder::AddRef();
@@ -2816,6 +2817,7 @@ void tTJSNI_BaseLayer::AssignTexture(iTVPTexture2D* tex)
 //---------------------------------------------------------------------------
 iTJSDispatch2* tTJSNI_BaseLayer::LoadImages(const ttstr& name, tjs_uint32 colorkey)
 {
+    krkrsdl3::layer_hotspot::Scope hotspot(LayerDiagnosticID,"image");
     // loads image(s) from specified storage.
     // colorkey must be a color that should be transparent, or:
     // 0x 01 ff ff ff (clAdapt) : the color key will be automatically chosen
@@ -4161,6 +4163,7 @@ void tTJSNI_BaseLayer::DefaultKeyPress(tjs_uint16 key)
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::AllocateCache()
 {
+    krkrsdl3::layer_hotspot::Scope hotspot(LayerDiagnosticID,"cache");
     if (!CacheBitmap)
     {
         CacheBitmap = new tTVPBaseTexture(Rect.get_width(), Rect.get_height(), 32);
@@ -6950,6 +6953,7 @@ void tTJSNI_BaseLayer::InternalDrawNoCache_CPU(tTVPDrawable* target, const tTVPR
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::Draw(tTVPDrawable* target, const tTVPRect& r, bool visiblecheck)
 {
+    krkrsdl3::layer_hotspot::Scope hotspot(LayerDiagnosticID,"draw");
     // process updating pipe line.
     // draw the layer content to "target".
     // "r" is a rectangle to be drawn in the parent's coordinates.
@@ -7257,6 +7261,7 @@ void tTJSNI_BaseLayer::DrawCompleted(const tTVPRect& destrect,
                                      tTVPLayerType type,
                                      tjs_int opacity)
 {
+    krkrsdl3::layer_hotspot::Scope hotspot(LayerDiagnosticID,"composite");
     // called from children to notify that the image drawing is completed.
     // blend the image to the target unless bmp is the same as
     // UpdateBitmapForChild.
@@ -7604,6 +7609,7 @@ void tTJSNI_BaseLayer::StartTransition(const ttstr& name,
                                        tTJSNI_BaseLayer* transsource,
                                        tTJSVariantClosure options)
 {
+    krkrsdl3::layer_hotspot::Scope hotspot(LayerDiagnosticID,"transition.start");
     // start transition
 
     // is current transition processing?
@@ -7908,6 +7914,7 @@ void tTJSNI_BaseLayer::StopTransitionByHandler()
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::InvokeTransition(tjs_uint64 tick)
 {
+    krkrsdl3::layer_hotspot::Scope hotspot(LayerDiagnosticID,"transition");
     if (!TransCompEventPrevented)
     {
         if (UseTransTickCallback)
@@ -7947,6 +7954,7 @@ void tTJSNI_BaseLayer::DoDivisibleTransition(iTVPBaseBitmap* dest,
                                              tjs_int dy,
                                              const tTVPRect& srcrect)
 {
+    krkrsdl3::layer_hotspot::Scope hotspot(LayerDiagnosticID,"transition.output");
     // apply transition ( with no children ) over given target bitmap
     if (!InTransition || !DivisibleTransHandler)
         return;
@@ -8039,6 +8047,7 @@ void tTJSNI_BaseLayer::tTransDrawable::DrawCompleted(const tTVPRect& destrect,
                                                      tTVPLayerType type,
                                                      tjs_int opacity)
 {
+    krkrsdl3::layer_hotspot::Scope hotspot(Owner->LayerDiagnosticID,"transition.output");
     // do divisible transition
     if (!Owner->InTransition || !Owner->DivisibleTransHandler)
         return;

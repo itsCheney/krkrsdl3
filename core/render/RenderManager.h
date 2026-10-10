@@ -1,6 +1,7 @@
 #pragma once
 #include "LayerRenderOperation.h"
 #include "LayerWorkDiagnostics.h"
+#include "LayerHotspotContext.h"
 
 #include "ComplexRect.h"
 #include <unordered_map>
@@ -54,6 +55,11 @@ public:
     }
 
     virtual TVPTextureFormat::e GetFormat() const = 0;
+    // Diagnostic metadata must never acquire pixel data or synchronize the GPU.
+    virtual krkrsdl3::layer_hotspot::Identity DiagnosticIdentity() const { return {}; }
+    virtual void SetDiagnosticAsset(const char*) {}
+    virtual void SetDiagnosticParent(const krkrsdl3::layer_hotspot::Identity&,
+                                     const char*, bool) {}
     virtual const void* GetScanLineForRead(tjs_uint l) { return nullptr; }
     virtual const void* GetPixelData() { return GetScanLineForRead(0); }
     virtual void* GetScanLineForWrite(tjs_uint l) { return (void*)GetScanLineForRead(l); }
