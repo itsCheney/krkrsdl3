@@ -11,6 +11,7 @@
 #include "LayerSpanRouteDiagnostics.h"
 #include "CPUReadAggregation.h"
 #include "LayerImageDiagnostics.h"
+#include "CPUFrameDiagnostics.h"
 
 // Bounded, opt-in diagnostics. Timings are inclusive wall time: script/load/
 // software scopes can contain each other and GPU waits, so never add them.
@@ -187,6 +188,7 @@ inline void SetEnabled(bool value) {
     lastSuccessfulProfileWindowID=0;
     lastSuccessfulProfileGeneration=0;
     lastFrameTimestamp=0; haveLastFrameTimestamp=false;
+    cpu_frame::SetEnabled(value,next,profile.cpuConsumerBudget.spanWindow.id);
 }
 inline uint64_t CaptureGeneration() {
     if(!enabled.load(std::memory_order_relaxed)) return 0;
@@ -547,6 +549,7 @@ inline Summary Take() {
           profile.cpuConsumerBudget.spanWindow.overflow=!profile.cpuConsumerBudget.spanWindow.id;}
       out.spanRouteWindowID=captured.cpuConsumerBudget.spanWindow.id;
       out.spanRouteGeneration=capturedGeneration; }
+    cpu_frame::TakeWindow(out.spanRouteWindowID,profile.cpuConsumerBudget.spanWindow.id);
     if(cpuConsumerWindowTaken) cpuConsumerWindowTaken(captured.cpuConsumerBudget,capturedGeneration);
     out.decodedFrames=captured.decodedFrames; out.decodedBytes=captured.decodedBytes;
     out.frameSampleCount=captured.frameSampleCount;out.frameSamplesDropped=captured.frameSamplesDropped;

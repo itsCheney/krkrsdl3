@@ -4,6 +4,8 @@
 #include <array>
 #include <string>
 #include "TVPCompositor.h"
+#include "StaticPresentation.h"
+#include "PendingLayerFill.h"
 
 struct SDL_Window;
 
@@ -82,6 +84,9 @@ public:
     const char* GetName() const override { return "metal"; }
     bool IsHardware() const override { return true; }
     void FetchInfo() override;
+    void InvalidatePresentation(const char* reason) override;
+    static_presentation::Counters GetStaticPresentationStats() const;
+    pending_fill::Counters GetLayerFillCoalescingStats() const;
     bool SupportsLayerOperations() const override;
     bool SupportsLayerTransitions() const override;
     bool OperateLayerTransition(const TVPLayerTransitionOperation&, void*, void*, void*) override;

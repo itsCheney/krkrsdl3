@@ -23,6 +23,7 @@ tTJSNI_Bitmap::~tTJSNI_Bitmap()
 // uint, uint, [bpp] 幅、高さ、bppの順で指定
 tjs_error tTJSNI_Bitmap::Construct(tjs_int numparams, tTJSVariant** param, iTJSDispatch2* tjs_obj)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     Owner = tjs_obj;
     if (numparams > 0)
     {
@@ -58,12 +59,14 @@ tjs_error tTJSNI_Bitmap::Construct(tjs_int numparams, tTJSVariant** param, iTJSD
 //----------------------------------------------------------------------
 void tTJSNI_Bitmap::Invalidate()
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     if (Bitmap)
         delete Bitmap, Bitmap = NULL;
 }
 //----------------------------------------------------------------------
 tjs_uint32 tTJSNI_Bitmap::GetPixel(tjs_int x, tjs_int y) const
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     krkrsdl3::point_trace::OriginScope trace(krkrsdl3::point_trace::Source::BitmapColor, this);
     if (Loading)
         TVPThrowExceptionMessage(TVPCurrentlyAsyncLoadBitmap);
@@ -75,6 +78,7 @@ tjs_uint32 tTJSNI_Bitmap::GetPixel(tjs_int x, tjs_int y) const
 //----------------------------------------------------------------------
 void tTJSNI_Bitmap::SetPixel(tjs_int x, tjs_int y, tjs_uint32 color)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     if (Loading)
         TVPThrowExceptionMessage(TVPCurrentlyAsyncLoadBitmap);
     if (!Bitmap)
@@ -85,6 +89,7 @@ void tTJSNI_Bitmap::SetPixel(tjs_int x, tjs_int y, tjs_uint32 color)
 //----------------------------------------------------------------------
 tjs_int tTJSNI_Bitmap::GetMaskPixel(tjs_int x, tjs_int y) const
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     krkrsdl3::point_trace::OriginScope trace(krkrsdl3::point_trace::Source::BitmapMask, this);
     if (Loading)
         TVPThrowExceptionMessage(TVPCurrentlyAsyncLoadBitmap);
@@ -100,6 +105,7 @@ tjs_int tTJSNI_Bitmap::GetMaskPixel(tjs_int x, tjs_int y) const
 //----------------------------------------------------------------------
 void tTJSNI_Bitmap::SetMaskPixel(tjs_int x, tjs_int y, tjs_int mask)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     if (Loading)
         TVPThrowExceptionMessage(TVPCurrentlyAsyncLoadBitmap);
     if (!Bitmap)
@@ -110,6 +116,7 @@ void tTJSNI_Bitmap::SetMaskPixel(tjs_int x, tjs_int y, tjs_int mask)
 //----------------------------------------------------------------------
 void tTJSNI_Bitmap::Independ(bool copy)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     if (Loading)
         TVPThrowExceptionMessage(TVPCurrentlyAsyncLoadBitmap);
     if (Bitmap)
@@ -123,6 +130,7 @@ void tTJSNI_Bitmap::Independ(bool copy)
 //----------------------------------------------------------------------
 iTJSDispatch2* tTJSNI_Bitmap::Load(const ttstr& name, tjs_uint32 colorkey)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     if (Loading)
         TVPThrowExceptionMessage(TVPCurrentlyAsyncLoadBitmap);
     if (!Bitmap)
@@ -135,6 +143,7 @@ iTJSDispatch2* tTJSNI_Bitmap::Load(const ttstr& name, tjs_uint32 colorkey)
 //----------------------------------------------------------------------
 void tTJSNI_Bitmap::LoadAsync(const ttstr& name)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     if (Loading)
         TVPThrowExceptionMessage(TVPCurrentlyAsyncLoadBitmap);
     Loading = true;
@@ -143,6 +152,7 @@ void tTJSNI_Bitmap::LoadAsync(const ttstr& name)
 //----------------------------------------------------------------------
 void tTJSNI_Bitmap::Save(const ttstr& name, const ttstr& type, iTJSDispatch2* meta)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     if (Loading)
         TVPThrowExceptionMessage(TVPCurrentlyAsyncLoadBitmap);
     if (!Bitmap)
@@ -153,6 +163,7 @@ void tTJSNI_Bitmap::Save(const ttstr& name, const ttstr& type, iTJSDispatch2* me
 //----------------------------------------------------------------------
 void tTJSNI_Bitmap::SetSize(tjs_uint width, tjs_uint height, bool keepimage)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     if (!Bitmap)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
 
@@ -175,6 +186,7 @@ void tTJSNI_Bitmap::SetSize(tjs_uint width, tjs_uint height, bool keepimage)
 //----------------------------------------------------------------------
 void tTJSNI_Bitmap::SetSizeAndImageBuffer(tTVPBitmap* bmp)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     if (!Bitmap)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
 
@@ -187,6 +199,7 @@ void tTJSNI_Bitmap::SetSizeAndImageBuffer(tTVPBitmap* bmp)
 //----------------------------------------------------------------------
 void tTJSNI_Bitmap::SetWidth(tjs_uint width)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     if (Loading)
         TVPThrowExceptionMessage(TVPCurrentlyAsyncLoadBitmap);
     if (!Bitmap)
@@ -200,6 +213,7 @@ void tTJSNI_Bitmap::SetWidth(tjs_uint width)
 //----------------------------------------------------------------------
 tjs_uint tTJSNI_Bitmap::GetWidth() const
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     if (Loading)
         TVPThrowExceptionMessage(TVPCurrentlyAsyncLoadBitmap);
     if (!Bitmap)
@@ -209,6 +223,7 @@ tjs_uint tTJSNI_Bitmap::GetWidth() const
 //----------------------------------------------------------------------
 void tTJSNI_Bitmap::SetHeight(tjs_uint height)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     if (Loading)
         TVPThrowExceptionMessage(TVPCurrentlyAsyncLoadBitmap);
     if (!Bitmap)
@@ -221,6 +236,7 @@ void tTJSNI_Bitmap::SetHeight(tjs_uint height)
 //----------------------------------------------------------------------
 tjs_uint tTJSNI_Bitmap::GetHeight() const
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     if (Loading)
         TVPThrowExceptionMessage(TVPCurrentlyAsyncLoadBitmap);
     if (!Bitmap)
@@ -230,6 +246,7 @@ tjs_uint tTJSNI_Bitmap::GetHeight() const
 //----------------------------------------------------------------------
 const void* tTJSNI_Bitmap::GetPixelBuffer() const
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     if (!Bitmap)
         return NULL;
     return Bitmap->GetTexture()->GetPersistentCPUData(false);
@@ -237,6 +254,7 @@ const void* tTJSNI_Bitmap::GetPixelBuffer() const
 //----------------------------------------------------------------------
 void* tTJSNI_Bitmap::GetPixelBufferForWrite()
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     if (!Bitmap)
         return NULL;
     return Bitmap->GetTextureForRender(true, nullptr)->GetPersistentCPUData(true);
@@ -244,6 +262,7 @@ void* tTJSNI_Bitmap::GetPixelBufferForWrite()
 //----------------------------------------------------------------------
 tjs_int tTJSNI_Bitmap::GetPixelBufferPitch() const
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     if (!Bitmap)
         return 0;
     return Bitmap->GetPitchBytes();
@@ -251,11 +270,13 @@ tjs_int tTJSNI_Bitmap::GetPixelBufferPitch() const
 //----------------------------------------------------------------------
 void tTJSNI_Bitmap::CopyFrom(const tTJSNI_Bitmap* src)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     Bitmap->Assign(*src->GetBitmap());
 }
 //----------------------------------------------------------------------
 void tTJSNI_Bitmap::CopyFrom(const iTVPBaseBitmap* src)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     Bitmap->Assign(*src);
 }
 //----------------------------------------------------------------------
@@ -285,6 +306,7 @@ tTJSNC_Bitmap::tTJSNC_Bitmap() : inherited(TJS_N("Bitmap"))
     TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ getPixel)
     {
         TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Bitmap);
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",_this->GetReceiverDiagnosticID(),krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
         if (numparams < 2)
             return TJS_E_BADPARAMCOUNT;
         if (result)
@@ -296,6 +318,7 @@ tTJSNC_Bitmap::tTJSNC_Bitmap() : inherited(TJS_N("Bitmap"))
     TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ setPixel)
     {
         TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Bitmap);
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",_this->GetReceiverDiagnosticID(),krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
         if (numparams < 3)
             return TJS_E_BADPARAMCOUNT;
         _this->SetPixel(*param[0], *param[1], (tjs_int)*param[2]);
@@ -306,6 +329,7 @@ tTJSNC_Bitmap::tTJSNC_Bitmap() : inherited(TJS_N("Bitmap"))
     TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ getMaskPixel)
     {
         TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Bitmap);
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",_this->GetReceiverDiagnosticID(),krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
         if (numparams < 2)
             return TJS_E_BADPARAMCOUNT;
         if (result)
@@ -317,6 +341,7 @@ tTJSNC_Bitmap::tTJSNC_Bitmap() : inherited(TJS_N("Bitmap"))
     TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ setMaskPixel)
     {
         TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Bitmap);
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",_this->GetReceiverDiagnosticID(),krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
         if (numparams < 3)
             return TJS_E_BADPARAMCOUNT;
         _this->SetMaskPixel(*param[0], *param[1], *param[2]);
@@ -327,6 +352,7 @@ tTJSNC_Bitmap::tTJSNC_Bitmap() : inherited(TJS_N("Bitmap"))
     TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ independ)
     {
         TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Bitmap);
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",_this->GetReceiverDiagnosticID(),krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
         bool copy = true;
         if (numparams >= 1 && param[0]->Type() != tvtVoid)
             copy = param[0]->operator bool();
@@ -338,6 +364,7 @@ tTJSNC_Bitmap::tTJSNC_Bitmap() : inherited(TJS_N("Bitmap"))
     TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ setSize)
     {
         TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Bitmap);
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",_this->GetReceiverDiagnosticID(),krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
         if (numparams < 2)
             return TJS_E_BADPARAMCOUNT;
         if (_this->IsLoading())
@@ -350,6 +377,7 @@ tTJSNC_Bitmap::tTJSNC_Bitmap() : inherited(TJS_N("Bitmap"))
     TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ copyFrom)
     {
         TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Bitmap);
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",_this->GetReceiverDiagnosticID(),krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
         if (numparams < 1)
             return TJS_E_BADPARAMCOUNT;
         if (_this->IsLoading())
@@ -370,6 +398,7 @@ tTJSNC_Bitmap::tTJSNC_Bitmap() : inherited(TJS_N("Bitmap"))
     TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ save)
     {
         TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Bitmap);
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",_this->GetReceiverDiagnosticID(),krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
         if (numparams < 1)
             return TJS_E_BADPARAMCOUNT;
         ttstr name(*param[0]);
@@ -387,6 +416,7 @@ tTJSNC_Bitmap::tTJSNC_Bitmap() : inherited(TJS_N("Bitmap"))
     TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ load)
     {
         TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Bitmap);
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",_this->GetReceiverDiagnosticID(),krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
         if (numparams < 1)
             return TJS_E_BADPARAMCOUNT;
         ttstr name(*param[0]);
@@ -414,6 +444,7 @@ tTJSNC_Bitmap::tTJSNC_Bitmap() : inherited(TJS_N("Bitmap"))
     TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ loadAsync)
     {
         TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Bitmap);
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",_this->GetReceiverDiagnosticID(),krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
         if (numparams < 1)
             return TJS_E_BADPARAMCOUNT;
         ttstr name(*param[0]);
@@ -517,6 +548,7 @@ tTJSNC_Bitmap::tTJSNC_Bitmap() : inherited(TJS_N("Bitmap"))
     //----------------------------------------------------------------------
     TJS_BEGIN_NATIVE_PROP_DECL(width){TJS_BEGIN_NATIVE_PROP_GETTER{
         TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Bitmap);
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",_this->GetReceiverDiagnosticID(),krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     *result = (tjs_int64)_this->GetWidth();
     return TJS_S_OK;
 }
@@ -525,6 +557,7 @@ TJS_END_NATIVE_PROP_GETTER
 TJS_BEGIN_NATIVE_PROP_SETTER
 {
     TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Bitmap);
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",_this->GetReceiverDiagnosticID(),krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     _this->SetWidth(static_cast<tjs_uint>((tjs_int64)*param));
     return TJS_S_OK;
 }
@@ -534,6 +567,7 @@ TJS_END_NATIVE_PROP_DECL(width)
 //----------------------------------------------------------------------
 TJS_BEGIN_NATIVE_PROP_DECL(height){TJS_BEGIN_NATIVE_PROP_GETTER{
     TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Bitmap);
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",_this->GetReceiverDiagnosticID(),krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
 *result = (tjs_int64)_this->GetHeight();
 return TJS_S_OK;
 }
@@ -542,6 +576,7 @@ TJS_END_NATIVE_PROP_GETTER
 TJS_BEGIN_NATIVE_PROP_SETTER
 {
     TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Bitmap);
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",_this->GetReceiverDiagnosticID(),krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
     _this->SetHeight(static_cast<tjs_uint>((tjs_int64)*param));
     return TJS_S_OK;
 }
@@ -551,6 +586,7 @@ TJS_END_NATIVE_PROP_DECL(height)
 //----------------------------------------------------------------------
 TJS_BEGIN_NATIVE_PROP_DECL(buffer){TJS_BEGIN_NATIVE_PROP_GETTER{
     TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Bitmap);
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",_this->GetReceiverDiagnosticID(),krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
 if (_this->IsLoading())
     TVPThrowExceptionMessage(TVPCurrentlyAsyncLoadBitmap);
 *result = (tTVInteger) reinterpret_cast<tjs_intptr_t>(_this->GetPixelBuffer());
@@ -564,6 +600,7 @@ TJS_END_NATIVE_PROP_DECL(buffer)
 //----------------------------------------------------------------------
 TJS_BEGIN_NATIVE_PROP_DECL(bufferForWrite){TJS_BEGIN_NATIVE_PROP_GETTER{
     TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Bitmap);
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",_this->GetReceiverDiagnosticID(),krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
 if (_this->IsLoading())
     TVPThrowExceptionMessage(TVPCurrentlyAsyncLoadBitmap);
 *result = (tTVInteger) reinterpret_cast<tjs_intptr_t>(_this->GetPixelBufferForWrite());
@@ -577,6 +614,7 @@ TJS_END_NATIVE_PROP_DECL(bufferForWrite)
 //----------------------------------------------------------------------
 TJS_BEGIN_NATIVE_PROP_DECL(bufferPitch){TJS_BEGIN_NATIVE_PROP_GETTER{
     TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Bitmap);
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",_this->GetReceiverDiagnosticID(),krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
 if (_this->IsLoading())
     TVPThrowExceptionMessage(TVPCurrentlyAsyncLoadBitmap);
 *result = _this->GetPixelBufferPitch();
@@ -590,6 +628,7 @@ TJS_END_NATIVE_PROP_DECL(bufferPitch)
 //----------------------------------------------------------------------
 TJS_BEGIN_NATIVE_PROP_DECL(loading){TJS_BEGIN_NATIVE_PROP_GETTER{
     TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Bitmap);
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",_this->GetReceiverDiagnosticID(),krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
 *result = (tjs_int)(_this->IsLoading() ? 1 : 0);
 return TJS_S_OK;
 }

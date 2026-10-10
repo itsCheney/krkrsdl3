@@ -11,7 +11,9 @@
 #include "MetalStageDiagnostics.h"
 #include "PointReadTrace.h"
 #include "LayerInitialization.h"
+#include "PendingLayerFill.h"
 #include "LayerHotspotDiagnostics.h"
+#include "TransitionCache.h"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -346,6 +348,8 @@ struct MetalRenderBackend::Impl
 {
     struct Resource
     {
+        const uint64_t lifetimeID=static_presentation::NextResourceID();
+        uint64_t mutationVersion=0;
         id<MTLTexture> texture = nil;
         int width = 0, height = 0;
         int bytesPerPixel = 4;
@@ -357,9 +361,44 @@ struct MetalRenderBackend::Impl
     struct WindowDraw
     {
         id<MTLTexture> texture = nil;
+        Resource* resource=nullptr;
         float x, y, width, height;
     };
     SDL_Window* window = nullptr;
+    static_presentation::Policy presentationPolicy;
+    bool staticPresentEnabled=SDL_GetHintBoolean("MIKAGE_METAL_STATIC_PRESENT",true);
+    bool wasHidden=false;
+    uint64_t nextPresentationReportNS=0;
+    static void Write(Resource* resource) noexcept {
+        if(resource) ++resource->mutationVersion;
+    }
+    static_presentation::Signature PresentationSignature() const {
+        static_presentation::Signature signature;
+        signature.width=width;signature.height=height;signature.epoch=presentationPolicy.Epoch();
+        signature.windows.reserve(windows.size());
+        for(const auto& draw:windows) {
+            const auto* r=draw.resource;
+            signature.windows.push_back({r?r->lifetimeID:0,r?r->mutationVersion:0,
+                r?r->width:0,r?r->height:0,draw.x,draw.y,draw.width,draw.height});
+        }
+        return signature;
+    }
+    void ReportPresentation() {
+        const auto now=SDL_GetTicksNS();
+        if(!SDL_GetHintBoolean("MIKAGE_METAL_DIAGNOSTICS",false) || now<nextPresentationReportNS)return;
+        nextPresentationReportNS=now+1000000000ULL;
+        const auto& s=presentationPolicy.Stats();
+        const auto c=transition_cache::Snapshot();
+        std::string denials;
+        for(size_t i=0;i<s.denied.size();++i) {
+            if(i)denials+=',';denials+=std::to_string(i)+":"+std::to_string(s.denied[i]);
+        }
+        SDL_Log("metal.staticPresentation version=1 epoch=%llu eligible=%llu skipped=%llu denials=%s cacheEligible=%llu cacheMaterialized=%llu cacheCancelled=%llu",
+            static_cast<unsigned long long>(presentationPolicy.Epoch()),
+            static_cast<unsigned long long>(s.eligible),static_cast<unsigned long long>(s.skipped),denials.c_str(),
+            static_cast<unsigned long long>(c.eligible),static_cast<unsigned long long>(c.materialized),
+            static_cast<unsigned long long>(c.cancelled));
+    }
     SDL_MetalView view = nullptr;
     CAMetalLayer* layer = nil;
     id<MTLDevice> device = nil;
@@ -517,7 +556,11 @@ struct MetalRenderBackend::Impl
     uint64_t commandSerial = 0, lastSubmittedSerial = 0, renderFrameSerial = 0;
     layer_hotspot::Recorder hotspots;
     std::shared_ptr<layer_hotspot::OutputGate> hotspotOutput=std::make_shared<layer_hotspot::OutputGate>();
-    uint64_t diagnosticResourceSerial=0, diagnosticEncoderSerial=0;
+    uint64_t diagnosticResourceSerial=0, diagnosticEncoderSerial=0, logicalOperationSerial=0;
+    struct LayerParameters { simd_int4 destination,source,clip,operation,color; };
+    pending_fill::Slot<LayerParameters> pendingFill;
+    pending_fill::Counters fillCoalescingStats;
+    const bool coalesceFill=SDL_GetHintBoolean("MIKAGE_METAL_LAYER_COALESCE_FILL",true);
     uint64_t previousFrameNS=0;
     double diagnosticFrameMS=0;
     layer_hotspot::ResourceInfo* Info(Resource* resource) {
@@ -532,20 +575,42 @@ struct MetalRenderBackend::Impl
         return nullptr;
     }
     static std::array<int,4> DiagnosticRect(const TVPLayerRect& r) {return {r.left,r.top,r.right,r.bottom};}
-    void Trace(layer_hotspot::Access access,int kind,Resource* target,Resource* source,
+    uint64_t Trace(layer_hotspot::Access access,int kind,Resource* target,Resource* source,
                const TVPLayerRect& destination,const TVPLayerRect& sourceRect,const TVPLayerRect& clip,
-               bool draw=true,uint64_t snapshotBytes=0,int knownOpaque=-1) {
-        if(!hotspots.Enabled())return;
+               bool draw=true,uint64_t snapshotBytes=0,int knownOpaque=-1,
+               const TVPLayerOperation* parameters=nullptr,unsigned sampling=0,
+               layer_hotspot::Execution execution=layer_hotspot::Execution::Immediate,uint64_t logicalID=0) {
+        if(!logicalID && kind>0)logicalID=++logicalOperationSerial;
+        if(!hotspots.Enabled())return logicalID;
         const bool scaled=source && (std::abs(sourceRect.Width())!=destination.Width() || std::abs(sourceRect.Height())!=destination.Height());
         const bool full=target && layer_initialization::FullSurface(target->width,target->height,clip.left,clip.top,clip.right,clip.bottom);
         hotspots.Record(access,kind,Info(target),Info(source),DiagnosticRect(destination),DiagnosticRect(sourceRect),
             DiagnosticRect(clip),kind>0?uint64_t(std::max(0,clip.Width()))*std::max(0,clip.Height()):0,
             scaled,target && source==target,kind>0 && TVPLayerOperationReadsTarget(TVPLayerOperationKind(kind)),full,
-            knownOpaque>=0?knownOpaque:(full && kind==int(TVPLayerOperationKind::CopyOpaque)?1:-1),
+            knownOpaque>=0?knownOpaque:(parameters && kind==int(TVPLayerOperationKind::Fill)?
+                ((parameters->color>>24)==255?1:0):(full && kind==int(TVPLayerOperationKind::CopyOpaque)?1:-1)),
             diagnosticEncoderSerial,snapshotBytes,
             int(access==layer_hotspot::Access::Snapshot?layer_hotspot::Boundary::Snapshot:
-                access==layer_hotspot::Access::Read?layer_hotspot::Boundary::Read:layer_hotspot::Boundary::Other));
+                access==layer_hotspot::Access::Read?layer_hotspot::Boundary::Read:layer_hotspot::Boundary::Other),
+            parameters,sampling,logicalID,execution);
         if(draw)hotspots.Count([](layer_hotspot::Totals& t){t.Add(t.draws);});
+        return logicalID;
+    }
+    void ResolvePendingFill(bool omit=false) {
+        if(!pendingFill)return;
+        auto* target=static_cast<Resource*>(pendingFill.target);
+        if(!omit) {
+            // Parameters are copied, never borrowed from a script/native stack.
+            [ordinaryRenderEncoder setVertexBytes:&pendingFill.parameters length:sizeof(LayerParameters) atIndex:0];
+            [ordinaryRenderEncoder setFragmentBytes:&pendingFill.parameters length:sizeof(LayerParameters) atIndex:0];
+            [ordinaryRenderEncoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+            hotspots.Count([](layer_hotspot::Totals& t){t.Add(t.actualDraws);});
+        }
+        Trace(layer_hotspot::Access::Execution,0,target,nullptr,pendingFill.region,{},pendingFill.region,!omit,0,-1,
+            nullptr,0,omit?layer_hotspot::Execution::Omitted:layer_hotspot::Execution::Materialized,pendingFill.logicalID);
+        hotspots.Count([&](layer_hotspot::Totals& t){if(omit)t.Add(t.omittedFills);else t.Add(t.materializedFills);});
+        if(omit)++fillCoalescingStats.omitted;else ++fillCoalescingStats.materialized;
+        pendingFill.Reset();
     }
     void ReportHotspots(bool final=false) {
         hotspots.Enable(SDL_GetHintBoolean("MIKAGE_METAL_DIAGNOSTICS",false));
@@ -877,8 +942,10 @@ struct MetalRenderBackend::Impl
     }
     id<MTLCommandBuffer> Commands()
     {
-        if (gpuFailed->load(std::memory_order_relaxed))
+        if (gpuFailed->load(std::memory_order_relaxed)) {
+            presentationPolicy.Invalidate();
             throw std::runtime_error("Metal GPU command execution failed (see render log)");
+        }
         if (!commands) {
             const Uint64 waitStarted = SDL_GetTicksNS();
             dispatch_semaphore_wait(inFlight, DISPATCH_TIME_FOREVER);
@@ -992,6 +1059,7 @@ struct MetalRenderBackend::Impl
         return {page->buffer, offset, length};
     }
     void EndOrdinary(layer_hotspot::Boundary why=layer_hotspot::Boundary::Target) {
+        ResolvePendingFill();
         if(ordinaryEncoder || ordinaryRenderEncoder)hotspots.End(why,diagnosticEncoderSerial);
         if(ordinaryEncoder) { [ordinaryEncoder endEncoding]; ordinaryEncoder=nil; }
         if(ordinaryRenderEncoder) { [ordinaryRenderEncoder endEncoding]; ordinaryRenderEncoder=nil; }
@@ -1175,6 +1243,7 @@ struct MetalRenderBackend::Impl
         Resource* resource = nullptr, MTLClearColor clearColor = MTLClearColorMake(0,0,0,0),
         layer_hotspot::ClearOrigin origin=layer_hotspot::ClearOrigin::Explicit)
     {
+        Write(resource?resource:FindTexture(texture));
         EndUpload("render");
         EndMesh();
         EndOrdinary();
@@ -1205,6 +1274,7 @@ struct MetalRenderBackend::Impl
     }
     id<MTLRenderCommandEncoder> MeshPass(Resource* resource, bool clear = false)
     {
+        Write(resource);
         id<MTLTexture> texture = resource->texture;
         EndOrdinary(layer_hotspot::Boundary::Mesh);
         if (!clear && activeMeshEncoder && activeMeshTarget == texture) return activeMeshEncoder;
@@ -1213,6 +1283,7 @@ struct MetalRenderBackend::Impl
         return activeMeshEncoder;
     }
     void EnsureInitialized(Resource* resource,bool writing=false) {
+        if(pendingFill.target==resource)ResolvePendingFill();
         if(resource && resource->initialization.Pending())
             EndLocal(Pass(resource->texture,true,metal_diagnostics::Workload::OtherRender,resource,MTLClearColorMake(0,0,0,0),
                   writing?layer_hotspot::ClearOrigin::FirstWrite:layer_hotspot::ClearOrigin::FirstRead),layer_hotspot::Boundary::Initialization);
@@ -1233,6 +1304,7 @@ struct MetalRenderBackend::Impl
     }
     void Destroy(void* handle, bool target)
     {
+        ResolvePendingFill();
         EndUpload("destroy");
         Resource* r = Find(handle);
         if (!r || r->target != target) return;
@@ -1245,6 +1317,7 @@ struct MetalRenderBackend::Impl
     }
     void Upload(Resource* r, const uint8_t* pixels, int w, int h, int pitch)
     {
+        Write(r);
         if (!r || !pixels || !ValidSize(w, h) || w > r->width || h > r->height || pitch < w * 4) return;
         const size_t rowBytes = (static_cast<size_t>(w) * 4 + 255) & ~size_t(255);
         if (static_cast<size_t>(h) > std::numeric_limits<size_t>::max() / rowBytes) return;
@@ -1336,6 +1409,7 @@ struct MetalRenderBackend::Impl
             [e setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
             [e setFragmentTexture:draw.texture atIndex:0];
             [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+            hotspots.Count([](layer_hotspot::Totals& t){t.Add(t.actualDraws);});
             Trace(layer_hotspot::Access::Window,0,nullptr,FindTexture(draw.texture),{}, {}, {},true);
             if (diagnosticSampled) ++diagnosticWorkload.windowDraws;
         }
@@ -1558,7 +1632,9 @@ struct MetalRenderBackend::Impl
     }
 };
 
-MetalRenderBackend::MetalRenderBackend() : impl_(std::make_unique<Impl>()) {}
+MetalRenderBackend::MetalRenderBackend() : impl_(std::make_unique<Impl>()) {
+    transition_cache::SetEnabled(SDL_GetHintBoolean("MIKAGE_METAL_DEFER_TRANSITION_CACHE",true));
+}
 MetalRenderBackend::~MetalRenderBackend() = default;
 iTVPRenderBackend* MetalRenderBackend::Create(SDL_Window* window, bool vsync)
 {
@@ -1591,6 +1667,7 @@ void MetalRenderBackend::BeginFrame(int w, int h)
         double(now-impl_->previousFrameNS)/1000000.0:0;
     impl_->previousFrameNS=now;
     ++impl_->renderFrameSerial;
+    if(impl_->width!=w || impl_->height!=h)impl_->presentationPolicy.Invalidate();
     impl_->width = w; impl_->height = h;
     impl_->windows.clear();
 }
@@ -1607,59 +1684,114 @@ uint64_t MetalRenderBackend::GetLastLayerPresentationSerial() const
 {
     return impl_->lastLayerPresentation->load(std::memory_order_acquire);
 }
+void MetalRenderBackend::InvalidatePresentation(const char* reason)
+{
+    impl_->presentationPolicy.Invalidate();
+    if(reason && (std::strcmp(reason,"session")==0 || std::strcmp(reason,"backend")==0)) {
+        impl_->staticPresentEnabled=SDL_GetHintBoolean("MIKAGE_METAL_STATIC_PRESENT",true);
+        transition_cache::SetEnabled(SDL_GetHintBoolean("MIKAGE_METAL_DEFER_TRANSITION_CACHE",true));
+    }
+}
+static_presentation::Counters MetalRenderBackend::GetStaticPresentationStats() const
+{
+    return impl_->presentationPolicy.Stats();
+}
+pending_fill::Counters MetalRenderBackend::GetLayerFillCoalescingStats() const
+{
+    return impl_->fillCoalescingStats;
+}
 void MetalRenderBackend::EndFrame()
 {
     @autoreleasepool {
         auto& p = *impl_;
         auto presentation = p.layerPresentation;
-        bool scheduledPresentation = false;
-        double drawableWaitMS = 0;
-        if (p.width > 0 && p.height > 0 && !(SDL_GetWindowFlags(p.window) & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED))) {
-            if (p.layer.drawableSize.width != p.width || p.layer.drawableSize.height != p.height)
-                p.layer.drawableSize = CGSizeMake(p.width, p.height);
-            const Uint64 waitStarted = SDL_GetTicksNS();
-            id<CAMetalDrawable> drawable = [p.layer nextDrawable];
-            const Uint64 drawableWaitNS = SDL_GetTicksNS() - waitStarted;
-            drawableWaitMS = static_cast<double>(drawableWaitNS) / 1000000.0;
-            p.ReportSlowWait(Impl::DrawableWait, drawableWaitNS);
-            if (drawable) {
-                p.DrawWindows(drawable.texture, p.windowPipeline);
-                if (presentation) {
+        try {
+            // Pending logical fills must be encoded before signature comparison
+            // and before any offscreen-only Submit on a skipped presentation.
+            p.ResolvePendingFill();
+            bool scheduledPresentation = false;
+            double drawableWaitMS = 0;
+            const bool hidden=(SDL_GetWindowFlags(p.window) & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED))!=0;
+            if(hidden!=p.wasHidden) {p.presentationPolicy.Invalidate();p.wasHidden=hidden;}
+            if(p.gpuFailed->load(std::memory_order_acquire))p.presentationPolicy.Invalidate();
 #if TARGET_OS_SIMULATOR
-                    // The simulator SDK omits presentedTime/handlers. Never
-                    // treat command completion as proof of actual display.
-                    presentation->failed.store(true, std::memory_order_release);
+            const bool acknowledgedPresentation=false;
+#else
+            const bool acknowledgedPresentation=true;
+#endif
+            bool trackPresentation=p.staticPresentEnabled && acknowledgedPresentation &&
+                !p.gpuFailed->load(std::memory_order_acquire);
+            static_presentation::Signature signature;
+            bool skip=false;
+            try {
+                if(trackPresentation)signature=p.PresentationSignature();
+                skip=p.presentationPolicy.CanSkip(signature,p.staticPresentEnabled &&
+                    !p.gpuFailed->load(std::memory_order_acquire),acknowledgedPresentation,hidden,bool(presentation));
+            } catch(const std::bad_alloc&) {
+                // Optional confirmation metadata cannot make normal rendering
+                // fail. Disable skipping until session/backend reinitialization.
+                p.presentationPolicy.Invalidate();p.staticPresentEnabled=false;trackPresentation=false;
+            }
+            if (!skip && p.width > 0 && p.height > 0 && !hidden) {
+                if (p.layer.drawableSize.width != p.width || p.layer.drawableSize.height != p.height)
+                    p.layer.drawableSize = CGSizeMake(p.width, p.height);
+                const Uint64 waitStarted = SDL_GetTicksNS();
+                id<CAMetalDrawable> drawable = [p.layer nextDrawable];
+                const Uint64 drawableWaitNS = SDL_GetTicksNS() - waitStarted;
+                drawableWaitMS = static_cast<double>(drawableWaitNS) / 1000000.0;
+                p.ReportSlowWait(Impl::DrawableWait, drawableWaitNS);
+                if (drawable) {
+                    p.DrawWindows(drawable.texture, p.windowPipeline);
+                    std::shared_ptr<static_presentation::Record> record;
+                    if(trackPresentation)try {record=p.presentationPolicy.Track(std::move(signature));}
+                    catch(const std::bad_alloc&) {p.presentationPolicy.Invalidate();p.staticPresentEnabled=false;}
+#if TARGET_OS_SIMULATOR
+                    if(presentation)presentation->failed.store(true,std::memory_order_release);
 #else
                     auto lastPresented = p.lastLayerPresentation;
                     [drawable addPresentedHandler:^(id<MTLDrawable> displayed) {
                         const double time = displayed.presentedTime;
-                        presentation->presentedTime.store(time, std::memory_order_relaxed);
-                        if (time > 0) {
-                            uint64_t previous = lastPresented->load(std::memory_order_relaxed);
-                            while (previous < presentation->frameSerial &&
-                                   !lastPresented->compare_exchange_weak(previous, presentation->frameSerial,
-                                       std::memory_order_release, std::memory_order_relaxed)) {}
-                            presentation->presented.store(true, std::memory_order_release);
-                        } else
-                            presentation->failed.store(true, std::memory_order_release);
+                        if(record) {
+                            if(time>0) record->displayed.store(true,std::memory_order_release);
+                            else record->failed.store(true,std::memory_order_release);
+                        }
+                        if(presentation) {
+                            presentation->presentedTime.store(time,std::memory_order_relaxed);
+                            if(time>0) {
+                                uint64_t previous = lastPresented->load(std::memory_order_relaxed);
+                                while(previous<presentation->frameSerial &&
+                                    !lastPresented->compare_exchange_weak(previous,presentation->frameSerial,
+                                        std::memory_order_release,std::memory_order_relaxed)) {}
+                                presentation->presented.store(true,std::memory_order_release);
+                            } else presentation->failed.store(true,std::memory_order_release);
+                        }
                     }];
 #endif
-                    [p.Commands() addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
-                        if (buffer.status != MTLCommandBufferStatusCompleted)
-                            presentation->failed.store(true, std::memory_order_release);
+                    if(record || presentation) [p.Commands() addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+                        if(buffer.status==MTLCommandBufferStatusCompleted) {
+                            if(record)record->commandSucceeded.store(true,std::memory_order_release);
+                        } else {
+                            if(record)record->failed.store(true,std::memory_order_release);
+                            if(presentation)presentation->failed.store(true,std::memory_order_release);
+                        }
                     }];
-                }
-                [p.Commands() presentDrawable:drawable];
-                scheduledPresentation = true;
+                    [p.Commands() presentDrawable:drawable];
+                    scheduledPresentation = true;
+                } else p.presentationPolicy.Invalidate();
             }
+            if(presentation && !scheduledPresentation)presentation->failed.store(true,std::memory_order_release);
+            p.layerPresentation.reset();
+            p.hotspots.Drawable(drawableWaitMS);
+            p.Submit(); // Offscreen/script work still advances on skipped frames.
+            p.lastPresentationWaitMS=p.pendingQueueWaitMS+drawableWaitMS;
+            p.pendingQueueWaitMS=0;
+            p.ReportPresentation();
+        } catch(...) {
+            p.presentationPolicy.Invalidate();
+            if(presentation)presentation->failed.store(true,std::memory_order_release);
+            p.layerPresentation.reset();
+            throw;
         }
-        if (presentation && !scheduledPresentation)
-            presentation->failed.store(true, std::memory_order_release);
-        p.layerPresentation.reset();
-        p.hotspots.Drawable(drawableWaitMS);
-        p.Submit(); // Offscreen work must still complete when no drawable is available.
-        p.lastPresentationWaitMS = p.pendingQueueWaitMS + drawableWaitMS;
-        p.pendingQueueWaitMS = 0;
     }
 }
 void* MetalRenderBackend::CreateTexture(int w, int h) { @autoreleasepool { return impl_->Create(w, h, false); } }
@@ -1718,7 +1850,7 @@ void MetalRenderBackend::DrawWindowTexture(void* h, float x, float y, float w, f
         !std::isfinite(w) || !std::isfinite(height)) return;
     if (auto r = impl_->Find(h)) {
         impl_->EnsureInitialized(r);
-        impl_->windows.push_back({r->texture, x, y, w, height});
+        impl_->windows.push_back({r->texture, r, x, y, w, height});
     }
 }
 void MetalRenderBackend::SetBlendMode(int mode, const float* color)
@@ -1765,6 +1897,7 @@ void MetalRenderBackend::DrawMesh(const float* vertices, int vertexCount, const 
         [e setFragmentTexture:p.mask ? (p.mask == p.current ? snapshot : p.mask->texture) : source atIndex:1];
         [e drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:indexCount indexType:MTLIndexTypeUInt16
                      indexBuffer:upload.buffer indexBufferOffset:upload.offset + indexOffset];
+        p.hotspots.Count([](layer_hotspot::Totals& t){t.Add(t.actualDraws);});
         if (p.diagnosticSampled) {
             ++p.diagnosticWorkload.meshDraws;
             if (p.mask) ++p.diagnosticWorkload.maskedDraws;
@@ -1826,6 +1959,7 @@ bool MetalRenderBackend::DrawDeformedMesh(int divX, int divY,
                         indexType:MTLIndexTypeUInt16
                       indexBuffer:topology->indices
                 indexBufferOffset:0];
+        p.hotspots.Count([](layer_hotspot::Totals& t){t.Add(t.actualDraws);});
         if (p.diagnosticSampled) {
             ++p.diagnosticWorkload.deformDraws;
             if (p.mask) ++p.diagnosticWorkload.maskedDraws;
@@ -1854,6 +1988,7 @@ void MetalRenderBackend::LayerDrawRect(void* h, float x, float y, float w, float
     @autoreleasepool {
         auto& p = *impl_;
         auto r = p.Find(h);
+        p.Write(p.current);
         if (!p.current || !r || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(w) ||
             !std::isfinite(height) || !std::isfinite(u0) || !std::isfinite(v0) ||
             !std::isfinite(u1) || !std::isfinite(v1) || w <= 0 || height <= 0 ||
@@ -1902,6 +2037,7 @@ bool MetalRenderBackend::CaptureFrame(std::vector<uint8_t>& pixels, int& w, int&
 {
     @autoreleasepool {
         auto& p = *impl_;
+        p.presentationPolicy.Invalidate();
         w = h = pitch = 0;
         if (p.width <= 0 || p.height <= 0 || p.windows.empty()) return false;
         id<MTLTexture> output = p.Texture(p.width, p.height);
@@ -1988,7 +2124,7 @@ void MetalRenderBackend::SetLayerDiagnosticIdentity(void* handle,const layer_hot
 void MetalRenderBackend::DestroyLayerTexture(void* handle) { impl_->Destroy(handle,true); }
 bool MetalRenderBackend::UpdateLayerTexture(void* handle, const uint8_t* pixels, int pitch, const TVPLayerRect& rc) {
     @autoreleasepool {
-        auto& p=*impl_; auto* r=p.Find(handle);
+        auto& p=*impl_; auto* r=p.Find(handle); p.Write(r);
         if (!r || !pixels || rc.left<0 || rc.top<0 || rc.right>r->width || rc.bottom>r->height ||
             rc.Width()<=0 || rc.Height()<=0 || pitch<rc.Width()*r->bytesPerPixel) return false;
         size_t row=0,length=0;
@@ -2051,7 +2187,7 @@ bool MetalRenderBackend::OperateLayerGlyph(const TVPLayerOperation& operation,vo
         const auto reject=[&](layer_upload::GlyphReject reason,const char* name) {
             upload.reason=name;RecordLayerGlyphRejection(reason);return false;
         };
-        auto* t=p.Find(target);
+        auto* t=p.Find(target); p.Write(t);
         if(operation.kind!=TVPLayerOperationKind::ColorMap && operation.kind!=TVPLayerOperationKind::RemoveOpacity)
             return reject(layer_upload::GlyphReject::Domain,"domain");
         if(!t || t->bytesPerPixel!=4 || !p.ordinaryLayerPipeline)
@@ -2078,6 +2214,7 @@ bool MetalRenderBackend::OperateLayerGlyph(const TVPLayerOperation& operation,vo
         ++page->reservations;
         struct Reservation { Impl::GlyphPage* page;~Reservation(){--page->reservations;} } reservation{page};
         auto* source=p.Find(page->handle);
+        p.Write(source);
         [source->texture replaceRegion:MTLRegionMake2D(left,top,width,height) mipmapLevel:0 withBytes:pixels bytesPerRow:pitch];
         const auto copied=SDL_GetTicksNS();
         upload.textureID=page->textureID;upload.width=upload.height=layer_upload::AtlasSide;
@@ -2118,7 +2255,7 @@ bool MetalRenderBackend::CopyTargetToLayerTexture(void* sourceHandle, void* dest
     @autoreleasepool {
         auto& p=*impl_;
         auto* source=p.Find(sourceHandle);
-        auto* destination=p.Find(destinationHandle);
+        auto* destination=p.Find(destinationHandle); p.Write(destination);
         if(!source || !destination || source==destination || !source->target || !destination->target ||
            source->bytesPerPixel!=4 || destination->bytesPerPixel!=4 ||
            source->width!=destination->width || source->height!=destination->height ||
@@ -2156,7 +2293,7 @@ bool MetalRenderBackend::CopyTargetToLayerTextureRegion(void* sourceHandle, void
     @autoreleasepool {
         auto& p = *impl_;
         auto* source = p.Find(sourceHandle);
-        auto* destination = p.Find(destinationHandle);
+        auto* destination = p.Find(destinationHandle); p.Write(destination);
         if (!source || !destination || source == destination || !source->target || !destination->target ||
             source->bytesPerPixel != 4 || destination->bytesPerPixel != 4 ||
             source->width != destination->width || source->height != destination->height ||
@@ -2267,7 +2404,7 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
         // Reject unknown/Count and multi-source kinds before any GPU encoding.
         // Their dedicated entry points retain their own validation and binding.
         if(!traits || traits->backendInputCount>1) return false;
-        auto& p=*impl_; auto* t=p.Find(target); auto* s=p.Find(source);
+        auto& p=*impl_; auto* t=p.Find(target); p.Write(t); auto* s=p.Find(source);
         int kind=static_cast<int>(operation.kind);
         bool needsSource=TVPLayerOperationNeedsSource(operation.kind);
         if(!p.ordinaryLayerPipeline || !t || t->bytesPerPixel!=4 || (needsSource && !s) ||
@@ -2323,7 +2460,7 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
             [columns setBytes:&params length:sizeof(params) atIndex:0];
             [columns setBuffer:p.boxBlurSums offset:0 atIndex:1]; [columns setTexture:t->texture atIndex:0];
             [columns dispatchThreads:MTLSizeMake(src.Width(),1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
-            p.Trace(layer_hotspot::Access::Rect,kind,t,s,dst,src,clip);
+            p.Trace(layer_hotspot::Access::Rect,kind,t,s,dst,src,clip,true,0,-1,&operation,sampling);
             p.EndLocal(columns,layer_hotspot::Boundary::Compute);
             if(p.diagnosticSampled) {
                 p.diagnosticWorkload.layerDispatches+=2;
@@ -2348,7 +2485,7 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
                 layer_initialization::ClearChannel(operation.color,1),layer_initialization::ClearChannel(operation.color,2),
                 layer_initialization::ClearChannel(operation.color,3));
             p.OrdinaryRender(t,&clear);
-            p.Trace(layer_hotspot::Access::Rect,kind,t,nullptr,dst,src,clip,false,0,(operation.color>>24)==255?1:0);
+            p.Trace(layer_hotspot::Access::Rect,kind,t,nullptr,dst,src,clip,false,0,(operation.color>>24)==255?1:0,&operation,sampling);
             p.hotspots.Count([](layer_hotspot::Totals& t){t.Add(t.fastFills);});
             if(p.glyphWriteMarker) *p.glyphWriteMarker=true;
             if(p.diagnosticSampled) {
@@ -2364,6 +2501,7 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
         if(!tile || s==t) p.EnsureInitialized(t,!TVPLayerOperationReadsTarget(operation.kind));
         id<MTLTexture> snapshot=nil, sourceTexture=s ? s->texture : p.ordinaryDummy;
         if(!sourceTexture) { p.ordinaryDummy=p.Texture(1,1); sourceTexture=p.ordinaryDummy; }
+        if(!sourceTexture)return false;
         // Snapshot only affected destination pixels. Source aliases need a
         // separate region snapshot before any write, including overlapping copies.
         if((!inPlace && !overwrite) || s==t) {
@@ -2388,7 +2526,7 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
             }
             p.EndLocal(blit,layer_hotspot::Boundary::Blit);
         }
-        struct LayerParameters { simd_int4 destination,source,clip,operation,color; } params;
+        Impl::LayerParameters params;
         params.destination={dst.left,dst.top,dst.right,dst.bottom};
         params.source={src.left,src.top,src.right,src.bottom};
         if(s==t) { int x=std::min(src.left,src.right),y=std::min(src.top,src.bottom); params.source-=simd_int4{x,y,x,y}; }
@@ -2405,7 +2543,13 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
         // shader signature still requires a valid buffer(3) binding.
         id<MTLBuffer> psBuffer=needsPsTables ? p.psTables : p.alphaTables;
         if(tile) {
+            // Resolve before rebinding. Rejected/preparation-failed operations
+            // above leave the last accepted Fill intact for fallback reads.
+            const bool omit=p.pendingFill && p.pendingFill.target==t &&
+                pending_fill::CanOmit(operation,clip,p.pendingFill.region,t->width,t->height,s==t);
+            if(!omit)p.ResolvePendingFill();
             auto e=p.OrdinaryRender(t);
+            if(!e)return false;
             [e setVertexBytes:&params length:sizeof(params) atIndex:0];
             [e setFragmentBytes:&params length:sizeof(params) atIndex:0];
             [e setFragmentBuffer:gammaBuffer offset:0 atIndex:2];
@@ -2413,8 +2557,23 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
             if(p.ordinaryRenderSource!=sourceTexture) {
                 [e setFragmentTexture:sourceTexture atIndex:0]; p.ordinaryRenderSource=sourceTexture;
             }
-            [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
-            p.Trace(layer_hotspot::Access::Rect,kind,t,s,dst,src,clip);
+            const bool defer=p.coalesceFill && operation.kind==TVPLayerOperationKind::Fill &&
+                operation.flags==0 && !p.glyphWriteMarker;
+            if(!defer) {
+                [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+                p.hotspots.Count([](layer_hotspot::Totals& t){t.Add(t.actualDraws);});
+            }
+            // Keep the old immutable Fill until the replacement's bindings
+            // (and Copy draw) have succeeded. An exception before this point
+            // leaves it available for the next observation/fallback read.
+            if(omit)p.ResolvePendingFill(true);
+            const uint64_t logicalID=p.Trace(layer_hotspot::Access::Rect,kind,t,s,dst,src,clip,!defer,0,-1,
+                &operation,sampling,defer?layer_hotspot::Execution::Deferred:layer_hotspot::Execution::Immediate);
+            if(defer) {
+                p.pendingFill.target=t;p.pendingFill.region=clip;p.pendingFill.parameters=params;p.pendingFill.logicalID=logicalID;
+                p.hotspots.Count([](layer_hotspot::Totals& t){t.Add(t.deferredFills);});
+                ++p.fillCoalescingStats.deferred;
+            }
             if(p.glyphWriteMarker) *p.glyphWriteMarker=true;
             if(p.diagnosticSampled) {
                 ++p.diagnosticWorkload.layerDispatches;
@@ -2437,7 +2596,7 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
             [e setTexture:sourceTexture atIndex:0]; [e setTexture:snapshot ? snapshot : sourceTexture atIndex:1]; [e setTexture:t->texture atIndex:2];
         }
         [e dispatchThreads:MTLSizeMake(clip.Width(),clip.Height(),1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
-        p.Trace(layer_hotspot::Access::Rect,kind,t,s,dst,src,clip);
+        p.Trace(layer_hotspot::Access::Rect,kind,t,s,dst,src,clip,true,0,-1,&operation,sampling);
         if(p.glyphWriteMarker) *p.glyphWriteMarker=true;
         if (p.diagnosticSampled) {
             ++p.diagnosticWorkload.layerDispatches;
@@ -2453,7 +2612,7 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
 bool MetalRenderBackend::OperateLayerAffine(const TVPLayerOperation& operation,void* target,
                                            const TVPLayerAffineCopy& affine,void* source,int sampling) {
     @autoreleasepool {
-        auto& p=*impl_; auto* t=p.Find(target); auto* s=p.Find(source);
+        auto& p=*impl_; auto* t=p.Find(target); p.Write(t); auto* s=p.Find(source);
         const auto& clip=affine.clip; const auto& crop=affine.sourceCrop;
         const bool copy=operation.kind==TVPLayerOperationKind::Copy;
         if(!copy && (clip.right<clip.left || clip.bottom<clip.top ||
@@ -2532,7 +2691,7 @@ bool MetalRenderBackend::OperateLayerAffine(const TVPLayerOperation& operation,v
             [e setBuffer:psBuffer offset:0 atIndex:3];
             [e setTexture:sourceTexture atIndex:0]; [e setTexture:snapshot atIndex:1]; [e setTexture:t->texture atIndex:2];
             [e dispatchThreads:MTLSizeMake(clip.Width(),clip.Height(),1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
-            p.Trace(layer_hotspot::Access::Affine,int(operation.kind),t,s,clip,crop,clip);
+            p.Trace(layer_hotspot::Access::Affine,int(operation.kind),t,s,clip,crop,clip,true,0,-1,&operation,sampling);
             if(p.diagnosticSampled) {
                 ++p.diagnosticWorkload.layerDispatches;
                 p.diagnosticWorkload.RecordKindPixels(static_cast<int>(operation.kind),uint64_t(clip.Width())*clip.Height());
@@ -2562,7 +2721,7 @@ bool MetalRenderBackend::OperateLayerAffine(const TVPLayerOperation& operation,v
         [e setBytes:&params length:sizeof(params) atIndex:0];
         [e setTexture:sourceTexture atIndex:0]; [e setTexture:t->texture atIndex:1];
         [e dispatchThreads:MTLSizeMake(clip.Width(),clip.Height(),1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
-            p.Trace(layer_hotspot::Access::Affine,int(operation.kind),t,s,clip,crop,clip);
+            p.Trace(layer_hotspot::Access::Affine,int(operation.kind),t,s,clip,crop,clip,true,0,-1,&operation,sampling);
         if(p.diagnosticSampled) ++p.diagnosticWorkload.layerDispatches;
         p.EndLocal(e);
         if(++p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
@@ -2578,7 +2737,7 @@ bool MetalRenderBackend::OperateLayerPerspective(const TVPLayerOperation& operat
         if(!TVPLayerOperationSupportsPerspective(operation) || sampling<0 || sampling>1 || count>maxQuads)
             return false;
         if(count==0) return true;
-        auto& p=*impl_; auto* t=p.Find(target); auto* s=p.Find(source);
+        auto& p=*impl_; auto* t=p.Find(target); p.Write(t); auto* s=p.Find(source);
         if(!quads || !p.perspectivePipeline || !t || !s || !t->texture || !s->texture ||
            t->bytesPerPixel!=4 || s->bytesPerPixel!=4 ||
            t->texture.pixelFormat!=MTLPixelFormatRGBA8Unorm || s->texture.pixelFormat!=MTLPixelFormatRGBA8Unorm)
@@ -2706,7 +2865,7 @@ bool MetalRenderBackend::OperateLayerPerspective(const TVPLayerOperation& operat
                 sourceSize:MTLSizeMake(commitRegion.Width(),commitRegion.Height(),1) toTexture:t->texture destinationSlice:0
                 destinationLevel:0 destinationOrigin:MTLOriginMake(commitRegion.left,commitRegion.top,0)];
         p.EndLocal(commit,layer_hotspot::Boundary::Blit);
-        p.Trace(layer_hotspot::Access::Perspective,0,t,s,commitRegion,{0,0,s->width,s->height},commitRegion);
+        p.Trace(layer_hotspot::Access::Perspective,int(operation.kind),t,s,commitRegion,{0,0,s->width,s->height},commitRegion,true,0,-1,&operation,sampling);
         p.transientOps+=2+active*2;
         if(p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
         return true;
@@ -2722,7 +2881,7 @@ bool MetalRenderBackend::OperateLayerSpanComposite(const TVPLayerSpanCompositePa
         using Result=TVPLayerSpanCompositeResult;
         auto& p=*impl_;p.spanCompositeResult=Result::BackendFailure;
         auto fail=[&](Result result){p.spanCompositeResult=result;return false;};
-        auto* t=p.Find(target);
+        auto* t=p.Find(target); p.Write(t);
         if(!t || t->bytesPerPixel!=4 || t->texture.pixelFormat!=MTLPixelFormatRGBA8Unorm) return fail(Result::Resource);
         auto valid=TVPLayerSpanCompositeGeometry::Validate(packet,t->width,t->height);
         if(valid!=Result::Applied) return fail(valid);
@@ -2810,7 +2969,7 @@ bool MetalRenderBackend::SupportsLayerShrink64() const {return impl_ && impl_->s
 TVPLayerShrinkResult MetalRenderBackend::LastLayerShrinkResult() const {return impl_?impl_->shrinkResult:TVPLayerShrinkResult::BackendFailure;}
 bool MetalRenderBackend::OperateLayerShrink(const TVPLayerShrinkOperation& operation,void* target,void* source) {
     @autoreleasepool {
-        auto& p=*impl_;auto* t=p.Find(target);auto* s=p.Find(source);
+        auto& p=*impl_;auto* t=p.Find(target); p.Write(t);auto* s=p.Find(source);
         p.shrinkResult=TVPLayerShrinkResult::BackendFailure;
         struct PendingRelease {
             std::vector<id<MTLBuffer>>& pending;
@@ -2915,7 +3074,7 @@ bool MetalRenderBackend::OperateLayerTransition(const TVPLayerTransitionOperatio
         void* target,void* source1,void* source2) {
     @autoreleasepool {
         auto& p=*impl_; const auto& q=operation.params;
-        auto* t=p.Find(target);auto* s1=p.Find(source1);auto* s2=p.Find(source2);
+        auto* t=p.Find(target); p.Write(t);auto* s1=p.Find(source1);auto* s2=p.Find(source2);
         auto fail=[&](TVPLayerTransitionResult result) {p.transitionResult=result;return false;};
         if(!p.transitionPipeline) return fail(TVPLayerTransitionResult::PipelineUnavailable);
         if(!t || !s1 || !s2 || t->bytesPerPixel!=4 || s1->bytesPerPixel!=4 || s2->bytesPerPixel!=4)
@@ -2965,7 +3124,7 @@ bool MetalRenderBackend::OperateLayerRectDualSource(const TVPLayerOperation& ope
                                                     void* source2,const TVPLayerRect& src2) {
     @autoreleasepool {
         auto& p=*impl_;
-        auto* t=p.Find(target); auto* s1=p.Find(source1); auto* s2=p.Find(source2);
+        auto* t=p.Find(target); p.Write(t); auto* s1=p.Find(source1); auto* s2=p.Find(source2);
         if(!p.dualSourceLayerPipeline || !t || !s1 || !s2 ||
            operation.kind!=TVPLayerOperationKind::ConstAlphaSD ||
            t->bytesPerPixel!=4 || s1->bytesPerPixel!=4 || s2->bytesPerPixel!=4 ||
@@ -3043,7 +3202,7 @@ bool MetalRenderBackend::OperateLayerRectDualSource(const TVPLayerOperation& ope
         }
         p.EndLocal(e);
         p.Trace(layer_hotspot::Access::Read,0,nullptr,s2,actual2,actual2,actual2,false);
-        p.Trace(layer_hotspot::Access::Rect,int(operation.kind),t,s1,dst,actual1,clip);
+        p.Trace(layer_hotspot::Access::Rect,int(operation.kind),t,s1,dst,actual1,clip,true,0,-1,&operation,0);
         // Compute dispatch over existing GPU textures; no host-visible bytes.
         if(++p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
         return true;
@@ -3057,7 +3216,7 @@ bool MetalRenderBackend::OperateLayerRectTripleSource(const TVPLayerOperation& o
                                                       void* rule,const TVPLayerRect& ruleRect) {
     @autoreleasepool {
         auto& p=*impl_;
-        auto* t=p.Find(target); auto* s1=p.Find(source1); auto* s2=p.Find(source2); auto* r=p.Find(rule);
+        auto* t=p.Find(target); p.Write(t); auto* s1=p.Find(source1); auto* s2=p.Find(source2); auto* r=p.Find(rule);
         if(!p.univTransLayerPipeline || !t || !s1 || !s2 || !r ||
            operation.kind!=TVPLayerOperationKind::UnivTrans ||
            t->bytesPerPixel!=4 || s1->bytesPerPixel!=4 || s2->bytesPerPixel!=4 || r->bytesPerPixel!=1 ||
@@ -3140,7 +3299,7 @@ bool MetalRenderBackend::OperateLayerRectTripleSource(const TVPLayerOperation& o
         p.EndLocal(e);
         p.Trace(layer_hotspot::Access::Read,0,nullptr,s2,actual2,actual2,actual2,false);
         p.Trace(layer_hotspot::Access::Read,0,nullptr,r,ruleRect,ruleRect,ruleRect,false);
-        p.Trace(layer_hotspot::Access::Rect,int(operation.kind),t,s1,dst,actual1,clip);
+        p.Trace(layer_hotspot::Access::Rect,int(operation.kind),t,s1,dst,actual1,clip,true,0,-1,&operation,0);
         // Retain the existing submission budget; never submit/wait per transition.
         if(++p.transientOps>=Impl::kSubmissionOpBudget) p.Submit();
         return true;

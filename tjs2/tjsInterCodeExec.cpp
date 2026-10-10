@@ -10,6 +10,7 @@
 //---------------------------------------------------------------------------
 
 #include "tjsCommHead.h"
+#include "../core/render/CPUFrameDiagnostics.h"
 #include "../core/render/LayerWorkDiagnostics.h"
 
 #include "tjsInterCodeExec.h"
@@ -744,6 +745,7 @@ void tTJSInterCodeContext::ExecuteAsFunction(iTJSDispatch2* objthis,
                                              tTJSVariant* result,
                                              tjs_int start_ip)
 {
+    krkrsdl3::cpu_frame::CallScope cpuCall;
     tjs_int num_alloc = MaxVariableCount + VariableReserveCount + 1 + MaxFrameCount;
 
     try
@@ -853,6 +855,7 @@ void tTJSInterCodeContext::ExecuteAsFunction(iTJSDispatch2* objthis,
 #endif                      // ENABLE_DEBUGGER
             ra[-2].Clear(); // at least we must clear the object placed at local stack
             TJSVariantArrayStack->Deallocate(num_alloc, regs);
+            cpuCall.Finish(true); // capture while this VM frame still owns its tracer record
             if (TJSStackTracerEnabled())
                 TJSStackTracerPop();
             throw;
@@ -867,6 +870,7 @@ void tTJSInterCodeContext::ExecuteAsFunction(iTJSDispatch2* objthis,
 
         TJSVariantArrayStack->Deallocate(num_alloc, regs);
 
+        cpuCall.Finish(); // finish before the outer ExecuteAsFunction tracer pop
         if (TJSStackTracerEnabled())
             TJSStackTracerPop();
     }
@@ -958,6 +962,9 @@ tjs_int tTJSInterCodeContext::ExecuteCode(
     krkrsdl3::layer_work::StageScope stage(krkrsdl3::layer_work::Stage::Script);
     // execute VM codes
     tjs_int32* codesave;
+    // Preserve the current position while codesave is alive; a slow outer VM
+    // scope may capture its stack after ExecuteCode returns or unwinds.
+    struct FreezeTracePosition {~FreezeTracePosition() {TJSStackTracerFreezeCodePointer();}} freezeTracePosition;
     try
     {
         tjs_int32* code = codesave = CodeArea + startip;

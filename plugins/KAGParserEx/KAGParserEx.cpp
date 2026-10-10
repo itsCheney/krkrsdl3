@@ -1,3 +1,4 @@
+#include "CPUFrameDiagnostics.h"
 #include "tjsCommHead.h"
 #include "KAGParserEx.hpp"
 
@@ -107,6 +108,7 @@ void tTVPScenarioCacheItemEX::LoadScenario(const ttstr& name, bool isstring)
 
         try
         {
+            krkrsdl3::cpu_frame::EventScope cpuRead(krkrsdl3::cpu_frame::Kind::KAGRead);
             stream = TVPCreateTextStreamForRead(name, TJS_N(""));
             ttstr tmp;
             if (stream)
@@ -204,6 +206,7 @@ void tTVPScenarioCacheItemEX::EnsureLabelCache()
     // construct label cache
     if (!LabelCached)
     {
+        krkrsdl3::cpu_frame::EventScope cpuLabel(krkrsdl3::cpu_frame::Kind::KAGLabelBuild);
         // make label cache
         LabelAliases.resize(LineCount);
         ttstr prevlabel;
@@ -316,10 +319,12 @@ static tTVPScenarioCacheItemEX* TVPGetScenario(const ttstr& storagename, bool is
     tTVPScenarioCacheItemHolder* ptr = TVPScenarioCache.FindAndTouchWithHash(storagename, hash);
     if (ptr)
     {
+        krkrsdl3::cpu_frame::EventScope cpuHit(krkrsdl3::cpu_frame::Kind::KAGCacheHit);
         // found in the cache
         return ptr->GetObject();
     }
 
+    krkrsdl3::cpu_frame::EventScope cpuMiss(krkrsdl3::cpu_frame::Kind::KAGCacheMiss);
     // not found in the cache
     tTVPScenarioCacheItemEX* item = new tTVPScenarioCacheItemEX(storagename, false);
     try
@@ -961,6 +966,7 @@ void tTJSNI_KAGParserEX::Restore(iTJSDispatch2* dic)
 //---------------------------------------------------------------------------
 void tTJSNI_KAGParserEX::LoadScenario(const ttstr& name)
 {
+    krkrsdl3::cpu_frame::EventScope cpuLoad(krkrsdl3::cpu_frame::Kind::KAGLoad);
     // load scenario to buffer
 
     BreakConditionAndMacro();
@@ -1666,6 +1672,7 @@ bool tTJSNI_KAGParserEX::EntryParam(bool& condition,
 
 iTJSDispatch2* tTJSNI_KAGParserEX::GetNextTag()
 {
+    krkrsdl3::cpu_frame::EventScope cpuTag(krkrsdl3::cpu_frame::Kind::KAGNextTag);
     // get next tag and return information dictionary object.
     // return NULL if the tag not found.
     // normal characters are interpreted as a "ch" tag.

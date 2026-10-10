@@ -12,10 +12,13 @@ struct Identity {
     uint64_t parent = 0, parentSession = 0, creatorLayer = 0;
     uint64_t assetHash = 0;
     char asset[192] = {}, role[24] = {};
-    bool assetTruncated = false;
+    bool assetTruncated = false, displayShortened = false;
 };
+enum class ReceiverKind : unsigned { Unknown, Layer, Bitmap, LayerEx };
 struct Context {
     uint64_t currentLayer = 0;
+    uint64_t currentReceiver = 0;
+    ReceiverKind receiverKind = ReceiverKind::Unknown;
     char role[24] = {};
 };
 inline void CopyBounded(char* target, size_t capacity, const char* source) noexcept {
@@ -42,8 +45,12 @@ inline uint64_t NextLayerID() noexcept {
 class Scope {
     Context previous;
 public:
-    Scope(uint64_t layer, const char* role) noexcept : previous(CurrentStorage()) {
+    Scope(uint64_t layer, const char* role) noexcept
+        : Scope(layer, role, layer, layer ? ReceiverKind::Layer : ReceiverKind::Unknown) {}
+    Scope(uint64_t layer, const char* role, uint64_t receiver, ReceiverKind kind) noexcept : previous(CurrentStorage()) {
         CurrentStorage().currentLayer = layer;
+        CurrentStorage().currentReceiver = receiver;
+        CurrentStorage().receiverKind = kind;
         CopyBounded(CurrentStorage().role, sizeof(CurrentStorage().role), role);
     }
     ~Scope() { CurrentStorage() = previous; }
@@ -60,10 +67,20 @@ inline void SetAsset(Identity& identity, const char* name) noexcept {
         const unsigned char ch = *p == '\\' ? '/' : static_cast<unsigned char>(*p);
         hash = (hash ^ ch) * UINT64_C(1099511628211);
     }
-    CopyBounded(identity.asset, sizeof(identity.asset), name);
+    // Archive members are useful even when the physical prefix is very long.
+    // Keep the complete physical path in the hash, never in a retained object.
+    const char* display = name;
+    for(const char* p=name; *p; ++p) if(*p=='>') display=p+1;
+    if(std::strlen(display)>=sizeof(identity.asset)) {
+        const char* leaf=display;
+        for(const char* p=display; *p; ++p) if(*p=='/' || *p=='\\') leaf=p+1;
+        display=leaf;
+    }
+    CopyBounded(identity.asset, sizeof(identity.asset), display);
     for(char* p = identity.asset; *p; ++p) if(*p == '\\') *p = '/';
     identity.assetHash = length ? hash : 0;
-    identity.assetTruncated = length >= sizeof(identity.asset);
+    identity.displayShortened = display != name;
+    identity.assetTruncated = std::strlen(display) >= sizeof(identity.asset);
 }
 inline Identity CreatedIdentity(uint64_t session, uint64_t texture) noexcept {
     Identity result;
@@ -80,8 +97,10 @@ inline void SetParent(Identity& identity, const Identity& parent, const char* ro
     if(copiedContent) {
         std::memcpy(identity.asset, parent.asset, sizeof(identity.asset));
         identity.assetHash = parent.assetHash; identity.assetTruncated = parent.assetTruncated;
+        identity.displayShortened = parent.displayShortened;
     } else {
         identity.asset[0] = 0; identity.assetHash = 0; identity.assetTruncated = false;
+        identity.displayShortened = false;
     }
 }
 } }

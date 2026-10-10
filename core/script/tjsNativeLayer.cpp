@@ -22,6 +22,8 @@
 #include "FontRasterizer.h"
 #include "LayerManager.h"
 #include "MetalLayerRenderManager.h"
+#include "TVPCompositor.h"
+#include "backend/TransitionCache.h"
 #include "TVPFont.h"
 #include "Platform.h"
 
@@ -425,6 +427,7 @@ tTJSNI_BaseLayer::tTJSNI_BaseLayer()
     // cache management
     CacheEnabledCount = 0;
     CacheBitmap = NULL;
+    TransitionCachePending = false;
     Cached = false;
 
     // drawing function stuff
@@ -2061,6 +2064,7 @@ void tTJSNI_BaseLayer::CreateExposedRegion()
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::InternalSetSize(tjs_uint width, tjs_uint height)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.InternalSetSize",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (Rect.get_width() != (tjs_int)width || Rect.get_height() != (tjs_int)height)
     {
         Update(false);
@@ -2078,6 +2082,7 @@ void tTJSNI_BaseLayer::InternalSetSize(tjs_uint width, tjs_uint height)
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::InternalSetBounds(const tTVPRect& rect)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.InternalSetBounds",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     tjs_int width = rect.right - rect.left;
     tjs_int height = rect.bottom - rect.top;
     if (width < 0 || height < 0)
@@ -2164,6 +2169,7 @@ void tTJSNI_BaseLayer::SetPosition(tjs_int left, tjs_int top)
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::SetWidth(tjs_uint width)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.SetWidth",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (Rect.get_width() != (tjs_int)width)
     {
         Update(false);
@@ -2180,6 +2186,7 @@ void tTJSNI_BaseLayer::SetWidth(tjs_uint width)
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::SetHeight(tjs_uint height)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.SetHeight",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (Rect.get_height() != (tjs_int)height)
     {
         Update(false);
@@ -2196,6 +2203,7 @@ void tTJSNI_BaseLayer::SetHeight(tjs_uint height)
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::SetSize(tjs_uint width, tjs_uint height)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.SetSize",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     InternalSetSize(width, height);
 }
 //---------------------------------------------------------------------------
@@ -2256,6 +2264,7 @@ void tTJSNI_BaseLayer::FromPrimaryCoordinates(tjs_real& x, tjs_real& y) const
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::ChangeImageSize(tjs_uint width, tjs_uint height)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.ChangeImageSize",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // be called from geographical management
     if (!width || !height)
         TVPThrowExceptionMessage(TVPCannotCreateEmptyLayerImage);
@@ -2275,6 +2284,7 @@ void tTJSNI_BaseLayer::ChangeImageSize(tjs_uint width, tjs_uint height)
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::AllocateImage()
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.AllocateImage",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (!MainImage)
     {
         ImageLeft = 0;
@@ -2308,6 +2318,7 @@ void tTJSNI_BaseLayer::DeallocateImage()
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::AllocateProvinceImage()
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.AllocateProvinceImage",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     tjs_uint neww = MainImage ? MainImage->GetWidth() : Rect.get_width();
     tjs_uint newh = MainImage ? MainImage->GetHeight() : Rect.get_height();
 
@@ -2346,6 +2357,7 @@ void tTJSNI_BaseLayer::AllocateDefaultImage()
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::AssignImages(tTJSNI_BaseLayer* src)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.AssignImages",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // assign images
     bool main_changed = true;
 
@@ -2391,6 +2403,7 @@ void tTJSNI_BaseLayer::AssignImages(tTJSNI_BaseLayer* src)
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::AssignMainImageWithUpdate(iTVPBaseBitmap* bmp)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.AssignMainImageWithUpdate",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // assign images
     bool main_changed = true;
 
@@ -2424,6 +2437,7 @@ void tTJSNI_BaseLayer::AssignMainImageWithUpdate(iTVPBaseBitmap* bmp)
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::AssignMainImage(iTVPBaseBitmap* bmp)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.AssignMainImage",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // assign single main bitmap image. the image size assigned must be
     // identical to the destination layer bitmap.
     // destination bitmap must have a layer bitmap
@@ -2447,6 +2461,7 @@ void tTJSNI_BaseLayer::AssignMainImage(iTVPBaseBitmap* bmp)
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::CopyFromMainImage(tTJSNI_Bitmap* bmp)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.CopyFromMainImage",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (!MainImage)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
     bmp->CopyFrom(MainImage);
@@ -2535,6 +2550,7 @@ void tTJSNI_BaseLayer::SetImagePosition(tjs_int left, tjs_int top)
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::SetImageWidth(tjs_uint width)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.SetImageWidth",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (!MainImage)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
 
@@ -2566,6 +2582,7 @@ tjs_uint tTJSNI_BaseLayer::GetImageWidth() const
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::SetImageHeight(tjs_uint height)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.SetImageHeight",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (!MainImage)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
 
@@ -2597,6 +2614,7 @@ tjs_uint tTJSNI_BaseLayer::GetImageHeight() const
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::InternalSetImageSize(tjs_uint width, tjs_uint height)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.InternalSetImageSize",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // adjust position
     if ((tjs_int)width < Rect.get_width())
     {
@@ -2623,6 +2641,7 @@ void tTJSNI_BaseLayer::InternalSetImageSize(tjs_uint width, tjs_uint height)
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::SetImageSize(tjs_uint width, tjs_uint height)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.SetImageSize",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (!MainImage)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
 
@@ -2683,6 +2702,7 @@ void tTJSNI_BaseLayer::IndependProvinceImage(bool copy)
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::SaveLayerImage(const ttstr& name, const ttstr& type)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.SaveLayerImage",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     krkrsdl3::cpu_consumer_trace::ConsumerScope consumer("Layer.saveLayerImage",
         krkrsdl3::cpu_consumer_trace::Access::Read,"SaveLayerImage",reinterpret_cast<uintptr_t>(this),true);
     if (!MainImage)
@@ -2805,6 +2825,7 @@ void tTJSNI_BaseLayer::SaveLayerImage(const ttstr& name, const ttstr& type)
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::AssignTexture(iTVPTexture2D* tex)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.AssignTexture",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (!MainImage)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
     MainImage->AssignTexture(tex);
@@ -2817,6 +2838,7 @@ void tTJSNI_BaseLayer::AssignTexture(iTVPTexture2D* tex)
 //---------------------------------------------------------------------------
 iTJSDispatch2* tTJSNI_BaseLayer::LoadImages(const ttstr& name, tjs_uint32 colorkey)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.LoadImages",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     krkrsdl3::layer_hotspot::Scope hotspot(LayerDiagnosticID,"image");
     // loads image(s) from specified storage.
     // colorkey must be a color that should be transparent, or:
@@ -2891,6 +2913,7 @@ iTJSDispatch2* tTJSNI_BaseLayer::LoadImages(const ttstr& name, tjs_uint32 colork
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::LoadProvinceImage(const ttstr& name)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.LoadProvinceImage",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // load an image as a province image
 
     if (!MainImage)
@@ -2918,6 +2941,7 @@ void tTJSNI_BaseLayer::LoadProvinceImage(const ttstr& name)
 //---------------------------------------------------------------------------
 tjs_uint32 tTJSNI_BaseLayer::GetMainPixel(tjs_int x, tjs_int y) const
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.GetMainPixel",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     krkrsdl3::point_trace::OriginScope trace(krkrsdl3::point_trace::Source::LayerColor, this);
     if (!MainImage)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
@@ -2927,6 +2951,7 @@ tjs_uint32 tTJSNI_BaseLayer::GetMainPixel(tjs_int x, tjs_int y) const
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::SetMainPixel(tjs_int x, tjs_int y, tjs_uint32 color)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.SetMainPixel",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (!MainImage)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
 
@@ -2946,6 +2971,7 @@ void tTJSNI_BaseLayer::SetMainPixel(tjs_int x, tjs_int y, tjs_uint32 color)
 //---------------------------------------------------------------------------
 tjs_int tTJSNI_BaseLayer::GetMaskPixel(tjs_int x, tjs_int y) const
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.GetMaskPixel",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     krkrsdl3::point_trace::OriginScope trace(krkrsdl3::point_trace::Source::LayerMask, this);
     if (!MainImage)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
@@ -2959,6 +2985,7 @@ tjs_int tTJSNI_BaseLayer::GetMaskPixel(tjs_int x, tjs_int y) const
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::SetMaskPixel(tjs_int x, tjs_int y, tjs_int mask)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.SetMaskPixel",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (!MainImage)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
 
@@ -2978,6 +3005,7 @@ void tTJSNI_BaseLayer::SetMaskPixel(tjs_int x, tjs_int y, tjs_int mask)
 //---------------------------------------------------------------------------
 tjs_int tTJSNI_BaseLayer::GetProvincePixel(tjs_int x, tjs_int y) const
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.GetProvincePixel",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (!ProvinceImage)
         return 0;
 
@@ -2990,6 +3018,7 @@ tjs_int tTJSNI_BaseLayer::GetProvincePixel(tjs_int x, tjs_int y) const
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::SetProvincePixel(tjs_int x, tjs_int y, tjs_int n)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.SetProvincePixel",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (!ProvinceImage)
         AllocateProvinceImage();
 
@@ -3009,6 +3038,7 @@ void tTJSNI_BaseLayer::SetProvincePixel(tjs_int x, tjs_int y, tjs_int n)
 //---------------------------------------------------------------------------
 const void* tTJSNI_BaseLayer::GetMainImagePixelBuffer() const
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.GetMainImagePixelBuffer",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (!MainImage)
         return NULL;
     return MainImage->GetTexture()->GetPersistentCPUData(false);
@@ -3016,6 +3046,7 @@ const void* tTJSNI_BaseLayer::GetMainImagePixelBuffer() const
 //---------------------------------------------------------------------------
 iTVPTexture2D* tTJSNI_BaseLayer::GetMainImageTextureForCPUAccess(bool write)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.GetMainImageTextureForCPUAccess",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if(!MainImage) return nullptr;
     if(write) { ImageModified=true; return MainImage->GetTextureForRender(true,nullptr); }
     return MainImage->GetTexture();
@@ -3023,11 +3054,13 @@ iTVPTexture2D* tTJSNI_BaseLayer::GetMainImageTextureForCPUAccess(bool write)
 //---------------------------------------------------------------------------
 iTVPTexture2D* tTJSNI_BaseLayer::GetMainImageTextureForSpanComposite()
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.GetMainImageTextureForSpanComposite",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     return MainImage ? MainImage->GetTextureForRender(true,nullptr) : nullptr;
 }
 //---------------------------------------------------------------------------
 void* tTJSNI_BaseLayer::GetMainImagePixelBufferForWrite()
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.GetMainImagePixelBufferForWrite",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (!MainImage)
         return NULL;
     ImageModified = true;
@@ -3036,6 +3069,7 @@ void* tTJSNI_BaseLayer::GetMainImagePixelBufferForWrite()
 //---------------------------------------------------------------------------
 void* tTJSNI_BaseLayer::GetMainImagePixelBufferForOverwrite()
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.GetMainImagePixelBufferForOverwrite",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (!MainImage)
         return NULL;
     ImageModified = true;
@@ -3044,6 +3078,7 @@ void* tTJSNI_BaseLayer::GetMainImagePixelBufferForOverwrite()
 //---------------------------------------------------------------------------
 void* tTJSNI_BaseLayer::GetMainImageGPUHandleForOverwrite()
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.GetMainImageGPUHandleForOverwrite",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (!MainImage)
         return NULL;
     iTVPTexture2D* texture = MainImage->GetTextureForRender(true, nullptr);
@@ -3052,6 +3087,7 @@ void* tTJSNI_BaseLayer::GetMainImageGPUHandleForOverwrite()
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::CommitMainImageGPUOverwrite()
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.CommitMainImageGPUOverwrite",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (!MainImage)
         return;
     iTVPTexture2D* texture = MainImage->GetTexture();
@@ -3064,6 +3100,7 @@ void tTJSNI_BaseLayer::CommitMainImageGPUOverwrite()
 bool tTJSNI_BaseLayer::CopyMainImageFromGPUTarget(krkrsdl3::iTVPRenderBackend* renderer,
                                                void* source, tjs_int width, tjs_int height)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.CopyMainImageFromGPUTarget",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (!MainImage || width <= 0 || height <= 0 ||
         MainImage->GetWidth() != static_cast<tjs_uint>(width) ||
         MainImage->GetHeight() != static_cast<tjs_uint>(height))
@@ -3078,6 +3115,7 @@ bool tTJSNI_BaseLayer::CopyMainImageFromGPUTargetRegion(krkrsdl3::iTVPRenderBack
                                                      void* source,tjs_int width,tjs_int height,
                                                      const tTVPRect& region)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.CopyMainImageFromGPUTargetRegion",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if(!MainImage || width<=0 || height<=0 || width!=tjs_int(MainImage->GetWidth()) ||
        height!=tjs_int(MainImage->GetHeight()) || !MainImage->CopyFromGPUTargetRegion(renderer,source,region))
         return false;
@@ -3087,6 +3125,7 @@ bool tTJSNI_BaseLayer::CopyMainImageFromGPUTargetRegion(krkrsdl3::iTVPRenderBack
 bool tTJSNI_BaseLayer::CopyMainImageFromCPU(const void* pixels, tjs_int pitch,
                                          tjs_int width, tjs_int height)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.CopyMainImageFromCPU",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (!MainImage || !pixels || pitch <= 0 || width <= 0 || height <= 0 ||
         MainImage->GetTexture()->GetFormat() != TVPTextureFormat::RGBA)
         return false;
@@ -3120,6 +3159,7 @@ bool tTJSNI_BaseLayer::CopyMainImageFromCPU(const void* pixels, tjs_int pitch,
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::ReleaseMainImagePixelBufferForWrite(const tTVPRect& written)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.ReleaseMainImagePixelBufferForWrite",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (!MainImage)
         return;
     MainImage->GetTexture()->ReleasePersistentCPUData(&written);
@@ -3127,6 +3167,7 @@ void tTJSNI_BaseLayer::ReleaseMainImagePixelBufferForWrite(const tTVPRect& writt
 //---------------------------------------------------------------------------
 tjs_int tTJSNI_BaseLayer::GetMainImagePixelBufferPitch() const
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.GetMainImagePixelBufferPitch",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     if (!MainImage)
         return 0;
     return MainImage->GetPitchBytes();
@@ -4166,13 +4207,41 @@ void tTJSNI_BaseLayer::AllocateCache()
     krkrsdl3::layer_hotspot::Scope hotspot(LayerDiagnosticID,"cache");
     if (!CacheBitmap)
     {
-        CacheBitmap = new tTVPBaseTexture(Rect.get_width(), Rect.get_height(), 32);
+        std::unique_ptr<tTVPBaseTexture> bitmap(new tTVPBaseTexture(Rect.get_width(), Rect.get_height(), 32));
+        CacheRecalcRegion.Or(tTVPRect(0, 0, Rect.get_width(), Rect.get_height()));
+        CacheBitmap=bitmap.release();
     }
     else
     {
         CacheBitmap->SetSize(Rect.get_width(), Rect.get_height());
+        CacheRecalcRegion.Or(tTVPRect(0, 0, Rect.get_width(), Rect.get_height()));
     }
-    CacheRecalcRegion.Or(tTVPRect(0, 0, Rect.get_width(), Rect.get_height()));
+    if(TransitionCachePending) {
+        TransitionCachePending=false;
+        krkrsdl3::transition_cache::Storage().materialized.fetch_add(1,std::memory_order_relaxed);
+    }
+}
+// A failed allocation leaves the logical lease and pending state intact so
+// callers propagate the original error without a half-cache or CPU replay.
+void tTJSNI_BaseLayer::EnsureCacheAllocated()
+{
+    if(TransitionCachePending) AllocateCache();
+}
+
+tjs_uint tTJSNI_BaseLayer::IncTransitionCacheEnabledCount()
+{
+    auto* backend=krkrsdl3::TVPGetRenderBackend();
+    if(krkrsdl3::transition_cache::Enabled() && backend &&
+       std::strcmp(backend->GetName(),"metal")==0 && TVPMetalLayerCompositionActive() &&
+       CacheEnabledCount==0 && CacheBitmap==nullptr) {
+        RegisterCompactEventHook();
+        CacheRecalcRegion.Or(tTVPRect(0,0,Rect.get_width(),Rect.get_height()));
+        ++CacheEnabledCount;
+        TransitionCachePending=true;
+        krkrsdl3::transition_cache::Storage().eligible.fetch_add(1,std::memory_order_relaxed);
+        return CacheEnabledCount;
+    }
+    return IncCacheEnabledCount();
 }
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::ResizeCache()
@@ -4209,6 +4278,7 @@ void tTJSNI_BaseLayer::CompactCache()
 //---------------------------------------------------------------------------
 tjs_uint tTJSNI_BaseLayer::IncCacheEnabledCount()
 {
+    EnsureCacheAllocated(); // an ordinary second lease preserves eager semantics
     CacheEnabledCount++;
     if (CacheEnabledCount)
     {
@@ -4222,6 +4292,10 @@ tjs_uint tTJSNI_BaseLayer::IncCacheEnabledCount()
 tjs_uint tTJSNI_BaseLayer::DecCacheEnabledCount()
 {
     CacheEnabledCount--;
+    if(!CacheEnabledCount && TransitionCachePending) {
+        TransitionCachePending=false;
+        krkrsdl3::transition_cache::Storage().cancelled.fetch_add(1,std::memory_order_relaxed);
+    }
     if (TVPFreeUnusedLayerCache && !CacheEnabledCount)
         DeallocateCache();
     // object is not freed until compact event, unless TVPFreeUnusedLayerCache
@@ -4507,6 +4581,7 @@ bool tTJSNI_BaseLayer::GetBltMethodFromOperationModeAndDrawFace(tTVPBBBltMethod&
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::FillRect(const tTVPRect& rect, tjs_uint32 color)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.FillRect",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // fill given rectangle with given "color"
     // this method does not do transparent coloring.
 
@@ -4582,6 +4657,7 @@ void tTJSNI_BaseLayer::FillRect(const tTVPRect& rect, tjs_uint32 color)
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::ColorRect(const tTVPRect& rect, tjs_uint32 color, tjs_int opa)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.ColorRect",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // color given rectangle with given "color"
 
     tTVPRect destrect;
@@ -4693,6 +4769,7 @@ void tTJSNI_BaseLayer::DrawText(tjs_int x,
                                 tjs_int shadowofsx,
                                 tjs_int shadowofsy)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.DrawText",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // draw text
     if (!MainImage)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
@@ -4748,6 +4825,7 @@ void tTJSNI_BaseLayer::DrawGlyph(tjs_int x,
                                  tjs_int shadowofsx,
                                  tjs_int shadowofsy)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.DrawGlyph",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // draw text
     if (!MainImage)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
@@ -4794,6 +4872,7 @@ void tTJSNI_BaseLayer::PiledCopy(tjs_int dx,
                                  tTJSNI_BaseLayer* src,
                                  const tTVPRect& srcrect)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.PiledCopy",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // rectangle copy of piled layer image
 
     // this can transfer the piled image of the source layer
@@ -4843,6 +4922,7 @@ void tTJSNI_BaseLayer::CopyRect(tjs_int dx,
                                 iTVPBaseBitmap* provincesrc,
                                 const tTVPRect& srcrect)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.CopyRect",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // copy rectangle
 
     // this method switches automatically backward or forward copy, when
@@ -4949,6 +5029,7 @@ void tTJSNI_BaseLayer::StretchCopy(const tTVPRect& destrect,
                                    tTVPBBStretchType type,
                                    tjs_real typeopt)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.StretchCopy",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // stretching copy
     tTVPRect ur = destrect;
     if (ur.right < ur.left)
@@ -5002,6 +5083,7 @@ void tTJSNI_BaseLayer::AffineCopy(const t2DAffineMatrix& matrix,
                                   tTVPBBStretchType type,
                                   bool clear)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.AffineCopy",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     krkrsdl3::layer_triangle_trace::SourceScope triangleSource(
         krkrsdl3::layer_triangle_trace::Source::AffineCopy);
     // affine copy
@@ -5052,6 +5134,7 @@ void tTJSNI_BaseLayer::AffineCopy(const tTVPPointD* points,
                                   tTVPBBStretchType type,
                                   bool clear)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.AffineCopy",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     krkrsdl3::layer_triangle_trace::SourceScope triangleSource(
         krkrsdl3::layer_triangle_trace::Source::AffineCopy);
     // affine copy
@@ -5099,6 +5182,7 @@ void tTJSNI_BaseLayer::AffineCopy(const tTVPPointD* points,
 void tTJSNI_BaseLayer::PileRect(
     tjs_int dx, tjs_int dy, tTJSNI_BaseLayer* src, const tTVPRect& srcrect, tjs_int opacity)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.PileRect",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // obsoleted (use OperateRect)
 
     // pile rectangle ( pixel alpha blend )
@@ -5162,6 +5246,7 @@ void tTJSNI_BaseLayer::PileRect(
 void tTJSNI_BaseLayer::BlendRect(
     tjs_int dx, tjs_int dy, tTJSNI_BaseLayer* src, const tTVPRect& srcrect, tjs_int opacity)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.BlendRect",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // obsoleted (use OperateRect)
 
     // blend rectangle ( constant alpha blend )
@@ -5224,6 +5309,7 @@ void tTJSNI_BaseLayer::OperateRect(tjs_int dx,
                                    tTVPBlendOperationMode mode,
                                    tjs_int opacity)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.OperateRect",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // operate on rectangle ( add/sub/mul/div and others )
     tTVPRect rect;
     if (!ClipDestPointAndSrcRect(dx, dy, rect, srcrect))
@@ -5267,6 +5353,7 @@ void tTJSNI_BaseLayer::StretchPile(const tTVPRect& destrect,
                                    tjs_int opacity,
                                    tTVPBBStretchType type)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.StretchPile",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // obsoleted (use OperateStretch)
 
     // stretching pile
@@ -5326,6 +5413,7 @@ void tTJSNI_BaseLayer::StretchBlend(const tTVPRect& destrect,
                                     tjs_int opacity,
                                     tTVPBBStretchType type)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.StretchBlend",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // obsoleted (use OperateStretch)
 
     // stretching blend
@@ -5387,6 +5475,7 @@ void tTJSNI_BaseLayer::OperateStretch(const tTVPRect& destrect,
                                       tTVPBBStretchType type,
                                       tjs_real typeopt)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.OperateStretch",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // stretching operation (add/mul/sub etc.)
 
     tTVPRect ur = destrect;
@@ -5434,6 +5523,7 @@ void tTJSNI_BaseLayer::AffinePile(const t2DAffineMatrix& matrix,
                                   tjs_int opacity,
                                   tTVPBBStretchType type)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.AffinePile",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     krkrsdl3::layer_triangle_trace::SourceScope triangleSource(
         krkrsdl3::layer_triangle_trace::Source::AffinePile);
     // obsoleted (use OperateAffine)
@@ -5489,6 +5579,7 @@ void tTJSNI_BaseLayer::AffinePile(const tTVPPointD* points,
                                   tjs_int opacity,
                                   tTVPBBStretchType type)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.AffinePile",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     krkrsdl3::layer_triangle_trace::SourceScope triangleSource(
         krkrsdl3::layer_triangle_trace::Source::AffinePile);
     // obsoleted (use OperateAffine)
@@ -5544,6 +5635,7 @@ void tTJSNI_BaseLayer::AffineBlend(const t2DAffineMatrix& matrix,
                                    tjs_int opacity,
                                    tTVPBBStretchType type)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.AffineBlend",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     krkrsdl3::layer_triangle_trace::SourceScope triangleSource(
         krkrsdl3::layer_triangle_trace::Source::AffineBlend);
     // obsoleted (use OperateAffine)
@@ -5600,6 +5692,7 @@ void tTJSNI_BaseLayer::AffineBlend(const tTVPPointD* points,
                                    tjs_int opacity,
                                    tTVPBBStretchType type)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.AffineBlend",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     krkrsdl3::layer_triangle_trace::SourceScope triangleSource(
         krkrsdl3::layer_triangle_trace::Source::AffineBlend);
     // obsoleted (use OperateAffine)
@@ -5657,6 +5750,7 @@ void tTJSNI_BaseLayer::OperateAffine(const t2DAffineMatrix& matrix,
                                      tjs_int opacity,
                                      tTVPBBStretchType type)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.OperateAffine",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     krkrsdl3::layer_triangle_trace::SourceScope triangleSource(
         krkrsdl3::layer_triangle_trace::Source::OperateAffine);
     // affine operation
@@ -5698,6 +5792,7 @@ void tTJSNI_BaseLayer::OperateAffine(const tTVPPointD* points,
                                      tjs_int opacity,
                                      tTVPBBStretchType type)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.OperateAffine",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     krkrsdl3::layer_triangle_trace::SourceScope triangleSource(
         krkrsdl3::layer_triangle_trace::Source::OperateAffine);
     // affine operation
@@ -5734,6 +5829,7 @@ void tTJSNI_BaseLayer::OperateAffine(const tTVPPointD* points,
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::DoBoxBlur(tjs_int xblur, tjs_int yblur)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.DoBoxBlur",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // blur with box blur method
     if (!MainImage)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
@@ -5757,6 +5853,7 @@ void tTJSNI_BaseLayer::DoBoxBlur(tjs_int xblur, tjs_int yblur)
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::AdjustGamma(const tTVPGLGammaAdjustData& data)
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.AdjustGamma",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // this is not affected by DrawFace
     if (!MainImage)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
@@ -5772,6 +5869,7 @@ void tTJSNI_BaseLayer::AdjustGamma(const tTVPGLGammaAdjustData& data)
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::DoGrayScale()
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.DoGrayScale",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // this is not affected by DrawFace
     if (!MainImage)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
@@ -5784,6 +5882,7 @@ void tTJSNI_BaseLayer::DoGrayScale()
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::LRFlip()
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.LRFlip",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // this is not affected by DrawFace
     if (!MainImage)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
@@ -5799,6 +5898,7 @@ void tTJSNI_BaseLayer::LRFlip()
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::UDFlip()
 {
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.UDFlip",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
     // this is not affected by DrawFace
     if (!MainImage)
         TVPThrowExceptionMessage(TVPNotDrawableLayerType);
@@ -6983,6 +7083,7 @@ void tTJSNI_BaseLayer::Draw(tTVPDrawable* target, const tTVPRect& r, bool visibl
 
     if (GetCacheEnabled() && !(InTransition && !TransWithChildren && DivisibleTransHandler))
     {
+        EnsureCacheAllocated();
         // process must-recalc region
 
         tTVPComplexRect::tIterator it = CacheRecalcRegion.GetIterator();
@@ -7561,6 +7662,7 @@ tTVPBaseTexture* tTJSNI_BaseLayer::Complete(const tTVPRect& rect)
 
     if (!GetCacheEnabled())
         return NULL;
+    EnsureCacheAllocated();
     // caller must ensure that the caching is enabled
 
     if (GetVisibleChildrenCount() == 0 && ImageLeft == 0 && ImageTop == 0 &&
@@ -7723,9 +7825,9 @@ void tTJSNI_BaseLayer::StartTransition(const ttstr& name,
         TransWithChildren = withchildren;
         if (TransWithChildren)
         {
-            IncCacheEnabledCount();
+            IncTransitionCacheEnabledCount();
             if (transsource)
-                transsource->IncCacheEnabledCount();
+                transsource->IncTransitionCacheEnabledCount();
         }
 
         // set to interrupt into updating/completion pipe line

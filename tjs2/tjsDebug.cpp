@@ -14,6 +14,9 @@
 #include "tjsDebug.h"
 #include "tjsHashSearch.h"
 #include "tjsInterCodeGen.h"
+#include "tjsScriptBlock.h"
+#include <cstdio>
+#include <cstring>
 #include "tjsGlobalStringMap.h"
 
 #ifdef ENABLE_DEBUGGER
@@ -562,6 +565,8 @@ struct tTJSStackRecord
     const tjs_int* CodeBase;
     tjs_int* const* CodePtr;
     bool InTry;
+    tjs_int SavedPosition = 0;
+    bool HasSavedPosition = false;
 
     tTJSStackRecord(tTJSInterCodeContext* context, bool in_try)
     {
@@ -598,6 +603,8 @@ struct tTJSStackRecord
         CodeBase = rhs.CodeBase;
         CodePtr = rhs.CodePtr;
         InTry = rhs.InTry;
+        SavedPosition = rhs.SavedPosition;
+        HasSavedPosition = rhs.HasSavedPosition;
     }
 };
 
@@ -658,6 +665,64 @@ public:
         tjs_uint top = size - 1;
         Stack[top].CodeBase = codebase;
         Stack[top].CodePtr = codeptr;
+        Stack[top].HasSavedPosition = false;
+    }
+
+    void FreezeCodePointer() noexcept
+    {
+        if (Stack.empty()) return;
+        auto& rec = Stack.back();
+        if (rec.CodeBase && rec.CodePtr) {
+            rec.SavedPosition = tjs_int(*rec.CodePtr - rec.CodeBase);
+            rec.HasSavedPosition = true;
+            rec.CodePtr = nullptr;
+        }
+    }
+    bool GetTraceUTF8(char* output, tjs_uint capacity, tjs_uint frames)
+    {
+        if (!output || !capacity) return false;
+        capacity = std::min<tjs_uint>(capacity, 513);
+        frames = std::min<tjs_uint>(frames, 4);
+        tjs_uint used = 0;
+        output[0] = 0;
+        auto append = [&](const tjs_char* text, tjs_uint fieldLimit) {
+            if (!text) return;
+            const auto fieldEnd = std::min<tjs_uint>(capacity - 1, used + fieldLimit);
+            while (*text && used < fieldEnd) {
+                tjs_uint cp = tjs_uint(*text++);
+                if (sizeof(tjs_char) == 2 && cp >= 0xd800 && cp <= 0xdbff) {
+                    const tjs_uint low = tjs_uint(*text);
+                    if (low >= 0xdc00 && low <= 0xdfff) {++text;cp = 0x10000 + ((cp - 0xd800) << 10) + low - 0xdc00;}
+                    else cp = 0xfffd;
+                } else if ((cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff) cp = 0xfffd;
+                const tjs_uint bytes = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+                if (used + bytes > fieldEnd) break;
+                if (bytes == 1) output[used++] = char(cp < 32 ? ' ' : cp);
+                else {
+                    output[used++] = char((bytes == 2 ? 0xc0 : bytes == 3 ? 0xe0 : 0xf0) | (cp >> (6 * (bytes - 1))));
+                    for (int shift = int(bytes - 2) * 6; shift >= 0; shift -= 6)
+                        output[used++] = char(0x80 | ((cp >> shift) & 0x3f));
+                }
+            }
+            output[used] = 0;
+        };
+        for (tjs_int top = tjs_int(Stack.size()) - 1; top >= 0 && frames && used < capacity - 1; --top, --frames) {
+            if (used) append(TJS_N(" | "), 3);
+            const auto& rec = Stack[top];
+            auto* block = rec.Context->GetBlock();
+            append(block->GetName(), 96);
+            const tjs_int position = rec.CodeBase && rec.CodePtr ? tjs_int(*rec.CodePtr - rec.CodeBase) : rec.HasSavedPosition ? rec.SavedPosition : 0;
+            const auto line = block->SrcPosToLine(rec.Context->CodePosToSrcPos(position)) + 1;
+            char number[32];
+            std::snprintf(number, sizeof(number), ":%d[", int(line));
+            for (const char* p = number; *p && used < capacity - 1; ++p) output[used++] = *p;
+            output[used] = 0;
+            append(rec.Context->GetName(), 64);
+            append(TJS_N("]"), 1);
+            while (top >= 0 && Stack[top].InTry) --top;
+        }
+        output[used] = 0;
+        return true;
     }
 
     ttstr GetTraceString(tjs_int limit, const tjs_char* delimiter)
@@ -682,7 +747,7 @@ public:
             }
             else
             {
-                str = rec.Context->GetPositionDescriptionString(0);
+                str = rec.Context->GetPositionDescriptionString(rec.HasSavedPosition ? rec.SavedPosition : 0);
             }
 
             ret += str;
@@ -734,6 +799,20 @@ void TJSStackTracerPop()
 {
     if (TJSStackTracer)
         TJSStackTracer->Pop();
+}
+//---------------------------------------------------------------------------
+void TJSStackTracerFreezeCodePointer() noexcept
+{
+    if (TJSStackTracer) TJSStackTracer->FreezeCodePointer();
+}
+//---------------------------------------------------------------------------
+bool TJSGetStackTraceUTF8(char* output, tjs_uint capacity, tjs_uint frames) noexcept
+{
+    if (!output || !capacity) return false;
+    output[0] = 0;
+    if (!TJSStackTracer) return false;
+    try {return TJSStackTracer->GetTraceUTF8(output, capacity, frames);}
+    catch (...) {output[0] = 0;return false;}
 }
 //---------------------------------------------------------------------------
 ttstr TJSGetStackTraceString(tjs_int limit, const tjs_char* delimiter)

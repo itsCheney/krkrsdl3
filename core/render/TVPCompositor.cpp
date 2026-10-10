@@ -541,11 +541,17 @@ bool TVPRenderBackendAvailable(const std::string& name)
 void TVPSetRenderBackend(iTVPRenderBackend* backend)
 {
     GetCurrentBackendRef() = backend;
+    TVPInvalidatePresentation("backend");
 }
 
 iTVPRenderBackend* TVPGetRenderBackend()
 {
     return GetCurrentBackendRef();
+}
+
+void TVPInvalidatePresentation(const char* reason)
+{
+    if(auto* backend=TVPGetRenderBackend()) backend->InvalidatePresentation(reason);
 }
 
 void TVPShutdownRenderBackend()
@@ -600,6 +606,7 @@ static void TVPReportCompositorFrame(int spriteCount,
 
 void TVPResetCompositorSessionState()
 {
+    TVPInvalidatePresentation("session");
     renderTexture.clear();
     TVPResetEmoteCaptureStats();
     TVPResetRuntimeProfileStats();

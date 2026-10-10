@@ -18,7 +18,8 @@ namespace krkrsdl3 { namespace layer_hotspot {
 inline constexpr size_t OperationCapacity=256, ResourceCapacity=64;
 inline constexpr size_t MessageBytes=960, OutputBytes=32*1024, ChunkBytes=720;
 enum class Access : unsigned { Rect, Read, Snapshot, Upload, Copy, Affine,
-    Perspective, Span, Shrink, Transition, Window, Mesh, Create, Clear, Pass, End };
+    Perspective, Span, Shrink, Transition, Window, Mesh, Create, Clear, Pass, End, Execution };
+enum class Execution : unsigned { Immediate, Deferred, Materialized, Omitted };
 enum class Boundary : unsigned { Target, Upload, Blit, Compute, Mesh, Submit,
     Destroy, Read, Snapshot, Window, ExplicitClear, Initialization, Other, Count };
 enum class ClearOrigin : unsigned { LayerCreate, OtherCreate, FirstRead, FirstWrite,
@@ -36,6 +37,7 @@ struct Totals {
     uint64_t calls=0,pixels=0,scaledPixels=0,aliasPixels=0,snapshotBytes=0;
     uint64_t render=0,compute=0,blit=0,draws=0,creates=0,clearBytes=0;
     uint64_t elidedInitialization=0,fusedInitialization=0,fastFills=0,sampleFailures=0,diagnosticGaps=0;
+    uint64_t deferredFills=0,materializedFills=0,omittedFills=0,actualDraws=0;
     bool saturated=false;
     std::array<uint64_t,TVP_LAYER_OPERATION_COUNT> kindPixels{};
     std::array<uint64_t,size_t(Boundary::Count)> ends{};
@@ -47,6 +49,10 @@ struct Totals {
     }
 };
 struct Operation {
+    uint64_t receiver=0,logicalID=0;
+    unsigned receiverKind=0,flags=0,color=0,sampling=0;
+    int opacity=255;
+    Execution execution=Execution::Immediate;
     uint64_t sequence=0,layer=0,encoder=0,targetVersion=0,sourceVersion=0,pixels=0,snapshotBytes=0;
     int target=-1,source=-1,kind=0,opaque=-1,reason=0;
     Access access=Access::Rect;
@@ -85,12 +91,15 @@ inline std::string TotalsJSON(const Totals& t) {
     P2D_TOTAL(draws) P2D_TOTAL(creates) P2D_TOTAL(clearBytes) P2D_TOTAL(elidedInitialization)
     P2D_TOTAL(fusedInitialization) P2D_TOTAL(fastFills)
     P2D_TOTAL(sampleFailures) P2D_TOTAL(diagnosticGaps)
+    P2D_TOTAL(deferredFills) P2D_TOTAL(materializedFills) P2D_TOTAL(omittedFills)
+    P2D_TOTAL(actualDraws)
 #undef P2D_TOTAL
     return out+",\"saturated\":"+std::to_string(t.saturated)+",\"kindPixels\":"+Numbers(t.kindPixels)+
         ",\"ends\":"+Numbers(t.ends)+",\"clears\":"+Numbers(t.clears)+'}';
 }
 class Recorder {
     bool enabled=false;
+    uint64_t logicalSerial=0;
     std::shared_ptr<Sample> sample;
 public:
     const uint64_t epoch=NextEpoch();
@@ -121,8 +130,13 @@ public:
                 const std::array<int,4>& destination={},const std::array<int,4>& sourceRect={},
                 const std::array<int,4>& clip={},uint64_t pixels=0,bool scaled=false,bool alias=false,
                 bool readsTarget=false,bool full=false,int opaque=-1,uint64_t encoder=0,
-                uint64_t snapshotBytes=0,int reason=0) {
+                uint64_t snapshotBytes=0,int reason=0,const TVPLayerOperation* parameters=nullptr,
+                unsigned sampling=0,uint64_t logicalID=0,Execution execution=Execution::Immediate) {
         if(!enabled)return;
+        if(kind>0) {
+            if(!logicalID)logicalID=++logicalSerial;
+            else logicalSerial=std::max(logicalSerial,logicalID);
+        }
         if(kind>0 && size_t(kind)<TVP_LAYER_OPERATION_COUNT)Count([&](Totals& t){
             t.Add(t.calls);t.Add(t.pixels,pixels);t.Add(t.kindPixels[size_t(kind)],pixels);
             if(scaled)t.Add(t.scaledPixels,pixels);if(alias)t.Add(t.aliasPixels,pixels);
@@ -132,6 +146,9 @@ public:
         const int ti=Resource(target),si=Resource(source);const uint64_t sequence=++sample->sequence;
         if(sample->operationCount==OperationCapacity){++sample->operationOverflow;return;}
         auto& op=sample->operations[sample->operationCount++];const auto context=Current();
+        op.receiver=context.currentReceiver;op.receiverKind=unsigned(context.receiverKind);
+        op.logicalID=logicalID;op.execution=execution;op.sampling=sampling;
+        if(parameters){op.flags=parameters->flags;op.color=parameters->color;op.opacity=parameters->opacity;}
         op.sequence=sequence;op.layer=context.currentLayer;CopyBounded(op.role,sizeof(op.role),context.role);
         op.access=access;op.kind=kind;op.target=ti;op.source=si;op.encoder=encoder;
         op.targetVersion=target?target->identity.version:0;op.sourceVersion=source?source->identity.version:0;
@@ -158,7 +175,8 @@ inline std::string ResourceJSON(const ResourceInfo& r) {
     return '['+std::to_string(r.generation)+','+std::to_string(i.session)+','+std::to_string(i.texture)+','+
         std::to_string(i.parentSession)+','+std::to_string(i.parent)+','+std::to_string(i.creatorLayer)+','+
         std::to_string(i.assetHash)+','+std::to_string(r.width)+','+std::to_string(r.height)+','+
-        std::to_string(r.bytesPerPixel)+','+std::to_string(i.assetTruncated)+','+JSON(i.asset)+','+JSON(i.role)+']';
+        std::to_string(r.bytesPerPixel)+','+std::to_string(i.assetTruncated)+','+JSON(i.asset)+','+JSON(i.role)+','+
+        std::to_string(i.displayShortened)+']';
 }
 inline std::string OperationJSON(const Operation& o) {
     return '['+std::to_string(o.sequence)+','+std::to_string(unsigned(o.access))+','+std::to_string(o.kind)+','+
@@ -167,7 +185,10 @@ inline std::string OperationJSON(const Operation& o) {
         std::to_string(o.encoder)+','+std::to_string(o.pixels)+','+std::to_string(o.snapshotBytes)+','+
         std::to_string(o.full)+','+std::to_string(o.opaque)+','+std::to_string(o.readsTarget)+','+
         std::to_string(o.scaled)+','+std::to_string(o.alias)+','+std::to_string(o.reason)+','+
-        Numbers(o.destination)+','+Numbers(o.sourceRect)+','+Numbers(o.clip)+']';
+        Numbers(o.destination)+','+Numbers(o.sourceRect)+','+Numbers(o.clip)+','+
+        std::to_string(o.receiver)+','+std::to_string(o.receiverKind)+','+std::to_string(o.flags)+','+
+        std::to_string(o.color)+','+std::to_string(o.opacity)+','+std::to_string(o.sampling)+','+
+        std::to_string(o.logicalID)+','+std::to_string(unsigned(o.execution))+']';
 }
 inline std::string Base64(const std::string& input) {
     constexpr char alphabet[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -187,7 +208,7 @@ inline std::vector<std::string> FormatSample(const Sample& s,double gpuMS,bool a
     size_t dropped=0;std::string encoded;
     // Header + base64 framing is charged against the same per-sample budget.
     for(;;){
-        const std::string document="{\"version\":1,\"epoch\":"+std::to_string(s.epoch)+
+        const std::string document="{\"version\":2,\"epoch\":"+std::to_string(s.epoch)+
             ",\"id\":"+std::to_string(s.command)+",\"firstFrame\":"+std::to_string(s.firstFrame)+
             ",\"lastFrame\":"+std::to_string(s.lastFrame)+",\"hot\":"+std::to_string(hot)+
             ",\"gpuMS\":"+std::to_string(available?gpuMS:-1)+",\"drawableMS\":"+std::to_string(s.drawableMS)+
@@ -203,7 +224,7 @@ inline std::vector<std::string> FormatSample(const Sample& s,double gpuMS,bool a
         ++dropped;
     }
     std::vector<std::string> out;const size_t parts=(encoded.size()+ChunkBytes-1)/ChunkBytes;
-    for(size_t p=0;p<parts;++p)out.push_back("metal.layerHotspot version=1 epoch="+std::to_string(s.epoch)+
+    for(size_t p=0;p<parts;++p)out.push_back("metal.layerHotspot version=2 epoch="+std::to_string(s.epoch)+
         " id="+std::to_string(s.command)+" part="+std::to_string(p)+" parts="+std::to_string(parts)+
         " data="+encoded.substr(p*ChunkBytes,ChunkBytes));
     return out;
@@ -235,7 +256,7 @@ struct OutputGate {
         const auto encoded=Base64(document);std::vector<std::string> lines;
         const size_t parts=(encoded.size()+ChunkBytes-1)/ChunkBytes;
         uint64_t lost=0;{std::lock_guard<std::mutex> lock(mutex);lost=droppedReports;}
-        for(size_t p=0;p<parts;++p)lines.push_back("metal.layerPasses version=1 epoch="+std::to_string(recorder.epoch)+
+        for(size_t p=0;p<parts;++p)lines.push_back("metal.layerPasses version=2 epoch="+std::to_string(recorder.epoch)+
             " id="+std::to_string(command)+" final="+std::to_string(final)+" droppedReports="+std::to_string(lost)+
             " part="+std::to_string(p)+" parts="+std::to_string(parts)+" data="+encoded.substr(p*ChunkBytes,ChunkBytes));
         Emit(now,lines,log);

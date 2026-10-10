@@ -714,9 +714,12 @@ public:
     //--------------------------------------------------- cache management --
 private:
     tTVPBaseTexture* CacheBitmap;
+    bool TransitionCachePending;
     // tTVPComplexRect CachedRegion;
 
     void AllocateCache();
+    void EnsureCacheAllocated();
+    tjs_uint IncTransitionCacheEnabledCount();
     void ResizeCache();
     void DeallocateCache();
     void DispSizeChanged(); // is called from geographical management

@@ -1,3 +1,4 @@
+#include "CPUFrameDiagnostics.h"
 //---------------------------------------------------------------------------
 /*
         TVP2 ( T Visual Presenter 2 )  A script authoring tool
@@ -118,6 +119,7 @@ void tTVPScenarioCacheItem::LoadScenario(const ttstr& name, bool isstring)
 
         try
         {
+            krkrsdl3::cpu_frame::EventScope cpuRead(krkrsdl3::cpu_frame::Kind::KAGRead);
             stream = TVPCreateTextStreamForRead(name, TJS_N(""));
             ttstr tmp;
             if (stream)
@@ -215,6 +217,7 @@ void tTVPScenarioCacheItem::EnsureLabelCache()
     // construct label cache
     if (!LabelCached)
     {
+        krkrsdl3::cpu_frame::EventScope cpuLabel(krkrsdl3::cpu_frame::Kind::KAGLabelBuild);
         // make label cache
         LabelAliases.resize(LineCount);
         ttstr prevlabel;
@@ -326,10 +329,12 @@ tTVPScenarioCacheItem* TVPGetScenario(const ttstr& storagename, bool isstring)
     tTVPScenarioCacheItemHolder* ptr = TVPScenarioCache.FindAndTouchWithHash(storagename, hash);
     if (ptr)
     {
+        krkrsdl3::cpu_frame::EventScope cpuHit(krkrsdl3::cpu_frame::Kind::KAGCacheHit);
         // found in the cache
         return ptr->GetObject();
     }
 
+    krkrsdl3::cpu_frame::EventScope cpuMiss(krkrsdl3::cpu_frame::Kind::KAGCacheMiss);
     // not found in the cache
     tTVPScenarioCacheItem* item = new tTVPScenarioCacheItem(storagename, false);
     try
@@ -925,6 +930,7 @@ void tTJSNI_KAGParser::Restore(iTJSDispatch2* dic)
 //---------------------------------------------------------------------------
 void tTJSNI_KAGParser::LoadScenario(const ttstr& name)
 {
+    krkrsdl3::cpu_frame::EventScope cpuLoad(krkrsdl3::cpu_frame::Kind::KAGLoad);
     // load scenario to buffer
 
     BreakConditionAndMacro();
@@ -2336,6 +2342,7 @@ parse_start:
 //---------------------------------------------------------------------------
 iTJSDispatch2* tTJSNI_KAGParser::GetNextTag()
 {
+    krkrsdl3::cpu_frame::EventScope cpuTag(krkrsdl3::cpu_frame::Kind::KAGNextTag);
     return _GetNextTag();
 }
 //---------------------------------------------------------------------------

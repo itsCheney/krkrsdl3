@@ -156,6 +156,14 @@ struct layerExBase_GL
     typedef unsigned char* BufferRT;
 
     tTJSNI_Layer* _this;
+    const uint64_t ReceiverDiagnosticID=krkrsdl3::layer_hotspot::NextLayerID();
+    void SetHotspotReceiver() const noexcept {
+        auto& context=krkrsdl3::layer_hotspot::CurrentStorage();
+        context.currentLayer=_this ? _this->GetLayerDiagnosticID() : 0;
+        context.currentReceiver=ReceiverDiagnosticID;
+        context.receiverKind=krkrsdl3::layer_hotspot::ReceiverKind::LayerEx;
+    }
+
 
     GeometryT _width, _height;
     BufferT _buffer;

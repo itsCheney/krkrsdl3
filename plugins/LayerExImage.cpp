@@ -541,6 +541,7 @@ template<> struct ncbInvocationPolicy<layerExImage> {
     };
     static tjs_error InvokeFuncCall(const char* name,ncbInvocationKind kind,iTJSDispatch2* dispatch,
         tjs_uint32 flag,tjs_uint32* hint,tTJSVariant* result,tjs_int count,tTJSVariant** params,iTJSDispatch2* object) {
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"layerExImage");
         Scope scope(name,kind,object);auto& c=scope.value;
         if(count<Arity(name)) {
             c.stage="arity";c.route="error";c.reason="arity";
@@ -588,6 +589,7 @@ NCB_GET_INSTANCE_HOOK(layerExImage){
                 krkrsdl3::cpu_consumer_trace::RecordImage(constructed);
             }
         }
+        obj->SetHotspotReceiver();
         pixelsOwner=obj;
         obj->setPixelCaller("layerExImage.write");
         const auto* c=krkrsdl3::layer_image::context;

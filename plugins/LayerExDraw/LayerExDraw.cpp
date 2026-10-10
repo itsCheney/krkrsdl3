@@ -3220,6 +3220,7 @@ struct ncbInvocationPolicy<LayerExDraw>
             // Raw callbacks and bridge getters historically only look up an
             // existing instance. Let their original missing-instance path run.
             if(!value) return;
+            value->SetHotspotReceiver();
             if(Metadata(name,kind,value)) value->refreshMetadata();
             else pixels.emplace(*value);
         }
@@ -3369,6 +3370,7 @@ struct ncbInvocationPolicy<LayerExDraw>
 #endif
     static tjs_error InvokeFuncCall(const char* name,ncbInvocationKind kind,iTJSDispatch2* dispatch,
         tjs_uint32 flag,tjs_uint32* hint,tTJSVariant* result,tjs_int count,tTJSVariant** params,iTJSDispatch2* object) {
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"layerExDraw");
 #if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
         const bool selected=kind==ncbInvocationKind::Method &&
             (!strcmp(name,"drawLine") || !strcmp(name,"drawPath") || !strcmp(name,"drawImageStretch") || !strcmp(name,"drawRectangle") || !strcmp(name,"clear"));
@@ -3381,6 +3383,7 @@ struct ncbInvocationPolicy<LayerExDraw>
             krkrsdl3::cpu_consumer_trace::ConsumerScope consumer(name,
                 krkrsdl3::cpu_consumer_trace::Access::Write,"method",(uintptr_t)object);
             LayerExDraw* value=Scope::Instance(object);
+            value->SetHotspotReceiver();
             const char* reason=Preflight(name,count,params,value);
             // Releasing an existing object result can run script finalizers.
             // Keep their historical lease/conversion order on the legacy route.
@@ -3472,6 +3475,7 @@ NCB_GET_INSTANCE_HOOK(LayerExDraw)
             obj = new ClassT(objthis);
             SetNativeInstance(objthis, obj);
         }
+        obj->SetHotspotReceiver();
         return obj;
     }
 };

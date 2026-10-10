@@ -190,6 +190,8 @@ extern void TVPTouchImages(const std::vector<ttstr>& storages, tjs_int64 limit, 
 //---------------------------------------------------------------------------
 
 class iTVPBaseBitmap;
+// Metadata only; success tagging must not allocate or submit GPU work.
+void TVPTagGraphicDiagnosticAsset(iTVPBaseBitmap* dest, const ttstr& normalizedName);
 //---------------------------------------------------------------------------
 // TVPLoadGraphic
 //---------------------------------------------------------------------------

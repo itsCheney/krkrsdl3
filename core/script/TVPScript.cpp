@@ -826,6 +826,7 @@ void TVPExecuteStorage(const ttstr& name,
                        bool isexpression,
                        const tjs_char* modestr)
 {
+    krkrsdl3::cpu_frame::EventScope cpuStorage(krkrsdl3::cpu_frame::Kind::ScriptStorage);
     krkrsdl3::layer_work::SourceScope source("script.storage");
     // Includes execution of the loaded script; keep this explicit instead of
     // inferring image decode time from the legacy resourceLoad total.

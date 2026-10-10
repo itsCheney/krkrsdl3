@@ -84,6 +84,9 @@ public:
     // ---- 帧控制（由 TVPRenderOnce 统一调度）----
     virtual void BeginFrame(int winWidth, int winHeight) = 0;
     virtual void EndFrame() = 0; // 提交并呈现（SwapBuffers / Present / vkQueuePresent）
+    // Lifecycle invalidation is optional; conservative static-present reuse
+    // must refresh after expose, resize, resume, capture and session changes.
+    virtual void InvalidatePresentation(const char* reason) {}
 
     // ---- 窗口贴图管理（上屏合成用；SW=SDL_Texture，GPU=与一般贴图同一实现）----
     // 句柄为后端持有的不透明指针，nullptr 表示无效
@@ -299,6 +302,7 @@ bool TVPRenderBackendAvailable(const std::string& name);
 //---------------------------------------------------------------------------
 void TVPSetRenderBackend(iTVPRenderBackend* backend);
 iTVPRenderBackend* TVPGetRenderBackend();
+void TVPInvalidatePresentation(const char* reason);
 
 struct TVPEmoteCaptureStats {
     uint64_t calls = 0;
