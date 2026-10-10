@@ -1746,7 +1746,7 @@ void MetalRenderBackend::EndFrame()
                     if(trackPresentation)try {record=p.presentationPolicy.Track(std::move(signature));}
                     catch(const std::bad_alloc&) {p.presentationPolicy.Invalidate();p.staticPresentEnabled=false;}
 #if TARGET_OS_SIMULATOR
-                    if(presentation)presentation->failed.store(true,std::memory_order_release);
+                    if(presentation)presentation->MarkFailed(PresentationFailure::Unsupported);
 #else
                     auto lastPresented = p.lastLayerPresentation;
                     [drawable addPresentedHandler:^(id<MTLDrawable> displayed) {
@@ -1763,23 +1763,24 @@ void MetalRenderBackend::EndFrame()
                                     !lastPresented->compare_exchange_weak(previous,presentation->frameSerial,
                                         std::memory_order_release,std::memory_order_relaxed)) {}
                                 presentation->presented.store(true,std::memory_order_release);
-                            } else presentation->failed.store(true,std::memory_order_release);
+                            } else presentation->MarkFailed(PresentationFailure::NotDisplayed);
                         }
                     }];
 #endif
                     if(record || presentation) [p.Commands() addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
                         if(buffer.status==MTLCommandBufferStatusCompleted) {
                             if(record)record->commandSucceeded.store(true,std::memory_order_release);
+                            if(presentation)presentation->MarkCommandCompleted(true);
                         } else {
                             if(record)record->failed.store(true,std::memory_order_release);
-                            if(presentation)presentation->failed.store(true,std::memory_order_release);
+                            if(presentation)presentation->MarkCommandCompleted(false);
                         }
                     }];
                     [p.Commands() presentDrawable:drawable];
                     scheduledPresentation = true;
                 } else p.presentationPolicy.Invalidate();
             }
-            if(presentation && !scheduledPresentation)presentation->failed.store(true,std::memory_order_release);
+            if(presentation && !scheduledPresentation)presentation->MarkFailed(PresentationFailure::NoDrawable);
             p.layerPresentation.reset();
             p.hotspots.Drawable(drawableWaitMS);
             p.Submit(); // Offscreen/script work still advances on skipped frames.
@@ -1788,7 +1789,7 @@ void MetalRenderBackend::EndFrame()
             p.ReportPresentation();
         } catch(...) {
             p.presentationPolicy.Invalidate();
-            if(presentation)presentation->failed.store(true,std::memory_order_release);
+            if(presentation)presentation->MarkFailed(PresentationFailure::EncodingFailed);
             p.layerPresentation.reset();
             throw;
         }
@@ -2383,7 +2384,7 @@ bool MetalRenderBackend::RequestLayerTextureRegionRead(void* handle, const TVPLa
                 }
             } else if (buffer.status != MTLCommandBufferStatusCompleted) {
                 result->failed.store(true, std::memory_order_relaxed);
-                if (result->presentation) result->presentation->failed.store(true, std::memory_order_release);
+                if (result->presentation) result->presentation->MarkFailed(PresentationFailure::CommandFailed);
             }
             // A completed command buffer may retain its handler object. Drop
             // the handler's strong staging reference after CPU copying, before
