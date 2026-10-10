@@ -13,7 +13,7 @@ class layerExImage : public layerExBase_GL
 {
 public:
     // コンストラクタ
-    layerExImage(DispatchT obj) : layerExBase_GL(obj) {}
+    layerExImage(DispatchT obj) : layerExBase_GL(obj,true) {}
 
     virtual void reset();
 

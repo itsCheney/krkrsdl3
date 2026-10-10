@@ -8,6 +8,35 @@
 #include <math.h>
 #include <ncbind/ncbind.hpp>
 #include "LayerExImage.h"
+#include <cmath>
+#include <exception>
+#include <iomanip>
+#include <locale>
+#include <sstream>
+#include <typeinfo>
+
+namespace {
+void LayerImageEntered(std::initializer_list<double> parameters) {
+    auto* c=krkrsdl3::layer_image::context;
+    if(!c) return;
+    c->entered=true;
+    if(!c->epoch) return;
+    try {
+        std::ostringstream out;out.imbue(std::locale::classic());out<<std::setprecision(17)<<'[';
+        bool first=true;
+        for(double p:parameters) {if(!first) out<<',';first=false;out<<p;}
+        out<<']';const auto value=out.str();
+        if(!krkrsdl3::layer_image::Copy(c->parameters,value.c_str()))
+            std::strcpy(c->parameters,"parametersOversize");
+    } catch(...) {std::strcpy(c->parameters,"parametersUnavailable");}
+}
+void LayerImageLightTable(int brightness,int contrast,BYTE (&table)[256]) {
+    float c=(100+contrast)/100.0f;
+    brightness+=128;
+    for(int i=0;i<256;++i)
+        table[i]=(BYTE)std::max(0,std::min(255,(int)((i-128)*c+brightness)));
+}
+}
 
 #define NCB_MODULE_NAME TJS_N("layerExImage.dll")
 
@@ -45,13 +74,41 @@ void layerExImage::lut(BYTE* pLut)
  */
 void layerExImage::light(int brightness, int contrast)
 {
-    float c = (100 + contrast) / 100.0f;
-    brightness += 128;
+    LayerImageEntered({double(brightness),double(contrast)});
     BYTE cTable[256];
-    for (int i = 0; i < 256; i++)
-    {
-        cTable[i] = (BYTE)std::max(0, std::min(255, (int)((i - 128) * c + brightness)));
+    LayerImageLightTable(brightness,contrast,cTable);
+    auto* c=krkrsdl3::layer_image::context;
+    if(c && c->allowGPU && !_pixels.Data()) {
+        refreshMetadata();
+        const TVPLayerRect roi{_clipLeft,_clipTop,_clipLeft+_clipWidth,_clipTop+_clipHeight};
+        std::shared_ptr<TVPLayerGammaLUT> lut;
+        iTVPTexture2D* target=nullptr;
+        try {
+            lut=std::make_shared<TVPLayerGammaLUT>();
+            static std::atomic<uint64_t> nextVersion{1};
+            lut->version=nextVersion.fetch_add(1,std::memory_order_relaxed);
+            for(int channel=0;channel<3;++channel)
+                std::memcpy(lut->bytes.data()+channel*256,cTable,256);
+            target=_this->GetMainImageTextureForSpanComposite();
+        } catch(...) {c->reason="allocation";}
+        if(target) {
+            TVPLayerImageResult status;
+            try {status=TVPTryMetalLayerImageLUT(target,roi,lut);}
+            catch(...) {
+                c->route="error";c->reason="backendException";
+                _this->SetImageModified(true);throw;
+            }
+            if(status==TVPLayerImageResult::Applied) {
+                c->route=roi.Width() && roi.Height() ? "gpu" : "noop";c->reason="applied";
+                c->metrics.parameterBytes=roi.Width() && roi.Height() ? 768 : 0;
+                _this->SetImageModified(true);redraw();return;
+            }
+            c->reason=status==TVPLayerImageResult::CPUAccess ? "activeLease" :
+                status==TVPLayerImageResult::Geometry ? "geometry" :
+                status==TVPLayerImageResult::Resource ? "resource" : "backend";
+        }
     }
+    PixelCall pixels(*this,"layerExImage.write");
     lut(cTable);
     redraw();
 }
@@ -184,6 +241,7 @@ static RGBQUAD HSLtoRGB(RGBQUAD lHSLColor)
  */
 void layerExImage::colorize(int hue, int sat, double blend)
 {
+    LayerImageEntered({double(hue),double(sat),blend});
     if (blend < 0.0f)
         blend = 0.0f;
     if (blend > 1.0f)
@@ -362,6 +420,7 @@ static void modulate(int& b, int& g, int& r, double h, double s, double l)
  */
 void layerExImage::modulate(int hue, int saturation, int luminance)
 {
+    LayerImageEntered({double(hue),double(saturation),double(luminance)});
     double h = hue / 360.0f;
     double s = saturation / 100.0f;
     double l = luminance / 100.0f;
@@ -392,6 +451,7 @@ void layerExImage::modulate(int hue, int saturation, int luminance)
  */
 void layerExImage::noise(int level)
 {
+    LayerImageEntered({double(level)});
     BYTE* src = (BYTE*)_buffer;
     for (int y = 0; y < _height; y++)
     {
@@ -416,6 +476,7 @@ void layerExImage::noise(int level)
  */
 void layerExImage::generateWhiteNoise()
 {
+    LayerImageEntered({});
     BYTE* src = (BYTE*)_buffer;
     for (int y = 0; y < _height; y++)
     {
@@ -440,6 +501,77 @@ static const char* copyright =
 
 // ----------------------------------- クラスの登録
 
+template<> struct ncbInvocationPolicy<layerExImage> {
+    static constexpr bool Enabled=true,RawPreflight=true;
+    template<class T> static bool CaptureResult(const T&) {return false;}
+    static int Arity(const char* name) {
+        return !std::strcmp(name,"light") ? 2 :
+            (!std::strcmp(name,"colorize") || !std::strcmp(name,"modulate")) ? 3 :
+            !std::strcmp(name,"noise") ? 1 : 0;
+    }
+    static const char* Consumer(const char* name) {
+        if(!std::strcmp(name,"light")) return "LayerExImage.light";
+        if(!std::strcmp(name,"colorize")) return "LayerExImage.colorize";
+        if(!std::strcmp(name,"modulate")) return "LayerExImage.modulate";
+        if(!std::strcmp(name,"noise")) return "LayerExImage.noise";
+        return "LayerExImage.generateWhiteNoise";
+    }
+    struct Scope {
+        krkrsdl3::cpu_consumer_trace::ConsumerScope consumer;
+        krkrsdl3::layer_image::Context value;
+        krkrsdl3::layer_image::Context* previous;
+        int exceptions=std::uncaught_exceptions();bool succeeded=false;
+        Scope(const char* name,ncbInvocationKind,iTJSDispatch2* object)
+          :consumer(Consumer(name),krkrsdl3::cpu_consumer_trace::Access::Write,"native.image",(uintptr_t)object),
+           previous(krkrsdl3::layer_image::context) {
+            value.method=name;value.receiver=object;value.metrics.calls=1;
+            krkrsdl3::cpu_consumer_trace::BeginImage(value);
+            krkrsdl3::layer_image::context=&value;
+        }
+        ~Scope() {
+            if(std::uncaught_exceptions()>exceptions || !succeeded) {
+                if(!value.entered) {value.stage="conversion";value.reason="conversion";}
+                else if(!std::strcmp(value.route,"gpu") || !std::strcmp(value.route,"noop")) value.reason="postCommitFailure";
+                else if(std::strcmp(value.reason,"backendException")) value.reason="exception";
+                if(std::strcmp(value.route,"gpu") && std::strcmp(value.route,"noop")) value.route="error";
+            }
+            krkrsdl3::cpu_consumer_trace::RecordImage(value);
+            krkrsdl3::layer_image::context=previous;
+        }
+    };
+    static tjs_error InvokeFuncCall(const char* name,ncbInvocationKind kind,iTJSDispatch2* dispatch,
+        tjs_uint32 flag,tjs_uint32* hint,tTJSVariant* result,tjs_int count,tTJSVariant** params,iTJSDispatch2* object) {
+        Scope scope(name,kind,object);auto& c=scope.value;
+        if(count<Arity(name)) {
+            c.stage="arity";c.route="error";c.reason="arity";
+            // Let the real NCBind arity check run before any native instance.
+            const auto hr=dispatch->FuncCall(flag,nullptr,hint,result,count,params,object);
+            scope.succeeded=true;return hr;
+        }
+        if(!std::strcmp(name,"light")) {
+            c.reason="numericType";
+            bool numeric=true;
+            for(int i=0;i<2;++i) {
+                const auto type=params[i]->Type();
+                if(type!=tvtInteger && type!=tvtReal) {numeric=false;break;}
+                const double v=params[i]->AsReal();
+                if(!std::isfinite(v) || v<(i ? -100 : -255) || v>(i ? 100 : 255)) {
+                    numeric=false;c.reason="numericRange";break;
+                }
+            }
+            if(numeric) {
+                c.reason="nonNativeReceiver";
+                if(object && typeid(*object)==typeid(tTJSCustomObject)) {
+                    c.reason="backendUnavailable";
+                    if(TVPHasMetalLayerImageLUTSupport()) {c.allowGPU=true;c.reason="resource";}
+                }
+            }
+        }
+        const auto hr=dispatch->FuncCall(flag,nullptr,hint,result,count,params,object);
+        scope.succeeded=TJS_SUCCEEDED(hr);return hr;
+    }
+};
+
 NCB_GET_INSTANCE_HOOK(layerExImage){
     // インスタンスゲッタ
     ClassT* pixelsOwner=nullptr;
@@ -450,10 +582,18 @@ NCB_GET_INSTANCE_HOOK(layerExImage){
         {
             obj = new ClassT(objthis);       // ない場合は生成する
             SetNativeInstance(objthis, obj); // objthis に obj をネイティブインスタンスとして登録する
+            if(auto* c=krkrsdl3::layer_image::context) {
+                auto constructed=*c;constructed.stage="construct";constructed.route="metadata";
+                constructed.reason="metadataOnly";constructed.metrics={1,0,0,0,0,0};
+                krkrsdl3::cpu_consumer_trace::RecordImage(constructed);
+            }
         }
         pixelsOwner=obj;
         obj->setPixelCaller("layerExImage.write");
-        obj->reset();
+        const auto* c=krkrsdl3::layer_image::context;
+        // Non-primitive conversions retain lease-before-conversion ordering.
+        // Only proven light arguments can defer CPU acquisition into the body.
+        if(!c || c->receiver!=objthis || !c->allowGPU || obj->currentPixelAccess().Data()) obj->reset();
         return obj;
     }
     // デストラクタ（実際のメソッドが呼ばれた後に呼ばれる）

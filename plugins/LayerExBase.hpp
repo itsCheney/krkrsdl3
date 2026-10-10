@@ -185,8 +185,8 @@ struct layerExBase_GL
         PixelCall& operator=(const PixelCall&)=delete;
     };
 
-    // Existing extensions keep their eager writable construction. LayerExDraw
-    // opts in because constructing its script facade does not touch pixels.
+    // Extensions opt in when constructing their facade only needs metadata.
+    // LayerExDraw and LayerExImage defer pixels to a real CPU consumer.
     layerExBase_GL(DispatchT obj, bool metadataOnly=false) : _obj(obj)
     {
         tjs_error hr;

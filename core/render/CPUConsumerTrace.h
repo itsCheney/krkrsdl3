@@ -319,9 +319,52 @@ inline void ReadWindowTaken(const layer_work::CPUConsumerBudget& b,uint64_t epoc
             ",\"overflow\":"+(b.readWindow.overflow ? "true" : "false")+'}');
     } catch(...) {}
 }
+inline void BeginImage(layer_image::Context& c) {
+    if(!Enabled()) return;
+    std::lock_guard<std::mutex> lock(layer_work::mutex);
+    if(!Enabled()) return;
+    c.epoch=layer_work::generation.load(std::memory_order_relaxed);
+    c.windowID=layer_work::profile.cpuConsumerBudget.spanWindow.id;
+}
+inline void RecordImage(const layer_image::Context& c) noexcept {
+    if(!CurrentEpoch(c.epoch)) return;
+    std::lock_guard<std::mutex> lock(layer_work::mutex);
+    if(!CurrentEpoch(c.epoch)) return;
+    auto& b=layer_work::profile.cpuConsumerBudget;auto& w=b.imageWindow;
+    if(c.windowID==b.spanWindow.id) w.Record(c);
+    else if(!layer_image::Add(w.lateCalls,c.metrics.calls)) w.saturated=true;
+}
+inline std::string ImageMetricsJSON(const layer_image::Metrics& m) {
+    return "\"records\":"+std::to_string(m.calls)+",\"readCalls\":"+std::to_string(m.readCalls)+
+        ",\"readBytes\":"+std::to_string(m.readBytes)+",\"readWallNS\":"+std::to_string(m.readWallNS)+
+        ",\"readWaitNS\":"+std::to_string(m.readWaitNS)+",\"parameterBytes\":"+std::to_string(m.parameterBytes);
+}
+inline void ImageWindowTaken(const layer_work::CPUConsumerBudget& b,uint64_t epoch) noexcept {
+    if(!CurrentEpoch(epoch)) return;
+    try {
+        const auto& w=b.imageWindow;
+        const auto base="\"version\":1,\"generation\":"+std::to_string(epoch)+
+            ",\"windowID\":"+std::to_string(b.spanWindow.id)+',';
+        for(size_t i=0;i<w.size;++i) {
+            const auto& r=w.rows[i];
+            Emit(epoch,"metal.layerImage {\"phase\":\"aggregate\","+base+
+                "\"method\":"+Label(r.method)+",\"stage\":"+Label(r.stage)+",\"route\":"+Label(r.route)+
+                ",\"reason\":"+Label(r.reason)+",\"parameters\":"+Label(r.parameters)+','+ImageMetricsJSON(r.metrics)+'}');
+        }
+        Emit(epoch,"metal.layerImage {\"phase\":\"overflow\","+base+ImageMetricsJSON(w.overflow)+'}');
+        Emit(epoch,"metal.layerImage {\"phase\":\"window\","+base+ImageMetricsJSON(w.totals)+
+            ",\"calls\":"+std::to_string(w.calls)+",\"constructors\":"+std::to_string(w.constructors)+
+            ",\"gpuCalls\":"+std::to_string(w.gpuCalls)+",\"cpuCalls\":"+std::to_string(w.cpuCalls)+
+            ",\"noopCalls\":"+std::to_string(w.noopCalls)+",\"errorCalls\":"+std::to_string(w.errorCalls)+
+            ",\"aggregateRows\":"+std::to_string(w.size)+",\"capacityRecords\":"+std::to_string(w.capacityRecords)+
+            ",\"oversizeRecords\":"+std::to_string(w.oversizeRecords)+",\"lateCalls\":"+std::to_string(w.lateCalls)+
+            ",\"lateReads\":"+std::to_string(w.lateReads)+",\"saturated\":"+(w.saturated?"true":"false")+'}');
+    } catch(...) {}
+}
 inline void WindowTaken(const layer_work::CPUConsumerBudget& b,uint64_t epoch) {
     SpanWindowTaken(b.spanWindow,epoch);
     ReadWindowTaken(b,epoch);
+    ImageWindowTaken(b,epoch);
     if(!CurrentEpoch(epoch) || !(b.reads || b.producers || b.readExceeded || b.producerExceeded ||
             b.spanRoutes || b.spanRouteExceeded)) return;
     try {

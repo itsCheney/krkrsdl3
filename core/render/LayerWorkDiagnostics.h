@@ -10,6 +10,7 @@
 #include <string>
 #include "LayerSpanRouteDiagnostics.h"
 #include "CPUReadAggregation.h"
+#include "LayerImageDiagnostics.h"
 
 // Bounded, opt-in diagnostics. Timings are inclusive wall time: script/load/
 // software scopes can contain each other and GPU waits, so never add them.
@@ -128,6 +129,7 @@ struct CPUConsumerBudget {
     uint64_t spanRoutes=0,spanRouteExceeded=0;
     span_route::Window spanWindow;
     cpu_reads::Window readWindow;
+    layer_image::Window imageWindow;
 };
 inline void (*cpuConsumerWindowTaken)(const CPUConsumerBudget&,uint64_t)=nullptr;
 struct Profile { std::array<Timing,size_t(Stage::Count)> stages{};
@@ -405,6 +407,12 @@ inline void Record(bool upload,uint64_t texture,int width,int height,uint64_t by
     char name[48]{};std::memcpy(name,rawName,std::min(length,sizeof(name)-1));
     std::lock_guard<std::mutex> lock(mutex);
     if(!enabled.load(std::memory_order_relaxed) || epoch!=generation.load(std::memory_order_relaxed)) return;
+    if(!upload && layer_image::context && layer_image::context->epoch==epoch) {
+        auto& c=*layer_image::context;auto& w=profile.cpuConsumerBudget.imageWindow;
+        if(c.windowID==profile.cpuConsumerBudget.spanWindow.id) {
+            if(!layer_image::Add(c.metrics,{0,1,bytes,ns,waitNS,0})) w.saturated=true;
+        } else if(!layer_image::Add(w.lateReads,1)) w.saturated=true;
+    }
     if(!upload && consumer) {
         auto& b=profile.cpuConsumerBudget;
         b.readWindow.Record(consumer->method,consumer->entry,consumer->access,consumer->origin,

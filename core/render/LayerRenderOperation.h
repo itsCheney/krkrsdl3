@@ -28,6 +28,9 @@ enum TVPLayerOperationFlags : uint32_t
     TVP_LAYER_DEST_ALPHA = 2,
     TVP_LAYER_DEST_PREMULTIPLIED = 4,
     TVP_LAYER_FULL_OPACITY_BRANCH = 8,
+    // LayerExImage RGB LUT also transforms RGB under zero alpha. Ordinary
+    // AdjustGamma retains its historical transparent-pixel skip.
+    TVP_LAYER_RGB_LUT_ALL_PIXELS = 16,
 };
 // Immutable parameter bytes follow tTVPGLGammaAdjustTempData's B/G/R layout.
 // Operations retain the snapshot, never a caller's gammaAdjustData pointer.

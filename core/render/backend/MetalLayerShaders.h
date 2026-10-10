@@ -307,7 +307,7 @@ uint layerPremulToAlphaPixel(uint s) {
 }
 uint layerGammaPixel(uint d,uint flags,const device uchar* gamma) {
     uint alpha=d>>24, result=d&0xff000000u;
-    if((flags&4u)==0 && alpha==0) return d;
+    if((flags&4u)==0 && (flags&16u)==0 && alpha==0) return d;
     if((flags&4u)!=0 && d==0) return 0;
     // tTVPGLGammaAdjustTempData stores B/G/R tables. Software's low byte
     // indexes R and its high RGB byte indexes B, preserving existing ordering.

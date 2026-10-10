@@ -1268,6 +1268,36 @@ bool TVPHasMetalLayerSpanCompositionSupport() {
     const auto& s=Manager().session;
     return s && s->backend && s->backend->SupportsLayerSpanComposition();
 }
+bool TVPHasMetalLayerImageLUTSupport() {
+    const auto& s=Manager().session;
+    return s && s->backend && s->backend->SupportsLayerOperations();
+}
+TVPLayerImageResult TVPTryMetalLayerImageLUT(iTVPTexture2D* target,const TVPLayerRect& rect,
+        const std::shared_ptr<const TVPLayerGammaLUT>& lut) {
+    using Result=TVPLayerImageResult;
+    auto& s=Manager().session;
+    if(!TVPHasMetalLayerImageLUTSupport()) return Result::BackendFailure;
+    auto* t=dynamic_cast<LayerTexture*>(target);
+    if(!t || !t->Belongs(s) || t->GetFormat()!=TVPTextureFormat::RGBA || !lut) return Result::Resource;
+    if(t->IsCPUResident() || t->HasCPUAccess()) return Result::CPUAccess;
+    if(rect.left<0 || rect.top<0 || rect.right<rect.left || rect.bottom<rect.top ||
+       rect.right>int(t->GetWidth()) || rect.bottom>int(t->GetHeight())) return Result::Geometry;
+    if(rect.left==rect.right || rect.top==rect.bottom) return Result::Applied;
+    const tTVPRect written(rect.left,rect.top,rect.right,rect.bottom);
+    TVPLayerOperation op;op.kind=TVPLayerOperationKind::AdjustGamma;op.gammaLUT=lut;
+    op.flags=TVP_LAYER_RGB_LUT_ALL_PIXELS;
+    void* handle=t->GetTextureHandleForRegionWrite();
+    if(!handle) return Result::Resource;
+    try {
+        if(!s->backend->OperateLayerRect(op,handle,rect,nullptr,{},0)) return Result::BackendFailure;
+    } catch(...) {
+        // An encoder or submission can throw after the write. Invalidate
+        // conservatively and propagate; a second CPU execution is forbidden.
+        t->InvalidateCPUCacheRegion(written,true,krkrsdl3::point_trace::Invalidation::GPUOperation,"LayerExImage.light");throw;
+    }
+    t->InvalidateCPUCacheRegion(written,true,krkrsdl3::point_trace::Invalidation::GPUOperation,"LayerExImage.light");++s->stats.gpuOperations;
+    return Result::Applied;
+}
 TVPLayerSpanCompositeResult TVPCheckMetalLayerCPUOverwrite(iTVPTexture2D* target) {
     using Result=TVPLayerSpanCompositeResult;
     auto& session=Manager().session;

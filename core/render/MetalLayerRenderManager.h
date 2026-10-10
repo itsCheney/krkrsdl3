@@ -31,6 +31,12 @@ void TVPUnbindMetalLayerRenderManager();
 const char* TVPMetalLayerFallbackReason();
 bool TVPMetalLayerCompositionActive();
 TVPLayerRenderStats TVPGetMetalLayerRenderStats();
+enum class TVPLayerImageResult { Applied, Resource, CPUAccess, Geometry, BackendFailure };
+bool TVPHasMetalLayerImageLUTSupport();
+// Existing RGB gamma/LUT kernel, without a software registry singleton/setter.
+// Rejection precedes target writes; exceptions are never replayed on CPU.
+TVPLayerImageResult TVPTryMetalLayerImageLUT(iTVPTexture2D*,const TVPLayerRect&,
+    const std::shared_ptr<const TVPLayerGammaLUT>&);
 std::string TVPGetMetalLayerMultipleInputMethodSummary();
 std::string TVPGetMetalLayerUnsupportedMethodSummary();
 
