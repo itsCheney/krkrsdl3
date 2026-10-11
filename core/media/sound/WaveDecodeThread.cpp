@@ -13,11 +13,15 @@
 #include "TVPSystem.h"
 #include "TVPSettings.h"
 
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+
 static bool TVPControlPrimaryBufferRun = true;
 #if defined(_KRKRSDL3_EMSCRIPTEN)
 static int TVPDecodeThreadCount = 1;
 #else
-static int TVPDecodeThreadCount = 0; // 0 = auto (number of CPUs)
+static int TVPDecodeThreadCount = 0; // 0 = auto (see TVPDefaultDecodeThreads)
 #endif
 
 //---------------------------------------------------------------------------
@@ -46,13 +50,24 @@ class tTVPWaveSoundBufferDecodePool
         }
         void Execute() override
         {
-            while (!GetTerminated())
+            while (!GetTerminated() && !Pool->_terminated)
                 Pool->WorkerLoop();
         }
     };
 
+    // Decoding one 1/8 s unit takes far less than a unit of playback, and
+    // more workers than playing buffers only add idle wakeups.
+    static constexpr int TVPDefaultDecodeThreads = 2;
+    // Safety net while a buffer plays but its L2 ring is full. Consumption
+    // (ReadL2Buffer) wakes the pool, and the ring holds 1 s of audio.
+    static constexpr int TVPFullBufferWaitMS = 50;
+
     tTJSCriticalSection _cs;
-    tTVPThreadEvent _wakeEvent;
+    // tTVPThreadEvent is a bare condition variable: a Set() with no waiter is
+    // lost. The serial makes a wake that races a worker's scan observable.
+    std::mutex _waitMutex;
+    std::condition_variable _waitCond;
+    uint64_t _wakeSerial = 0;
     std::atomic_bool _terminated{false};
     std::vector<tTVPWaveSoundBufferDecodePoolWorker*> _workers;
     std::vector<iTVPDecodeSoundBuffer*> _buffers;
@@ -63,7 +78,7 @@ public:
     {
         int n = TVPDecodeThreadCount;
         if (n <= 0)
-            n = std::max(1, TVPGetProcessorNum());
+            n = std::max(1, std::min(TVPDefaultDecodeThreads, TVPGetProcessorNum()));
         n = std::min(n, TVPMaxThreadNum);
         _workers.resize(n);
         for (int i = 0; i < n; i++)
@@ -73,7 +88,7 @@ public:
     ~tTVPWaveSoundBufferDecodePool()
     {
         _terminated = true;
-        _wakeEvent.Set();
+        Wake();
         for (auto* w : _workers)
             delete w;
     }
@@ -103,48 +118,64 @@ public:
             TVPSleepFor(1);
     }
 
-    void Wake() { _wakeEvent.Set(); }
+    void Wake()
+    {
+        {
+            std::lock_guard<std::mutex> lock(_waitMutex);
+            ++_wakeSerial;
+        }
+        _waitCond.notify_all();
+    }
 
 private:
     void WorkerLoop()
     {
-        iTVPDecodeSoundBuffer* target = nullptr;
-        do
+        uint64_t serial;
         {
-            tTJSCriticalSectionHolder holder(_cs);
-            size_t n = _buffers.size();
-            if (n == 0)
-                break;
-            size_t start = _nextCheck.fetch_add(1, std::memory_order_relaxed) % n;
-            for (size_t i = 0; i < n; i++)
+            std::lock_guard<std::mutex> lock(_waitMutex);
+            serial = _wakeSerial;
+        }
+        // Offer every playing buffer one unit per pass. A buffer stays
+        // DecodeActive while its L2 ring is full, and FillL2Buffer then returns
+        // false at once; looping without a wait kept one core at 100% per
+        // playing sound. Only wait once no buffer took a unit.
+        bool anyActive = false, filledAny = false;
+        const size_t start = _nextCheck.fetch_add(1, std::memory_order_relaxed);
+        for (size_t i = 0;; i++)
+        {
+            iTVPDecodeSoundBuffer* target = nullptr;
             {
-                size_t idx = (start + i) % n;
-                auto* buf = _buffers[idx];
+                tTJSCriticalSectionHolder holder(_cs);
+                const size_t n = _buffers.size();
+                if (i >= n)
+                    break;
+                auto* buf = _buffers[(start + i) % n];
                 if (buf->DecodeActive.load(std::memory_order_acquire))
                 {
+                    anyActive = true;
                     bool expected = false;
                     if (buf->DecodeInProgress.compare_exchange_strong(expected, true,
                                                                       std::memory_order_acq_rel))
-                    {
                         target = buf;
-                        break;
-                    }
                 }
             }
-        } while (false);
-
-        if (target)
-        {
-            const bool filled = target->FillL2Buffer(false, true);
-            target->DecodeInProgress.store(false, std::memory_order_release);
-            // A playing buffer stays DecodeActive while its L2 ring is full, and
-            // FillL2Buffer then returns false at once. Looping without a wait
-            // kept one core at 100% per playing sound. A unit is 1/8 s of audio,
-            // so the 10 ms wait below cannot starve playback.
-            if (filled)
-                return;
+            if (target)
+            {
+                if (target->FillL2Buffer(false, true))
+                    filledAny = true;
+                target->DecodeInProgress.store(false, std::memory_order_release);
+            }
         }
-        _wakeEvent.WaitFor(10);
+        if (filledAny)
+            return;
+        // Wait for Play, consumption or shutdown. With nothing playing there
+        // is no timeout: idle workers no longer wake 100 times a second each.
+        std::unique_lock<std::mutex> lock(_waitMutex);
+        auto woken = [&] { return _wakeSerial != serial || _terminated; };
+        if (anyActive)
+            _waitCond.wait_for(lock, std::chrono::milliseconds(TVPFullBufferWaitMS), woken);
+        else
+            _waitCond.wait(lock, woken);
     }
 };
 //---------------------------------------------------------------------------
