@@ -1435,7 +1435,7 @@ struct MetalRenderBackend::Impl
             [e setFragmentTexture:draw.texture atIndex:0];
             [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
             hotspots.Count([](layer_hotspot::Totals& t){t.Add(t.actualDraws);});
-            Trace(layer_hotspot::Access::Window,0,nullptr,FindTexture(draw.texture),{}, {}, {},true);
+            Trace(layer_hotspot::Access::Window,0,nullptr,draw.resource,{}, {}, {},true);
             if (diagnosticSampled) ++diagnosticWorkload.windowDraws;
         }
         EndLocal(e);
