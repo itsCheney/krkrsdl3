@@ -6,6 +6,7 @@
 #include "TVPCompositor.h"
 #include "StaticPresentation.h"
 #include "PendingLayerFill.h"
+#include "OrdinaryLayerPipeline.h"
 
 struct SDL_Window;
 
@@ -87,6 +88,7 @@ public:
     void InvalidatePresentation(const char* reason) override;
     static_presentation::Counters GetStaticPresentationStats() const;
     pending_fill::Counters GetLayerFillCoalescingStats() const;
+    ordinary_layer::Counters GetLayerPipelineStats() const;
     bool SupportsLayerOperations() const override;
     bool SupportsLayerTransitions() const override;
     bool OperateLayerTransition(const TVPLayerTransitionOperation&, void*, void*, void*) override;

@@ -537,6 +537,37 @@ fragment LayerRasterColor ordinaryLayerFragment(LayerRasterVertex in [[stage_in]
     int4 d=int4(round(previous*255.0));
     return {float4(layerPixel(d,s,p.color,kind,p.operation.y,p.operation.z,tables,gamma,psTables))/255.0};
 }
+#ifdef TVP_LAYER_SPECIALIZED_PIPELINES
+// All variants retain the same raster order group as programmable blending.
+// Copy/Fill/CopyColor have no framebuffer input. Reuse the software-compatible
+// sampler rather than substituting hardware filtering or changing byte rules.
+fragment LayerRasterColor ordinaryLayerCopyFragment(LayerRasterVertex in [[stage_in]],
+    constant LayerParameters& p [[buffer(0)]],
+    texture2d<float,access::read> source [[texture(0)]]) {
+    return {float4(layerSample(source,p,int2(in.position.xy)))/255.0};
+}
+fragment LayerRasterColor ordinaryLayerFillFragment(
+    constant LayerParameters& p [[buffer(0)]]) {
+    return {float4(p.color)/255.0};
+}
+fragment LayerRasterColor ordinaryLayerCopyColorFragment(LayerRasterVertex in [[stage_in]],
+    constant LayerParameters& p [[buffer(0)]],
+    texture2d<float,access::read> source [[texture(0)]]) {
+    // The RGB-only attachment write mask preserves destination alpha.
+    return {float4(layerSample(source,p,int2(in.position.xy)))/255.0};
+}
+fragment LayerRasterColor ordinaryLayerAlphaHDAFragment(LayerRasterVertex in [[stage_in]],
+    float4 previous [[color(0), raster_order_group(0)]],
+    constant LayerParameters& p [[buffer(0)]],
+    texture2d<float,access::read> source [[texture(0)]]) {
+    int4 s=layerSample(source,p,int2(in.position.xy));
+    int3 d=int3(round(previous.rgb*255.0));
+    // FULL_OPACITY_BRANCH: alpha is s.a, without the opacity multiply. Signed
+    // >>8 must remain arithmetic, including negative products and alpha=255.
+    int3 rgb=d+(((s.rgb-d)*s.a)>>8);
+    return {float4(float3(rgb)/255.0,0.0)};
+}
+#endif
 #endif
 
 

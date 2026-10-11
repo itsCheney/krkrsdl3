@@ -6885,6 +6885,14 @@ void tTJSNI_BaseLayer::CopySelf(iTVPBaseBitmap* dest,
 void tTJSNI_BaseLayer::InternalDrawNoCache_CPU(tTVPDrawable* target, const tTVPRect& rect)
 {
     bool totalopaque = (DisplayType == ltOpaque && Opacity == 255);
+    // Ordinary binders forward child buffers/completion to CurrentDrawTarget;
+    // their own transparent temporary is never consumed. This includes the
+    // existing effect/filter binder aliases, without implementing new effects.
+    // Keep caches and transition participants on the old path.
+    const bool skipBinderTemporary =
+        (Type == ltBinder || Type == ltEffect || Type == ltFilter) && DisplayType == ltBinder &&
+        MainImage == NULL && !GetCacheEnabled() && !InTransition &&
+        !TransSrc && !TransDest && !DivisibleTransHandler && !GiveUpdateTransHandler;
     if (GetVisibleChildrenCount() == 0)
     {
         // no visible children; no action needed
@@ -6918,7 +6926,12 @@ void tTJSNI_BaseLayer::InternalDrawNoCache_CPU(tTVPDrawable* target, const tTVPR
             bool tempalloc = false;
 
             // setup UpdateBitmapForChild and "updaterectforchild"
-            if (totalopaque)
+            if (skipBinderTemporary)
+            {
+                UpdateBitmapForChild = NULL;
+                updaterectforchild = tTVPRect(0, 0, cr.get_width(), cr.get_height());
+            }
+            else if (totalopaque)
             {
                 // this layer is totally opaque
                 UpdateBitmapForChild = target->GetDrawTargetBitmap(cr, updaterectforchild);
@@ -6940,7 +6953,13 @@ void tTJSNI_BaseLayer::InternalDrawNoCache_CPU(tTVPDrawable* target, const tTVPR
             try
             {
                 // copy self image to the target
-                CopySelf(UpdateBitmapForChild, updaterectforchild.left, updaterectforchild.top, cr);
+                if (skipBinderTemporary)
+                {
+                    // CopySelf also binds image-less alpha input to this presentation.
+                    if (Manager) Manager->CaptureAlphaForPresentation(this);
+                }
+                else
+                    CopySelf(UpdateBitmapForChild, updaterectforchild.left, updaterectforchild.top, cr);
 
                 TVP_LAYER_FOR_EACH_CHILD_BEGIN(child)
                 {
@@ -7081,6 +7100,14 @@ void tTJSNI_BaseLayer::Draw(tTVPDrawable* target, const tTVPRect& r, bool visibl
     DirectTransferToParent = false;
     bool totalopaque = (DisplayType == ltOpaque && Opacity == 255);
 
+    // Match InternalDrawNoCache_CPU: binder child callbacks bypass its unused
+    // temporary. Preserve the existing effect/filter binder aliases, and leave
+    // caches and transition participants on the old path.
+    const bool skipBinderTemporary =
+        (Type == ltBinder || Type == ltEffect || Type == ltFilter) && DisplayType == ltBinder &&
+        MainImage == NULL && !GetCacheEnabled() && !InTransition &&
+        !TransSrc && !TransDest && !DivisibleTransHandler && !GiveUpdateTransHandler;
+
     if (GetCacheEnabled() && !(InTransition && !TransWithChildren && DivisibleTransHandler))
     {
         EnsureCacheAllocated();
@@ -7194,7 +7221,12 @@ void tTJSNI_BaseLayer::Draw(tTVPDrawable* target, const tTVPRect& r, bool visibl
                 bool tempalloc = false;
 
                 // setup UpdateBitmapForChild and "updaterectforchild"
-                if (totalopaque)
+                if (skipBinderTemporary)
+                {
+                    UpdateBitmapForChild = NULL;
+                    updaterectforchild = tTVPRect(0, 0, cr.get_width(), cr.get_height());
+                }
+                else if (totalopaque)
                 {
                     // this layer is totally opaque
                     UpdateBitmapForChild = target->GetDrawTargetBitmap(cr, updaterectforchild);
@@ -7216,8 +7248,14 @@ void tTJSNI_BaseLayer::Draw(tTVPDrawable* target, const tTVPRect& r, bool visibl
                 try
                 {
                     // copy self image to the target
-                    CopySelf(UpdateBitmapForChild, updaterectforchild.left, updaterectforchild.top,
-                             cr);
+                    if (skipBinderTemporary)
+                    {
+                        // Preserve CopySelf's presentation side effect without a fill.
+                        if (Manager) Manager->CaptureAlphaForPresentation(this);
+                    }
+                    else
+                        CopySelf(UpdateBitmapForChild, updaterectforchild.left, updaterectforchild.top,
+                                 cr);
 
                     TVP_LAYER_FOR_EACH_CHILD_BEGIN(child)
                     {

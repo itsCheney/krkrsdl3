@@ -417,6 +417,8 @@ struct MetalRenderBackend::Impl
     id<MTLComputePipelineState> layerPipeline = nil, layerInPlacePipeline = nil;
     id<MTLComputePipelineState> ordinaryLayerPipeline = nil, ordinaryInPlacePipeline = nil;
     id<MTLRenderPipelineState> ordinaryRenderPipeline = nil;
+    id<MTLRenderPipelineState> ordinarySpecializedPipelines[ordinary_layer::PipelineCount] = {};
+    id<MTLRenderPipelineState> ordinaryBoundRenderPipeline = nil;
     id<MTLRenderCommandEncoder> ordinaryRenderEncoder = nil;
     id<MTLTexture> ordinaryRenderTarget = nil, ordinaryRenderSource = nil;
     id<MTLComputePipelineState> dualSourceLayerPipeline = nil;
@@ -561,6 +563,8 @@ struct MetalRenderBackend::Impl
     pending_fill::Slot<LayerParameters> pendingFill;
     pending_fill::Counters fillCoalescingStats;
     const bool coalesceFill=SDL_GetHintBoolean("MIKAGE_METAL_LAYER_COALESCE_FILL",true);
+    const bool specializeLayers=SDL_GetHintBoolean("MIKAGE_METAL_LAYER_SPECIALIZED_PIPELINES",true);
+    ordinary_layer::Counters layerPipelineStats;
     uint64_t previousFrameNS=0;
     double diagnosticFrameMS=0;
     layer_hotspot::ResourceInfo* Info(Resource* resource) {
@@ -596,6 +600,20 @@ struct MetalRenderBackend::Impl
         if(draw)hotspots.Count([](layer_hotspot::Totals& t){t.Add(t.draws);});
         return logicalID;
     }
+    void DrawOrdinaryLayer(const LayerParameters& parameters) {
+        auto selected=ordinary_layer::Select(parameters.operation.x,parameters.operation.y,
+                                             uint32_t(parameters.operation.z));
+        auto pipeline=specializeLayers ? ordinarySpecializedPipelines[unsigned(selected)] : nil;
+        if(!pipeline) { selected=ordinary_layer::Pipeline::Generic; pipeline=ordinaryRenderPipeline; }
+        if(ordinaryBoundRenderPipeline!=pipeline) {
+            [ordinaryRenderEncoder setRenderPipelineState:pipeline];
+            ordinaryBoundRenderPipeline=pipeline;
+        }
+        [ordinaryRenderEncoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        layerPipelineStats.Record(selected,uint64_t(parameters.clip.z-parameters.clip.x)*
+                                          uint64_t(parameters.clip.w-parameters.clip.y));
+        hotspots.Count([](layer_hotspot::Totals& t){t.Add(t.actualDraws);});
+    }
     void ResolvePendingFill(bool omit=false) {
         if(!pendingFill)return;
         auto* target=static_cast<Resource*>(pendingFill.target);
@@ -603,8 +621,7 @@ struct MetalRenderBackend::Impl
             // Parameters are copied, never borrowed from a script/native stack.
             [ordinaryRenderEncoder setVertexBytes:&pendingFill.parameters length:sizeof(LayerParameters) atIndex:0];
             [ordinaryRenderEncoder setFragmentBytes:&pendingFill.parameters length:sizeof(LayerParameters) atIndex:0];
-            [ordinaryRenderEncoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
-            hotspots.Count([](layer_hotspot::Totals& t){t.Add(t.actualDraws);});
+            DrawOrdinaryLayer(pendingFill.parameters);
         }
         Trace(layer_hotspot::Access::Execution,0,target,nullptr,pendingFill.region,{},pendingFill.region,!omit,0,-1,
             nullptr,0,omit?layer_hotspot::Execution::Omitted:layer_hotspot::Execution::Materialized,pendingFill.logicalID);
@@ -616,6 +633,12 @@ struct MetalRenderBackend::Impl
         hotspots.Enable(SDL_GetHintBoolean("MIKAGE_METAL_DIAGNOSTICS",false));
         try {hotspotOutput->Report(hotspots,SDL_GetTicksNS(),commandSerial,final,[](const char* line){SDL_Log("%s",line);});}
         catch(...) {hotspotOutput->Drop();}
+        // One final aggregate, never sampled draw counts or a GPU-time estimate.
+        if(final && SDL_GetHintBoolean("MIKAGE_METAL_DIAGNOSTICS",false)) {
+            try { hotspotOutput->Emit(SDL_GetTicksNS(),{layerPipelineStats.Report()},
+                                      [](const char* line){SDL_Log("%s",line);}); }
+            catch(...) {hotspotOutput->Drop();}
+        }
     }
     void EndLocal(id<MTLCommandEncoder> encoder,layer_hotspot::Boundary why=layer_hotspot::Boundary::Other) {
         if(encoder){hotspots.End(why,diagnosticEncoderSerial);[encoder endEncoding];}
@@ -1064,6 +1087,7 @@ struct MetalRenderBackend::Impl
         if(ordinaryEncoder) { [ordinaryEncoder endEncoding]; ordinaryEncoder=nil; }
         if(ordinaryRenderEncoder) { [ordinaryRenderEncoder endEncoding]; ordinaryRenderEncoder=nil; }
         ordinaryRenderTarget=nil; ordinaryRenderSource=nil;
+        ordinaryBoundRenderPipeline=nil;
         ordinaryBoundSource=nil; ordinaryBoundTarget=nil;
     }
     void EndMesh(layer_hotspot::Boundary why=layer_hotspot::Boundary::Mesh) {
@@ -1138,6 +1162,7 @@ struct MetalRenderBackend::Impl
                                        fill?layer_hotspot::ClearOrigin::FullFill:layer_hotspot::ClearOrigin::FusedInitialization);
             ordinaryRenderTarget=target;
             [ordinaryRenderEncoder setRenderPipelineState:ordinaryRenderPipeline];
+            ordinaryBoundRenderPipeline=ordinaryRenderPipeline;
             [ordinaryRenderEncoder setViewport:MTLViewport{0,0,double(target.width),double(target.height),0,1}];
             [ordinaryRenderEncoder setCullMode:MTLCullModeNone];
             simd_int2 size={int(target.width),int(target.height)};
@@ -1597,16 +1622,46 @@ struct MetalRenderBackend::Impl
         if(@available(macOS 11.0,iOS 14.0,tvOS 14.0,*)) {
             if([device supportsFamily:MTLGPUFamilyApple4] &&
                 SDL_GetHintBoolean("MIKAGE_METAL_LAYER_TILE_RENDERER",true)) {
-                const std::string source=TVPBuildMetalLayerShaderSource("#define TVP_LAYER_FRAMEBUFFER_FETCH 1\n");
+                bool specializedLibrary=specializeLayers;
+                const std::string source=TVPBuildMetalLayerShaderSource(specializeLayers ?
+                    "#define TVP_LAYER_FRAMEBUFFER_FETCH 1\n#define TVP_LAYER_SPECIALIZED_PIPELINES 1\n" :
+                    "#define TVP_LAYER_FRAMEBUFFER_FETCH 1\n");
                 auto tileLibrary=[device newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()]
                                                      options:ordinaryOptions error:&error];
+                if(!tileLibrary && specializeLayers) {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
+                        "Metal Layer specialized library unavailable; retrying generic tile: %s",
+                        error.localizedDescription.UTF8String);
+                    const auto generic=TVPBuildMetalLayerShaderSource("#define TVP_LAYER_FRAMEBUFFER_FETCH 1\n");
+                    tileLibrary=[device newLibraryWithSource:[NSString stringWithUTF8String:generic.c_str()]
+                                                    options:ordinaryOptions error:&error];
+                    specializedLibrary=false;
+                }
                 if(tileLibrary) {
                     auto descriptor=[MTLRenderPipelineDescriptor new];
                     descriptor.vertexFunction=[tileLibrary newFunctionWithName:@"ordinaryLayerVertex"];
                     descriptor.fragmentFunction=[tileLibrary newFunctionWithName:@"ordinaryLayerFragment"];
                     descriptor.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA8Unorm;
                     descriptor.colorAttachments[0].blendingEnabled=NO;
+                    descriptor.colorAttachments[0].writeMask=MTLColorWriteMaskAll;
                     ordinaryRenderPipeline=[device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+                    if(ordinaryRenderPipeline) {
+                        layerPipelineStats.enabled=specializeLayers;
+                        layerPipelineStats.availableMask=1u;
+                        if(specializedLibrary) for(unsigned i=1;i<ordinary_layer::PipelineCount;++i) {
+                            const auto kind=static_cast<ordinary_layer::Pipeline>(i);
+                            const char* name=ordinary_layer::FunctionName(kind);
+                            descriptor.fragmentFunction=[tileLibrary newFunctionWithName:[NSString stringWithUTF8String:name]];
+                            descriptor.colorAttachments[0].writeMask=ordinary_layer::WritesRGBOnly(kind) ?
+                                (MTLColorWriteMaskRed|MTLColorWriteMaskGreen|MTLColorWriteMaskBlue) : MTLColorWriteMaskAll;
+                            if(descriptor.fragmentFunction)
+                                ordinarySpecializedPipelines[i]=[device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+                            if(ordinarySpecializedPipelines[i]) layerPipelineStats.availableMask|=1u<<i;
+                            else SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
+                                "Metal Layer specialized pipeline %s unavailable; generic tile retained: %s",
+                                name,error.localizedDescription.UTF8String);
+                        }
+                    }
                 }
                 if(!ordinaryRenderPipeline) SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
                     "Metal Layer tile pipeline unavailable; compute retained: %s",error.localizedDescription.UTF8String);
@@ -2065,6 +2120,9 @@ bool MetalRenderBackend::SupportsLayerTileRendering() const {
     return false;
 }
 bool MetalRenderBackend::IsLayerTileRenderingActive() const { return impl_->ordinaryRenderPipeline!=nil; }
+ordinary_layer::Counters MetalRenderBackend::GetLayerPipelineStats() const {
+    return impl_ ? impl_->layerPipelineStats : ordinary_layer::Counters{};
+}
 TVPLayerParameterUploadStats MetalRenderBackend::GetLayerParameterUploadStats() const {
     return impl_ ? impl_->parameterUploadStats : TVPLayerParameterUploadStats{};
 }
@@ -2561,8 +2619,7 @@ bool MetalRenderBackend::OperateLayerRect(const TVPLayerOperation& operation,voi
             const bool defer=p.coalesceFill && operation.kind==TVPLayerOperationKind::Fill &&
                 operation.flags==0 && !p.glyphWriteMarker;
             if(!defer) {
-                [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
-                p.hotspots.Count([](layer_hotspot::Totals& t){t.Add(t.actualDraws);});
+                p.DrawOrdinaryLayer(params);
             }
             // Keep the old immutable Fill until the replacement's bindings
             // (and Copy draw) have succeeded. An exception before this point
