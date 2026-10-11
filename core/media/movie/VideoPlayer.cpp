@@ -469,7 +469,14 @@ void BasePlayer::Execute()
         {
             // when paused, demuxer could be be returning empty
             if (m_playSpeed == DVD_PLAYSPEED_PAUSE)
+            {
+                // HandleMessages does not block, and the queues are not full
+                // once a short clip has ended (Ended rewinds with speed 0), so
+                // a bare continue spun this thread at 100% until the movie
+                // object was closed. Seeks and resumes arrive as messages.
+                Sleep(10);
                 continue;
+            }
 
             if (m_iLoopSegmentBegin != -1)
             { // process loop info
