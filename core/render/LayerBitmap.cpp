@@ -16,6 +16,8 @@
 #include "TVPMsg.h"
 #include "PlatformThread.h"
 #include "RenderManager.h"
+#include "TVPCompositor.h"
+#include <memory>
 #include "TVPSystem.h"
 #include "TVPStorage.h"
 #include "TVPFont.h"
@@ -631,6 +633,7 @@ bool iTVPBaseBitmap::CopyRect(
 //---------------------------------------------------------------------------
 bool iTVPBaseBitmap::Copy9Patch(const iTVPBaseBitmap* ref, tTVPRect& margin)
 {
+    krkrsdl3::layer_work::SourceScope source("bitmap.Copy9Patch");
     if (!Is32BPP())
         return false;
 
@@ -1455,6 +1458,7 @@ bool iTVPBaseBitmap::DoBoxBlurForAlpha(const tTVPRect& rect, const tTVPRect& are
 //---------------------------------------------------------------------------
 void tTVPBaseBitmap::UDFlip(const tTVPRect& rect)
 {
+    krkrsdl3::layer_work::SourceScope source("bitmap.UDFlip");
     // up-down flip for given rectangle
 
     if (rect.left < 0 || rect.top < 0 || rect.right > (tjs_int)GetWidth() ||
@@ -1495,6 +1499,7 @@ void tTVPBaseBitmap::UDFlip(const tTVPRect& rect)
 
 void iTVPBaseBitmap::UDFlip(const tTVPRect& rect)
 {
+    krkrsdl3::layer_work::SourceScope source("bitmap.UDFlip");
     // up-down flip for given rectangle
 
     if (rect.left < 0 || rect.top < 0 || rect.right > (tjs_int)GetWidth() ||
@@ -1511,6 +1516,7 @@ void iTVPBaseBitmap::UDFlip(const tTVPRect& rect)
 //---------------------------------------------------------------------------
 void tTVPBaseBitmap::LRFlip(const tTVPRect& rect)
 {
+    krkrsdl3::layer_work::SourceScope source("bitmap.LRFlip");
     // left-right flip
     if (rect.left < 0 || rect.top < 0 || rect.right > (tjs_int)GetWidth() ||
         rect.bottom > (tjs_int)GetHeight())
@@ -1546,6 +1552,7 @@ void tTVPBaseBitmap::LRFlip(const tTVPRect& rect)
 
 void iTVPBaseBitmap::LRFlip(const tTVPRect& rect)
 {
+    krkrsdl3::layer_work::SourceScope source("bitmap.LRFlip");
     // left-right flip
     if (rect.left < 0 || rect.top < 0 || rect.right > (tjs_int)GetWidth() ||
         rect.bottom > (tjs_int)GetHeight())
@@ -2315,6 +2322,52 @@ bool tTVPNativeBaseBitmap::AssignTexture(iTVPTexture2D* tex)
 
     return true;
 }
+bool tTVPNativeBaseBitmap::CopyFromGPUTarget(krkrsdl3::iTVPRenderBackend* renderer,
+                                          void* source)
+{
+    if (!renderer || !source || !Bitmap || !renderer->SupportsLayerOperations() ||
+        Bitmap->GetFormat() != TVPTextureFormat::RGBA || Bitmap->IsCPUResident())
+        return false;
+
+    // Do not sever sharing until the copy succeeds: a rejected copy must leave
+    // both this image and any snapshots unchanged for the CPU fallback.
+    auto release = [](iTVPTexture2D* texture) { if (texture) texture->Release(); };
+    std::unique_ptr<iTVPTexture2D, decltype(release)> replacement(nullptr, release);
+    iTVPTexture2D* destination = Bitmap;
+    if (!Bitmap->IsIndependent() || Bitmap->IsStatic())
+    {
+        replacement.reset(GetRenderManager()->CreateTexture2D(
+            nullptr, 0, Bitmap->GetWidth(), Bitmap->GetHeight(), Bitmap->GetFormat()));
+        destination = replacement.get();
+    }
+    // Exclusive pinned/leased images decline GPU writes so raw CPU pointers
+    // remain authoritative. A shared snapshot retains its own old texture.
+    void* handle = destination ? destination->GetTextureHandleForOverwrite() : nullptr;
+    if (!handle || !renderer->CopyTargetToLayerTexture(source, handle))
+        return false;
+
+    destination->CommitGPUOverwrite();
+    if (replacement)
+        AssignTexture(destination);
+    return true;
+}
+//---------------------------------------------------------------------------
+bool tTVPNativeBaseBitmap::CopyFromGPUTargetRegion(krkrsdl3::iTVPRenderBackend* renderer,
+                                                void* source, const tTVPRect& region)
+{
+    if (!renderer || !source || !Bitmap || !renderer->SupportsLayerOperations() ||
+        Bitmap->GetFormat() != TVPTextureFormat::RGBA || Bitmap->IsCPUResident() ||
+        !Bitmap->IsIndependent() || Bitmap->IsStatic() ||
+        region.left < 0 || region.top < 0 || region.right > Bitmap->GetWidth() ||
+        region.bottom > Bitmap->GetHeight() || region.get_width() <= 0 || region.get_height() <= 0)
+        return false;
+    void* handle = Bitmap->GetTextureHandleForRegionWrite();
+    const TVPLayerRect rect{region.left,region.top,region.right,region.bottom};
+    if (!handle || !renderer->CopyTargetToLayerTextureRegion(source,handle,rect))
+        return false;
+    Bitmap->CommitGPURegionWrite(region);
+    return true;
+}
 //---------------------------------------------------------------------------
 const void* tTVPNativeBaseBitmap::GetScanLine(tjs_uint l) const
 {
@@ -2351,7 +2404,9 @@ void tTVPNativeBaseBitmap::IndependNoCopy()
     // indepent the bitmap, but not to copy the original bitmap
     if (!Bitmap->IsStatic() && Bitmap->IsIndependent())
         return;
+    const auto discarded=Bitmap->DiagnosticIdentity();
     Recreate();
+    Bitmap->SetDiagnosticParent(discarded,"discarded",false);
 }
 //---------------------------------------------------------------------------
 void tTVPNativeBaseBitmap::Recreate()
@@ -2494,7 +2549,25 @@ bool tTVPNativeBaseBitmap::InternalBlendText(tTVPCharacterData* data,
             GEMTHOD_OPA_CLR(ApplyColorMap);
         }
 
-        // blend to the texture
+        method->SetParameterOpa(opa_id, dtdata->opa);
+        method->SetParameterColor4B(clr_id, color);
+    }
+
+    auto* manager = TVPGetRenderManager();
+    auto* target = GetTextureForRender(method->IsBlendTarget(), &drect);
+    // Keep the existing cropped R8 bytes and immediate draw order. In particular,
+    // this optimization does not change the legacy left-clipping interpretation.
+    if (manager->TryBlendGlyph(method, target, drect, bp, pitch, w, h))
+        return true;
+
+    {
+        // The ordinary source remains the fallback for unsupported backends,
+        // CPU targets and bounded atlas allocation failures.
+        if (_CharacterTexture && !GetRenderManager()->CanReuseCachedTexture(_CharacterTexture))
+        {
+            _CharacterTexture->Release();
+            _CharacterTexture = nullptr;
+        }
         if (!_CharacterTexture)
         {
             _CharacterTexture =
@@ -2509,16 +2582,12 @@ bool tTVPNativeBaseBitmap::InternalBlendText(tTVPCharacterData* data,
         }
         _CharacterTexture->Update(bp, TVPTextureFormat::Gray, pitch, tTVPRect(0, 0, w, h));
 
-        method->SetParameterOpa(opa_id, dtdata->opa);
-        method->SetParameterColor4B(clr_id, color);
-
         pTexSrc = _CharacterTexture;
     }
 
     tRenderTexRectArray::Element src_tex[] = {
         tRenderTexRectArray::Element(pTexSrc, tTVPRect(0, 0, w, h))};
-    TVPGetRenderManager()->OperateRect(method, GetTextureForRender(method->IsBlendTarget(), &drect),
-                                       nullptr, drect, tRenderTexRectArray(src_tex));
+    manager->OperateRect(method, target, nullptr, drect, tRenderTexRectArray(src_tex));
     return true;
 }
 

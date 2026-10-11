@@ -9,6 +9,8 @@
 #include "turn.h"
 #include "turntrans_table.h"
 #include "common.h"
+#include "metaltransition.h"
+#include <new>
 
 #include <stdio.h>
 
@@ -168,6 +170,40 @@ tjs_error tTVPTurnTransHandler::Process(tTVPDivisibleData* data)
     // ちなみに吉里吉里は通常 8 ラインごとの横に細長い領域を上から順に
     // 指定してくる。
     // ブロックサイズは 64x64 固定。
+
+    TVPSetTransitionMetadata("{\"time\":%llu,\"bgcolor\":%u}", static_cast<unsigned long long>(Time), unsigned(BGColor));
+    if (TVPHasDivisibleMetalTransitionSupport(data))
+    {
+        TVPLayerTransitionOperation operation;
+        bool parametersReady = false;
+        try
+        {
+            // One immutable identity shared by all turn instances.
+            static const auto table = [] {
+                auto bytes = std::make_shared<TVPLayerTransitionBytes>(sizeof(TurnTransParams) + sizeof(gloss));
+                std::memcpy(bytes->data(), TurnTransParams, sizeof(TurnTransParams));
+                std::memcpy(bytes->data() + sizeof(TurnTransParams), gloss, sizeof(gloss));
+                return std::shared_ptr<const TVPLayerTransitionBytes>(bytes);
+            }();
+            static_assert(sizeof(tTurnTransParams) == 8 * 4, "turn table ABI");
+            auto &p = operation.params;
+            p.kind = static_cast<int>(TVPLayerTransitionKind::Turn);
+            p.frameWidth = Width; p.frameHeight = Height; p.phase = Phase;
+            p.color = BGColor; p.offsetX = TURN_WIDTH_FACTOR;
+            operation.table = table;
+            parametersReady = true;
+        }
+        catch (const std::bad_alloc &) {
+            krkrsdl3::layer_work::RecordTransitionResult(false, "allocationFailed",
+                static_cast<uint64_t>(data->Width) * static_cast<uint64_t>(data->Height));
+            /* Software uses the static table directly. */
+        }
+        // Once encoding begins, exceptions must propagate to the engine. A
+        // post-dispatch allocation failure must never replay this ROI on CPU.
+        if (parametersReady &&
+            TVPTryDivisibleMetalTransition(operation, data) == TVPLayerTransitionResult::Applied)
+            return TJS_S_OK;
+    }
 
     // 変数の準備
     tjs_uint8* dest;
@@ -557,6 +593,9 @@ public:
         if (TJS_SUCCEEDED(options->GetValue(TJS_N("bgcolor"), &tmp)))
             if (tmp.Type() != tvtVoid)
                 bgcolor = (tjs_int)tmp;
+
+        if (!src1w || !src1h)
+            TVPThrowExceptionMessage(TJS_N("turn requires nonempty images"));
 
         // オブジェクトを作成
         *handler = new tTVPTurnTransHandler(time, src1w, src1h, bgcolor);

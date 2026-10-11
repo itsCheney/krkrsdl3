@@ -3,11 +3,13 @@
 #include "TVPStorage.h"
 #include "TVPFont.h"
 #include "PlatformFile.h"
+#include "CPUConsumerTrace.h"
 #include <vector>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <optional>
 
 #define NCB_MODULE_NAME TJS_N("layerExDraw.dll")
 
@@ -324,13 +326,13 @@ Appearance::~Appearance()
 
 Appearance* Appearance::Clone() const
 {
-    Appearance* newItm = new Appearance();
+    std::unique_ptr<Appearance> newItm(new Appearance());
+    newItm->drawInfos.reserve(drawInfos.size());
     for (const auto& itm : drawInfos)
     {
-        DrawInfo newdraw(itm);
-        newItm->drawInfos.push_back(newdraw);
+        newItm->drawInfos.emplace_back(itm);
     }
-    return newItm;
+    return newItm.release();
 }
 
 void Appearance::clear()
@@ -1145,7 +1147,7 @@ GdipImage::~GdipImage()
 
 GdipImage* GdipImage::Clone()
 {
-    GdipImage* cloned = nullptr;
+    std::unique_ptr<GdipImage> cloned;
     if (type == 0)
     {
         if (_surface)
@@ -1153,28 +1155,36 @@ GdipImage* GdipImage::Clone()
             int w = plutovg_surface_get_width(_surface);
             int h = plutovg_surface_get_height(_surface);
             plutovg_surface_t* newSurf = plutovg_surface_create(w, h);
+            if(!newSurf) throw std::bad_alloc();
+            std::unique_ptr<plutovg_surface_t,void(*)(plutovg_surface_t*)> held(newSurf,plutovg_surface_destroy);
             // Copy pixel data
             unsigned char* src = plutovg_surface_get_data(_surface);
             unsigned char* dst = plutovg_surface_get_data(newSurf);
             int stride = plutovg_surface_get_stride(_surface);
             memcpy(dst, src, stride * h);
-            cloned = new GdipImage(newSurf);
-            plutovg_surface_destroy(newSurf); // GdipImage constructor references it
+            cloned.reset(new GdipImage(newSurf));
         }
     }
     else if (type == 1)
     {
-        cloned = new GdipImage(width, height);
+        cloned.reset(new GdipImage(width, height));
+        cloned->vectorGraph.reserve(vectorGraph.size());
         for (auto& info : vectorGraph)
         {
-            GdipImage::Info newInfo;
-            newInfo.app = info.app ? info.app->Clone() : nullptr;
-            newInfo.path = info.path ? plutovg_path_clone(info.path) : nullptr;
-            cloned->vectorGraph.push_back(newInfo);
+            std::unique_ptr<Appearance> app(info.app ? info.app->Clone() : nullptr);
+            std::unique_ptr<plutovg_path_t,void(*)(plutovg_path_t*)> path(
+#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
+                info.path ? plutovg_path_clone_checked(info.path) : nullptr,
+#else
+                info.path ? plutovg_path_clone(info.path) : nullptr,
+#endif
+                plutovg_path_destroy);
+            if(info.path && !path) throw std::bad_alloc();
+            cloned->vectorGraph.push_back({app.get(),path.get()});app.release();path.release();
         }
         cloned->transMtx = transMtx;
     }
-    return cloned;
+    return cloned.release();
 }
 
 RectF GdipImage::GetBounds()
@@ -1245,8 +1255,16 @@ Status GdipImage::RotateFlip(RotateFlipType rftype)
 // ============================================================
 // LayerExDraw core implementation
 // ============================================================
+#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
+#include "SpanCapture.h"
+#include <typeinfo>
+#endif
+
 void LayerExDraw::updateRect(RectF& rect)
 {
+#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
+    if(invocationCapture) { deferCapturedUpdate(rect); return; }
+#endif
     if (updateWhenDraw)
     {
         tTVPRect rc((tjs_int)rect.x, (tjs_int)rect.y, (tjs_int)(rect.x + rect.w),
@@ -1256,7 +1274,7 @@ void LayerExDraw::updateRect(RectF& rect)
 }
 
 LayerExDraw::LayerExDraw(DispatchT obj)
-  : layerExBase_GL(obj),
+  : layerExBase_GL(obj, true),
     width(-1),
     height(-1),
     pitch(0),
@@ -1280,38 +1298,406 @@ LayerExDraw::LayerExDraw(DispatchT obj)
 LayerExDraw::~LayerExDraw()
 {
     destroyRecord();
+    destroyCanvas();
+    finishPixels();
+}
+
+void LayerExDraw::destroyCanvas()
+{
+    // Unknown software identities retain the exact texture independently of a
+    // pixel lock; Metal uses its stable resource ID without retaining GPU data.
     if (canvas)
         plutovg_canvas_destroy(canvas);
     if (surface)
         plutovg_surface_destroy(surface);
+    canvas = nullptr;
+    surface = nullptr;
+    if (canvasTexture) canvasTexture->ReleaseCPUAccessRef();
+    canvasTexture = nullptr;
+    canvasTextureID = 0;
+    canvasHasTextureID = false;
+    buffer = nullptr;
+    pitch = 0;
+}
+
+void LayerExDraw::finishPixels()
+{
+    // Cached surface data is only used after reset validates a new lease.
+    layerExBase_GL::finishPixels();
+}
+
+class LayerExDraw::InvocationPixels
+{
+    LayerExDraw& owner;
+    tTVPScopedLayerPixels pixels;
+    std::optional<PixelCall> call;
+    tTVPScopedLayerPixels* previous;
+    bool suspended=false;
+    struct State
+    {
+        GeometryT width,height,clipLeft,clipTop,clipWidth,clipHeight;
+        BufferT buffer;
+        PitchT pitch;
+        GeometryT nativeWidth,nativeHeight,nativeClipLeft,nativeClipTop,nativeClipWidth,nativeClipHeight;
+        BufferT nativeBuffer;
+        PitchT nativePitch;
+        plutovg_surface_t* surface;
+        plutovg_canvas_t* canvas;
+        iTVPTexture2D* texture;
+        uint64_t textureID;
+        bool hasTextureID;
+        const char* caller;
+    } saved;
+    void Restore()
+    {
+        owner.width=saved.width;owner.height=saved.height;owner.buffer=saved.buffer;owner.pitch=saved.pitch;
+        owner.clipLeft=saved.clipLeft;owner.clipTop=saved.clipTop;owner.clipWidth=saved.clipWidth;owner.clipHeight=saved.clipHeight;
+        owner._width=saved.nativeWidth;owner._height=saved.nativeHeight;owner._buffer=saved.nativeBuffer;owner._pitch=saved.nativePitch;
+        owner._clipLeft=saved.nativeClipLeft;owner._clipTop=saved.nativeClipTop;
+        owner._clipWidth=saved.nativeClipWidth;owner._clipHeight=saved.nativeClipHeight;
+        owner.surface=saved.surface;owner.canvas=saved.canvas;owner.canvasTexture=saved.texture;
+        owner.canvasTextureID=saved.textureID;owner.canvasHasTextureID=saved.hasTextureID;
+        owner._pixelCaller=saved.caller;owner.invocationPixels=previous;
+    }
+public:
+    explicit InvocationPixels(LayerExDraw& value):owner(value),previous(value.invocationPixels)
+    {
+        auto& active=owner.currentPixelAccess();
+        if(active.Data())
+        {
+            // Registered/user reentry is a new target boundary. An internal
+            // record redraw uses PixelCall directly and shares the outer lease.
+            krkrsdl3::layer_work::SourceScope origin("layerExDraw.write");
+            auto* current=owner._this->GetMainImageTextureForCPUAccess(true);
+            if(current==active.Texture())
+            {
+                owner.refreshMetadata();owner.reset();return;
+            }
+            saved={owner.width,owner.height,owner.clipLeft,owner.clipTop,owner.clipWidth,owner.clipHeight,
+                owner.buffer,owner.pitch,owner._width,owner._height,owner._clipLeft,owner._clipTop,
+                owner._clipWidth,owner._clipHeight,owner._buffer,owner._pitch,owner.surface,owner.canvas,
+                owner.canvasTexture,owner.canvasTextureID,owner.canvasHasTextureID,owner._pixelCaller};
+            suspended=true;owner.invocationPixels=&pixels;
+            owner.canvas=nullptr;owner.surface=nullptr;owner.canvasTexture=nullptr;
+            owner.canvasTextureID=0;owner.canvasHasTextureID=false;owner.buffer=nullptr;owner.pitch=0;
+        }
+        try { call.emplace(owner,"layerExDraw.write"); }
+        catch(...)
+        {
+            if(suspended) { owner.destroyCanvas();Restore(); }
+            throw;
+        }
+    }
+    ~InvocationPixels()
+    {
+        call.reset();
+        if(suspended) { owner.destroyCanvas();Restore(); }
+    }
+};
+
+#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
+class LayerExDraw::InvocationSpanCapture
+{
+    LayerExDraw& owner;
+    plutovg_surface_t* capturedSurface=nullptr;
+    plutovg_canvas_t* capturedCanvas=nullptr;
+    InvocationSpanCapture* previous;
+    std::vector<GdipImage::Info> stagedRecord;
+    std::unique_ptr<GdipImage> replacementRecord;
+    bool fullUpdate=false;
+    uint64_t recordBytes=0;
+    plutovg_matrix_t recordTransform;
+    struct State {
+        GeometryT width,height,clipLeft,clipTop,clipWidth,clipHeight;
+        BufferT buffer; PitchT pitch;
+        GeometryT nativeWidth,nativeHeight,nativeClipLeft,nativeClipTop,nativeClipWidth,nativeClipHeight;
+        plutovg_surface_t* surface; plutovg_canvas_t* canvas;
+        iTVPTexture2D* texture; uint64_t textureID; bool hasTextureID;
+        plutovg_matrix_t calcTransform;
+    } saved;
+    void Restore() {
+        owner.width=saved.width;owner.height=saved.height;
+        owner.clipLeft=saved.clipLeft;owner.clipTop=saved.clipTop;
+        owner.clipWidth=saved.clipWidth;owner.clipHeight=saved.clipHeight;
+        owner.buffer=saved.buffer;owner.pitch=saved.pitch;
+        owner._width=saved.nativeWidth;owner._height=saved.nativeHeight;
+        owner._clipLeft=saved.nativeClipLeft;owner._clipTop=saved.nativeClipTop;
+        owner._clipWidth=saved.nativeClipWidth;owner._clipHeight=saved.nativeClipHeight;
+        owner.surface=saved.surface;owner.canvas=saved.canvas;
+        owner.canvasTexture=saved.texture;owner.canvasTextureID=saved.textureID;
+        owner.canvasHasTextureID=saved.hasTextureID;
+        owner.calcTransform=saved.calcTransform;
+        owner.invocationCapture=nullptr;
+        current=previous;
+    }
+public:
+    TVPPlutovgSpanCapture sink;
+    inline static thread_local InvocationSpanCapture* current=nullptr;
+    RectF typedResult;
+    RectF update;
+    bool hasUpdate=false,installed=false;
+    InvocationSpanCapture(LayerExDraw& value,iTVPTexture2D* target):owner(value),previous(current) {
+        saved={owner.width,owner.height,owner.clipLeft,owner.clipTop,owner.clipWidth,owner.clipHeight,
+            owner.buffer,owner.pitch,owner._width,owner._height,owner._clipLeft,owner._clipTop,
+            owner._clipWidth,owner._clipHeight,owner.surface,owner.canvas,owner.canvasTexture,
+            owner.canvasTextureID,owner.canvasHasTextureID,owner.calcTransform};
+        owner.refreshMetadata();
+        if(owner._width<=0 || owner._height<=0 || owner._width>=32768 || owner._height>=32768) { Restore();return; }
+        capturedSurface=plutovg_surface_create_for_data(nullptr,owner._width,owner._height,owner._width*4);
+        if(!capturedSurface) { Restore();return; }
+        uint64_t identity=0,version=0;
+        const bool keyed=target && target->GetContentKey(identity,version);
+        const bool same=keyed ? owner.canvasHasTextureID && identity==owner.canvasTextureID :
+            !owner.canvasHasTextureID && target==owner.canvasTexture;
+        const bool reuse=owner.canvas && same && owner.width==owner._width && owner.height==owner._height;
+        capturedCanvas=reuse ? plutovg_canvas_clone_for_surface(owner.canvas,capturedSurface) :
+            plutovg_canvas_create(capturedSurface);
+        if(!capturedCanvas) { Restore();return; }
+        owner.canvas=capturedCanvas;owner.surface=capturedSurface;
+        owner.width=owner._width;owner.height=owner._height;owner.buffer=nullptr;owner.pitch=0;
+        if(!reuse) { owner.clipLeft=owner.clipTop=owner.clipWidth=owner.clipHeight=-1;
+            plutovg_canvas_set_operator(capturedCanvas,PLUTOVG_OPERATOR_SRC_OVER); }
+        if(owner.clipLeft!=owner._clipLeft || owner.clipTop!=owner._clipTop ||
+           owner.clipWidth!=owner._clipWidth || owner.clipHeight!=owner._clipHeight) {
+            owner.clipLeft=owner._clipLeft;owner.clipTop=owner._clipTop;
+            owner.clipWidth=owner._clipWidth;owner.clipHeight=owner._clipHeight;
+            plutovg_canvas_clip_rect(capturedCanvas,float(owner.clipLeft),float(owner.clipTop),
+                float(owner.clipWidth),float(owner.clipHeight));
+        }
+        plutovg_canvas_set_span_capture(capturedCanvas,&TVPPlutovgSpanCapture::Append,&sink);
+        owner.invocationCapture=this;current=this;installed=true;
+    }
+    ~InvocationSpanCapture() {
+        for(auto& info:stagedRecord) {delete info.app;if(info.path) plutovg_path_destroy(info.path);}
+        if(installed) Restore();
+        if(capturedCanvas) plutovg_canvas_destroy(capturedCanvas);
+        if(capturedSurface) plutovg_surface_destroy(capturedSurface);
+    }
+    bool Failed() const { return !installed || sink.failed || plutovg_canvas_span_capture_failed(capturedCanvas); }
+    bool SamplingFailed() const { return installed && !sink.failed && plutovg_canvas_span_capture_failed(capturedCanvas); }
+    static uint64_t CloneBytes(const Appearance* app,const plutovg_path_t* path) {
+        constexpr uint64_t limit=TVPLayerSpanCompositeGeometry::ParameterBudget;
+        uint64_t bytes=sizeof(Appearance)+sizeof(GdipImage::Info);
+        const auto add=[&](uint64_t count,uint64_t size) {
+            if(count>(limit-bytes)/size) throw std::length_error("record budget");
+            bytes+=count*size;
+        };
+        const auto pathBytes=[&](const plutovg_path_t* p) {
+            if(!p) return;
+            const plutovg_path_element_t* elements=nullptr;
+            const int n=plutovg_path_get_elements(p,&elements);
+            if(n<0) throw std::length_error("record path");
+            add(uint64_t(n),sizeof(plutovg_path_element_t));add(1,256);
+        };
+        pathBytes(path);add(app->drawInfos.size(),sizeof(Appearance::DrawInfo));
+        const auto brushBytes=[&](const SoftBrush* b) {
+            if(!b) return;
+            add(1,sizeof(SoftBrush));
+            if(b->gradient) {add(1,sizeof(SoftBrush::GradientData));add(b->gradient->stops.size(),sizeof(plutovg_gradient_stop_t));}
+        };
+        for(const auto& d:app->drawInfos) if(d.info) {
+            if(d.type==0) {const auto* p=static_cast<const SoftPen*>(d.info);
+                add(1,sizeof(SoftPen));add(p->dashArray.size(),sizeof(float));
+                brushBytes(p->brush);pathBytes(p->startCapPath);pathBytes(p->endCapPath);
+            } else brushBytes(static_cast<const SoftBrush*>(d.info));
+        }
+        return bytes;
+    }
+    void StageRecord(const Appearance* app,const plutovg_path_t* path) {
+        uint64_t bytes=0;
+        try {bytes=CloneBytes(app,path);} catch(const std::length_error&) {sink.failed=true;return;}
+        if(bytes>TVPLayerSpanCompositeGeometry::ParameterBudget-recordBytes) {sink.failed=true;return;}
+        std::unique_ptr<Appearance> copy(app->Clone());
+        std::unique_ptr<plutovg_path_t,void(*)(plutovg_path_t*)> copiedPath(plutovg_path_clone_checked(path),plutovg_path_destroy);
+        if(!copy || !copiedPath) throw std::bad_alloc();
+        stagedRecord.push_back({copy.get(),copiedPath.get()});
+        copy.release();copiedPath.release();recordBytes+=bytes;recordTransform=owner.transform;
+    }
+    void PublishRecord() noexcept {
+        if(replacementRecord) {delete owner.metaGraphics;owner.metaGraphics=replacementRecord.release();}
+        if(stagedRecord.empty()) return;
+        for(auto& info:stagedRecord) {
+            owner.metaGraphics->vectorGraph.push_back(info);info={nullptr,nullptr};
+        }
+        owner.metaGraphics->transMtx=recordTransform;stagedRecord.clear();
+    }
+    void StageClear(tjs_uint32 argb) {
+        fullUpdate=true;
+        if(owner.metaGraphics) {
+            replacementRecord.reset(new GdipImage(owner._width,owner._height));
+            replacementRecord->bgColor=argb;recordBytes=sizeof(GdipImage);
+        }
+    }
+    bool FullOverwrite() const {
+        const auto& p=sink.packet;
+        if(p.destination.left || p.destination.top || p.destination.right!=owner.width || p.destination.bottom!=owner.height)
+            return false;
+        for(int y=0;y<owner.height;++y) {
+            int64_t x=0;
+            for(uint32_t i=p.rowOffsets[size_t(y)];i<p.rowOffsets[size_t(y)+1];++i) {
+                const auto& s=p.spans[p.rowEntries[i]];
+                if(s.kind!=uint32_t(TVPLayerSpanKind::SolidSource) || s.coverage!=255 || s.x!=x) return false;
+                x+=s.length;
+            }
+            if(x!=owner.width) return false;
+        }
+        return true;
+    }
+    bool CommitCPUOverwrite(iTVPTexture2D* target) {
+        // All validation/allocation precedes the first output write. Once the
+        // lease succeeds, this fill cannot fail; commit/update errors propagate.
+        if(target->GetPitch()!=owner.width*4 || target->GetWidth()!=owner.width || target->GetHeight()!=owner.height)
+            return false;
+        tTVPScopedTexturePixels pixels;
+        try {pixels.Acquire(target,true,"layerExDraw.write",true);}
+        catch(...) {return false;}
+        krkrsdl3::cpu_consumer_trace::ReportSpanRoute("clear","cpu","fullOverwrite",target,
+            sink.packet.spans.size(),0,0,0);
+        for(const auto& s:sink.packet.spans) {
+            auto* row=reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(pixels.Data())+size_t(s.y)*pixels.Pitch());
+            std::fill_n(row+s.x,s.length,s.solid);
+        }
+        pixels.Written(tTVPRect(0,0,owner.width,owner.height));
+        Commit(target);
+        return true;
+    }
+    TVPLayerSpanCompositeResult Prepare() {
+        if(!installed) return TVPLayerSpanCompositeResult::Resource;
+        if(sink.failed) return TVPLayerSpanCompositeResult::ParameterBudget;
+        if(plutovg_canvas_span_capture_failed(capturedCanvas)) return TVPLayerSpanCompositeResult::Geometry;
+        auto& p=sink.packet;
+        if(p.spans.empty()) p.destination={0,0,0,0};
+        else {
+            p.destination={owner.width,owner.height,0,0};
+            for(const auto& s:p.spans) {
+                p.destination.left=std::min(p.destination.left,s.x);
+                p.destination.top=std::min(p.destination.top,s.y);
+                p.destination.right=std::max(p.destination.right,int32_t(int64_t(s.x)+s.length));
+                p.destination.bottom=std::max(p.destination.bottom,s.y+1);
+            }
+        }
+        const auto status=TVPLayerSpanCompositeGeometry::PrepareRows(p,owner.width,owner.height);
+        if(status!=TVPLayerSpanCompositeResult::Applied) return status;
+        const auto gpuBytes=TVPLayerSpanCompositeGeometry::ParameterBytes(p)+
+            TVPLayerSpanCompositeGeometry::ScratchRowBytes(p)*uint64_t(p.destination.bottom-p.destination.top)*2;
+        const auto vectorBytes=uint64_t(stagedRecord.capacity())*sizeof(GdipImage::Info);
+        if(vectorBytes>TVPLayerSpanCompositeGeometry::ParameterBudget-gpuBytes) return TVPLayerSpanCompositeResult::ParameterBudget;
+        const auto available=TVPLayerSpanCompositeGeometry::ParameterBudget-gpuBytes-vectorBytes;
+        if(recordBytes>available) return TVPLayerSpanCompositeResult::ParameterBudget;
+        if(!stagedRecord.empty()) {
+            auto& graph=owner.metaGraphics->vectorGraph;
+            if(stagedRecord.size()>graph.max_size()-graph.size()) return TVPLayerSpanCompositeResult::ParameterBudget;
+            const auto size=graph.size()+stagedRecord.size();
+            if(size>graph.capacity() && size>(available-recordBytes)/sizeof(GdipImage::Info))
+                return TVPLayerSpanCompositeResult::ParameterBudget;
+            graph.reserve(size);
+        }
+        return status;
+    }
+    void Commit(iTVPTexture2D* target) {
+        PublishRecord();
+        const GeometryT left=owner.clipLeft,top=owner.clipTop,cw=owner.clipWidth,ch=owner.clipHeight;
+        Restore();owner.destroyCanvas();owner.refreshMetadata();
+        owner.surface=capturedSurface;owner.canvas=capturedCanvas;
+        capturedSurface=nullptr;capturedCanvas=nullptr;installed=false;
+        plutovg_canvas_set_span_capture(owner.canvas,nullptr,nullptr);
+        owner.width=owner._width;owner.height=owner._height;
+        owner.clipLeft=left;owner.clipTop=top;owner.clipWidth=cw;owner.clipHeight=ch;
+        uint64_t version=0;
+        owner.canvasHasTextureID=target->GetContentKey(owner.canvasTextureID,version);
+        if(!owner.canvasHasTextureID) { owner.canvasTexture=target;target->AddCPUAccessRef(); }
+        owner._this->SetImageModified(true);
+        if(fullUpdate) owner._this->Update();
+        else if(hasUpdate) owner.updateRect(update);
+    }
+};
+void LayerExDraw::deferCapturedUpdate(const RectF& rect) {
+    invocationCapture->update=rect;invocationCapture->hasUpdate=true;
+}
+void LayerExDraw::stageCapturedRecord(const Appearance* app,const plutovg_path_t* path) {
+    invocationCapture->StageRecord(app,path);
+}
+void LayerExDraw::stageCapturedClear(tjs_uint32 argb) {
+    invocationCapture->StageClear(argb);
+}
+bool LayerExDraw::spanCaptureStateSafe() const {
+    // Escaped GdipImage(surface) objects retain the live CPU allocation. Keep
+    // their historical alias semantics on the CPU route until all escape refs end.
+    const float values[]={calcTransform.a,calcTransform.b,calcTransform.c,
+        calcTransform.d,calcTransform.e,calcTransform.f};
+    for(float v:values) if(!std::isfinite(v) || std::abs(v)>1000000.f) return false;
+    // Bound geometry before upstream raster fixed-point conversions. Unusual
+    // transforms retain the CPU route; no targetless cast may overflow.
+    if((std::abs(calcTransform.a)+std::abs(calcTransform.c))*200000.f+
+        std::abs(calcTransform.e)>1000000.f ||
+       (std::abs(calcTransform.b)+std::abs(calcTransform.d))*200000.f+
+        std::abs(calcTransform.f)>1000000.f) return false;
+    return true;
+}
+bool LayerExDraw::spanCaptureTargetAliased() const {
+    return surface && plutovg_surface_get_reference_count(surface)>2;
+}
+#endif
+
+GdipImage* LayerExDraw::getImageForBridge()
+{
+    krkrsdl3::cpu_consumer_trace::ConsumerScope consumer("imageBridge",
+        krkrsdl3::cpu_consumer_trace::Access::Write,"bridge",(uintptr_t)_obj,true);
+    InvocationPixels pixels(*this);
+    return new GdipImage(surface);
 }
 
 void LayerExDraw::reset()
 {
-    layerExBase_GL::reset();
-    if (!(canvas && width == _width && height == _height && pitch == _pitch && buffer == _buffer))
+    // A nested record redraw must not unlock and reacquire its caller's lease.
+    // Revalidate the surface against the exact held texture after COW or
+    // replacement, together with current data, pitch, geometry and clip.
+    auto& pixels=currentPixelAccess();
+    if (!pixels.Data()) layerExBase_GL::reset();
+    if (pixels.Data())
     {
-        if (canvas)
-        {
-            plutovg_canvas_destroy(canvas);
-            canvas = NULL;
+        _width = (GeometryT)pixels.Width();
+        _height = (GeometryT)pixels.Height();
+    }
+    uint64_t textureID=0, version=0;
+    const bool hasTextureID = pixels.Texture() && pixels.Texture()->GetContentKey(textureID,version);
+    const bool sameTexture = hasTextureID ? canvasHasTextureID && canvasTextureID==textureID :
+        !canvasHasTextureID && canvasTexture==pixels.Texture();
+    if (!(canvas && sameTexture && width == _width && height == _height && pitch == _pitch && buffer == _buffer))
+    {
+#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
+        // Capture canvases retain the full intersected clip history. Rebind
+        // their target storage across the next CPU invocation of the same image.
+        if(canvas && sameTexture && width==_width && height==_height && !buffer && pixels.Data()) {
+            plutovg_surface_t* next=plutovg_surface_create_for_data(_buffer,_width,_height,_pitch);
+            if(next && plutovg_canvas_rebind_surface(canvas,next)) {
+                plutovg_surface_destroy(surface);surface=next;buffer=_buffer;pitch=_pitch;
+            } else { if(next) plutovg_surface_destroy(next);destroyCanvas(); }
         }
-        if (surface)
-        {
-            plutovg_surface_destroy(surface);
-            surface = NULL;
-        }
+        if(!(canvas && sameTexture && width==_width && height==_height && pitch==_pitch && buffer==_buffer)) {
+#endif
+        destroyCanvas();
         width = _width;
         height = _height;
         pitch = _pitch;
         buffer = _buffer;
         if (buffer && width > 0 && height > 0)
         {
+            canvasHasTextureID = hasTextureID;
+            canvasTextureID = textureID;
+            if(!hasTextureID)
+            {
+                canvasTexture = pixels.Texture();
+                canvasTexture->AddCPUAccessRef();
+            }
             surface = plutovg_surface_create_for_data(buffer, width, height, pitch);
             canvas = plutovg_canvas_create(surface);
             plutovg_canvas_set_operator(canvas, PLUTOVG_OPERATOR_SRC_OVER);
         }
         clipLeft = clipTop = clipWidth = clipHeight = -1;
+#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
+        }
+#endif
     }
     if (canvas && (_clipLeft != clipLeft || _clipTop != clipTop || _clipWidth != clipWidth ||
                    _clipHeight != clipHeight))
@@ -1420,6 +1806,9 @@ void LayerExDraw::clear(tjs_uint32 argb)
     plutovg_canvas_fill_rect(canvas, 0, 0, (float)width, (float)height);
     plutovg_canvas_restore(canvas);
 
+#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
+    if(invocationCapture) {stageCapturedClear(argb);return;}
+#endif
     if (metaGraphics)
     {
         createRecord();
@@ -1514,11 +1903,24 @@ RectF LayerExDraw::_drawPath(const Appearance* app, const plutovg_path_t* path)
 
         if (metaGraphics)
         {
-            GdipImage::Info info;
-            info.app = app->Clone();
-            info.path = plutovg_path_clone(path);
-            metaGraphics->vectorGraph.push_back(info);
+#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
+            if(invocationCapture) stageCapturedRecord(app,path);
+            else
+#endif
+            {
+            std::unique_ptr<Appearance> copiedApp(app->Clone());
+            std::unique_ptr<plutovg_path_t,void(*)(plutovg_path_t*)> copiedPath(
+#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
+                plutovg_path_clone_checked(path),
+#else
+                plutovg_path_clone(path),
+#endif
+                plutovg_path_destroy);
+            if(!copiedPath) throw std::bad_alloc();
+            metaGraphics->vectorGraph.push_back({copiedApp.get(),copiedPath.get()});
+            copiedApp.release();copiedPath.release();
             metaGraphics->transMtx = transform;
+            }
         }
 
         plutovg_matrix_t drawMatrix;
@@ -1981,7 +2383,8 @@ RectF LayerExDraw::drawImageAffine(GdipImage* src, tjs_real sleft, tjs_real stop
 void LayerExDraw::createRecord()
 {
     destroyRecord();
-    metaGraphics = new GdipImage(width, height);
+    refreshMetadata();
+    metaGraphics = new GdipImage(_width, _height);
 }
 
 void LayerExDraw::recreateRecord()
@@ -2045,6 +2448,11 @@ GdipImage* LayerExDraw::getRecordImage()
     GdipImage* image = NULL;
     if (metaGraphics)
     {
+        // This method is also reached through a raw callback that bypasses the
+        // normal per-call native getter. Reacquire pixels before using canvas.
+        krkrsdl3::cpu_consumer_trace::ConsumerScope consumer("getRecordImage",
+            krkrsdl3::cpu_consumer_trace::Access::Write, "native", (uintptr_t)_obj, true);
+        PixelCall pixels(*this,"layerExDraw.record");
         image = metaGraphics->Clone();
         if (image)
             redraw(image);
@@ -2746,6 +3154,317 @@ NCB_REGISTER_CLASS(GdiPlus)
 }
 
 // ------------------------------------------------------- LayerExDraw hook
+template<>
+struct ncbInvocationPolicy<LayerExDraw>
+{
+    static constexpr bool Enabled = true;
+    static constexpr bool RawPreflight = true;
+    template<class Result> static bool CaptureResult(const Result&) { return false; }
+    static bool CaptureResult(const RectF& result) {
+#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
+        auto* capture=LayerExDraw::InvocationSpanCapture::current;
+        if(capture) { capture->typedResult=result;return true; }
+#endif
+        return false;
+    }
+    struct Scope
+    {
+        krkrsdl3::cpu_consumer_trace::ConsumerScope consumer;
+        std::optional<LayerExDraw::InvocationPixels> pixels;
+        static LayerExDraw* Instance(iTJSDispatch2* object)
+        {
+            LayerExDraw* value = ncbInstanceAdaptor<LayerExDraw>::GetNativeInstance(object);
+            if(!value)
+            {
+                std::unique_ptr<LayerExDraw> created(new LayerExDraw(object));
+                if(!ncbInstanceAdaptor<LayerExDraw>::SetAdaptorWithNativeInstance(object,created.get()))
+                    TVPThrowExceptionMessage(TJS_N("Cannot attach LayerExDraw"));
+                value = created.release();
+            }
+            return value;
+        }
+        static bool Metadata(const char* name,ncbInvocationKind kind,LayerExDraw* value)
+        {
+            if(kind==ncbInvocationKind::Raw || kind==ncbInvocationKind::Bridge) return false;
+            if(kind==ncbInvocationKind::Get || kind==ncbInvocationKind::Set)
+                return !strcmp(name,"updateWhenDraw") || !strcmp(name,"smoothingMode") ||
+                    !strcmp(name,"textRenderingHint") || !strcmp(name,"record");
+            if(!strcmp(name,"measureString") || !strcmp(name,"measureStringInternal")) return true;
+            const char* transforms[]={"setViewTransform","resetViewTransform","rotateViewTransform",
+                "scaleViewTransform","translateViewTransform","setTransform","resetTransform",
+                "rotateTransform","scaleTransform","translateTransform"};
+            for(const char* transform:transforms)
+                if(!strcmp(name,transform)) return !value->getRecord() || !strstr(transform,"ViewTransform");
+            return false;
+        }
+        static const char* Entry(ncbInvocationKind kind)
+        {
+            switch(kind)
+            {
+                case ncbInvocationKind::Get: return "get";
+                case ncbInvocationKind::Set: return "set";
+                case ncbInvocationKind::Raw: return "raw";
+                case ncbInvocationKind::Bridge: return "bridge";
+                default: return "method";
+            }
+        }
+        Scope(const char* name,ncbInvocationKind kind,iTJSDispatch2* object)
+          : Scope(name,kind,object,
+                kind==ncbInvocationKind::Raw || kind==ncbInvocationKind::Bridge ?
+                    ncbInstanceAdaptor<LayerExDraw>::GetNativeInstance(object) : Instance(object)) {}
+        Scope(const char* name,ncbInvocationKind kind,iTJSDispatch2* object,LayerExDraw* value)
+          : consumer(name,
+                Metadata(name,kind,value) ? krkrsdl3::cpu_consumer_trace::Access::Metadata :
+                    krkrsdl3::cpu_consumer_trace::Access::Write,Entry(kind),(uintptr_t)object)
+        {
+            // Raw callbacks and bridge getters historically only look up an
+            // existing instance. Let their original missing-instance path run.
+            if(!value) return;
+            value->SetHotspotReceiver();
+            if(Metadata(name,kind,value)) value->refreshMetadata();
+            else pixels.emplace(*value);
+        }
+    };
+#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
+    static bool PlainObject(iTJSDispatch2* object) {
+        return object && typeid(*object)==typeid(tTJSCustomObject);
+    }
+    template<class T> static T* DirectNative(const tTJSVariant* value) {
+        if(!value || value->Type()!=tvtObject || !PlainObject(value->AsObjectNoAddRef())) return nullptr;
+        // Appearance/Path use NCB_REGISTER_SUBCLASS and default NCBind
+        // boxing. A probe must not throw; legacy conversion owns errors.
+        return ncbInstanceAdaptor<T>::GetNativeInstance(value->AsObjectNoAddRef(),false);
+    }
+    static GdipImage* ImageNative(const tTJSVariant* value) {
+        if(!value || value->Type()!=tvtObject || !PlainObject(value->AsObjectNoAddRef())) return nullptr;
+        auto* wrapper=ncbInstanceAdaptor<GdipWrapper<GdipImage>>::GetNativeInstance(value->AsObjectNoAddRef(),false);
+        return wrapper ? wrapper->getGdipObject() : nullptr;
+    }
+    static bool Numeric(const tTJSVariant* value) {
+        if(!value || (value->Type()!=tvtInteger && value->Type()!=tvtReal)) return false;
+        const double v=value->AsReal();return std::isfinite(v) && std::abs(v)<=100000.0;
+    }
+    static bool Brush(const SoftBrush* b) {
+        if(!b) return true;
+        if(b->texSurface && !plutovg_surface_is_owned(b->texSurface)) return false;
+        if(b->type<BrushTypeNone || b->type>BrushTypeLinearGradient) return false;
+        if(b->hasTexMatrix) {
+            const float values[]={b->texMatrix.a,b->texMatrix.b,b->texMatrix.c,b->texMatrix.d,b->texMatrix.e,b->texMatrix.f};
+            for(float v:values) if(!std::isfinite(v) || std::abs(v)>1000000.f) return false;
+        }
+        if(b->gradient) {
+            const auto& g=*b->gradient;
+            const float values[]={g.x1,g.y1,g.x2,g.y2,g.cx,g.cy,g.cr,g.fx,g.fy,g.fr};
+            for(float v:values) if(!std::isfinite(v) || std::abs(v)>100000.f) return false;
+            for(const auto& stop:g.stops) {
+                const float values[]={stop.offset,stop.color.r,stop.color.g,stop.color.b,stop.color.a};
+                for(float v:values) if(!std::isfinite(v) || std::abs(v)>100000.f) return false;
+            }
+        }
+        return true;
+    }
+    static bool PathData(const plutovg_path_t* path) {
+        if(!path) return false;
+        const plutovg_path_element_t* elements=nullptr;
+        const int count=plutovg_path_get_elements(path,&elements);
+        for(int i=0;i<count;) {
+            const int length=elements[i].header.length;
+            if(length<1 || length>4 || length>count-i) return false;
+            for(int j=1;j<length;++j) {
+                const auto& p=elements[i+j].point;
+                if(!std::isfinite(p.x) || !std::isfinite(p.y) ||
+                    std::abs(p.x)>100000.f || std::abs(p.y)>100000.f) return false;
+            }
+            i+=length;
+        }
+        return true;
+    }
+    static bool Paints(const Appearance* a) {
+        if(!a) return false;
+        for(const auto& d:a->drawInfos) {
+            if(!std::isfinite(d.ox) || !std::isfinite(d.oy) || std::abs(d.ox)>100000 || std::abs(d.oy)>100000) return false;
+            if(!d.info) continue;
+            if(d.type==0) {
+                const auto* p=static_cast<const SoftPen*>(d.info);
+                if(!Brush(p->brush) || !std::isfinite(p->strokeWidth) ||
+                   !std::isfinite(p->miterLimit) || !std::isfinite(p->dashOffset) ||
+                   std::abs(p->strokeWidth)>100000 || std::abs(p->miterLimit)>100000) return false;
+                for(float dash:p->dashArray) if(!std::isfinite(dash)) return false;
+                if(p->startCapPath && !PathData(p->startCapPath)) return false;
+                if(p->endCapPath && !PathData(p->endCapPath)) return false;
+            } else if(d.type==1) { if(!Brush(static_cast<const SoftBrush*>(d.info))) return false; }
+            else return false;
+        }
+        return true;
+    }
+    static const char* Preflight(const char* name,tjs_int count,tTJSVariant** params,LayerExDraw* value) {
+        if(value->invocationCapture || value->currentPixelAccess().Data()) return "activeLease";
+        if(value->spanCaptureTargetAliased()) return "targetAlias";
+        if(!value->spanCaptureStateSafe()) return "state";
+        // NCBind accepts trailing arguments and converts only the signature
+        // parameters. Keep the same minimum arity and leave extras untouched.
+        if(!strcmp(name,"clear")) {
+            if(count<1) return "arguments";
+            if(params[0]->Type()!=tvtInteger &&
+                (params[0]->Type()!=tvtReal || !std::isfinite(params[0]->AsReal()) || std::abs(params[0]->AsReal())>4294967295.0))
+                return "numeric";
+        } else if(!strcmp(name,"drawLine") || !strcmp(name,"drawRectangle")) {
+            if(count<5) return "arguments";
+            auto* appearance=DirectNative<Appearance>(params[0]);
+            if(!appearance) return "appearanceType";
+            if(!Paints(appearance)) return "paint";
+            for(int i=1;i<5;++i) if(!Numeric(params[i])) return "numeric";
+        } else if(!strcmp(name,"drawPath")) {
+            if(count<2) return "arguments";
+            auto* path=DirectNative<Path>(params[1]);
+            auto* appearance=DirectNative<Appearance>(params[0]);
+            if(!appearance) return "appearanceType";
+            if(!Paints(appearance)) return "paint";
+            if(!path) return "pathType";
+            if(!PathData(path->spanCapturePath())) return "path";
+        } else {
+            if(count<9) return "arguments";
+            auto* src=ImageNative(params[4]);
+            if(!src) return "imageType";
+            for(int i=0;i<9;++i) if(i!=4 && !Numeric(params[i])) return "numeric";
+            if(src->type==0) {
+                if(!src->_surface) return "source";
+                if(!plutovg_surface_is_owned(src->_surface)) return "borrowedSource";
+            } else if(src->type==1) {
+                if(src->width<=0 || src->height<=0) return "source";
+                if(params[7]->AsReal()==0 || params[8]->AsReal()==0) return "geometry";
+                // No script callback occurs from this probe through capture.
+                // The argument owns the vector for that synchronous interval;
+                // the packet copies all sampled paint before GPU submission.
+                plutovg_matrix_t matrix,rect,temp;
+                plutovg_matrix_init(&matrix,float(params[2]->AsReal()/params[7]->AsReal()),0,0,
+                    float(params[3]->AsReal()/params[8]->AsReal()),float(params[0]->AsReal()),float(params[1]->AsReal()));
+                plutovg_matrix_init_scale(&rect,float(params[7]->AsReal()/src->GetWidth()),float(params[8]->AsReal()/src->GetHeight()));
+                plutovg_matrix_translate(&rect,float(-params[5]->AsReal()),float(-params[6]->AsReal()));
+                temp=matrix;plutovg_matrix_multiply(&matrix,&temp,&rect);
+                temp=matrix;plutovg_matrix_multiply(&matrix,&temp,&src->transMtx);
+                const float values[]={matrix.a,matrix.b,matrix.c,matrix.d,matrix.e,matrix.f};
+                for(float v:values) if(!std::isfinite(v) || std::abs(v)>1000000.f) return "state";
+                if((std::abs(matrix.a)+std::abs(matrix.c))*200000.f+std::abs(matrix.e)>1000000.f ||
+                   (std::abs(matrix.b)+std::abs(matrix.d))*200000.f+std::abs(matrix.f)>1000000.f) return "state";
+                if(src->vectorGraph.size()>TVPLayerSpanCompositeGeometry::MaxSpans) return "budget";
+                for(const auto& info:src->vectorGraph) {
+                    if(!info.app || !info.path || pathIsEmpty(info.path)) continue;
+                    if(!PathData(info.path)) return "path";
+                    if(!Paints(info.app)) return "paint";
+                }
+            } else return "vectorSource";
+        }
+        return nullptr;
+    }
+    static const char* Rejection(TVPLayerSpanCompositeResult result) {
+        switch(result) {
+            case TVPLayerSpanCompositeResult::Unsupported:return "unsupported";
+            case TVPLayerSpanCompositeResult::Geometry:return "geometry";
+            case TVPLayerSpanCompositeResult::Resource:return "resource";
+            case TVPLayerSpanCompositeResult::CPUAccess:return "activeLease";
+            case TVPLayerSpanCompositeResult::ParameterBudget:return "budget";
+            default:return "backend";
+        }
+    }
+#endif
+    static tjs_error InvokeFuncCall(const char* name,ncbInvocationKind kind,iTJSDispatch2* dispatch,
+        tjs_uint32 flag,tjs_uint32* hint,tTJSVariant* result,tjs_int count,tTJSVariant** params,iTJSDispatch2* object) {
+        krkrsdl3::layer_hotspot::Scope receiverScope(0,"layerExDraw");
+#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
+        const bool selected=kind==ncbInvocationKind::Method &&
+            (!strcmp(name,"drawLine") || !strcmp(name,"drawPath") || !strcmp(name,"drawImageStretch") || !strcmp(name,"drawRectangle") || !strcmp(name,"clear"));
+        if(selected && !PlainObject(object)) {
+            krkrsdl3::cpu_consumer_trace::ConsumerScope consumer(name,
+                krkrsdl3::cpu_consumer_trace::Access::Write,"method",(uintptr_t)object);
+            krkrsdl3::cpu_consumer_trace::ReportSpanRoute(name,"cpu","nonNativeReceiver",nullptr,0,0,0,0);
+        }
+        if(selected && PlainObject(object)) {
+            krkrsdl3::cpu_consumer_trace::ConsumerScope consumer(name,
+                krkrsdl3::cpu_consumer_trace::Access::Write,"method",(uintptr_t)object);
+            LayerExDraw* value=Scope::Instance(object);
+            value->SetHotspotReceiver();
+            const char* reason=Preflight(name,count,params,value);
+            // Releasing an existing object result can run script finalizers.
+            // Keep their historical lease/conversion order on the legacy route.
+            if(!reason && !strcmp(name,"clear") && result && result->Type()==tvtObject) reason="resultObject";
+            if(!reason && !TVPHasMetalLayerSpanCompositionSupport()) reason="backendUnavailable";
+            if(!reason) {
+                // COW happens through the native renderer, before capture and
+                // without target CPU pixels or early ImageModified mutation.
+                iTVPTexture2D* target=nullptr;
+                std::unique_ptr<LayerExDraw::InvocationSpanCapture> prepared;
+                try {
+                    target=value->_this->GetMainImageTextureForSpanComposite();
+                    if(target) prepared.reset(new LayerExDraw::InvocationSpanCapture(*value,target));
+                } catch(...) { reason="resource"; }
+                if(!target) reason="target";
+                else if(prepared) {
+                    auto& capture=*prepared;
+                    tjs_error hr=TJS_E_FAIL;
+                    try {
+                        // Typed completion captures RectF before any boxing.
+                        // Result constructors run exactly once after commit,
+                        // or once inside the sole legacy CPU replay.
+                        if(capture.installed) {
+                            if(!strcmp(name,"clear") && result) result->Clear();
+                            hr=dispatch->FuncCall(flag,nullptr,hint,nullptr,count,params,object);
+                        }
+                    } catch(...) { capture.sink.failed=true; }
+                    auto status=TVPLayerSpanCompositeResult::Resource;
+                    if(TJS_SUCCEEDED(hr)) {
+                        try {status=capture.Prepare();}
+                        catch(const std::bad_alloc&) {status=TVPLayerSpanCompositeResult::ParameterBudget;}
+                        catch(const std::length_error&) {status=TVPLayerSpanCompositeResult::ParameterBudget;}
+                    }
+                    if(status==TVPLayerSpanCompositeResult::Applied && !strcmp(name,"clear")) {
+                        if(!capture.FullOverwrite()) {status=TVPLayerSpanCompositeResult::Geometry;reason="partialOverwrite";}
+                        else {
+                            status=TVPCheckMetalLayerCPUOverwrite(target);
+                            if(status==TVPLayerSpanCompositeResult::Applied) {
+                                if(capture.CommitCPUOverwrite(target)) return hr;
+                                status=TVPLayerSpanCompositeResult::Resource;
+                            }
+                        }
+                    } else if(status==TVPLayerSpanCompositeResult::Applied && !capture.sink.packet.spans.empty()) {
+                        bool committed=false;
+                        try {status=TVPTryMetalLayerSpanComposite(capture.sink.packet,target,&committed);}
+                        catch(...) {
+                            if(committed) {
+                                const auto& p=capture.sink.packet;
+                                krkrsdl3::cpu_consumer_trace::ReportSpanRoute(name,"gpu","none",target,p.spans.size(),p.sourcePixels.size()*4,
+                                    TVPLayerSpanCompositeGeometry::ParameterBytes(p),TVPLayerSpanCompositeGeometry::ScratchRowBytes(p)*
+                                    uint64_t(p.destination.bottom-p.destination.top)*2);
+                                capture.PublishRecord();value->_this->SetImageModified(true);throw;
+                            }
+                            status=TVPLayerSpanCompositeResult::BackendFailure;
+                        }
+                    }
+                    if(status==TVPLayerSpanCompositeResult::Applied) {
+                        const auto& p=capture.sink.packet;
+                        krkrsdl3::cpu_consumer_trace::ReportSpanRoute(name,p.spans.empty()?"noop":"gpu","none",target,
+                            p.spans.size(),p.sourcePixels.size()*4,
+                            p.spans.empty()?0:TVPLayerSpanCompositeGeometry::ParameterBytes(p),
+                            p.spans.empty()?0:TVPLayerSpanCompositeGeometry::ScratchRowBytes(p)*
+                                uint64_t(p.destination.bottom-p.destination.top)*2);
+                        capture.Commit(target);
+                        if(result) {
+                            using Conv=typename ncbTypeConvertor::SelectConvertorType<RectF,tTJSVariant>::Type;
+                            Conv converter;converter(*result,capture.typedResult,ncbTypedefs::Tag<RectF>());
+                        }
+                        return hr;
+                    }
+                    if(!reason) reason=capture.SamplingFailed()?"sampling":Rejection(status);
+                }
+            }
+            krkrsdl3::cpu_consumer_trace::ReportSpanRoute(name,"cpu",reason,nullptr,0,0,0,0);
+        }
+#endif
+        Scope scope(name,kind,object);
+        return dispatch->FuncCall(flag,nullptr,hint,result,count,params,object);
+    }
+};
+
 NCB_GET_INSTANCE_HOOK(LayerExDraw)
 {
     NCB_INSTANCE_GETTER(objthis)
@@ -2756,10 +3475,9 @@ NCB_GET_INSTANCE_HOOK(LayerExDraw)
             obj = new ClassT(objthis);
             SetNativeInstance(objthis, obj);
         }
-        obj->reset();
+        obj->SetHotspotReceiver();
         return obj;
     }
-    ~NCB_GET_INSTANCE_HOOK_CLASS() {}
 };
 
 #define LAYEREX_METHOD(type, name) \

@@ -416,6 +416,9 @@ protected:
     ttstr missing_name;     // name of the 'missing' method
     virtual void Finalize(void);
     std::vector<ttstr> ClassNames;
+    // Native Array/Dictionary initialization uses the same member transfer as
+    // EnumMembers + its callback, without allocating callback argument variants.
+    void CopyNativeClassMembersTo(iTJSDispatch2* destination);
 
     //---------------------------------------------------------------------
 public:

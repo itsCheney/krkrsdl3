@@ -16,9 +16,8 @@ namespace drawdevice
 {
 
 // emoteplayer::ResourceManager 与 EmotePlayer 的包装（避免头文件耦合）。
-// ResourceManager 全局共享以支持不同 emote 文件之间互相引用 source/motion；
-// PlayerImpl 记录本播放器实际 load 过的文件，析构时逐个释放引用计数，
-// 引用归零的 file 会从 ResourceManager 的 source/motion 索引中移除，避免下次同名冲突。
+// 普通实例独立持有 ResourceManager；clone 显式共享 manager 和播放器状态。
+// 一个 manager 中的文件可互相引用 source/motion，最后一个持有者释放时统一卸载。
 class PlayerImpl
 {
 public:
@@ -52,7 +51,7 @@ D3DEmotePlayer::D3DEmotePlayer(iTJSDispatch2* d3dlayer)
     Layer = ncbInstanceAdaptor<D3DLayer>::GetNativeInstance(d3dlayer);
     if (Layer)
         Device = Layer->Device;
-    // 每实例独立动画状态机；资源缓存/跨文件索引由共享 ResourceManager 管理
+    // 每实例独立动画状态机和资源缓存；同一实例内支持跨文件索引。
     Impl = new PlayerImpl();
 }
 
@@ -82,7 +81,7 @@ tjs_error D3DEmotePlayer::load(tTJSVariant* result,
     for (int i = 0; i < numparams; i++)
     {
         tmpname = *param[i];
-        objthis->Impl->RM->load(tmpname);
+        objthis->Impl->RM->ensureLoaded(tmpname);
     }
     try
     {
@@ -109,6 +108,7 @@ tTJSVariant D3DEmotePlayer::clone(iTJSDispatch2* newlayer)
         {
             emoteplayer::EmotePlayer* src = Impl->Player;
             emoteplayer::EmotePlayer* dst = np->Impl->Player;
+            dst->inheritAnimationModeFrom(*src);
             // clone 先给新播放器加载同一文件并增加引用计数，再恢复 motion/状态
             dst->set_motionKey(src->get_motionKey());
             tTJSString motion = src->get_motion();
@@ -117,8 +117,10 @@ tTJSVariant D3DEmotePlayer::clone(iTJSDispatch2* newlayer)
             dst->set_tickCount(src->get_tickCount());
             dst->set_speed(src->get_speed());
             dst->unserialize(src->serialize());
+            dst->copyAnimationStateFrom(*src);
             // 变量复制（按当前 motion 的变量表枚举）
-            tTJSVariant keys = src->get_variableKeys();
+            tTJSVariant keys;
+            if (!src->usesIntegratedAnimation()) keys = src->get_variableKeys();
             if (keys.Type() == tvtObject)
             {
                 iTJSDispatch2* arr = keys.AsObjectNoAddRef();
@@ -217,7 +219,7 @@ void D3DEmotePlayer::setColor(tjs_uint32 color, tjs_real time, tjs_real easing)
 void D3DEmotePlayer::setVariable(tTJSString name, tjs_real value, tjs_real time, tjs_real accel)
 {
     if (Impl && Impl->Player)
-        Impl->Player->setVariable(name, value);
+        Impl->Player->setVariable(name, value, time, accel);
 }
 
 tjs_real D3DEmotePlayer::getVariable(tTJSString name)

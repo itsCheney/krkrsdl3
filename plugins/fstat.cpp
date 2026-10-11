@@ -5,6 +5,7 @@
 #include "Platform.h"
 #include "PlatformFile.h"
 #include "md5.h"
+#include "emoteplayer/emoteresourcecache.h"
 
 #define NCB_MODULE_NAME TJS_N("fstat.dll")
 
@@ -378,7 +379,10 @@ public:
         ttstr path = TVPGetLocallyAccessibleName(file);
         if (path.IsEmpty())
             return false;
-        return TVPTruncateFile(path.AsStdString(), (size_t)size);
+        const bool truncated = TVPTruncateFile(path.AsStdString(), (size_t)size);
+        if (truncated)
+            emoteplayer::InvalidateSharedEmoteResource(TVPNormalizeStorageName(file).AsStdString());
+        return truncated;
     }
 
     /**

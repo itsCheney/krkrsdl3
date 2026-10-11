@@ -5,6 +5,7 @@
 #include "TVPStorage.h"
 #include "UtilStreams.h"
 #include "tjsArray.h"
+#include "../../core/render/CPUFrameDiagnostics.h"
 
 #include <zlib.h>
 
@@ -37,53 +38,101 @@ tjs_error tTJSNI_PsbFile::Construct(tjs_int numparams, tTJSVariant** param, iTJS
 }
 void tTJSNI_PsbFile::Invalidate()
 {
+    krkrsdl3::cpu_frame::EventScope cpuInvalidate(krkrsdl3::cpu_frame::Kind::PSBInvalidate);
     if (filePtr != nullptr)
         delete filePtr;
     Owner = NULL;
     inherited::Invalidate();
 }
 
+void tTJSNI_PsbFile::Destruct()
+{
+    // The scope must surround deletion: a destructor-body scope would finish
+    // before _root's member destructor releases its TJS object tree.
+    krkrsdl3::cpu_frame::EventScope cpuDestroy(krkrsdl3::cpu_frame::Kind::PSBDestroy);
+    delete this;
+}
+
 bool tTJSNI_PsbFile::load(const ttstr& filePath)
 {
-    tTJSBinaryStream* _filePtr = TVPCreateStream(filePath);
+    tTJSBinaryStream* _filePtr;
+    {
+        krkrsdl3::cpu_frame::EventScope cpuOpen(krkrsdl3::cpu_frame::Kind::PSBOpen);
+        _filePtr = TVPCreateStream(filePath);
+        cpuOpen.Finish(_filePtr == nullptr);
+    }
     return loadFromStream(_filePtr, filePath);
 }
 
 bool tTJSNI_PsbFile::loadFromStream(tTJSBinaryStream* _filePtr, const ttstr& filePath)
 {
+    krkrsdl3::cpu_frame::EventScope cpuLoad(krkrsdl3::cpu_frame::Kind::PSBLoad);
     if (!_filePtr)
+    {
+        cpuLoad.Finish(true);
         return false;
+    }
     // _filePtr指针由PsbFile管理
     if (filePtr != NULL)
         delete filePtr;
     filePtr = _filePtr;
     const size_t readSize = filePtr->GetSize();
+    cpuLoad.SetWorkBytes(readSize);
     if (readSize < 9)
+    {
+        cpuLoad.Finish(true);
         return false;
+    }
 
     // Decompress MDF
     char sign[4];
-    filePtr->Read(sign, 4);
+    {
+        krkrsdl3::cpu_frame::EventScope cpuRead(krkrsdl3::cpu_frame::Kind::PSBRead);
+        cpuRead.SetWorkBytes(4);
+        filePtr->Read(sign, 4);
+    }
     sign[3] = '\0';
     if (TJS_strcasecmp(sign, "MDF") == 0)
     {
         // uncompress data
-        uLongf uncompressedSize = filePtr->ReadI32LE();
+        uLongf uncompressedSize;
+        {
+            krkrsdl3::cpu_frame::EventScope cpuRead(krkrsdl3::cpu_frame::Kind::PSBRead);
+            cpuRead.SetWorkBytes(4);
+            uncompressedSize = filePtr->ReadI32LE();
+        }
         tjs_uint8* _uncompress_buffer = new tjs_uint8[uncompressedSize];
         // compress data
         tjs_uint8* _compress_buffer = new tjs_uint8[readSize - 8];
-        filePtr->Read(_compress_buffer, readSize - 8);
+        {
+            krkrsdl3::cpu_frame::EventScope cpuRead(krkrsdl3::cpu_frame::Kind::PSBRead);
+            cpuRead.SetWorkBytes(readSize - 8);
+            filePtr->Read(_compress_buffer, readSize - 8);
+        }
         // uncompress buffer
-        if (uncompress(_uncompress_buffer, &uncompressedSize, _compress_buffer, readSize - 8) !=
-            Z_OK)
+        int decompressResult;
+        {
+            krkrsdl3::cpu_frame::EventScope cpuDecompress(krkrsdl3::cpu_frame::Kind::PSBDecompress);
+            cpuDecompress.SetWorkBytes(readSize - 8);
+            decompressResult = uncompress(_uncompress_buffer, &uncompressedSize,
+                                          _compress_buffer, readSize - 8);
+            cpuDecompress.Finish(decompressResult != Z_OK);
+        }
+        if (decompressResult != Z_OK)
         {
             delete[] _uncompress_buffer;
             delete[] _compress_buffer;
+            cpuLoad.Finish(true);
             return false;
         }
         // compress data
-        tTVPMemoryStream* _stream = new tTVPMemoryStream(nullptr, uncompressedSize);
-        memcpy(_stream->GetInternalBuffer(), _uncompress_buffer, uncompressedSize);
+        tTVPMemoryStream* _stream;
+        {
+            krkrsdl3::cpu_frame::EventScope cpuCopy(krkrsdl3::cpu_frame::Kind::PSBCopy);
+            cpuCopy.SetWorkBytes(uncompressedSize);
+            _stream = new tTVPMemoryStream(nullptr, uncompressedSize);
+            memcpy(_stream->GetInternalBuffer(), _uncompress_buffer, uncompressedSize);
+        }
         // clear data
         delete[] _uncompress_buffer;
         delete[] _compress_buffer;
@@ -94,11 +143,17 @@ bool tTJSNI_PsbFile::loadFromStream(tTJSBinaryStream* _filePtr, const ttstr& fil
     {
         tTVPMemoryStream* _stream = new tTVPMemoryStream(nullptr, filePtr->GetSize());
         filePtr->SetPosition(0);
-        filePtr->ReadBuffer(_stream->GetInternalBuffer(), filePtr->GetSize());
+        {
+            krkrsdl3::cpu_frame::EventScope cpuRead(krkrsdl3::cpu_frame::Kind::PSBRead);
+            cpuRead.SetWorkBytes(readSize);
+            filePtr->ReadBuffer(_stream->GetInternalBuffer(), filePtr->GetSize());
+        }
         delete filePtr;
         filePtr = _stream;
     }
 
+    {
+    krkrsdl3::cpu_frame::EventScope cpuTables(krkrsdl3::cpu_frame::Kind::PSBTables);
     // ReadHeader
     filePtr->SetPosition(0);
     _header.parsePSBHeader(filePtr);
@@ -107,11 +162,15 @@ bool tTJSNI_PsbFile::loadFromStream(tTJSBinaryStream* _filePtr, const ttstr& fil
     if (_header.isEncrypted() && _header.getHeaderLength() > filePtr->GetSize())
     {
         TVPConsoleLog("psb file is encrypted");
+        cpuTables.Finish(true);
+        cpuLoad.Finish(true);
         return false;
     }
     if (_header.version > 3)
     {
         TVPConsoleLog("not support psb file format version > 3");
+        cpuTables.Finish(true);
+        cpuLoad.Finish(true);
         return false;
     }
 
@@ -210,8 +269,13 @@ bool tTJSNI_PsbFile::loadFromStream(tTJSBinaryStream* _filePtr, const ttstr& fil
             filePtr->ReadI8LE() - static_cast<tjs_int8>(PSB::PSBObjType::ArrayN1) + 1, filePtr);
     }
 
-    // load All Data
-    _root = readAllObjs("root", _header.offsetEntries);
+    }
+
+    // Time only the outer materialization, not each recursive node/dispatch.
+    {
+        krkrsdl3::cpu_frame::EventScope cpuMaterialize(krkrsdl3::cpu_frame::Kind::PSBMaterialize);
+        _root = readAllObjs("root", _header.offsetEntries);
+    }
     // add To media
     if (psbVar != nullptr && !filePath.IsEmpty())
     {

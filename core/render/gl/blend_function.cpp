@@ -40,6 +40,15 @@ extern "C"
 unsigned char ps_soft_light_table::TABLE[256][256];
 unsigned char ps_color_dodge_table::TABLE[256][256];
 unsigned char ps_color_burn_table::TABLE[256][256];
+extern "C" const uint8_t* TVPGetPsBlendTable(unsigned int index)
+{
+    switch(index) {
+        case 0: return reinterpret_cast<const uint8_t*>(&ps_soft_light_table::TABLE);
+        case 1: return reinterpret_cast<const uint8_t*>(&ps_color_dodge_table::TABLE);
+        case 2: return reinterpret_cast<const uint8_t*>(&ps_color_burn_table::TABLE);
+        default: return nullptr;
+    }
+}
 #ifdef TVPPS_USE_OVERLAY_TABLE
 unsigned char ps_overlay_table::TABLE[256][256];
 #endif

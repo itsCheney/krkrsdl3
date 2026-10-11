@@ -20,6 +20,8 @@
 #include "TVPSystem.h"
 #include "TVPSettings.h"
 
+#include <typeinfo>
+
 //---------------------------------------------------------------------------
 // オプション
 //---------------------------------------------------------------------------
@@ -67,6 +69,8 @@ tTVPBasicDrawDevice::~tTVPBasicDrawDevice()
     // Release() を呼ぶ。
     if (Manager != NULL)
     {
+        if (auto* manager = dynamic_cast<tTVPLayerManager*>(Manager))
+            manager->SetPointerPresentationHitTestingEnabled(true);
         Manager->Release();
         Manager = NULL;
     }
@@ -89,6 +93,21 @@ void tTVPBasicDrawDevice::Destruct()
 void tTVPBasicDrawDevice::SetWindowInterface(TVPWindow* window)
 {
     Window = window;
+    UpdatePointerPresentationHitTesting();
+}
+//---------------------------------------------------------------------------
+
+void tTVPBasicDrawDevice::UpdatePointerPresentationHitTesting()
+{
+    if (auto* manager = dynamic_cast<tTVPLayerManager*>(Manager))
+    {
+        const bool noPresentation = Window &&
+            typeid(*Window) == typeid(TVPWindow) &&
+            manager->GetLayerTreeOwner() == static_cast<iTVPLayerTreeOwner*>(Window) &&
+            typeid(*this) == typeid(tTVPBasicDrawDevice) &&
+            !Window->HasNativePointerPresentation();
+        manager->SetPointerPresentationHitTestingEnabled(!noPresentation);
+    }
 }
 //---------------------------------------------------------------------------
 
@@ -105,6 +124,7 @@ void tTVPBasicDrawDevice::AddLayerManager(iTVPLayerManager* manager)
     manager->AddRef();
 
     manager->SetDesiredLayerType(ltOpaque); // ltOpaque な出力を受け取りたい
+    UpdatePointerPresentationHitTesting();
 }
 //---------------------------------------------------------------------------
 
@@ -114,6 +134,8 @@ void tTVPBasicDrawDevice::RemoveLayerManager(iTVPLayerManager* manager)
     // Managers から manager を削除する。Releaseする。
     if (Manager == NULL)
         TVPThrowInternalError;
+    if (auto* concrete = dynamic_cast<tTVPLayerManager*>(Manager))
+        concrete->SetPointerPresentationHitTestingEnabled(true);
     Manager->Release();
     Manager = NULL;
 }

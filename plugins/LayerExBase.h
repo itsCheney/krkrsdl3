@@ -2,6 +2,7 @@
 #define __LayerExBase__
 
 #include "tjsNative.h"
+#include "ScopedLayerPixels.h"
 
 /**
  * レイヤ拡張 基本情報保持用ネイティブインスタンス。
@@ -25,6 +26,7 @@ public:
     tjs_int _height;
     tjs_int _pitch;
     unsigned char* _buffer;
+    tTVPScopedLayerPixels _pixels;
 
 public:
     // クラスＩＤ保持用

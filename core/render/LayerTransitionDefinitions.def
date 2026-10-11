@@ -1,0 +1,10 @@
+// Independent from LayerOperationDefinitions.def: transition plugin ABI is unchanged.
+TVP_LAYER_TRANSITION(Unsupported, 0, "unsupported")
+TVP_LAYER_TRANSITION(Mosaic, 1, "mosaic")
+TVP_LAYER_TRANSITION(Wave, 2, "wave")
+TVP_LAYER_TRANSITION(Ripple, 3, "ripple")
+TVP_LAYER_TRANSITION(Turn, 4, "turn")
+TVP_LAYER_TRANSITION(RotateZoom, 5, "rotatezoom")
+TVP_LAYER_TRANSITION(RotateVanish, 6, "rotatevanish")
+TVP_LAYER_TRANSITION(RotateSwap, 7, "rotateswap")
+TVP_LAYER_TRANSITION_COUNT(8)

@@ -1,14 +1,16 @@
 #pragma once
 #include "LayerRenderOperation.h"
+#include "LayerWorkDiagnostics.h"
+#include "LayerHotspotContext.h"
 
 #include "ComplexRect.h"
 #include <unordered_map>
 #include <stdint.h>
 #include <string>
+#include <vector>
 
-// 由于gpu兼容软渲染，但软渲染不兼容gpu
-// 所以对于内核我们按照krkr2/krkrz原版思路，保持完全软渲染
-// gpu加速则放入插件中，使用特殊的Layer和DrawDevice来实现
+// Software methods define ordinary Layer semantics. The Metal facade reuses
+// their canonical objects and accelerates the documented supported input domain.
 struct TVPTextureFormat
 {
     enum e
@@ -28,6 +30,7 @@ class iTVPTexture2D
 {
 protected:
     int RefCount;
+    unsigned CPUAccessReferences = 0;
     tjs_int Width;  // actual width
     tjs_int Height; // actual height
     // int Flags, TexWidth, TexHeight, ActualWidth, ActualHeight;
@@ -36,6 +39,10 @@ protected:
 public:
     virtual ~iTVPTexture2D(){};
     void AddRef() { ++RefCount; }
+    // Keep native access alive without inventing image sharing for COW. A
+    // read/write alias within one native operation must keep software ordering.
+    void AddCPUAccessRef() { AddRef(); ++CPUAccessReferences; }
+    void ReleaseCPUAccessRef() { --CPUAccessReferences; Release(); }
     virtual void Release();
     tjs_uint GetWidth() const { return Width; }
     tjs_uint GetHeight() const { return Height; }
@@ -48,11 +55,16 @@ public:
     }
 
     virtual TVPTextureFormat::e GetFormat() const = 0;
+    // Diagnostic metadata must never acquire pixel data or synchronize the GPU.
+    virtual krkrsdl3::layer_hotspot::Identity DiagnosticIdentity() const { return {}; }
+    virtual void SetDiagnosticAsset(const char*) {}
+    virtual void SetDiagnosticParent(const krkrsdl3::layer_hotspot::Identity&,
+                                     const char*, bool) {}
     virtual const void* GetScanLineForRead(tjs_uint l) { return nullptr; }
     virtual const void* GetPixelData() { return GetScanLineForRead(0); }
     virtual void* GetScanLineForWrite(tjs_uint l) { return (void*)GetScanLineForRead(l); }
     virtual tjs_int GetPitch() const { return 0x100000; }
-    bool IsIndependent() const { return RefCount == 1; }
+    bool IsIndependent() const { return RefCount-int(CPUAccessReferences) == 1; }
 
     // virtual tGLTexture* GetTexture() = 0;
     virtual void Update(const void* pixel,
@@ -60,6 +72,9 @@ public:
                         int pitch,
                         const tTVPRect& rc) = 0;
     virtual uint32_t GetPoint(int x, int y) = 0;
+    // Alpha-only readers need not invalidate their cache after RGB-only writes.
+    // Backends may cache alpha separately, but must return the current value.
+    virtual uint32_t GetPointAlpha(int x, int y) { return GetPoint(x, y) >> 24; }
     virtual void SetPoint(int x, int y, uint32_t clr) = 0;
     virtual bool IsStatic() = 0; // aka. is readonly
     virtual bool IsOpaque() = 0;
@@ -78,9 +93,26 @@ public:
     bool IsGPUResident() const { return !IsCPUResident(); }
     // GPU 驻留时的后端纹理句柄（供上屏 sprite 别名，零拷贝）；CPU 驻留返回 nullptr
     virtual void* GetTextureHandle() { return nullptr; }
+    // Full-surface GPU overwrite lease. Getting the handle must not discard
+    // CPU state; CommitGPUOverwrite is called only after the backend copy succeeds.
+    virtual void* GetTextureHandleForOverwrite() { return nullptr; }
+    virtual void CommitGPUOverwrite() {}
+    // Stable resource identity plus a monotonically increasing content version.
+    virtual bool GetContentKey(uint64_t& identity, uint64_t& version) const { return false; }
+    // Preserve pixels outside the destination ROI; reject outstanding CPU leases.
+    virtual void* GetTextureHandleForRegionWrite() { return nullptr; }
+    virtual void CommitGPURegionWrite(const tTVPRect& written) {}
     // 显式回读（带缓存）：返回 CPU 像素；软件实现零拷贝返回真实缓冲
     virtual void* LockCPURead() { return const_cast<void*>(GetPixelData()); }
     virtual void UnlockCPU() {}
+    // Native callers hold these only through one operation. Unlike script raw
+    // pointers they neither pin the texture permanently nor end a raw lease.
+    virtual void* LockCPUWrite() { return LockCPURead(); }
+    // Full-output native producers promise to replace every pixel before use.
+    virtual void* LockCPUWriteForOverwrite() { return LockCPUWrite(); }
+    virtual void UnlockCPUWrite(const tTVPRect& written) {
+        MarkCPUModified(written); UnlockCPU();
+    }
     // CPU 数据已修改，下次 GPU 使用前需上传
     virtual void MarkCPUModified() {}
     // 同上，但已知被写区域，仅上传该区域
@@ -103,6 +135,43 @@ public:
     virtual void ReleasePersistentCPUData(const tTVPRect* written) {}
 
     static void RecycleProcess();
+};
+
+class tTVPScopedTexturePixels {
+    iTVPTexture2D* texture = nullptr;
+    void* pixels = nullptr;
+    bool write = false;
+    tTVPRect written{0,0,0,0};
+    // Keep one byte beyond the 47-byte diagnostic name limit so delayed
+    // acquisition/release can report oversize names instead of merging them.
+    char origin[49]{};
+public:
+    tTVPScopedTexturePixels() = default;
+    tTVPScopedTexturePixels(const tTVPScopedTexturePixels&) = delete;
+    tTVPScopedTexturePixels& operator=(const tTVPScopedTexturePixels&) = delete;
+    ~tTVPScopedTexturePixels() { Reset(); }
+    void Reset() {
+        if(!texture) return;
+        krkrsdl3::layer_work::SourceScope scope(origin);
+        if(write) texture->UnlockCPUWrite(written); else texture->UnlockCPU();
+        texture->ReleaseCPUAccessRef(); texture=nullptr; pixels=nullptr;
+    }
+    void Acquire(iTVPTexture2D* value,bool forWrite,const char* caller="native.layerPixels",bool overwrite=false) {
+        Reset(); if(!value) return;
+        std::snprintf(origin,sizeof(origin),"%s",caller ? caller : "unattributed");
+        krkrsdl3::layer_work::SourceScope scope(origin);
+        value->AddCPUAccessRef();
+        try { pixels=forWrite ? (overwrite ? value->LockCPUWriteForOverwrite() : value->LockCPUWrite()) : value->LockCPURead(); }
+        catch(...) { value->ReleaseCPUAccessRef(); throw; }
+        texture=value; write=forWrite; written=tTVPRect(0,0,0,0);
+    }
+    void Written(const tTVPRect& region) { written=region; }
+    void* Data() const { return pixels; }
+    // Borrowed identity of the exact acquired texture; valid only while held.
+    iTVPTexture2D* Texture() const { return texture; }
+    int Pitch() const { return texture ? texture->GetPitch() : 0; }
+    unsigned Width() const { return texture ? texture->GetWidth() : 0; }
+    unsigned Height() const { return texture ? texture->GetHeight() : 0; }
 };
 
 class iTVPRenderMethod
@@ -167,6 +236,15 @@ public:
 typedef tRenderTextureArray<tTVPRect> tRenderTexRectArray;
 typedef tRenderTextureArray<const tTVPPointD*> tRenderTexQuadArray;
 
+// A read-only snapshot of the canonical software registry, including aliases.
+// Method parameters and process-lived method objects are never copied or changed.
+struct TVPRenderMethodRegistration
+{
+    std::string name;
+    std::string canonicalName;
+    const iTVPRenderMethod* method;
+};
+
 class tTVPBitmap;
 namespace TJS
 {
@@ -184,6 +262,7 @@ protected:
         return nullptr;
     }
     std::unordered_map<uint32_t, iTVPRenderMethod*> AllMethods;
+    std::vector<TVPRenderMethodRegistration> MethodRegistrations;
 
 public:
     void Initialize();
@@ -208,6 +287,10 @@ public:
 
     // each method is singleton in whole lifecycle
     virtual iTVPRenderMethod* GetRenderMethod(const char* name, uint32_t* hint = nullptr);
+    // Unlike GetRenderMethod, a missing audit lookup never shows a message box.
+    // Audit the software registry; GPU facades delegate ordinary method lookup.
+    const iTVPRenderMethod* FindRegisteredRenderMethod(const char* name) const;
+    std::vector<TVPRenderMethodRegistration> GetRenderMethodRegistrations() const;
 #define RENDER_METHOD_FLAG_NONE 0
 #define RENDER_METHOD_FLAG_TARGET_AS_INPUT 1
     iTVPRenderMethod* CompileRenderMethod(const char* name,
@@ -225,6 +308,12 @@ public:
 
     virtual bool GetRenderStat(unsigned int& drawCount, uint64_t& vmemsize) = 0;
     virtual bool GetTextureStat(iTVPTexture2D* texture, uint64_t& vmemsize) { return false; }
+    // Process-lived scratch caches must belong to the current render session.
+    // Detached GPU textures are safe CPU objects, but cannot be GPU sources in
+    // a newly bound session. This is only for regenerable native caches.
+    virtual bool CanReuseCachedTexture(iTVPTexture2D* texture) const {
+        return texture && texture->IsCPUResident();
+    }
 
     virtual void BeginStencil(iTVPTexture2D* reftex) {}
     virtual void EndStencil() {}
@@ -239,6 +328,16 @@ public:
     virtual void SetParameterFloat(int id, float Value){};
 
     // -------------- operations ----------------
+    // Optional immediate R8 glyph path. Successful calls copy the borrowed pixels
+    // before returning; no caller address may be retained for later encoding.
+    // false promises no glyph target writes, so callers may use their ordinary
+    // scratch texture fallback. Exceptions must propagate without replaying it.
+    virtual bool TryBlendGlyph(iTVPRenderMethod* method,
+                              iTVPTexture2D* target,
+                              const tTVPRect& destination,
+                              const uint8_t* pixels,
+                              int pitch, int width, int height) { return false; }
+
     // dst x Tex1 x ... x TexN -> dst
     // referenced target texture would be used if target texture is required as source
     virtual void OperateRect(iTVPRenderMethod* method,

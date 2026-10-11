@@ -9,6 +9,8 @@
 #include "rotatebase.h"
 #include "rotatetrans.h"
 #include "common.h"
+#include <cmath>
+#include <cstdio>
 
 #include <stdio.h>
 
@@ -54,7 +56,14 @@ public:
         TwistAccel = twistaccel;
         CenterX = centerx;
         CenterY = centery;
+        char metadata[512];
+        std::snprintf(metadata, sizeof(metadata),
+            "{\"time\":%llu,\"factor\":%.17g,\"targetfactor\":%.17g,\"accel\":%.17g,\"twist\":%.17g,\"twistaccel\":%.17g,\"centerx\":%d,\"centery\":%d,\"fixsrc1\":%d}",
+            static_cast<unsigned long long>(time), factor, targetfactor, accel, twist, twistaccel,
+            centerx, centery, int(fixsrc1));
+        TransitionMetadata = metadata;
         FixSrc1 = fixsrc1;
+        TransitionKind = fixsrc1 ? TVPLayerTransitionKind::RotateZoom : TVPLayerTransitionKind::RotateVanish;
     }
 
     void CalcPosition()
@@ -227,7 +236,14 @@ public:
             if (tmp.Type() != tvtVoid)
                 centery = (tjs_int)tmp;
 
+        if (!src1w || !src1h || src1w > 32767 || src1h > 32767 ||
+            !std::isfinite(accel) || !std::isfinite(twist) || !std::isfinite(twistaccel))
+            TVPThrowExceptionMessage(TJS_N("rotate transition requires nonempty fixed-point dimensions and finite options"));
+
         // オブジェクトを作成
+        if (!std::isfinite(factor))
+            TVPThrowExceptionMessage(TJS_N("rotatezoom factor must be finite"));
+
         *handler = new tTVPRotateZoomTransHandler(time, src1w, src1h, factor, 1, accel, twist,
                                                   twistaccel, centerx, centery, true);
 
@@ -334,6 +350,10 @@ public:
             if (tmp.Type() != tvtVoid)
                 centery = (tjs_int)tmp;
 
+        if (!src1w || !src1h || src1w > 32767 || src1h > 32767 ||
+            !std::isfinite(accel) || !std::isfinite(twist) || !std::isfinite(twistaccel))
+            TVPThrowExceptionMessage(TJS_N("rotate transition requires nonempty fixed-point dimensions and finite options"));
+
         // オブジェクトを作成
         *handler = new tTVPRotateZoomTransHandler(time, src1w, src1h, 1, 0, accel, twist,
                                                   twistaccel, centerx, centery, false);
@@ -353,7 +373,12 @@ public:
         tjs_uint64 time, tjs_int width, tjs_int height, tjs_uint32 bgcolor, double twist)
       : tTVPBaseRotateTransHandler(time, width, height, bgcolor)
     {
+        char metadata[160];
+        std::snprintf(metadata, sizeof(metadata), "{\"time\":%llu,\"bgcolor\":%u,\"twist\":%.17g}",
+                      static_cast<unsigned long long>(time), bgcolor, twist);
+        TransitionMetadata = metadata;
         Twist = twist * 3.14159265368979 * 2;
+        TransitionKind = TVPLayerTransitionKind::RotateSwap;
     }
 
     void CalcPosition()
@@ -501,6 +526,9 @@ public:
         if (TJS_SUCCEEDED(options->GetValue(TJS_N("twist"), &tmp)))
             if (tmp.Type() != tvtVoid)
                 twist = (double)tmp;
+
+        if (!src1w || !src1h || src1w > 32767 || src1h > 32767 || !std::isfinite(twist))
+            TVPThrowExceptionMessage(TJS_N("rotateswap requires nonempty fixed-point dimensions and finite twist"));
 
         // オブジェクトを作成
         *handler = new tTVPRotateSwapTransHandler(time, src1w, src1h, bgcolor, twist);

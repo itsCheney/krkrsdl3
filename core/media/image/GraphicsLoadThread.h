@@ -3,6 +3,7 @@
 #define __GRAPHICS_LOAD_THREAD_H__
 
 #include <queue>
+#include "ImagePrefetchPolicy.h"
 
 #include "PlatformThread.h"
 #include "NativeEventQueue.h"
@@ -14,6 +15,8 @@ struct tTVPTmpBitmapImage
 {
     class tTVPBitmap* bmp = nullptr;
     std::vector<tTVPGraphicMetaInfoPair>* MetaInfo;
+    krkrsdl3::image_prefetch::Policy<ttstr>* prefetchPolicy = nullptr;
+    krkrsdl3::image_prefetch::Ticket prefetch;
     tTVPTmpBitmapImage();
     ~tTVPTmpBitmapImage();
     // パレット関連は現状読まない、ファイルに従うのではなく、事前指定方式なので
@@ -26,6 +29,8 @@ struct tTVPImageLoadCommand
     ttstr path_;
     tTVPTmpBitmapImage* dest_;
     ttstr result_;
+    bool failed_ = false;
+    krkrsdl3::image_prefetch::Ticket prefetch_;
     tTVPImageLoadCommand();
     ~tTVPImageLoadCommand();
 };
@@ -46,6 +51,7 @@ class tTVPAsyncImageLoader : public tTVPThread
     std::queue<tTVPImageLoadCommand*> CommandQueue;
     /** 読込み完了画像キュー */
     std::queue<tTVPImageLoadCommand*> LoadedQueue;
+    krkrsdl3::image_prefetch::Policy<ttstr> PrefetchPolicy;
 
 private:
     /**
@@ -62,6 +68,10 @@ public:
      * 読込みを読込みスレッドに要求する(キューへ入れる)
      */
     void PushLoadQueue(iTJSDispatch2* owner, tTJSNI_Bitmap* bmp, const ttstr& nname);
+    bool PushPrefetch(const ttstr& nname, const std::shared_ptr<krkrsdl3::image_prefetch::Budget>& budget);
+    bool CanPrefetch(const std::shared_ptr<krkrsdl3::image_prefetch::Budget>& budget, uint64_t now) {
+        return PrefetchPolicy.CanAdmit(budget,now);
+    }
 
     /**
      * 読込みスレッド実体

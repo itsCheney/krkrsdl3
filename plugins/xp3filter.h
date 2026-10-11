@@ -1,6 +1,10 @@
 #pragma once
 #include "tjsObject.h"
 
+// Stop decoder retention and release helper VMs before the game VM is torn
+// down. The image/audio workers must already be stopped by the caller.
+void TVPResetXP3FilterSession();
+
 class CBinaryAccessor : public tTJSDispatch
 {
     unsigned int m_length;

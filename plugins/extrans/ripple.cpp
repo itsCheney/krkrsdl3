@@ -13,6 +13,10 @@
 #include "TVPTrans.h"
 #include "ripple.h"
 #include "common.h"
+#include <cmath>
+#include <cstdio>
+#include "metaltransition.h"
+#include <new>
 
 //---------------------------------------------------------------------------
 /*
@@ -69,6 +73,8 @@ class tTVPRippleTable
     tjs_int MapHeight; // 置換マップの高さ
 
     tjs_uint16* DisplaceMap; // [位置]->[方向,距離] 置換マップ
+    std::shared_ptr<const TVPLayerTransitionBytes> MetalTable;
+
     tjs_uint16* DriftMap;    // [揺れの大きさ,方向,距離]->[ずれ] 置換マップ
 
 public:
@@ -134,6 +140,22 @@ public:
     {
         return DriftMap + drift * RippleWidth * (2 * TVP_RIPPLE_DIR_PREC) +
                phase * TVP_RIPPLE_DIR_PREC;
+    }
+
+    std::shared_ptr<const TVPLayerTransitionBytes> GetMetalTable()
+    {
+        if (!MetalTable)
+        {
+            const size_t displacementCount = static_cast<size_t>(MapWidth) * MapHeight;
+            const size_t driftCount = static_cast<size_t>(MaxDrift) * TVP_RIPPLE_DRIFT_PREC *
+                                      RippleWidth * 2 * TVP_RIPPLE_DIR_PREC;
+            auto bytes = std::make_shared<TVPLayerTransitionBytes>((displacementCount + driftCount) * sizeof(tjs_uint16));
+            std::memcpy(bytes->data(), DisplaceMap, displacementCount * sizeof(tjs_uint16));
+            std::memcpy(bytes->data() + displacementCount * sizeof(tjs_uint16), DriftMap,
+                        driftCount * sizeof(tjs_uint16));
+            MetalTable = bytes;
+        }
+        return MetalTable;
     }
 
 private:
@@ -1389,6 +1411,36 @@ tjs_error tTVPRippleTransHandler::Process(tTVPDivisibleData* data)
 
     // data には領域や画像に関する情報が入っている
 
+    TVPSetTransitionMetadata("{\"time\":%llu,\"centerx\":%d,\"centery\":%d,\"rwidth\":%d,\"roundness\":%.9g,\"speed\":%.9g,\"maxdrift\":%d}", static_cast<unsigned long long>(Time), CenterX, CenterY, RippleWidth, double(Roundness), double(Speed), MaxDrift);
+    if (TVPHasDivisibleMetalTransitionSupport(data))
+    {
+        TVPLayerTransitionOperation operation;
+        bool parametersReady = false;
+        try
+        {
+            auto &p = operation.params;
+            p.kind = static_cast<int>(TVPLayerTransitionKind::Ripple);
+            p.frameWidth = Width; p.frameHeight = Height; p.ratio = BlendRatio;
+            p.centerX = CenterX; p.centerY = CenterY; p.blockSize = RippleWidth;
+            p.offsetX = DriftCarePixels;
+            p.mapWidth = Table->GetMapWidth(); p.mapHeight = Table->GetMapHeight();
+            p.driftOffset = p.mapWidth * p.mapHeight + Drift * RippleWidth * (2 * TVP_RIPPLE_DIR_PREC) +
+                            Phase * TVP_RIPPLE_DIR_PREC;
+            operation.table = Table->GetMetalTable();
+            parametersReady = true;
+        }
+        catch (const std::bad_alloc &) {
+            krkrsdl3::layer_work::RecordTransitionResult(false, "allocationFailed",
+                static_cast<uint64_t>(data->Width) * static_cast<uint64_t>(data->Height));
+            /* Software tables remain intact. */
+        }
+        // Once encoding begins, exceptions must propagate to the engine. A
+        // post-dispatch allocation failure must never replay this ROI on CPU.
+        if (parametersReady &&
+            TVPTryDivisibleMetalTransition(operation, data) == TVPLayerTransitionResult::Applied)
+            return TJS_S_OK;
+    }
+
     // 変数の準備
     tjs_int destxofs = data->DestLeft - data->Left;
     //	tjs_int destyofs = data->DestTop - data->Top;
@@ -1677,6 +1729,13 @@ public:
         if (centerx < 0 || centery < 0 || (tjs_uint)centerx >= src1w || (tjs_uint)centery >= src1h)
             TVPThrowExceptionMessage(TJS_N("centerx and centery cannot be out of the image"));
 
+        // The original half-map rounds an exact odd floor-center down. Its
+        // opposite edge then indexes outside the map. Reject that undefined
+        // software domain before either backend can construct/use the table.
+        if (((src1w & 1) && centerx == static_cast<tjs_int>(src1w >> 1)) ||
+            ((src1h & 1) && centery == static_cast<tjs_int>(src1h >> 1)))
+            TVPThrowExceptionMessage(TJS_N("ripple odd-sized image requires center away from the floor midpoint"));
+
         if (TJS_SUCCEEDED(options->GetValue(TJS_N("rwidth"), &tmp)))
             if (tmp.Type() != tvtVoid)
                 ripplewidth = (tjs_int)tmp;
@@ -1688,18 +1747,21 @@ public:
             if (tmp.Type() != tvtVoid)
                 roundness = (float)(double)tmp;
 
-        if (roundness <= 0.0)
+        if (roundness <= 0.0 || !std::isfinite(roundness))
             TVPThrowExceptionMessage(TJS_N("roundness cannot be nagative or equal to 0"));
 
         if (TJS_SUCCEEDED(options->GetValue(TJS_N("speed"), &tmp)))
             if (tmp.Type() != tvtVoid)
                 speed = (float)(double)tmp;
 
+        if (!std::isfinite(speed))
+            TVPThrowExceptionMessage(TJS_N("ripple speed must be finite"));
+
         if (TJS_SUCCEEDED(options->GetValue(TJS_N("maxdrift"), &tmp)))
             if (tmp.Type() != tvtVoid)
                 maxdrift = (tjs_int)tmp;
-        if (maxdrift < 0 || maxdrift >= 128)
-            TVPThrowExceptionMessage(TJS_N("maxdrift cannot be nagative or larger than 127"));
+        if (maxdrift <= 0 || maxdrift >= 128)
+            TVPThrowExceptionMessage(TJS_N("ripple maxdrift must be between 1 and 127"));
 
         if ((tjs_uint)maxdrift >= src1w || (tjs_uint)maxdrift >= src1h)
             TVPThrowExceptionMessage(

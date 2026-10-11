@@ -6,6 +6,7 @@
 #include "TVPMsg.h"
 #include "tjsNativeLayer.h"
 #include "RenderManager.h"
+#include "ScopedLayerPixels.h"
 
 /**
  * プロパティのキャッシュ処理用
@@ -155,6 +156,14 @@ struct layerExBase_GL
     typedef unsigned char* BufferRT;
 
     tTJSNI_Layer* _this;
+    const uint64_t ReceiverDiagnosticID=krkrsdl3::layer_hotspot::NextLayerID();
+    void SetHotspotReceiver() const noexcept {
+        auto& context=krkrsdl3::layer_hotspot::CurrentStorage();
+        context.currentLayer=_this ? _this->GetLayerDiagnosticID() : 0;
+        context.currentReceiver=ReceiverDiagnosticID;
+        context.receiverKind=krkrsdl3::layer_hotspot::ReceiverKind::LayerEx;
+    }
+
 
     GeometryT _width, _height;
     BufferT _buffer;
@@ -163,8 +172,30 @@ struct layerExBase_GL
     // クリップ情報
     GeometryT _clipLeft, _clipTop, _clipWidth, _clipHeight;
     DispatchT _obj;
+    tTVPScopedLayerPixels _pixels;
+    virtual tTVPScopedLayerPixels& currentPixelAccess() { return _pixels; }
+    const char* _pixelCaller="layerExBase";
+    void setPixelCaller(const char* name) { _pixelCaller=name; }
+    virtual void finishPixels() { currentPixelAccess().Reset(); _buffer=nullptr; _pitch=0; }
+    class PixelCall {
+        layerExBase_GL& owner;
+        bool owns;
+    public:
+        PixelCall(layerExBase_GL& value,const char* caller):owner(value),owns(!value.currentPixelAccess().Data()) {
+            if(owns) {
+                owner.setPixelCaller(caller);
+                try { owner.reset(); }
+                catch(...) { owner.finishPixels(); throw; }
+            }
+        }
+        ~PixelCall() { if(owns) owner.finishPixels(); }
+        PixelCall(const PixelCall&)=delete;
+        PixelCall& operator=(const PixelCall&)=delete;
+    };
 
-    layerExBase_GL(DispatchT obj) : _obj(obj)
+    // Extensions opt in when constructing their facade only needs metadata.
+    // LayerExDraw and LayerExImage defer pixels to a real CPU consumer.
+    layerExBase_GL(DispatchT obj, bool metadataOnly=false) : _obj(obj)
     {
         tjs_error hr;
         hr = obj->NativeInstanceSupport(TJS_NIS_GETINSTANCE, tTJSNC_Layer::ClassID,
@@ -173,22 +204,35 @@ struct layerExBase_GL
             TVPThrowExceptionMessage(TJS_N("Not Layer"));
         _buffer = nullptr;
         _pitch = 0;
-        reset();
+        if(metadataOnly) refreshMetadata(); else reset();
     }
 
-    virtual void reset()
+    void refreshMetadata()
     {
         _width = (GeometryT)_this->GetImageWidth();
         _height = (GeometryT)_this->GetImageHeight();
-        if (TVPIsSoftwareRenderManager() || TVPMetalLayerCompositionActive())
-        {
-            _buffer = (BufferT)_this->GetMainImagePixelBufferForWrite();
-            _pitch = (PitchT)_this->GetMainImagePixelBufferPitch();
-        }
         _clipLeft = (GeometryT)_this->GetClipLeft();
         _clipTop = (GeometryT)_this->GetClipTop();
         _clipWidth = (GeometryT)_this->GetClipWidth();
         _clipHeight = (GeometryT)_this->GetClipHeight();
+    }
+
+    virtual void reset()
+    {
+        auto& pixels=currentPixelAccess();
+        pixels.Reset();
+        _buffer = nullptr;
+        _pitch = 0;
+        refreshMetadata();
+        if (TVPIsSoftwareRenderManager() || TVPMetalLayerCompositionActive())
+        {
+            pixels.Acquire(_obj,true,_pixelCaller);
+            _buffer = (BufferT)pixels.Data();
+            _pitch = (PitchT)pixels.Pitch();
+        }
+        // Some native operations bypass the clip (raster copies/record redraw).
+        // Derived operations may narrow this only when their writes are known.
+        pixels.Written(tTVPRect(0,0,_width,_height));
     }
     virtual void redraw()
     {

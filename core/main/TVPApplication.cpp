@@ -26,6 +26,9 @@
 #include "TVPCompositor.h"
 #include "KRMovieOverlay.h"
 #include "tjsNativeVideoOverlay.h"
+#include "emoteplayer/emoteresourcecache.h"
+#include "emoteplayer/emotesession.h"
+#include "xp3filter.h"
 
 #include "TVPStorage.h"
 #include "TVPColor.h"
@@ -35,6 +38,21 @@
 tTVPApplication* Application = NULL;
 static tTJSCriticalSection _NoMemCallBackCS;
 static void* _reservedMem = malloc(1024 * 1024 * 4); // 4M reserved mem
+
+struct tTVPClearEmoteResourceCacheCallback : public tTVPCompactEventCallbackIntf
+{
+    void OnCompact(tjs_int level) override
+    {
+        if (level >= TVP_COMPACT_LEVEL_MINIMIZE)
+        {
+            // Trim instead of clearing. Games call System.doCompact() routinely
+            // (for example before movies); a full clear turns every later load
+            // of the same resource into a disk read plus a full parse again.
+            emoteplayer::TrimSharedEmoteResourceCache("memoryCompact");
+        }
+    }
+};
+static tTVPClearEmoteResourceCacheCallback TVPClearEmoteResourceCacheCallback;
 
 ttstr TVPGetErrorDialogTitle()
 {
@@ -84,10 +102,14 @@ tTVPApplication::tTVPApplication()
 tTVPApplication::~tTVPApplication()
 {
     delete image_load_thread_;
+    // Also cover partially initialized sessions that never reach OnExit.
+    emoteplayer::ClearSharedEmoteResourceCache("appDestroy");
 }
 
 bool tTVPApplication::StartApplication()
 {
+    emoteplayer::ClearSharedEmoteResourceCache("sessionStart");
+    TVPAddCompactEventHook(&TVPClearEmoteResourceCacheCallback, true);
     TVPTerminated = false;
     TVPTerminateOnWindowClose = true;
     TVPTerminateOnNoWindowStartup = true;
@@ -194,7 +216,13 @@ void tTVPApplication::OnExit()
     // plugin formats). Run them before at-exit clears archive caches/factories.
     if (TVPGetScriptEngine())
         TVPDeliverCompactEvent(TVP_COMPACT_LEVEL_MAX);
+    // Finish session-owned native layers/callbacks before at-exit/plugin/VM
+    // teardown. They must never root or refer to a previous game's objects.
+    emoteplayer::ResetEmotePlayerSession();
     TVPSystemUninit();
+    // Wave decoder workers stop inside SystemUninit; image loading stopped
+    // above. No worker can retain/use an XP3 helper VM during this reset.
+    TVPResetXP3FilterSession();
     TVPUnloadPlugins();
     TVPResetEventState();
     TVPResetGraphicSessionState();
@@ -206,9 +234,13 @@ void tTVPApplication::OnExit()
     TVPUninitScriptEngine();
     TVPClearAllAutoPath();
     TVPClearAllWindows();
+    // Script finalizers can repopulate image caches after the first reset.
+    TVPResetGraphicSessionState();
     krkrsdl3::TVPClearAllTexture();
     iTVPTexture2D::RecycleProcess();
     TVPProjectDirSelected = false;
+    // Save callbacks and script finalizers may load resources during shutdown.
+    emoteplayer::ClearSharedEmoteResourceCache("sessionExit");
 }
 
 void tTVPApplication::LoadImageRequest(class iTJSDispatch2* owner,

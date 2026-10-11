@@ -26,6 +26,7 @@ static tjs_int32 ClassID_Dictionary;
 tjs_uint32 tTJSDictionaryClass::ClassID = (tjs_uint32)-1;
 tTJSDictionaryClass::tTJSDictionaryClass() : tTJSNativeClass(TJS_N("Dictionary"))
 {
+    UseDirectMemberCopy = true;
     // TJS class constructor
 
     TJS_BEGIN_NATIVE_MEMBERS(/*TJS class name*/ Dictionary)

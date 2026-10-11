@@ -1,5 +1,8 @@
 #include "tjsCommHead.h"
 #include "RenderManager.h"
+#include "LayerPerspectiveGeometry.h"
+#include <climits>
+#include <algorithm>
 
 #include "TVPMsg.h"
 #include "LayerBitmap.h"
@@ -355,65 +358,6 @@ inline void GetAffineTransform(
 // Rearranged:
 //   a*src_x + b*src_y + c - g*src_x*dst_x - h*src_y*dst_x = dst_x
 //   d*src_x + e*src_y + f - g*src_x*dst_y - h*src_y*dst_y = dst_y
-inline bool GetPerspectiveTransform(
-    const double* srcX, const double* srcY,
-    const double* dstX, const double* dstY,
-    double* mat8) // [a,b,c,d,e,f,g,h] for matrix [[a,b,c],[d,e,f],[g,h,1]]
-{
-    // Set up 8x8 linear system
-    // Actually solve using the standard technique: 
-    // We have 8 unknowns. Form matrix equation and solve via Gaussian elimination.
-    
-    double M[8][9]; // augmented matrix
-    for (int i = 0; i < 4; ++i)
-    {
-        int r = i * 2;
-        // Equation for dst_x
-        M[r][0] = srcX[i];  M[r][1] = srcY[i];  M[r][2] = 1.0;
-        M[r][3] = 0.0;      M[r][4] = 0.0;      M[r][5] = 0.0;
-        M[r][6] = -srcX[i] * dstX[i]; M[r][7] = -srcY[i] * dstX[i];
-        M[r][8] = dstX[i];
-        // Equation for dst_y
-        M[r+1][0] = 0.0;    M[r+1][1] = 0.0;    M[r+1][2] = 0.0;
-        M[r+1][3] = srcX[i]; M[r+1][4] = srcY[i]; M[r+1][5] = 1.0;
-        M[r+1][6] = -srcX[i] * dstY[i]; M[r+1][7] = -srcY[i] * dstY[i];
-        M[r+1][8] = dstY[i];
-    }
-
-    // Gaussian elimination with partial pivoting
-    for (int col = 0; col < 8; ++col)
-    {
-        // Find pivot
-        int maxRow = col;
-        double maxVal = fabs(M[col][col]);
-        for (int row = col + 1; row < 8; ++row)
-        {
-            double v = fabs(M[row][col]);
-            if (v > maxVal) { maxVal = v; maxRow = row; }
-        }
-        if (maxVal < 1e-15) return false; // singular
-        if (maxRow != col) std::swap(M[col], M[maxRow]);
-
-        // Eliminate rows below
-        for (int row = col + 1; row < 8; ++row)
-        {
-            double factor = M[row][col] / M[col][col];
-            for (int j = col; j <= 8; ++j)
-                M[row][j] -= factor * M[col][j];
-        }
-    }
-
-    // Back substitution
-    for (int row = 7; row >= 0; --row)
-    {
-        double sum = M[row][8];
-        for (int j = row + 1; j < 8; ++j)
-            sum -= M[row][j] * mat8[j];
-        mat8[row] = sum / M[row][row];
-    }
-    return true;
-}
-
 // ======================================================================
 // Warp image using affine transform (inverse mapping)
 // mat6 = [a,b,c,d,e,f] transforms src->dst: dst_x = a*src_x + b*src_y + c
@@ -476,42 +420,13 @@ inline void WarpAffineRGBA(
 //                    dst_y = (d*src_x + e*src_y + f) / (g*src_x + h*src_y + 1)
 // We compute inverse by solving per-pixel
 // ======================================================================
-inline void WarpPerspectiveRGBA(
-    const uint8_t* src, int srcW, int srcH, int srcPitch,
-    uint8_t* dst, int dstW, int dstH, int dstPitch,
-    const double* mat8, // [a,b,c,d,e,f,g,h]
-    int mode)
+inline void WarpPerspectiveInverseRGBA(
+    const uint8_t* src,int srcW,int srcH,int srcPitch,
+    uint8_t* dst,int dstW,int dstH,int dstPitch,const double* inverse,int mode)
 {
-    // For perspective transform, we iterate over destination pixels
-    // and compute source coordinates using the inverse transform.
-    // The inverse perspective transform is another perspective transform.
-    // We compute it by inverting the 3x3 matrix.
-    
-    double a = mat8[0], b = mat8[1], c = mat8[2];
-    double d = mat8[3], e = mat8[4], f = mat8[5];
-    double g = mat8[6], h = mat8[7];
-    
-    // Build 3x3 matrix: [[a,b,c],[d,e,f],[g,h,1]]
-    // Invert it
-    double det = a*(e*1 - f*h) - b*(d*1 - f*g) + c*(d*h - e*g);
-    if (fabs(det) < 1e-15)
-    {
-        memset(dst, 0, dstPitch * dstH);
-        return;
-    }
-    double invDet = 1.0 / det;
-    
-    // Inverse matrix
-    double invA = (e * 1 - f * h) * invDet;
-    double invB = (c * h - b * 1) * invDet;
-    double invC = (b * f - c * e) * invDet;
-    double invD = (f * g - d * 1) * invDet;
-    double invE = (a * 1 - c * g) * invDet;
-    double invF = (c * d - a * f) * invDet;
-    double invG = (d * h - e * g) * invDet;
-    double invH = (b * g - a * h) * invDet;
-    double invI = (a * e - b * d) * invDet;
-    
+    const double invA=inverse[0],invB=inverse[1],invC=inverse[2];
+    const double invD=inverse[3],invE=inverse[4],invF=inverse[5];
+    const double invG=inverse[6],invH=inverse[7],invI=inverse[8];
     for (int y = 0; y < dstH; ++y)
     {
         uint8_t* dline = dst + y * dstPitch;
@@ -529,7 +444,7 @@ inline void WarpPerspectiveRGBA(
             }
             float sx = (float)((invA * cx + invB * cy + invC) / denom);
             float sy = (float)((invD * cx + invE * cy + invF) / denom);
-            if (sx < 0.5f || sx >= srcW - 0.5f || sy < 0.5f || sy >= srcH - 0.5f)
+            if (!std::isfinite(sx) || !std::isfinite(sy) || sx < 0.5f || sx >= srcW - 0.5f || sy < 0.5f || sy >= srcH - 0.5f)
             {
                 *(uint32_t*)dline = 0;
                 dline += 4;
@@ -547,6 +462,14 @@ inline void WarpPerspectiveRGBA(
     }
 }
 
+inline void WarpPerspectiveRGBA(
+    const uint8_t* src,int srcW,int srcH,int srcPitch,
+    uint8_t* dst,int dstW,int dstH,int dstPitch,const double* forward,int mode)
+{
+    double inverse[9];
+    if(!InvertPerspectiveTransform(forward,inverse)) { memset(dst,0,size_t(dstPitch)*dstH);return; }
+    WarpPerspectiveInverseRGBA(src,srcW,srcH,srcPitch,dst,dstW,dstH,dstPitch,inverse,mode);
+}
 } // namespace TVPImageUtils
 
 //---------------------------------------------------------------------------
@@ -1762,7 +1685,7 @@ class tTVPRenderMethod_UnivTransBlt : public tTVPRenderMethod_Software
 {
 protected:
     tjs_int tpitch, spitch, dpitch, rpitch;
-    tjs_int phase, vague;
+    tjs_int phase = 0, vague = 0;
     tjs_uint32 BlendTable[256];
 
 public:
@@ -1806,10 +1729,12 @@ public:
         {
             case 0:
                 phase = v;
+                GpuOperation.phase = v;
                 FuncInitTable(BlendTable, phase, vague);
                 break;
             case 1:
                 vague = v;
+                GpuOperation.vague = v;
                 break;
             default:
                 break;
@@ -1902,6 +1827,25 @@ public:
     }
 };
 
+class tTVPRenderMethod_ChannelMask : public tTVPRenderMethod_BaseBlt<tjs_uint32,52>
+{
+    bool multiply;
+public:
+    explicit tTVPRenderMethod_ChannelMask(bool value):multiply(value) {}
+    void PartialFill(iTVPTexture2D* dst,iTVPTexture2D* src,tjs_int sx,tjs_int sy,
+                     tjs_int dx,tjs_int dy,tjs_int w,tjs_int h) override {
+        for(int y=0;y<h;++y) {
+            auto* d=static_cast<tjs_uint32*>(dst->GetScanLineForWrite(dy+y))+dx;
+            auto* s=static_cast<const tjs_uint32*>(src->GetScanLineForRead(sy+y))+sx;
+            for(int x=0;x<w;++x) {
+                tjs_uint32 alpha=s[x]&255u;
+                if(multiply) { const auto product=(d[x]>>24)*(s[x]>>24); alpha=(product+(product>>7))>>8; }
+                d[x]=(d[x]&0xffffffu)|(alpha<<24);
+            }
+        }
+    }
+};
+
 template<int THREAD_FACTOR, void (*&FuncWithOpa)(tjs_uint32*, const tjs_uint32*, tjs_int, tjs_int)>
 class tTVPRenderMethod_BltWithOpa : public tTVPRenderMethod_BaseBlt<tjs_uint32, THREAD_FACTOR>
 {
@@ -1970,9 +1914,26 @@ public:
 template<void (*&Func)(tjs_uint32*, tjs_int, tTVPGLGammaAdjustTempData*)>
 class tTVPRenderMethod_AdjustGamma : public tTVPRenderMethod_Software
 {
-    tTVPGLGammaAdjustTempData temp;
+    tTVPGLGammaAdjustTempData temp{};
+    uint64_t gammaVersion = 0;
+    void SnapshotLUT(const tTVPGLGammaAdjustTempData& next) {
+        static_assert(sizeof(temp) == 768, "Gamma snapshot must preserve software B/G/R layout");
+        if (GpuOperation.gammaLUT && !std::memcmp(GpuOperation.gammaLUT->bytes.data(), &next, sizeof(next))) {
+            temp = next;
+            return;
+        }
+        auto snapshot = std::make_shared<TVPLayerGammaLUT>();
+        snapshot->version = gammaVersion + 1;
+        std::memcpy(snapshot->bytes.data(), &next, sizeof(next));
+        temp = next;
+        gammaVersion = snapshot->version;
+        GpuOperation.gammaLUT = std::move(snapshot);
+    }
 
 public:
+    // Keep the software singleton's original zero-initialized LUT until a
+    // caller supplies parameters. Never substitute an identity curve here.
+    tTVPRenderMethod_AdjustGamma() { SnapshotLUT(temp); }
     virtual int EnumParameterID(const char* name)
     {
         if (!strcmp(name, "gammaAdjustData"))
@@ -1981,7 +1942,9 @@ public:
     }
     virtual void SetParameterPtr(int id, const void* data)
     {
-        TVPInitGammaAdjustTempData(&temp, (tTVPGLGammaAdjustData*)data);
+        tTVPGLGammaAdjustTempData next{};
+        TVPInitGammaAdjustTempData(&next, (const tTVPGLGammaAdjustData*)data);
+        SnapshotLUT(next);
     }
 
     virtual void DoRender(iTVPTexture2D* _tar,
@@ -2390,6 +2353,15 @@ class tTVPRenderMethod_DoBoxBlur : public tTVPRenderMethod_DirectCopy
     tTVPRect area;
 
 public:
+    bool DescribeGpuOperation(TVPLayerOperation& operation) const override
+    {
+        if(!iTVPRenderMethod::DescribeGpuOperation(operation)) return false;
+        const int64_t width=int64_t(area.right)-area.left+1;
+        const int64_t height=int64_t(area.bottom)-area.top+1;
+        if(width<=0 || height<=0 || width>INT_MAX || height>INT_MAX) return false;
+        operation.phase=int(width); operation.vague=int(height);
+        return true;
+    }
     virtual int EnumParameterID(const char* name)
     {
         if (!strcmp(name, "area_left"))
@@ -2673,10 +2645,19 @@ void iTVPRenderManager::Initialize()
 
 void iTVPRenderManager::RegisterRenderMethod(const char* name, iTVPRenderMethod* method)
 {
+    if (!name || !method) {
+        TVPConsoleLog("render.registerFailed name=%s backend=%s reason=null_method_or_name",
+                      name ? name : "<null>", GetName());
+        return;
+    }
     tjs_uint32 hash = tTJSHashFunc<tjs_char*>::Make(name);
     assert(method && AllMethods.find(hash) == AllMethods.end());
+    if (AllMethods.find(hash) != AllMethods.end()) return;
     AllMethods[hash] = method;
-    method->SetName(name);
+    // Aliases share the same method object. Keep its first/canonical name for
+    // diagnostic attribution instead of relabeling AlphaBlend as its HDA alias.
+    if (method->GetName().empty()) method->SetName(name);
+    MethodRegistrations.push_back({name, method->GetName(), method});
     // Canonical software methods live for the process. Semantic metadata is
     // attached to those same objects, so static pointers/parameter IDs remain
     // valid across software and GPU sessions (including registered aliases).
@@ -2690,6 +2671,14 @@ void iTVPRenderManager::RegisterRenderMethod(const char* name, iTVPRenderMethod*
         {"ConstColorAlphaBlend", K::FillBlend, TVP_LAYER_HOLD_ALPHA, true},
         {"ConstColorAlphaBlend_d", K::FillBlend, TVP_LAYER_DEST_ALPHA, true},
         {"ConstColorAlphaBlend_a", K::FillBlend, TVP_LAYER_DEST_PREMULTIPLIED, true},
+        {"RemoveConstOpacity", K::RemoveConstOpacity, 0, true},
+        {"ConstAlphaBlend_SD", K::ConstAlphaSD, 0, true},
+        {"ConstAlphaBlend_SD_d", K::ConstAlphaSD, TVP_LAYER_DEST_ALPHA, true},
+        {"ConstAlphaBlend_SD_a", K::ConstAlphaSD, TVP_LAYER_DEST_PREMULTIPLIED, true},
+        {"AlphaBlend_SD", K::AlphaSD, 0, true},
+        {"UnivTransBlend", K::UnivTrans, 0, false},
+        {"UnivTransBlend_d", K::UnivTrans, TVP_LAYER_DEST_ALPHA, false},
+        {"UnivTransBlend_a", K::UnivTrans, TVP_LAYER_DEST_PREMULTIPLIED, false},
         {"AlphaBlend", K::Alpha, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
         {"AlphaBlend_HDA", K::Alpha, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
         {"AlphaBlend_d", K::Alpha, TVP_LAYER_DEST_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
@@ -2701,12 +2690,64 @@ void iTVPRenderManager::RegisterRenderMethod(const char* name, iTVPRenderMethod*
         {"ApplyColorMap", K::ColorMap, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
         {"ApplyColorMap_d", K::ColorMap, TVP_LAYER_DEST_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
         {"ApplyColorMap_a", K::ColorMap, TVP_LAYER_DEST_PREMULTIPLIED | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"AdditiveAlphaBlend", K::AdditiveAlpha, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"AdditiveAlphaBlend_a", K::AdditiveAlpha, TVP_LAYER_DEST_PREMULTIPLIED | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsMulBlend", K::PsMul, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsOverlayBlend", K::PsOverlay, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsHardLightBlend", K::PsHardLight, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsScreenBlend", K::PsScreen, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsColorDodge5Blend", K::PsColorDodge5, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsAlphaBlend", K::PsAlpha, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsAddBlend", K::PsAdd, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsSubBlend", K::PsSub, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsSoftLightBlend", K::PsSoftLight, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsColorDodgeBlend", K::PsColorDodge, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsColorBurnBlend", K::PsColorBurn, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsLightenBlend", K::PsLighten, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsDarkenBlend", K::PsDarken, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsDiffBlend", K::PsDiff, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsDiff5Blend", K::PsDiff5, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"PsExclusionBlend", K::PsExclusion, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"AddBlend", K::Add, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"SubBlend", K::Sub, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"MulBlend", K::Mul, TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"MulBlend_HDA", K::Mul, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"ColorDodgeBlend", K::ColorDodge, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"DarkenBlend", K::Darken, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"LightenBlend", K::Lighten, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"ScreenBlend", K::Screen, TVP_LAYER_HOLD_ALPHA | TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"RemoveOpacity", K::RemoveOpacity, TVP_LAYER_FULL_OPACITY_BRANCH, true},
+        {"AdditiveAlphaToAlpha", K::AdditiveAlphaToAlpha, 0, false},
+        {"AdjustGamma", K::AdjustGamma, 0, false},
+        {"AdjustGamma_a", K::AdjustGamma, TVP_LAYER_DEST_PREMULTIPLIED, false},
+        {"AlphaToAdditiveAlpha", K::AlphaToAdditiveAlpha, 0, false},
+        {"DoGrayScale", K::GrayScale, 0, false},
+        {"CopyBlueToAlpha", K::CopyBlueToAlpha, 0, false},
+        {"MultiplyAlpha", K::MultiplyAlpha, 0, false},
+        {"BoxBlur", K::BoxBlur, 0, false},
+        {"BoxBlurAlpha", K::BoxBlur, 0, false},
     };
     for (const auto& entry : entries)
         if (!strcmp(name, entry.name)) {
             method->ConfigureGpuOperation(entry.kind, entry.flags, entry.opacity);
             break;
         }
+}
+
+const iTVPRenderMethod* iTVPRenderManager::FindRegisteredRenderMethod(const char* name) const
+{
+    if (!name) return nullptr;
+    auto it = AllMethods.find(tTJSHashFunc<tjs_char*>::Make(name));
+    return it == AllMethods.end() ? nullptr : it->second;
+}
+
+std::vector<TVPRenderMethodRegistration> iTVPRenderManager::GetRenderMethodRegistrations() const
+{
+    auto snapshot = MethodRegistrations;
+    std::sort(snapshot.begin(), snapshot.end(), [](const auto& a, const auto& b) {
+        return a.name < b.name;
+    });
+    return snapshot;
 }
 
 iTVPRenderMethod* iTVPRenderManager::CompileRenderMethod(const char* name,
@@ -2717,6 +2758,11 @@ iTVPRenderMethod* iTVPRenderManager::CompileRenderMethod(const char* name,
     auto it = AllMethods.find(tTJSHashFunc<tjs_char*>::Make(name));
     assert(it == AllMethods.end());
     iTVPRenderMethod* method = GetRenderMethodFromScript(script, nTex, flags);
+    if (!method) {
+        TVPConsoleLog("render.compileFailed name=%s backend=%s reason=unsupported_or_failed",
+                      name, GetName());
+        return nullptr;
+    }
     RegisterRenderMethod(name, method);
     return method;
 }
@@ -2790,6 +2836,7 @@ class tTVPSoftwareRenderManager : public iTVPRenderManager
     };
 
     tTVPBBStretchType StretchType;
+    bool negativePerspectiveStretch = false;
 
     iTVPTexture2D* tempTexture;
 
@@ -2996,6 +3043,7 @@ public:
         REGISER_BLEND_4(56, Lighten);
         REGISER_BLEND_4(42, Screen);
         REGISER_BLEND_4(52, AdditiveAlpha);
+        RegisterRenderMethod("AdditiveAlphaBlend_HDA", GetRenderMethod("AdditiveAlphaBlend"));
         {
             static tTVPRenderMethod_BltAndOpa<52, TVPAdditiveAlphaBlend_a, TVPAdditiveAlphaBlend_ao>
                 method;
@@ -3005,6 +3053,7 @@ public:
         REGISER_BLEND_4(30, PsAdd);
         REGISER_BLEND_4(29, PsSub);
         REGISER_BLEND_4(27, PsMul);
+        RegisterRenderMethod("PsMulBlend_HDA", GetRenderMethod("PsMulBlend"));
     }
 
     void Register_4()
@@ -3012,6 +3061,8 @@ public:
         REGISER_BLEND_4(27, PsScreen);
         REGISER_BLEND_4(15, PsOverlay);
         REGISER_BLEND_4(15, PsHardLight);
+        RegisterRenderMethod("PsOverlayBlend_HDA", GetRenderMethod("PsOverlayBlend"));
+        RegisterRenderMethod("PsHardLightBlend_HDA", GetRenderMethod("PsHardLightBlend"));
         REGISER_BLEND_4(10, PsSoftLight);
         REGISER_BLEND_4(10, PsColorDodge);
         REGISER_BLEND_4(10, PsColorDodge5);
@@ -3043,6 +3094,11 @@ public:
         {
             static tTVPRenderMethod_DoGrayScale method;
             RegisterRenderMethod("DoGrayScale", &method);
+        }
+        {
+            static tTVPRenderMethod_ChannelMask copyBlue(false), multiplyAlpha(true);
+            RegisterRenderMethod("CopyBlueToAlpha",&copyBlue);
+            RegisterRenderMethod("MultiplyAlpha",&multiplyAlpha);
         }
         {
             static tTVPRenderMethod_DoBoxBlur<TDoBoxBlurLoop<tTVPARGB<tjs_uint16>>,
@@ -3138,8 +3194,9 @@ public:
         switch (id)
         {
             case eParameters::StretchType:
+                negativePerspectiveStretch = Value < 0;
                 StretchType = (tTVPBBStretchType)Value;
-                if (StretchType > sizeof(stretchMode) / sizeof(stretchMode[0]))
+                if (StretchType >= sizeof(stretchMode) / sizeof(stretchMode[0]))
                 {
                     StretchType = (tTVPBBStretchType)(sizeof(stretchMode) / sizeof(stretchMode[0]) - 1);
                 }
@@ -4849,105 +4906,37 @@ public:
                                     const tTVPPointD* pttar /*quad*/,
                                     const tRenderTexQuadArray& textures) override
     {
-        assert(textures.size() == 1);
-        for (int i = 0; i < textures.size(); ++i)
+        if(nQuads<0 || !target || !method || textures.size()!=1 || !textures[0].first ||
+           target->GetFormat()!=TVPTextureFormat::RGBA || textures[0].first->GetFormat()!=TVPTextureFormat::RGBA || negativePerspectiveStretch)
+            TVPThrowExceptionMessage(TJS_N("Invalid perspective geometry"));
+        tTVPRect clip;
+        if(nQuads==0 || !TVPIntersectRect(&clip,rcclip,tTVPRect(0,0,target->GetWidth(),target->GetHeight()))) return;
+        if(!pttar || !textures[0].second) TVPThrowExceptionMessage(TJS_N("Invalid perspective geometry"));
+        iTVPTexture2D* src=textures[0].first;
+        std::vector<TVPLayerPerspectiveQuad> quads(size_t(nQuads),TVPLayerPerspectiveQuad{});
+        for(int i=0;i<nQuads;++i)
+            if(!layer_perspective::PrepareQuad(pttar+i*4,textures[0].second+i*4,src->GetWidth(),src->GetHeight(),
+                    TVPLayerRect{clip.left,clip.top,clip.right,clip.bottom},quads[i]))
+                TVPThrowExceptionMessage(TJS_N("Invalid perspective geometry"));
+        // Validate every quad before decompression, allocation or target writes.
+        src->GetScanLineForRead(0);
+        for(const auto& quad:quads)
         {
-            textures[i].first->GetScanLineForRead(0); // prepare pixel data for compressed texture
-        }
-        iTVPTexture2D* dst = target;
-        const tTVPPointD* dstpt = pttar;
-        iTVPTexture2D* src = textures[0].first;
-        const tTVPPointD* srcpt = textures[0].second;
-        for (int i = 0; i < nQuads; ++i)
-        {
-            bool isSrcRect = // route for square rect
-                isDoubleEqual(srcpt[0].y, srcpt[1].y) && isDoubleEqual(srcpt[1].x, srcpt[3].x) &&
-                isDoubleEqual(srcpt[0].x, srcpt[2].x) && isDoubleEqual(srcpt[2].y, srcpt[3].y) &&
-                isDoubleEqual(dstpt[0].y, dstpt[1].y) && isDoubleEqual(dstpt[1].x, dstpt[3].x) &&
-                isDoubleEqual(dstpt[0].x, dstpt[2].x) && isDoubleEqual(dstpt[2].y, dstpt[3].y);
-            bool processed = false;
-
-            if (isSrcRect)
-                do
-                {
-                    tTVPRect dstrect(dstpt[0].x, dstpt[0].y, dstpt[2].x, dstpt[2].y);
-                    tTVPRect refrect(srcpt[0].x, srcpt[0].y, srcpt[2].x, srcpt[2].y);
-                    if (dstrect.left > dstrect.right || dstrect.top > dstrect.bottom ||
-                        refrect.left > refrect.right || refrect.top > refrect.bottom)
-                        break;
-                    const tTVPRect& cr = rcclip;
-
-                    if (refrect.right < refrect.left && dstrect.right < dstrect.left)
-                    {
-                        std::swap(refrect.left, refrect.right);
-                        std::swap(dstrect.left, dstrect.right);
-                    }
-                    if (refrect.bottom < refrect.top && dstrect.bottom < dstrect.top)
-                    {
-                        std::swap(refrect.bottom, refrect.top);
-                        std::swap(dstrect.bottom, dstrect.top);
-                    }
-                    tTVPRect rcdest;
-                    if (TVPIntersectRect(&rcdest, cr, dstrect))
-                    {
-                        tjs_int dw = dstrect.get_width(), dh = dstrect.get_height();
-                        tjs_int rw = refrect.get_width(), rh = refrect.get_height();
-
-                        if (rcdest.left > dstrect.left)
-                        {
-                            refrect.left += (float)rw / dw * (rcdest.left - dstrect.left);
-                        }
-                        if (rcdest.right < dstrect.right)
-                        {
-                            refrect.right -= (float)rw / dw * (dstrect.right - rcdest.right);
-                        }
-                        if (rcdest.top > dstrect.top)
-                        {
-                            refrect.top += (float)rh / dh * (rcdest.top - dstrect.top);
-                        }
-                        if (rcdest.bottom < dstrect.bottom)
-                        {
-                            refrect.bottom -= (float)rh / dh * (dstrect.bottom - rcdest.bottom);
-                        }
-                        OperateRect(method, target, rcdest, src, refrect);
-                        processed = true;
-                    }
-                } while (false);
-            if (!processed)
-            {
-                const uint8_t* sdata;
-                int spitch = src->GetPitch();
-                sdata = (const uint8_t*)src->GetPixelData();
-                int dst_img_w = rcclip.get_width(), dst_img_h = rcclip.get_height();
-                size_t dstPitch = (dst_img_w * 4 + 7) & ~7;
-                uint8_t* dstData = new uint8_t[dstPitch * dst_img_h];
-                int src_img_w = src->GetWidth(), src_img_h = src->GetHeight();
-
-                // upper-left, upper-right, bottom-right, bottom-left
-                double pts_src_x[4] = { srcpt[0].x, srcpt[1].x + 1, srcpt[3].x + 1, srcpt[2].x };
-                double pts_src_y[4] = { srcpt[0].y, srcpt[1].y, srcpt[3].y + 1, srcpt[2].y + 1 };
-                double pts_dst_x[4] = { dstpt[0].x - rcclip.left, dstpt[1].x - rcclip.left, dstpt[3].x - rcclip.left, dstpt[2].x - rcclip.left };
-                double pts_dst_y[4] = { dstpt[0].y - rcclip.top, dstpt[1].y - rcclip.top, dstpt[3].y - rcclip.top, dstpt[2].y - rcclip.top };
-
-                double perspMat[8];
-                TVPImageUtils::GetPerspectiveTransform(pts_src_x, pts_src_y, pts_dst_x, pts_dst_y, perspMat);
-                TVPImageUtils::WarpPerspectiveRGBA(
-                    sdata, src_img_w, src_img_h, spitch,
-                    dstData, dst_img_w, dst_img_h, (int)dstPitch,
-                    perspMat, stretchMode[StretchType]);
-
-                iTVPTexture2D* tmp = new tTVPSoftwareTexture2D_static(
-                    dstData, (int)dstPitch, dst_img_w, dst_img_h, TVPTextureFormat::RGBA);
-                tTVPRect rc(0, 0, dst_img_w, dst_img_h);
-
-                ((tTVPRenderMethod_Software*)method)
-                    ->DoRender(target, rcclip, target, rcclip, tmp, rc, nullptr, rc);
-                tmp->Release();
-                delete[] dstData;
+            if(quad.rectangle) {
+                if(quad.destination.Width()<=0 || quad.destination.Height()<=0) continue;
+                OperateRect(method,target,tTVPRect(quad.destination.left,quad.destination.top,quad.destination.right,quad.destination.bottom),
+                    src,tTVPRect(quad.source.left,quad.source.top,quad.source.right,quad.source.bottom));
+                continue;
             }
-
-            dstpt += 4;
-            srcpt += 4;
+            const int width=clip.get_width(),height=clip.get_height();
+            const size_t pitch=(size_t(width)*4+7)&~size_t(7);
+            std::vector<uint8_t> pixels(pitch*height);
+            TVPImageUtils::WarpPerspectiveInverseRGBA(static_cast<const uint8_t*>(src->GetPixelData()),src->GetWidth(),src->GetHeight(),src->GetPitch(),
+                pixels.data(),width,height,int(pitch),quad.inverse,StretchType==0?0:1);
+            iTVPTexture2D* tmp=new tTVPSoftwareTexture2D_static(pixels.data(),int(pitch),width,height,TVPTextureFormat::RGBA);
+            tTVPRect rect(0,0,width,height);
+            ((tTVPRenderMethod_Software*)method)->DoRender(target,clip,target,clip,tmp,rect,nullptr,rect);
+            tmp->Release();
         }
     }
 };
