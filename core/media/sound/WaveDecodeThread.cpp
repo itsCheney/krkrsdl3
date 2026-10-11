@@ -135,13 +135,16 @@ private:
 
         if (target)
         {
-            target->FillL2Buffer(false, true);
+            const bool filled = target->FillL2Buffer(false, true);
             target->DecodeInProgress.store(false, std::memory_order_release);
+            // A playing buffer stays DecodeActive while its L2 ring is full, and
+            // FillL2Buffer then returns false at once. Looping without a wait
+            // kept one core at 100% per playing sound. A unit is 1/8 s of audio,
+            // so the 10 ms wait below cannot starve playback.
+            if (filled)
+                return;
         }
-        else
-        {
-            _wakeEvent.WaitFor(10);
-        }
+        _wakeEvent.WaitFor(10);
     }
 };
 //---------------------------------------------------------------------------
