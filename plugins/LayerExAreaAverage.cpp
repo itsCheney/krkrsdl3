@@ -1,6 +1,7 @@
 #include "ncbind/ncbind.hpp"
 
 #include "Platform.h"
+#include "ScopedLayerPixels.h"
 
 #define NCB_MODULE_NAME TJS_N("layerExAreaAverage.dll")
 
@@ -35,10 +36,9 @@ struct layerExAreaAverage
         dImageWidth = (tjs_int)val;
         objthis->PropGet(0, TJS_N("imageHeight"), NULL, &val, objthis);
         dImageHeight = (tjs_int)val;
-        objthis->PropGet(0, TJS_N("mainImageBufferPitch"), NULL, &val, objthis);
-        dPitch = (tjs_int)val;
-        objthis->PropGet(0, TJS_N("mainImageBufferForWrite"), NULL, &val, objthis);
-        dBuffer = (tjs_uint8*)(tjs_intptr_t)(tjs_int64)val;
+        tTVPScopedLayerPixels destination(objthis,true,"layerExAreaAverage.write");
+        dPitch = destination.Pitch();
+        dBuffer = static_cast<tjs_uint8*>(destination.Data());
 
         //	転送先の位置、サイズを取得
         tjs_int dLeft, dTop, dWidth, dHeight;
@@ -55,10 +55,9 @@ struct layerExAreaAverage
         sImageWidth = (tjs_int)val;
         srcobj->PropGet(0, TJS_N("imageHeight"), NULL, &val, srcobj);
         sImageHeight = (tjs_int)val;
-        srcobj->PropGet(0, TJS_N("mainImageBufferPitch"), NULL, &val, srcobj);
-        sPitch = (tjs_int)val;
-        srcobj->PropGet(0, TJS_N("mainImageBuffer"), NULL, &val, srcobj);
-        sBuffer = (tjs_uint8*)(tjs_intptr_t)(tjs_int64)val;
+        tTVPScopedLayerPixels source(srcobj,false,"layerExAreaAverage.read");
+        sPitch = source.Pitch();
+        sBuffer = static_cast<tjs_uint8*>(source.Data());
 
         //	転送元の位置、サイズを取得
         tjs_int sLeft, sTop, sWidth, sHeight;
@@ -101,6 +100,7 @@ struct layerExAreaAverage
         }
 
         fixdot sl = INT2FIXDOT(sLeft);
+        destination.Written(tTVPRect(dLeft,dTop,dLeft+dWidth,dTop+dHeight));
         fixdot st = INT2FIXDOT(sTop);
         fixdot rw = REAL2FIXDOT((tjs_real)sWidth / dWidth);
         fixdot rh = REAL2FIXDOT((tjs_real)sHeight / dHeight);
@@ -213,6 +213,7 @@ struct layerExAreaAverage
             val[2] = (tjs_int64)dWidth;
             val[3] = (tjs_int64)dHeight;
             static tjs_uint32 update_hint = 0;
+            destination.Reset();
             objthis->FuncCall(0, TJS_N("update"), &update_hint, NULL, 4, pval, objthis);
         }
 

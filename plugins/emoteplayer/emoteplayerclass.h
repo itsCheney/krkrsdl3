@@ -4,9 +4,12 @@
 #include "tjsNative.h"
 
 #include <map>
+#include <cstdint>
 #include <vector>
+#include <cmath>
 #include "emotefile.h"
 #include "emoterunner.h"
+#include "emotecapturecache.h"
 
 #include "tjsNativeLayer.h"
 #include "TVPCompositor.h" // krkrsdl3::iTVPRenderBackend
@@ -51,6 +54,19 @@ private:
 };
 
 class EmotePlayer;
+// Process-local diagnostics only: no paths, retained resource copies or cache policy.
+struct EmoteResourceDiagnostics
+{
+    std::uint64_t managerId = 0;
+    std::uint64_t loads = 0;
+    std::uint64_t hits = 0;
+    std::uint64_t misses = 0;
+    std::uint64_t failures = 0;
+    std::uint64_t unloads = 0;
+    std::uint64_t unloadAlls = 0;
+    std::uint64_t clearCacheCalls = 0;
+};
+
 class ResourceManager
 {
 public:
@@ -67,6 +83,8 @@ public:
             delete this;
     }
     tTJSVariant load(tTJSString path);
+    // Native players consume the parsed file, not a fresh script object tree.
+    void ensureLoaded(tTJSString path);
     void unload(tTJSString path);
     void unloadAll();
     void clearCache();
@@ -74,11 +92,17 @@ public:
 
     static void setEmotePSBDecryptSeed(tjs_int decryptkey);
     static void setEmotePSBDecryptFunc(tTJSVariant funclosure);
+    // Drop VM-owned callbacks and the borrowed work-layer/window cache while
+    // the current script engine and render backend are still alive.
+    static void ResetSession();
 
     static iTJSDispatch2* _kagWindow; // 本身就是唯一的，所以直接static
     std::map<ttstr, emotefile*> cacheData;
 
 private:
+    tTJSVariant loadInternal(tTJSString path, bool materializeRoot);
+    void unloadAllInternal(const char* diagnosticAction);
+    EmoteResourceDiagnostics _diagnostics;
     tjs_int RefCount = 1;
     inline static tjs_int _decryptkey = 0;
     inline static tTJSVariantClosure _decryptClo = NULL;
@@ -116,6 +140,7 @@ public:
     void* target = nullptr;
     void* maskTarget = nullptr;
     tjs_int _width = 0, _height = 0;
+    performance::CanvasCaptureCache captureCache;
 
 private:
     tTJSNI_Layer* _this = nullptr;
@@ -139,6 +164,7 @@ public:
     uint32_t _clearColor = 0;
     void* _target = nullptr;
     void* _maskTarget = nullptr;
+    performance::CanvasCaptureCache captureCache;
 };
 
 // EmotePlayer 和Player是一个玩意
@@ -147,8 +173,8 @@ class EmotePlayer
 public:
     enum EmotePlayerFlag
     {
-        TimelinePlayFlagParallel = 0,
-        TimelinePlayFlagDifference
+        TimelinePlayFlagParallel = 1,
+        TimelinePlayFlagDifference = 2
     };
 
     EmotePlayer(ResourceManager* resourceManager) : _resourceManager(resourceManager){};
@@ -164,7 +190,8 @@ public:
             delete this;
     }
 
-    property_marco(playing, bool, _playing);
+    bool get_playing() { return _playing; }
+    void set_playing(bool value) { _playing = value; emtEngine._animationPaused = !value; }
     property_marco(allplaying, bool, _allplaying);
     property_marco(animating, bool, _playing);
     property_marco(useD3D, bool, _useD3D);
@@ -185,7 +212,17 @@ public:
     property_marco(chara, tTJSString, _chara);
     void set_variableKeys() { throw "reject to set variableKeys"; };
     tTJSVariant get_variableKeys();
-    property_marco(tickCount, tjs_real, clockPassed);
+    tjs_real get_tickCount() { return clockPassed; }
+    void set_tickCount(tjs_real value)
+    {
+        if (emtEngine.integratedAnimation() && !std::isfinite(value)) return;
+        clockPassed = value;
+        if (emtEngine.integratedAnimation())
+        {
+            emtEngine.ensureAnimationState(); emtEngine._animation.seek(std::max(0.0, value));
+            emtEngine._animationClock = std::max(0.0, value);
+        }
+    }
     property_marco(speed, tjs_real, speedRatio);
     tTJSVariant get_outline() { return tTJSVariant(); }
     void set_outline(tTJSVariant v){/* TODO */};
@@ -204,7 +241,13 @@ public:
     void setScale(tjs_real scale);
     void setRotate(tjs_real rotate);
     void setColor(tjs_uint32 color);
-    void setVariable(tTJSString name, tjs_real value);
+    void setVariable(tTJSString name, tjs_real value, tjs_real time = 0, tjs_real easing = 0);
+    static tjs_error cb_setVariable(tTJSVariant* result, tjs_int count, tTJSVariant** args, EmotePlayer* self);
+    bool usesIntegratedAnimation() const { return emtEngine.integratedAnimation(); }
+    void inheritAnimationModeFrom(const EmotePlayer& source) { emtEngine.inheritAnimationMode(source.usesIntegratedAnimation()); }
+    bool get_queuing() { emtEngine.ensureAnimationState(); return emtEngine._animation.queuing(); }
+    void set_queuing(bool value) { emtEngine.ensureAnimationState(); emtEngine._animation.setQueuing(value); }
+    void copyAnimationStateFrom(const EmotePlayer& source);
     tjs_real getVariable(tTJSString name);
     void setOuterForce(tTJSString name, tjs_real ofx, tjs_real ofy);
     void setDrawAffineTranslateMatrix(
@@ -281,7 +324,7 @@ private:
     bool withoutAdaptor = false;
     // transform
     void updateTransMat();
-    void prepareFrame();
+    bool prepareFrame();
     void ResetDrawArea(tjs_int width, tjs_int height);
     tjs_int _width = 0, _height = 0;
     float currCoordx = 0, currCoordy = 0, currCoordz = 0; // 坐标
@@ -293,6 +336,8 @@ private:
     glm::mat4 _affineTrans = glm::mat4(1.0f);
     glm::mat4 _targetTrans = glm::mat4(1.0f);
     EmoteHitFrame _hitFrame;
+    const std::uint64_t _captureIdentity = performance::nextPlayerIdentity();
+    performance::CanvasCaptureCache _captureCache;
 
     ttstr _motionKey;
     ttstr _motion;
@@ -347,6 +392,8 @@ public:
     using EmotePlayer::setScale;
     using EmotePlayer::setTimelineBlendRatio;
     using EmotePlayer::setVariable;
+    static tjs_error cb_setVariable(tTJSVariant* result, tjs_int count, tTJSVariant** args, Player* self)
+    { return EmotePlayer::cb_setVariable(result, count, args, self); }
     using EmotePlayer::skip;
     using EmotePlayer::startWind;
     using EmotePlayer::stopTimeline;

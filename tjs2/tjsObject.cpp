@@ -1279,6 +1279,41 @@ void tTJSCustomObject::InternalEnumMembers(tjs_uint32 flags,
     }
 }
 //---------------------------------------------------------------------------
+void tTJSCustomObject::CopyNativeClassMembersTo(iTJSDispatch2* destination)
+{
+    auto copy = [destination](const tTJSSymbolData* data) {
+        if (!(data->SymFlags & TJS_SYMBOL_USING) || (data->SymFlags & TJS_SYMBOL_STATIC))
+            return;
+        const tjs_uint32 flags = TJS_MEMBERENSURE | TJS_IGNOREPROP |
+            ((data->SymFlags & TJS_SYMBOL_HIDDEN) ? TJS_HIDDENMEMBER : 0);
+        // Retain the name across a destination callback, just as the original
+        // enumeration's name variant does (the callback may mutate the class).
+        ttstr name(data->Name);
+        // TJS_IGNOREPROP in the original enumeration retrieves the raw value.
+        // Preserve already-bound closures and bind unbound instance members.
+        tTJSVariant value = GetValue(data);
+        if (value.Type() == tvtObject && value.AsObjectThisNoAddRef() == NULL)
+            value.ChangeClosureObjThis(destination);
+        // Retain the callback's fallback and error behavior: failed property
+        // writes do not stop member enumeration, while thrown exceptions do.
+        if (destination->PropSetByVS(flags, name.AsVariantStringNoAddRef(), &value, destination) == TJS_E_NOTIMPL)
+            destination->PropSet(flags, name.c_str(), NULL, &value, destination);
+    };
+    // Match InternalEnumMembers exactly: chained entries before their bucket.
+    // Read current members on every construction; no stale prototype snapshot.
+    const tTJSSymbolData* bucket = Symbols;
+    const tTJSSymbolData* end = bucket + HashSize;
+    for (; bucket < end; ++bucket) {
+        const tTJSSymbolData* entry = bucket->Next;
+        while (entry) {
+            const tTJSSymbolData* next = entry->Next;
+            copy(entry);
+            entry = next;
+        }
+        copy(bucket);
+    }
+}
+//---------------------------------------------------------------------------
 tjs_int tTJSCustomObject::GetValueInteger(const tjs_char* name, tjs_uint32* hint)
 {
     tTJSSymbolData* data = Find(name, hint);

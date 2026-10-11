@@ -140,6 +140,10 @@ extern void TJSStackTracerPush(tTJSInterCodeContext* context, bool in_try);
 extern void TJSStackTracerSetCodePointer(const tjs_int32* codebase, tjs_int32* const* codeptr);
 extern void TJSStackTracerPop();
 extern ttstr TJSGetStackTraceString(tjs_int limit = 0, const tjs_char* delimiter = NULL);
+// Owner-thread only, no allocations or VM state changes. Caps output to 512
+// UTF-8 bytes and four frames, preserving complete UTF-8 code points.
+extern void TJSStackTracerFreezeCodePointer() noexcept;
+extern bool TJSGetStackTraceUTF8(char* output, tjs_uint capacity, tjs_uint frames = 4) noexcept;
 static inline bool TJSStackTracerEnabled()
 {
     return 0 != TJSStackTracer;

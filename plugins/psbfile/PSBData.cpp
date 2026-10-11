@@ -77,13 +77,24 @@ bool parsePSBArray(std::vector<tjs_uint32>* target, tjs_int8 n, TJS::tTJSBinaryS
     }
     tjs_uint32 entryLength = stream->ReadI8LE() - static_cast<tjs_uint32>(PSBObjType::NumberN8);
     target->reserve(count);
+    // One stream read per entry; the previous loop issued one virtual call per
+    // byte. Only the low four bytes can survive in the 32-bit target, but the
+    // stream still advances by the whole entry so later entries stay aligned.
+    tjs_uint8 bytes[8] = {0};
+    const tjs_uint32 scratch = entryLength < sizeof(bytes) ? entryLength : sizeof(bytes);
+    const tjs_uint32 used = entryLength < 4 ? entryLength : 4;
     for (int i = 0; i < count; i++)
     {
+        const tjs_uint got = scratch ? stream->Read(bytes, scratch) : 0;
+        for (tjs_uint32 j = got; j < scratch; ++j)
+            bytes[j] = 0;
+        // A malformed length byte can exceed the scratch buffer; consume the
+        // remainder one byte at a time rather than reading past it.
+        for (tjs_uint32 j = scratch; j < entryLength; ++j)
+            stream->ReadI8LE();
         tjs_uint32 result = 0;
-        for (tjs_uint8 j = 0; j < entryLength; ++j)
-        {
-            result |= stream->ReadI8LE() << (j * 8);
-        }
+        for (tjs_uint32 j = 0; j < used; ++j)
+            result |= static_cast<tjs_uint32>(bytes[j]) << (j * 8);
         target->push_back(result);
     }
     return true;

@@ -11,6 +11,24 @@
 #include "ncb_invoke.hpp"
 #include <map>
 #include <list>
+#include <type_traits>
+#include <string>
+
+// Invocation policies are opt in. Existing classes retain their getter hooks
+// and raw callback behavior. The registration name is kept by the dispatch,
+// since TJS invokes an extracted method with membername == nullptr.
+enum class ncbInvocationKind { Method, Get, Set, Raw, Bridge };
+template<class ClassT>
+struct ncbInvocationPolicy
+{
+    static constexpr bool Enabled = false;
+    struct Scope { Scope(const char*, ncbInvocationKind, iTJSDispatch2*) {} };
+};
+// Raw preflight is separately opt in: existing policies retain their eager
+// lease-before-conversion ordering, including user-defined converter callbacks.
+template<class Policy,class=void> struct ncbHasRawPreflight : std::false_type {};
+template<class Policy> struct ncbHasRawPreflight<Policy,
+    std::void_t<decltype(Policy::RawPreflight)>> : std::bool_constant<Policy::RawPreflight> {};
 
 ////////////////////////////////////////
 // ログ出力用マクロ
@@ -1492,6 +1510,8 @@ private:
         template<typename ResultT>
         inline bool SetResult(ResultT r, DefsT::Tag<ResultT> const&, DefsT::BoolTag<false> const&)
         {
+            if constexpr(ncbHasRawPreflight<ncbInvocationPolicy<typename TraitsT::ClassT>>::value)
+                if(ncbInvocationPolicy<typename TraitsT::ClassT>::CaptureResult(r)) return true;
             if (_result)
                 _rconv(*_result, r); // ncbToVariantConvertor で返り値に変換
             return true;
@@ -1503,6 +1523,8 @@ private:
                               DefsT::Tag<ResultT> const& tag,
                               DefsT::BoolTag<true> const&)
         {
+            if constexpr(ncbHasRawPreflight<ncbInvocationPolicy<typename TraitsT::ClassT>>::value)
+                if(ncbInvocationPolicy<typename TraitsT::ClassT>::CaptureResult(r)) return true;
             if (_result)
                 _rconv(*_result, r, tag);
             return true;
@@ -2451,6 +2473,80 @@ struct ncbSubClassItem;
 ////////////////////////////////////////
 /// NativeClass クラスオブジェクト登録テンプレート
 
+template<class ClassT>
+class ncbPolicyDispatch : public ncbNativeClassMethodBase
+{
+    iTJSDispatch2* dispatch;
+    std::string name;
+    FlagsT flags;
+    TypesT type;
+    ncbInvocationKind kind;
+    int minArgs;
+    bool readable,writable;
+public:
+    ncbPolicyDispatch(const tjs_char* registeredName, iMethodT item, ncbInvocationKind entry,
+        int requiredArgs,bool canGet,bool canSet)
+      : ncbNativeClassMethodBase(item->GetType()), dispatch(item->GetDispatch()),
+        name(ttstr(registeredName).AsStdString()), flags(item->GetFlags()), type(item->GetType()),kind(entry),minArgs(requiredArgs),readable(canGet),writable(canSet)
+    {
+        item->Release();
+    }
+    ~ncbPolicyDispatch() { dispatch->Release(); }
+    tjs_error FuncCall(tjs_uint32 flag, const tjs_char* membername, tjs_uint32* hint,
+        tTJSVariant* result, tjs_int count, tTJSVariant** params, iTJSDispatch2* object) override
+    {
+        if(membername) return BaseT::FuncCall(flag,membername,hint,result,count,params,object);
+        if(type!=nitMethod) return dispatch->FuncCall(flag,nullptr,hint,result,count,params,object);
+        if(!object) return TJS_E_NATIVECLASSCRASH;
+        if(count<minArgs) return TJS_E_BADPARAMCOUNT;
+        if constexpr(ncbHasRawPreflight<ncbInvocationPolicy<ClassT>>::value)
+            return ncbInvocationPolicy<ClassT>::InvokeFuncCall(name.c_str(),kind,dispatch,
+                flag,hint,result,count,params,object);
+        typename ncbInvocationPolicy<ClassT>::Scope scope(name.c_str(),kind,object);
+        return dispatch->FuncCall(flag,nullptr,hint,result,count,params,object);
+    }
+    tjs_error PropGet(tjs_uint32 flag, const tjs_char* membername, tjs_uint32* hint,
+        tTJSVariant* result, iTJSDispatch2* object) override
+    {
+        if(membername) return BaseT::PropGet(flag,membername,hint,result,object);
+        if(type!=nitProperty) return dispatch->PropGet(flag,nullptr,hint,result,object);
+        if(!readable) return TJS_E_ACCESSDENYED;
+        if(!object) return TJS_E_NATIVECLASSCRASH;
+        typename ncbInvocationPolicy<ClassT>::Scope scope(name.c_str(),
+            kind==ncbInvocationKind::Raw || kind==ncbInvocationKind::Bridge ? kind : ncbInvocationKind::Get,object);
+        return dispatch->PropGet(flag,nullptr,hint,result,object);
+    }
+    tjs_error PropSet(tjs_uint32 flag, const tjs_char* membername, tjs_uint32* hint,
+        const tTJSVariant* value, iTJSDispatch2* object) override
+    {
+        if(membername) return BaseT::PropSet(flag,membername,hint,value,object);
+        if(type!=nitProperty) return dispatch->PropSet(flag,nullptr,hint,value,object);
+        if(!writable) return TJS_E_ACCESSDENYED;
+        if(!object) return TJS_E_NATIVECLASSCRASH;
+        if(!value && kind!=ncbInvocationKind::Raw) return TJS_E_FAIL;
+        typename ncbInvocationPolicy<ClassT>::Scope scope(name.c_str(),
+            kind==ncbInvocationKind::Raw || kind==ncbInvocationKind::Bridge ? kind : ncbInvocationKind::Set,object);
+        return dispatch->PropSet(flag,nullptr,hint,value,object);
+    }
+    static iMethodT Wrap(const tjs_char* registeredName,iMethodT item,ncbInvocationKind entry,
+        int requiredArgs=0,bool canGet=true,bool canSet=true)
+    {
+        if constexpr(ncbInvocationPolicy<ClassT>::Enabled)
+            return item ? (new ncbPolicyDispatch(registeredName,item,entry,requiredArgs,canGet,canSet))->GetIMethod() : nullptr;
+        return item;
+    }
+    // GetName() returns the owning string type when registration names are
+    // supplied in a character width different from tjs_char. Preserve that
+    // conversion path before forwarding to the pointer-based constructor.
+    static iMethodT Wrap(const tTJSString& registeredName,iMethodT item,ncbInvocationKind entry,
+        int requiredArgs=0,bool canGet=true,bool canSet=true)
+    {
+        return Wrap(registeredName.c_str(),item,entry,requiredArgs,canGet,canSet);
+    }
+private:
+    FlagsT GetFlags() const override { return flags; }
+};
+
 template<class IMPL>
 struct ncbRegistClass : public ncbNativeClassMethodBase::InvokeType
 {
@@ -2559,7 +2655,10 @@ public:
     void Method(NAME n, MethodT m, IVT const&)
     {
         DoItem(GetName(n),
-               ncbNativeClassMethod<InvokeCommand<ClassT, MethodT, IVT>>::Create(m, _isRegist));
+               ncbPolicyDispatch<ClassT>::Wrap(GetName(n),
+                   ncbNativeClassMethod<InvokeCommand<ClassT, MethodT, IVT>>::Create(m, _isRegist),
+                   std::is_same<IVT,ivtNormal>::value || std::is_same<IVT,ivtProxy<ivtNormal>>::value ? ncbInvocationKind::Method : ncbInvocationKind::Bridge,
+                   InvokeCommand<ClassT,MethodT,IVT>::ArgsCount));
     }
 
     /// プロパティを登録する
@@ -2567,8 +2666,10 @@ public:
     void Property(NAME n, GetterT g, SetterT s, IVT const&)
     {
         DoItem(GetName(n),
-               ncbNativeClassProperty<PropertyCommand<ClassT, GetterT, SetterT, IVT>>::Create(
-                   g, s, _isRegist));
+               ncbPolicyDispatch<ClassT>::Wrap(GetName(n),
+                   ncbNativeClassProperty<PropertyCommand<ClassT, GetterT, SetterT, IVT>>::Create(
+                       g, s, _isRegist),
+                   std::is_same<IVT,ivtNormal>::value || std::is_same<IVT,ivtProxy<ivtNormal>>::value ? ncbInvocationKind::Method : ncbInvocationKind::Bridge,0,g!=nullptr,s!=nullptr));
     }
 
     // 読み込み・書き込み専用プロパティ
@@ -2677,7 +2778,8 @@ public:
     template<typename NAME, typename MethodT>
     void RawCallback(NAME n, MethodT m, _FlagsT flags)
     {
-        DoItem(GetName(n), ncbRawCallbackMethod<MethodT>::Create(m, flags, _isRegist));
+        DoItem(GetName(n), ncbPolicyDispatch<ClassT>::Wrap(GetName(n),
+            ncbRawCallbackMethod<MethodT>::Create(m, flags, _isRegist),ncbInvocationKind::Raw));
     }
 
     /// RawCallback Property
@@ -2685,7 +2787,9 @@ public:
     void RawCallback(NAME n, GetterT g, SetterT s, _FlagsT flags)
     {
         DoItem(GetName(n),
-               ncbRawCallbackProperty<GetterT, SetterT>::Create(g, s, flags, _isRegist));
+               ncbPolicyDispatch<ClassT>::Wrap(GetName(n),
+                   ncbRawCallbackProperty<GetterT, SetterT>::Create(g, s, flags, _isRegist),ncbInvocationKind::Raw,0,
+                   !std::is_same<GetterT,int>::value,!std::is_same<SetterT,int>::value));
     }
 
     /// サブクラスを登録する

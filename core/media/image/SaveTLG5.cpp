@@ -8,6 +8,7 @@
 #include "TVPStorage.h"
 
 #include "SaveTLG.h"
+#include "CPUConsumerTrace.h"
 
 //---------------------------------------------------------------------------
 SlideCompressor::SlideCompressor()
@@ -438,6 +439,8 @@ static void Compress(const iTVPBaseBitmap* bmp, tTJSBinaryStream* out, bool is24
 //---------------------------------------------------------------------------
 void SaveTLG5(tTJSBinaryStream* stream, const iTVPBaseBitmap* image, bool is24)
 {
+    krkrsdl3::cpu_consumer_trace::ConsumerScope consumer("Image.saveTLG5",
+        krkrsdl3::cpu_consumer_trace::Access::Read,"SaveTLG5",reinterpret_cast<uintptr_t>(image),true);
     Compress(image, stream, is24);
 }
 //---------------------------------------------------------------------------

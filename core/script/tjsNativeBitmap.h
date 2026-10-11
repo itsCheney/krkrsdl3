@@ -1,6 +1,7 @@
 #pragma once
 
 #include "tjsNative.h"
+#include "LayerHotspotContext.h"
 
 class tTVPBitmap;
 class tTVPBaseBitmap;
@@ -9,6 +10,7 @@ class tTJSNI_Bitmap : public tTJSNativeInstance
     typedef tTJSNativeInstance inherited;
 
 protected:
+    const uint64_t ReceiverDiagnosticID=krkrsdl3::layer_hotspot::NextLayerID();
     iTJSDispatch2* Owner;
     tTVPBaseBitmap* Bitmap;
     bool Loading;
@@ -20,6 +22,7 @@ public:
     void Invalidate();
 
 public:
+    uint64_t GetReceiverDiagnosticID() const { return ReceiverDiagnosticID; }
     tTVPBaseBitmap* GetBitmap() { return Bitmap; }
     const tTVPBaseBitmap* GetBitmap() const { return Bitmap; }
 

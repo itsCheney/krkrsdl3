@@ -8,6 +8,10 @@
 #include "TVPEvent.h"
 #include "ObjectList.h"
 #include "tjsNative.h"
+#include <cstdint>
+#include <string>
+
+namespace krkrsdl3 { class iTVPRenderBackend; }
 
 //---------------------------------------------------------------------------
 // global flags
@@ -17,7 +21,7 @@ extern bool TVPFreeUnusedLayerCache;
 //---------------------------------------------------------------------------
 // initial bitmap holder ( since tTVPBaseBitmap cannot create empty bitmap )
 //---------------------------------------------------------------------------
-const tTVPBaseTexture& TVPGetInitialBitmap();
+tTVPBaseTexture TVPGetInitialBitmap();
 //---------------------------------------------------------------------------
 
 //---------------------------------------------------------------------------
@@ -154,6 +158,10 @@ extern iTJSDispatch2* TVPGetObjectFrom_NI_BaseLayer(tTJSNI_BaseLayer* layer);
 //---------------------------------------------------------------------------
 class tTJSNI_BaseWindow;
 class tTVPBaseBitmap;
+class tTJSNI_BaseLayer;
+// Reads raw native member closures; no property getters or pixel leases run.
+bool TVPGetCanonicalShrinkLayer(iTJSDispatch2* object,bool resize,
+                               tTJSNI_BaseLayer*& layer);
 class tTVPLayerManager;
 class tTJSNI_BaseLayer : public tTJSNativeInstance,
                          public tTVPDrawable,
@@ -165,6 +173,10 @@ class tTJSNI_BaseLayer : public tTJSNativeInstance,
 protected:
     iTJSDispatch2* Owner;
     tTJSVariantClosure ActionOwner;
+    // Stable native-instance identity for deferred input. This avoids keeping
+    // the TJS owner alive merely to detect stale/recycled layer pointers.
+    uint64_t LifetimeID;
+    const uint64_t LayerDiagnosticID;
 
     //---------------------------------------------- object lifetime stuff --
 public:
@@ -174,6 +186,8 @@ public:
     void Invalidate() override;
 
     iTJSDispatch2* GetOwnerNoAddRef() const { return Owner; }
+    uint64_t GetLifetimeID() const { return LifetimeID; }
+    uint64_t GetLayerDiagnosticID() const { return LayerDiagnosticID; }
 
     tTJSVariantClosure GetActionOwnerNoAddRef() const { return ActionOwner; }
 
@@ -484,7 +498,31 @@ public:
     void SetProvincePixel(tjs_int x, tjs_int y, tjs_int n);
 
     const void* GetMainImagePixelBuffer() const;
+    // Internal native access; raw TJS properties keep their persistent contract.
+    iTVPTexture2D* GetMainImageTextureForCPUAccess(bool write);
+    // Internal COW preparation without acquiring pixels or marking a failed
+    // span transaction as an image modification. Commit marks it separately.
+    iTVPTexture2D* GetMainImageTextureForSpanComposite();
     void* GetMainImagePixelBufferForWrite();
+    // For callers that replace every pixel of the layer. Skips the GPU readback
+    // that GetMainImagePixelBufferForWrite performs to preserve existing content.
+    void* GetMainImagePixelBufferForOverwrite();
+    // Full-surface GPU overwrite path used by render plugins. The handle is
+    // borrowed; commit only after the backend copy succeeds.
+    void* GetMainImageGPUHandleForOverwrite();
+    void CommitMainImageGPUOverwrite();
+    // Atomic shared-image replacement for a complete GPU frame. Size arguments
+    // describe the source target; a larger layer image requires a partial copy.
+    bool CopyMainImageFromGPUTarget(krkrsdl3::iTVPRenderBackend* renderer, void* source,
+                                    tjs_int width, tjs_int height);
+    bool CopyMainImageFromGPUTargetRegion(krkrsdl3::iTVPRenderBackend* renderer, void* source,
+                                        tjs_int width, tjs_int height, const tTVPRect& region);
+    // Copies the top-left source region, preserving image pixels outside it.
+    bool CopyMainImageFromCPU(const void* pixels, tjs_int pitch, tjs_int width, tjs_int height);
+    // Closes the write lease opened by GetMainImagePixelBufferForWrite so a GPU
+    // adapter can upload only `written` instead of the whole surface. Callers
+    // that cannot describe their writes may skip this and pay a full upload.
+    void ReleaseMainImagePixelBufferForWrite(const tTVPRect& written);
     tjs_int GetMainImagePixelBufferPitch() const;
     const void* GetProvinceImagePixelBuffer() const;
     void* GetProvinceImagePixelBufferForWrite();
@@ -676,9 +714,12 @@ public:
     //--------------------------------------------------- cache management --
 private:
     tTVPBaseTexture* CacheBitmap;
+    bool TransitionCachePending;
     // tTVPComplexRect CachedRegion;
 
     void AllocateCache();
+    void EnsureCacheAllocated();
+    tjs_uint IncTransitionCacheEnabledCount();
     void ResizeCache();
     void DeallocateCache();
     void DispSizeChanged(); // is called from geographical management
@@ -1029,6 +1070,10 @@ private:
 private:
     iTVPDivisibleTransHandler* DivisibleTransHandler;
     iTVPGiveUpdateTransHandler* GiveUpdateTransHandler;
+    std::string TransDiagnosticRequested,TransDiagnosticProvider;
+    int TransDiagnosticCanvasWidth=0,TransDiagnosticCanvasHeight=0;
+    tjs_uint64 TransDiagnosticFrame=0;
+    void RecordTransitionLifecycle(const char* stage);
 
     tTJSNI_BaseLayer* TransDest; // transition destination
     iTJSDispatch2* TransDestObj;

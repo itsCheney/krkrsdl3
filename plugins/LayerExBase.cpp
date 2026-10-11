@@ -1,6 +1,7 @@
 #include "LayerExBase.h"
 #include "TVPMsg.h"
 #include "TVPSystem.h"
+#include "CPUConsumerTrace.h"
 
 int NI_LayerExBase::classId;
 
@@ -115,10 +116,14 @@ static tjs_int64 getPropValue(iTJSDispatch2* dispatch, iTJSDispatch2* layerobj)
 
 void NI_LayerExBase::reset(iTJSDispatch2* layerobj)
 {
+    krkrsdl3::cpu_consumer_trace::ConsumerScope consumer("LayerExBase.reset",
+        krkrsdl3::cpu_consumer_trace::Access::Write,"native.layerExBase",reinterpret_cast<uintptr_t>(layerobj),true);
     _width = (int)getPropValue(_widthProp, layerobj);
     _height = (int)getPropValue(_heightProp, layerobj);
-    _buffer = (unsigned char*)getPropValue(_bufferProp, layerobj);
-    _pitch = (int)getPropValue(_pitchProp, layerobj);
+    _pixels.Acquire(layerobj,true,"layerExBase.write");
+    _buffer = static_cast<unsigned char*>(_pixels.Data());
+    _pitch = _pixels.Pitch();
+    _pixels.Written(tTVPRect(0,0,_width,_height));
 }
 
 /**
@@ -134,6 +139,7 @@ void NI_LayerExBase::redraw(iTJSDispatch2* layerobj)
     _widthProp->PropGet(0, NULL, NULL, &vars[2], layerobj);
     _heightProp->PropGet(0, NULL, NULL, &vars[3], layerobj);
     tTJSVariant* varsp[4] = {vars, vars + 1, vars + 2, vars + 3};
+    _pixels.Reset(); _buffer=nullptr;
     _updateProp->FuncCall(0, NULL, NULL, NULL, 4, varsp, layerobj);
 }
 

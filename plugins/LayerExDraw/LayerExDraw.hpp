@@ -783,6 +783,7 @@ class Path
     bool figureStarted = false;
 
 public:
+    const plutovg_path_t* spanCapturePath() const { return path; }
     Path();
     virtual ~Path();
     void startFigure();
@@ -823,6 +824,11 @@ protected:
 
     plutovg_surface_t* surface;
     plutovg_canvas_t* canvas;
+    iTVPTexture2D* canvasTexture = nullptr;
+    uint64_t canvasTextureID = 0;
+    bool canvasHasTextureID = false;
+    tTVPScopedLayerPixels* invocationPixels = nullptr;
+    void destroyCanvas();
 
     // Transform
     plutovg_matrix_t transform;
@@ -834,6 +840,12 @@ protected:
     TextRenderingHint textRenderingHint;
 
 public:
+    class InvocationPixels;
+    class InvocationSpanCapture;
+    InvocationSpanCapture* invocationCapture = nullptr;
+    bool spanCaptureStateSafe() const;
+    bool spanCaptureTargetAliased() const;
+    tTVPScopedLayerPixels& currentPixelAccess() override { return invocationPixels ? *invocationPixels : _pixels; }
     int getSmoothingMode() { return (int)smoothingMode; }
     void setSmoothingMode(int mode) { smoothingMode = (SmoothingMode)mode; }
     int getTextRenderingHint() { return (int)textRenderingHint; }
@@ -844,13 +856,17 @@ protected:
     std::string cvName;
     bool updateWhenDraw;
     void updateRect(RectF& rect);
+    void deferCapturedUpdate(const RectF& rect);
+    void stageCapturedRecord(const Appearance* app,const plutovg_path_t* path);
+    void stageCapturedClear(tjs_uint32 argb);
 
 public:
     void setUpdateWhenDraw(int updateWhenDraw) { this->updateWhenDraw = updateWhenDraw != 0; }
     int getUpdateWhenDraw() { return updateWhenDraw ? 1 : 0; }
 
-    inline operator GdipImage*() const { return new GdipImage(surface); }
-    inline operator const GdipImage*() const { return new GdipImage(surface); }
+    GdipImage* getImageForBridge();
+    inline operator GdipImage*() const { return const_cast<LayerExDraw*>(this)->getImageForBridge(); }
+    inline operator const GdipImage*() const { return const_cast<LayerExDraw*>(this)->getImageForBridge(); }
 
     template<class T>
     struct BridgeFunctor
@@ -862,6 +878,7 @@ public:
     LayerExDraw(DispatchT obj);
     ~LayerExDraw();
     virtual void reset();
+    void finishPixels() override;
 
 protected:
     void updateViewTransform();

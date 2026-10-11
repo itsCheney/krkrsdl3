@@ -1,17 +1,327 @@
 #include "ncbind/ncbind.hpp"
 #include "emoteplayerclass.h"
+#include "emoteresourcecache.h"
+#include "emoteperformance.h"
+#include "emotegeometrybounds.h"
+#include "PointReadTrace.h"
+#include "RenderManager.h"
 #include "tjsArray.h"
 #include "TVPStorage.h"
 #include "Platform.h"
+#include "Random.h"
+#include "md5.h"
+#include <SDL3/SDL.h>
 
 #include "tjsCommHead.h"
 #include "tjsNativeLayer.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <memory>
 
 namespace emoteplayer
 {
 
 iTJSDispatch2* ResourceManager::_kagWindow = nullptr;
 static SeparateLayerAdaptor* _motionWorkLayer = nullptr;
+
+// Keep the target unlocked even if destination allocation/copy throws.
+struct TargetReadLock
+{
+    krkrsdl3::iTVPRenderBackend* renderer;
+    void* target;
+    int pitch = 0;
+    uint8_t* pixels;
+    TargetReadLock(krkrsdl3::iTVPRenderBackend* backend, void* source)
+        : renderer(backend), target(source), pixels(renderer->LockTarget(target, pitch)) {}
+    ~TargetReadLock() { renderer->UnlockTarget(target); }
+    TargetReadLock(const TargetReadLock&) = delete;
+    TargetReadLock& operator=(const TargetReadLock&) = delete;
+};
+
+static bool captureFeaturesEnabled()
+{
+    return performanceEnabled("MIKAGE_EMOTE_CAPTURE_CACHE") ||
+           performanceEnabled("MIKAGE_EMOTE_LOCAL_UPDATE") ||
+           performanceEnabled("MIKAGE_EMOTE_REGION_COPY");
+}
+static performance::TextureKey layerTextureKey(tTJSNI_BaseLayer* layer)
+{
+    performance::TextureKey key;
+    auto* image = layer ? layer->GetMainImage() : nullptr;
+    auto* texture = image ? image->GetTexture() : nullptr;
+    if (texture) key.valid = texture->GetContentKey(key.identity,key.version);
+    return key;
+}
+static performance::Bounds renderedBounds(emoteengine& engine,int width,int height)
+{
+    if (performanceEnabled("MIKAGE_EMOTE_EXPERIMENTAL_BOUNDS"))
+    {
+        const Uint64 started = SDL_GetTicksNS();
+        const auto& motion = engine._mainMotionRef;
+        const auto candidate = motion ? performance::submittedExperimentalBounds(motion->drawNodes(),width,height)
+                                      : performance::Bounds{};
+        auto& stats = performanceCounters();
+        (candidate.known ? stats.captureExperimentalBoundsKnown : stats.captureExperimentalBoundsUnknown)
+            .fetch_add(1,std::memory_order_relaxed);
+        if (candidate.known) stats.captureExperimentalBoundsPixels.fetch_add(candidate.rect.pixels(),std::memory_order_relaxed);
+        stats.captureExperimentalBoundsNS.fetch_add(SDL_GetTicksNS()-started,std::memory_order_relaxed);
+    }
+    if (!performanceEnabled("MIKAGE_EMOTE_LOCAL_UPDATE") &&
+        !performanceEnabled("MIKAGE_EMOTE_REGION_COPY")) return {false,{}};
+    const Uint64 started = SDL_GetTicksNS();
+    const auto& motion = engine._mainMotionRef;
+    auto bounds = motion ? performance::submittedCPUBounds(motion->drawNodes(),width,height)
+                         : performance::Bounds{};
+    auto& counters = performanceCounters();
+    counters.captureBoundsNS.fetch_add(SDL_GetTicksNS()-started,std::memory_order_relaxed);
+    (bounds.known ? counters.captureKnownBounds : counters.captureUnknownBounds)
+        .fetch_add(1,std::memory_order_relaxed);
+    return bounds;
+}
+static void copyCanvasToLayer(tTJSNI_BaseLayer* layer,krkrsdl3::iTVPRenderBackend* renderer,
+                             void* target,int width,int height,
+                             performance::CanvasCaptureCache& cache,bool adaptor)
+{
+    if (!layer || !renderer || !target || width <= 0 || height <= 0) return;
+    auto& counters = performanceCounters();
+    counters.captureRequests.fetch_add(1,std::memory_order_relaxed);
+    const bool cacheEnabled = performanceEnabled("MIKAGE_EMOTE_CAPTURE_CACHE");
+    const bool localEnabled = performanceEnabled("MIKAGE_EMOTE_LOCAL_UPDATE");
+    const bool regionEnabled = performanceEnabled("MIKAGE_EMOTE_REGION_COPY");
+    const int layerWidth = layer->GetWidth(), layerHeight = layer->GetHeight();
+    const int copyWidth = std::min(width,layerWidth), copyHeight = std::min(height,layerHeight);
+    auto* image = layer->GetMainImage();
+    const bool exact = image && layerWidth == width && layerHeight == height &&
+                       image->GetWidth() == unsigned(width) && image->GetHeight() == unsigned(height);
+    const auto key = exact ? layerTextureKey(layer) : performance::TextureKey{};
+    const auto identity = reinterpret_cast<std::uintptr_t>(layer);
+    auto decision = cache.decide(identity,key);
+    if (!key.valid && captureFeaturesEnabled())
+        counters.captureInvalidDestinations.fetch_add(1,std::memory_order_relaxed);
+    if (cacheEnabled && decision.skip)
+    {
+        counters.captureSkips.fetch_add(1,std::memory_order_relaxed);
+        krkrsdl3::TVPRecordEmoteCaptureSkip();
+        return;
+    }
+    const performance::Rect full{0,0,width,height};
+    const auto damage = localEnabled && decision.canRegionCopy ? decision.update : full;
+    const auto copyRegion = regionEnabled && decision.canRegionCopy ? decision.update : full;
+    const auto fullPixels = full.pixels();
+    bool copied = false;
+    bool cpuFallback = false;
+    bool regionCopy = exact && regionEnabled && decision.canRegionCopy && copyRegion.pixels() < fullPixels;
+    if (regionCopy)
+    {
+        if (copyRegion.empty()) copied = true; // trusted destination and no changed visible pixels.
+        else
+        {
+            krkrsdl3::point_trace::WriterScope write(adaptor ? "emote.captureCanvas" : "emote.drawToLayer");
+            const tTVPRect rect(copyRegion.left,copyRegion.top,copyRegion.right,copyRegion.bottom);
+            copied = layer->CopyMainImageFromGPUTargetRegion(renderer,target,width,height,rect);
+        }
+        if (copied)
+        {
+            counters.captureRegionCopies.fetch_add(1,std::memory_order_relaxed);
+            counters.captureRegions.fetch_add(1,std::memory_order_relaxed);
+            counters.captureRegionPixels.fetch_add(copyRegion.pixels(),std::memory_order_relaxed);
+            krkrsdl3::TVPRecordEmoteCaptureRegion(copyRegion.pixels(),fullPixels);
+            if (adaptor) krkrsdl3::TVPRecordEmoteCaptureGPUCopy(copyRegion.pixels()*4);
+            else krkrsdl3::TVPRecordEmoteLayerGPUCopy(copyRegion.pixels()*4);
+        }
+        else
+        {
+            auto* texture = image ? image->GetTexture() : nullptr;
+            if (texture && (!texture->IsIndependent() || texture->IsStatic()))
+                counters.captureCOWFallbacks.fetch_add(1,std::memory_order_relaxed);
+            counters.captureRegionFallbacks.fetch_add(1,std::memory_order_relaxed);
+            regionCopy = false;
+        }
+    }
+    if (!copied && exact)
+    {
+        krkrsdl3::point_trace::WriterScope write(adaptor ? "emote.captureCanvas" : "emote.drawToLayer");
+        copied = layer->CopyMainImageFromGPUTarget(renderer,target,width,height);
+        if (copied)
+        {
+            counters.captureFullCopies.fetch_add(1,std::memory_order_relaxed);
+            counters.captureFull.fetch_add(1,std::memory_order_relaxed);
+            if (adaptor) krkrsdl3::TVPRecordEmoteCaptureGPUCopy(fullPixels*4);
+            else krkrsdl3::TVPRecordEmoteLayerGPUCopy(fullPixels*4);
+        }
+    }
+    if (!copied)
+    {
+        cpuFallback = true;
+        const Uint64 started = SDL_GetTicksNS();
+        TargetReadLock read(renderer,target);
+        if (!read.pixels || read.pitch <= 0) return;
+        const auto bytes = std::uint64_t(read.pitch)*std::uint64_t(height);
+        if (adaptor) krkrsdl3::TVPRecordEmoteCaptureCPUFallback(bytes);
+        else krkrsdl3::TVPRecordEmoteLayerCPUReadback(bytes,SDL_GetTicksNS()-started);
+        copied = layer->CopyMainImageFromCPU(read.pixels,read.pitch,copyWidth,copyHeight);
+        regionCopy = false;
+    }
+    if (!copied) return; // never cache a rejected copy: the next call must retry.
+    counters.captureFullPixels.fetch_add(fullPixels,std::memory_order_relaxed);
+    if (!regionCopy) krkrsdl3::TVPRecordEmoteCaptureRegion(fullPixels,fullPixels);
+    if (exact && captureFeaturesEnabled()) cache.commit(identity,layerTextureKey(layer),decision.sourceVersion);
+    const auto layerPixels = std::uint64_t(std::max(0,layerWidth))*std::uint64_t(std::max(0,layerHeight));
+    counters.captureUpdateFullPixels.fetch_add(layerPixels,std::memory_order_relaxed);
+    if (localEnabled && decision.canRegionCopy && !cpuFallback)
+    {
+        if (!damage.empty())
+        {
+            const int x = layer->GetImageLeft(), y = layer->GetImageTop();
+            const auto update = performance::clip({damage.left+x,damage.top+y,damage.right+x,damage.bottom+y},layerWidth,layerHeight);
+            counters.captureUpdatePixels.fetch_add(update.pixels(),std::memory_order_relaxed);
+            layer->Update(tTVPRect(damage.left+x,damage.top+y,damage.right+x,damage.bottom+y));
+        }
+    }
+    else
+    {
+        counters.captureUpdatePixels.fetch_add(layerPixels,std::memory_order_relaxed);
+        layer->Update();
+    }
+}
+
+static std::uint64_t nextEmoteManagerId()
+{
+    static std::atomic<std::uint64_t> next{0};
+    return next.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+static std::uint64_t emoteResourceId(const ttstr& placedPath)
+{
+    // Salted fingerprints correlate the same canonical resource across managers
+    // during one process run, without recording a path or retaining a path table.
+    // They are diagnostic identifiers, not an integrity/security primitive.
+    static const std::array<md5_byte_t, 16> salt = [] {
+        std::array<md5_byte_t, 16> value{};
+        TVPGetRandomBits128(value.data());
+        return value;
+    }();
+    md5_state_t state;
+    md5_init(&state);
+    md5_append(&state, salt.data(), static_cast<int>(salt.size()));
+    md5_append(&state, reinterpret_cast<const md5_byte_t*>(placedPath.c_str()),
+               placedPath.length() * sizeof(tjs_char));
+    md5_byte_t digest[16];
+    md5_finish(&state, digest);
+    std::uint64_t id = 0;
+    for (int i = 0; i < 8; ++i) id = (id << 8) | digest[i];
+    return id;
+}
+
+static void recordEmoteCacheEvent(const char* action, const EmoteResourceDiagnostics& diagnostic,
+                                 std::size_t entries, std::uint64_t resourceId = 0)
+{
+    static thread_local Uint64 lastReportAt = 0;
+    static thread_local Uint64 suppressed = 0;
+    const Uint64 now = SDL_GetTicksNS();
+    if (lastReportAt && now - lastReportAt < 1000000000ULL) {
+        ++suppressed;
+        return;
+    }
+    try {
+        const auto shared = GetSharedEmoteResourceCacheStats();
+        TVPConsoleLog("emote.resourceCache action=%s managerId=%llu resourceId=%016llx "
+                      "entries=%llu loads=%llu cacheHits=%llu cacheMisses=%llu failures=%llu "
+                      "unloads=%llu unloadAlls=%llu clearCacheCalls=%llu suppressed=%llu "
+                      "sharedHits=%llu sharedMisses=%llu sharedBytes=%llu "
+                      "sharedEntries=%llu sharedEvictions=%llu",
+                      action, static_cast<unsigned long long>(diagnostic.managerId),
+                      static_cast<unsigned long long>(resourceId),
+                      static_cast<unsigned long long>(entries),
+                      static_cast<unsigned long long>(diagnostic.loads),
+                      static_cast<unsigned long long>(diagnostic.hits),
+                      static_cast<unsigned long long>(diagnostic.misses),
+                      static_cast<unsigned long long>(diagnostic.failures),
+                      static_cast<unsigned long long>(diagnostic.unloads),
+                      static_cast<unsigned long long>(diagnostic.unloadAlls),
+                      static_cast<unsigned long long>(diagnostic.clearCacheCalls),
+                      static_cast<unsigned long long>(suppressed),
+                      static_cast<unsigned long long>(shared.hits),
+                      static_cast<unsigned long long>(shared.misses),
+                      static_cast<unsigned long long>(shared.retainedBytes),
+                      static_cast<unsigned long long>(shared.entries),
+                      static_cast<unsigned long long>(shared.evictions));
+    } catch (...) {
+        // Logging must never change resource lifetime or load behavior.
+    }
+    lastReportAt = now;
+    suppressed = 0;
+}
+
+// Keep long scene/resource stalls identifiable without logging every animation
+// update. Durations include any blocking work; no asset paths or script values
+// are written to the log. Resource loads and play calls each log at most once/s.
+static void recordSlowEmoteOperation(bool resourceLoad, Uint64 started,
+                                     Uint64 fileLoadNS = 0, Uint64 rootNS = 0,
+                                     bool cacheHit = false,
+                                     const EmoteResourceDiagnostics* diagnostic = nullptr,
+                                     std::uint64_t resourceId = 0, std::size_t entries = 0,
+                                     bool rootRequested = true, bool sharedCacheHit = false,
+                                     bool customDecrypt = false, bool archiveFilter = false)
+{
+    const Uint64 finished = SDL_GetTicksNS();
+    const Uint64 wallNS = finished - started;
+    if (wallNS < 50000000ULL) return;
+    struct ReportState {
+        Uint64 lastReportAt = 0;
+        Uint64 suppressed = 0;
+        Uint64 suppressedPeakNS = 0;
+    };
+    static thread_local ReportState states[2];
+    auto &state = states[resourceLoad ? 0 : 1];
+    if (state.lastReportAt && finished - state.lastReportAt < 1000000000ULL) {
+        ++state.suppressed;
+        state.suppressedPeakNS = std::max(state.suppressedPeakNS, wallNS);
+        return;
+    }
+    try {
+        const auto shared = GetSharedEmoteResourceCacheStats();
+        TVPConsoleLog("emote.slowOperation operation=%s wallMS=%.3f fileLoadMS=%.3f "
+                      "rootMS=%.3f cacheHit=%d suppressed=%llu suppressedPeakWallMS=%.3f "
+                      "rootRequested=%d managerId=%llu resourceId=%016llx entries=%llu "
+                      "loads=%llu cacheHits=%llu cacheMisses=%llu failures=%llu "
+                      "unloads=%llu unloadAlls=%llu clearCacheCalls=%llu "
+                      "sharedCacheHit=%d customDecrypt=%d archiveFilter=%d sharedHits=%llu sharedMisses=%llu "
+                      "sharedBytes=%llu sharedEntries=%llu sharedEvictions=%llu",
+                      resourceLoad ? "resourceLoad" : "play",
+                      static_cast<double>(wallNS) / 1000000.0,
+                      static_cast<double>(fileLoadNS) / 1000000.0,
+                      static_cast<double>(rootNS) / 1000000.0, cacheHit ? 1 : 0,
+                      static_cast<unsigned long long>(state.suppressed),
+                      static_cast<double>(state.suppressedPeakNS) / 1000000.0,
+                      resourceLoad && rootRequested ? 1 : 0,
+                      static_cast<unsigned long long>(diagnostic ? diagnostic->managerId : 0),
+                      static_cast<unsigned long long>(resourceId),
+                      static_cast<unsigned long long>(entries),
+                      static_cast<unsigned long long>(diagnostic ? diagnostic->loads : 0),
+                      static_cast<unsigned long long>(diagnostic ? diagnostic->hits : 0),
+                      static_cast<unsigned long long>(diagnostic ? diagnostic->misses : 0),
+                      static_cast<unsigned long long>(diagnostic ? diagnostic->failures : 0),
+                      static_cast<unsigned long long>(diagnostic ? diagnostic->unloads : 0),
+                      static_cast<unsigned long long>(diagnostic ? diagnostic->unloadAlls : 0),
+                      static_cast<unsigned long long>(diagnostic ? diagnostic->clearCacheCalls : 0),
+                      resourceLoad && !cacheHit && sharedCacheHit ? 1 : 0,
+                      resourceLoad && !cacheHit && customDecrypt ? 1 : 0,
+                      resourceLoad && !cacheHit && archiveFilter ? 1 : 0,
+                      static_cast<unsigned long long>(shared.hits),
+                      static_cast<unsigned long long>(shared.misses),
+                      static_cast<unsigned long long>(shared.retainedBytes),
+                      static_cast<unsigned long long>(shared.entries),
+                      static_cast<unsigned long long>(shared.evictions));
+    } catch (...) {
+        // Diagnostics must not make an otherwise successful operation fail.
+    }
+    state.lastReportAt = finished;
+    state.suppressed = state.suppressedPeakNS = 0;
+}
 
 static const emoterect* findShapeAreaRecursive(const emotemotionref* motion, const char* name)
 {
@@ -39,6 +349,8 @@ static emotemotionref* findMotionRefRecursive(emotemotionref* motion, const char
 
 ResourceManager::ResourceManager(iTJSDispatch2* kagWindow, tjs_int cacheSize)
 {
+    _diagnostics.managerId = nextEmoteManagerId();
+    recordEmoteCacheEvent("create", _diagnostics, 0);
     // window info
     tjs_int sWidth = 1280, sHeight = 720;
     if (kagWindow != nullptr)
@@ -51,7 +363,7 @@ ResourceManager::ResourceManager(iTJSDispatch2* kagWindow, tjs_int cacheSize)
         _kagWindow = kagWindow;
     }
     // 放这里来吧，省得init时啥也没有
-    if (_motionWorkLayer == nullptr)
+    if (_motionWorkLayer == nullptr && kagWindow != nullptr)
     {
         // kag.poolLayer作为父类
         tTJSVariant baseLayer;
@@ -77,28 +389,66 @@ ResourceManager::ResourceManager(iTJSDispatch2* kagWindow, tjs_int cacheSize)
 }
 ResourceManager::~ResourceManager()
 {
-    unloadAll();
+    unloadAllInternal("destroy");
 }
 tTJSVariant ResourceManager::load(tTJSString path)
 {
+    return loadInternal(path, true);
+}
+void ResourceManager::ensureLoaded(tTJSString path)
+{
+    loadInternal(path, false);
+}
+tTJSVariant ResourceManager::loadInternal(tTJSString path, bool materializeRoot)
+{
+    const Uint64 started = SDL_GetTicksNS();
     ttstr trimPath;
     if (path.StartsWith(TJS_N("lzfs://./")))
         trimPath = path.SubString(9, path.length() - 9);
     else
         trimPath = path;
-    auto rst = cacheData.find(TVPGetPlacedPath(trimPath));
-    if (rst != cacheData.end())
-    {
-        return rst->second->root();
+    const ttstr placedPath = TVPGetPlacedPath(trimPath);
+    const std::uint64_t resourceId = emoteResourceId(placedPath);
+    ++_diagnostics.loads;
+    auto rst = cacheData.find(placedPath);
+    const bool cacheHit = rst != cacheData.end();
+    const bool customDecrypt = !cacheHit && _decryptClo.Object != nullptr;
+    if (cacheHit) ++_diagnostics.hits;
+    else ++_diagnostics.misses;
+    Uint64 fileLoadNS = 0;
+    Uint64 rootNS = 0;
+    try {
+        emotefile* file = cacheHit ? rst->second : nullptr;
+        if (!file) {
+            auto pending = std::make_unique<emotefile>();
+            pending->setSeed(_decryptkey);
+            pending->setFun(_decryptClo);
+            const Uint64 fileLoadStarted = SDL_GetTicksNS();
+            const bool loaded = pending->load(trimPath);
+            fileLoadNS = SDL_GetTicksNS() - fileLoadStarted;
+            if (!loaded)
+                TVPThrowExceptionMessage(TJS_N("Unable to load Emote resource"));
+            auto inserted = cacheData.emplace(placedPath, pending.get());
+            file = inserted.first->second;
+            if (inserted.second) pending.release();
+        }
+        tTJSVariant root;
+        if (materializeRoot) {
+            // Script callers retain the contract of a fresh, mutable root tree.
+            const Uint64 rootStarted = SDL_GetTicksNS();
+            root = file->root();
+            rootNS = SDL_GetTicksNS() - rootStarted;
+        }
+        recordSlowEmoteOperation(true, started, fileLoadNS, rootNS, cacheHit,
+                                 &_diagnostics, resourceId, cacheData.size(), materializeRoot,
+                                 !cacheHit && file->WasSharedCacheHit(), customDecrypt,
+                                 !cacheHit && file->BypassedSharedCacheForArchiveFilter());
+        return root;
+    } catch (...) {
+        ++_diagnostics.failures;
+        recordEmoteCacheEvent("loadFailed", _diagnostics, cacheData.size(), resourceId);
+        throw;
     }
-    emotefile* file = new emotefile();
-    file->setSeed(_decryptkey);
-    file->setFun(_decryptClo);
-    file->load(trimPath);
-
-    // motionKey是唯一可区分的表示符，我们用其作为标志
-    cacheData.insert(std::pair<ttstr, emotefile*>(TVPGetPlacedPath(trimPath), file));
-    return file->root();
 }
 void ResourceManager::unload(tTJSString path)
 {
@@ -107,26 +457,39 @@ void ResourceManager::unload(tTJSString path)
         trimPath = path.SubString(9, path.length() - 9);
     else
         trimPath = path;
-    auto it = cacheData.find(TVPGetPlacedPath(trimPath));
+    const ttstr placedPath = TVPGetPlacedPath(trimPath);
+    auto it = cacheData.find(placedPath);
     if (it != cacheData.end())
     {
         if (it->second != nullptr)
             delete it->second;
         cacheData.erase(it);
+        ++_diagnostics.unloads;
     }
+    recordEmoteCacheEvent("unload", _diagnostics, cacheData.size(), emoteResourceId(placedPath));
 }
 void ResourceManager::unloadAll()
 {
+    unloadAllInternal("unloadAll");
+}
+void ResourceManager::unloadAllInternal(const char* diagnosticAction)
+{
+    ++_diagnostics.unloadAlls;
+    _diagnostics.unloads += cacheData.size();
     for (auto item : cacheData)
     {
         if (item.second != nullptr)
             delete item.second;
     }
     cacheData.clear();
+    recordEmoteCacheEvent(diagnosticAction, _diagnostics, 0);
 }
 void ResourceManager::clearCache()
 {
-    
+    // Drop reusable decoded data while preserving files used by active players.
+    ClearSharedEmoteResourceCache("scriptClearCache");
+    ++_diagnostics.clearCacheCalls;
+    recordEmoteCacheEvent("clearCache", _diagnostics, cacheData.size());
 }
 emotefile* ResourceManager::GetPlayerByName(const tTJSString& name)
 {
@@ -139,11 +502,47 @@ emotefile* ResourceManager::GetPlayerByName(const tTJSString& name)
 }
 void ResourceManager::setEmotePSBDecryptSeed(tjs_int decryptkey)
 {
+    if (_decryptkey == decryptkey) return;
     _decryptkey = decryptkey;
+    ClearSharedEmoteResourceCache("decryptSeed");
 }
 void ResourceManager::setEmotePSBDecryptFunc(tTJSVariant funclosure)
 {
+    // AsObjectClosure adds references. Acquire the replacement before releasing
+    // the old closure, including when a script reinstalls the same callback.
+    auto previous = _decryptClo;
     _decryptClo = funclosure.AsObjectClosure();
+    previous.Release();
+    // Reinstalling the same closure can accompany a change in its script state.
+    ClearSharedEmoteResourceCache("decryptFunc");
+}
+
+void ResourceManager::ResetSession()
+{
+    if (_motionWorkLayer || _kagWindow || _decryptClo.Object || _decryptClo.ObjThis)
+        TVPConsoleLog("emote.sessionReset workLayer=%d window=%d callback=%d context=%d",
+                      _motionWorkLayer ? 1 : 0, _kagWindow ? 1 : 0,
+                      _decryptClo.Object ? 1 : 0, _decryptClo.ObjThis ? 1 : 0);
+    // Clear borrowed identities before releasing anything: native Layer
+    // invalidation can release the last reference to the adaptor itself.
+    auto* workLayer = _motionWorkLayer;
+    _motionWorkLayer = nullptr;
+    _kagWindow = nullptr;
+    auto callback = _decryptClo;
+    _decryptClo = tTJSVariantClosure(nullptr);
+    _decryptkey = 0;
+    Motion::setEnableD3D(false);
+    if (workLayer) {
+        workLayer->AddRef();
+        workLayer->clear();
+        workLayer->Release();
+    }
+    callback.Release();
+}
+
+void ResetEmotePlayerSession()
+{
+    ResourceManager::ResetSession();
 }
 
 SeparateLayerAdaptor::SeparateLayerAdaptor(iTJSDispatch2* targetLayer)
@@ -170,6 +569,7 @@ SeparateLayerAdaptor::SeparateLayerAdaptor(iTJSDispatch2* targetLayer)
 }
 SeparateLayerAdaptor::~SeparateLayerAdaptor()
 {
+    if (_motionWorkLayer == this) _motionWorkLayer = nullptr;
     clear();
 }
 void SeparateLayerAdaptor::assign(iTJSDispatch2* anotherAdaptor)
@@ -261,6 +661,7 @@ void SeparateLayerAdaptor::checkDrawArea(tjs_int width, tjs_int height)
         _height = height;
         target = renderer->CreateTarget(width, height);
         maskTarget = renderer->CreateTarget(width, height); // 蒙版目标（与主体同尺寸）
+        captureCache.reset(width,height);
     }
 }
 
@@ -276,6 +677,7 @@ D3DAdaptor::D3DAdaptor(
         _height = height;
         _orgX = orgX;
         _orgY = orgY;
+        captureCache.reset(width,height);
     }
 }
 D3DAdaptor::~D3DAdaptor()
@@ -297,6 +699,7 @@ D3DAdaptor::~D3DAdaptor()
 }
 void D3DAdaptor::setClearColor(tjs_uint32 color)
 {
+    if (_clearColor != color) captureCache.invalidate();
     _clearColor = color;
 }
 void D3DAdaptor::captureCanvas(iTJSDispatch2* targetLayer)
@@ -308,13 +711,15 @@ void D3DAdaptor::captureCanvas(iTJSDispatch2* targetLayer)
     krkrsdl3::iTVPRenderBackend* renderer = krkrsdl3::TVPGetRenderBackend();
     if (!renderer)
         return;
-    int pitch = 0;
-    uint8_t* pixels = renderer->LockTarget(_target, pitch);
-    tjs_uint8* buff = (tjs_uint8*)ths->GetMainImagePixelBufferForWrite();
-    if (buff && pixels)
-        std::memcpy(buff, pixels, (size_t)_width * _height * 4);
-    renderer->UnlockTarget(_target);
-    ths->Update();
+
+    struct CaptureProfileScope {
+        Uint64 started = SDL_GetTicksNS();
+        ~CaptureProfileScope() {
+            krkrsdl3::TVPRecordEmoteCaptureTime(SDL_GetTicksNS() - started);
+        }
+    } captureProfile;
+    krkrsdl3::TVPRecordEmoteCaptureCall();
+    copyCanvasToLayer(ths,renderer,_target,_width,_height,captureCache,true);
 }
 void D3DAdaptor::unloadUnusedTextures()
 {
@@ -325,6 +730,7 @@ void D3DAdaptor::unloadUnusedTextures()
     {
         renderer->SetTarget(_target);
         renderer->ClearTarget(true);
+        captureCache.beginClear();
     }
 }
 
@@ -517,6 +923,17 @@ tTJSVariant EmotePlayer::serialize()
     setprop(dict, currZx);
     setprop(dict, currZy);
 
+    if (emtEngine.integratedAnimation())
+    {
+        emtEngine.ensureAnimationState();
+        tTJSVariant state(tTJSString(emtEngine.serializeAnimationState().c_str()));
+        dict->PropSet(TJS_MEMBERENSURE, TJS_N("emoteAnimationState"), nullptr, &state, dict);
+        tTJSVariant playing(_playing), clock(clockPassed), stopped(_isStop);
+        dict->PropSet(TJS_MEMBERENSURE, TJS_N("emoteMainClock"), nullptr, &clock, dict);
+        dict->PropSet(TJS_MEMBERENSURE, TJS_N("emoteMainPlaying"), nullptr, &playing, dict);
+        dict->PropSet(TJS_MEMBERENSURE, TJS_N("emoteStopped"), nullptr, &stopped, dict);
+    }
+
     auto res = tTJSVariant(dict, dict);
     dict->Release();
     return res;
@@ -535,9 +952,31 @@ void EmotePlayer::unserialize(tTJSVariant data)
     getprop_t(dict, currAngle, static_cast<tjs_real>);
     getprop_t(dict, currZx, static_cast<tjs_real>);
     getprop_t(dict, currZy, static_cast<tjs_real>);
+    if (emtEngine.integratedAnimation())
+    {
+        tTJSVariant state;
+        if (TJS_SUCCEEDED(dict->PropGet(0, TJS_N("emoteAnimationState"), nullptr, &state, dict)) && state.Type() == tvtString)
+        {
+            emtEngine.ensureAnimationState();
+            if (emtEngine.restoreAnimationState(tTJSString(state).AsStdString()))
+            {
+                tTJSVariant field;
+                if (TJS_SUCCEEDED(dict->PropGet(0, TJS_N("emoteMainClock"), nullptr, &field, dict)))
+                {
+                    const double value = field.AsReal();
+                    if (std::isfinite(value) && value >= -1) clockPassed = value;
+                }
+                if (TJS_SUCCEEDED(dict->PropGet(0, TJS_N("emoteMainPlaying"), nullptr, &field, dict))) _playing = field.AsInteger() != 0;
+                if (TJS_SUCCEEDED(dict->PropGet(0, TJS_N("emoteStopped"), nullptr, &field, dict))) _isStop = field.AsInteger() != 0;
+            }
+        }
+    }
 }
 void EmotePlayer::play(tTJSString name, int flag)
 {
+    _isStop = false;
+    emtEngine._animationPaused = false;
+    const Uint64 started = SDL_GetTicksNS();
     if (emtEngine._mainfile != nullptr && !isMotion) // motionKey的启动模式
     {
         // motion
@@ -618,6 +1057,7 @@ void EmotePlayer::play(tTJSString name, int flag)
         _allplaying = true;
         isSelfClear = false;
     }
+    recordSlowEmoteOperation(false, started);
 }
 void EmotePlayer::initPhysics(tTJSVariant metadata)
 {
@@ -645,11 +1085,12 @@ void EmotePlayer::clear(iTJSDispatch2* layer, tjs_uint32 neutralColor)
     krkrsdl3::iTVPRenderBackend* renderer = krkrsdl3::TVPGetRenderBackend();
     if (renderer)
     {
-        void* target = withoutAdaptor ? _target : (self ? self->target : nullptr);
+        void* target = self ? self->target : _target;
         if (target)
         {
             renderer->SetTarget(target);
             renderer->ClearTarget(true);
+            (self ? self->captureCache : _captureCache).beginClear();
             _hitFrame = {};
         }
     }
@@ -658,13 +1099,16 @@ void EmotePlayer::progress(tjs_real mstime)
 {
     if (_isStop)
         return;
+    const Uint64 profileStarted = SDL_GetTicksNS();
     if (emtEngine._mainfile != nullptr && emtEngine._mainmotion != nullptr && clockPassed > -1.0 &&
-        _limitArea.width != _limitArea.originX && _limitArea.height != _limitArea.originY)
+        (emtEngine.integratedAnimation() || (_limitArea.width != _limitArea.originX && _limitArea.height != _limitArea.originY)))
     {
-        if (_playing)
-            clockPassed += mstime / speedRatio;
+        if (_playing && !emtEngine._animationPaused)
+            clockPassed += emtEngine.integratedAnimation() ? animation::millisecondsToFrames(mstime, speedRatio) : mstime / speedRatio;
         // condition
-        if (emtEngine._mainfile->_metadata->_varList.size() > 0)
+        if (emtEngine.integratedAnimation())
+            emtEngine.advanceAnimation(mstime, speedRatio);
+        else if (emtEngine._mainfile->_metadata->_varList.size() > 0)
         {
             // 更新控制参数(通过引擎调用)
             emtEngine.updateEyeControl(clockPassed, true);
@@ -696,19 +1140,38 @@ void EmotePlayer::progress(tjs_real mstime)
         else
             _pipoVal = 0;
     }
+    emtEngine.recordAnimationProgress(mstime, clockPassed, _playing);
+    krkrsdl3::TVPRecordEmoteProgress(SDL_GetTicksNS() - profileStarted);
 }
-void EmotePlayer::prepareFrame()
+bool EmotePlayer::prepareFrame()
 {
+    const auto previousRevision = emtEngine.poseRevision();
+    emtEngine.recordAnimationDraw();
+    const Uint64 profileStarted = SDL_GetTicksNS();
+    krkrsdl3::TVPBeginEmotePrepareDetail();
+
+    const Uint64 transformStarted = SDL_GetTicksNS();
     updateTransMat();
     std::vector<emoteRender> methods{_renderMethod};
     if (emtEngine._mainfile->isMirror)
         methods.front().attachMat = glm::scale(methods.front().attachMat, glm::vec3(-1, 1, 1));
     const float tick = emtEngine._mainfile->_metadata->_varList.empty() ? clockPassed : 0;
+    const Uint64 transformTimeNS = SDL_GetTicksNS() - transformStarted;
+
+    const Uint64 motionStarted = SDL_GetTicksNS();
     emtEngine.progress(tick, methods, _limitArea);
+    const Uint64 motionTimeNS = SDL_GetTicksNS() - motionStarted;
+
+    const Uint64 snapshotStarted = SDL_GetTicksNS();
     _hitFrame.motion = emtEngine._mainMotionRef;
     _hitFrame.inputToClip = _renderMethod.attachMat;
     _hitFrame.width = _limitArea.viewW > 0 ? _limitArea.viewW : _limitArea.width;
     _hitFrame.height = _limitArea.viewH > 0 ? _limitArea.viewH : _limitArea.height;
+    const Uint64 snapshotTimeNS = SDL_GetTicksNS() - snapshotStarted;
+
+    krkrsdl3::TVPCommitEmotePrepareDetail(transformTimeNS, motionTimeNS, snapshotTimeNS);
+    krkrsdl3::TVPRecordEmotePrepare(SDL_GetTicksNS() - profileStarted);
+    return previousRevision != emtEngine.poseRevision();
 }
 
 void EmotePlayer::draw(iTJSDispatch2* objthis)
@@ -782,24 +1245,34 @@ void EmotePlayer::draw(iTJSDispatch2* objthis)
             }
             if (!target || !maskTarget)
                 return;
-            // 启用
-            renderer->SetTarget(target);
-            // isSelfClear: 自主清屏模式；否则由脚本 clear() 完成清屏
-            renderer->ClearTarget(isSelfClear);
         }
         if (!target) return;
+        krkrsdl3::TVPRecordEmotePlayerDraw(
+            reinterpret_cast<uintptr_t>(this), reinterpret_cast<uintptr_t>(target));
         prepareFrame();
-        emtEngine.draw(renderer, target, _limitArea, maskTarget);
+        auto& canvas = withD3DAdaptor ? d3dAdaptor->captureCache
+                                    : (withoutAdaptor ? _captureCache : self->captureCache);
+        const performance::DrawToken token{_captureIdentity,emtEngine.poseRevision()};
+        const bool retainDrawing = withoutAdaptor && isSelfClear &&
+            performanceEnabled("MIKAGE_EMOTE_CAPTURE_CACHE") && canvas.canRetainSingleDraw(token);
+        if (!retainDrawing)
+        {
+            if (!withD3DAdaptor)
+            {
+                renderer->SetTarget(target);
+                renderer->ClearTarget(isSelfClear);
+                if (isSelfClear) canvas.beginClear();
+            }
+            const Uint64 drawStarted = SDL_GetTicksNS();
+            emtEngine.draw(renderer, target, _limitArea, maskTarget);
+            krkrsdl3::TVPRecordEmoteDraw(SDL_GetTicksNS() - drawStarted);
+            if (captureFeaturesEnabled() || performanceEnabled("MIKAGE_EMOTE_EXPERIMENTAL_BOUNDS"))
+                canvas.recordDraw(token,renderedBounds(emtEngine,_width,_height));
+            else canvas.invalidate(); // enabling an experiment later must not trust an old recipe.
+        }
         if (!withD3DAdaptor)
         {
-            // 回读 CPU 像素并交给图层（GL 后端经 glReadPixels，软渲染后端零拷贝）
-            int pitch = 0;
-            uint8_t* pixels = renderer->LockTarget(target, pitch);
-            tjs_uint8* buff = (tjs_uint8*)ths->GetMainImagePixelBufferForWrite();
-            if (buff && pixels)
-                std::memcpy(buff, pixels, (size_t)_width * _height * 4);
-            renderer->UnlockTarget(target);
-            ths->Update();
+            copyCanvasToLayer(ths,renderer,target,_width,_height,canvas,false);
         }
     }
 }
@@ -827,10 +1300,14 @@ void EmotePlayer::drawToTarget(krkrsdl3::iTVPRenderBackend* renderer,
     _limitArea = {(float)originX, (float)originY, (float)width, (float)height,
                   std::max(30.0f, emtEngine.getZMax() * 2), (float)viewW, (float)viewH};
     _targetTrans = transform;
+    krkrsdl3::TVPRecordEmotePlayerDraw(
+        reinterpret_cast<uintptr_t>(this), reinterpret_cast<uintptr_t>(target));
     prepareFrame();
     renderer->SetTarget(target);
     renderer->ClearTarget(selfClear);
+    const Uint64 drawStarted = SDL_GetTicksNS();
     emtEngine.draw(renderer, target, _limitArea, maskTarget);
+    krkrsdl3::TVPRecordEmoteDraw(SDL_GetTicksNS() - drawStarted);
 }
 void EmotePlayer::assign(iTJSDispatch2* anotherAdaptor)
 {
@@ -857,14 +1334,31 @@ void EmotePlayer::setColor(tjs_uint32 color)
 {
     TVPConsoleLog("EmotePlayer::setColor TODO");
 }
-void EmotePlayer::setVariable(tTJSString name, tjs_real value)
+void EmotePlayer::setVariable(tTJSString name, tjs_real value, tjs_real time, tjs_real easing)
 {
     if (emtEngine._mainfile != nullptr)
     {
         std::string tmpName = name.AsStdString();
         tmpName.append(1, '\0'); // 终有一天，我会把这sb字符串给优化掉
-        emtEngine.setVariable(tmpName, value); // 管你有没有，设了再说
+        if (emtEngine.integratedAnimation()) emtEngine.setAnimationVariable(tmpName, value, time, easing);
+        else emtEngine.setVariable(tmpName, value);
     }
+}
+tjs_error EmotePlayer::cb_setVariable(tTJSVariant*, tjs_int count, tTJSVariant** args, EmotePlayer* self)
+{
+    if (!self) return TJS_E_INVALIDOBJECT;
+    if (count < 2 || count > 4) return TJS_E_BADPARAMCOUNT;
+    self->setVariable(tTJSString(*args[0]), args[1]->AsReal(),
+        count > 2 && args[2]->Type() != tvtVoid ? args[2]->AsReal() : 0,
+        count > 3 && args[3]->Type() != tvtVoid ? args[3]->AsReal() : 0);
+    return TJS_S_OK;
+}
+void EmotePlayer::copyAnimationStateFrom(const EmotePlayer& source)
+{
+    if (!usesIntegratedAnimation() || !source.usesIntegratedAnimation()) return;
+    emtEngine.copyAnimationStateFrom(source.emtEngine);
+    clockPassed = source.clockPassed; speedRatio = source.speedRatio;
+    _playing = source._playing; _allplaying = source._allplaying; _isStop = source._isStop;
 }
 tjs_real EmotePlayer::getVariable(tTJSString name)
 {
@@ -938,6 +1432,7 @@ void EmotePlayer::pass()
 }
 void EmotePlayer::stop()
 {
+    if (emtEngine.integratedAnimation()) emtEngine._animation.stop();
     _isStop = true;
     _playing = false;
     _allplaying = false;
@@ -947,8 +1442,8 @@ void EmotePlayer::playTimeline(tTJSString name, tjs_int flags)
 {
     if (emtEngine._mainfile != nullptr)
     {
-        emtEngine.startTimeline(-10000.0f, name.AsStdString(),
-                                true); // 管你有没有，设了再说
+        emtEngine.startTimeline(emtEngine.integratedAnimation() ? clockPassed : -10000.0f,
+                                name.AsStdString(), true, flags);
     }
 }
 void EmotePlayer::stopTimeline(tTJSString name)
@@ -970,6 +1465,12 @@ bool EmotePlayer::getTimelinePlaying(tTJSString name)
 }
 bool EmotePlayer::getLoopTimeline(tTJSString name)
 {
+    if (emtEngine.integratedAnimation())
+    {
+        emtEngine.ensureAnimationState(); std::string label(name.AsStdString().c_str()); label.append(1, '\0');
+        const auto* definition = emtEngine._animation.definition(label);
+        return definition && definition->loopBegin >= 0 && definition->loopEnd > definition->loopBegin;
+    }
     if (emtEngine._mainfile != nullptr)
     {
         for (auto itm : emtEngine._mainfile->_metadata->_timelineControl)
@@ -984,6 +1485,12 @@ bool EmotePlayer::getLoopTimeline(tTJSString name)
 }
 tjs_real EmotePlayer::getTimelineTotalFrameCount(tTJSString name)
 {
+    if (emtEngine.integratedAnimation())
+    {
+        emtEngine.ensureAnimationState(); std::string label(name.AsStdString().c_str()); label.append(1, '\0');
+        const auto* definition = emtEngine._animation.definition(label);
+        return definition ? std::max(0.0, definition->lastTime) : 0;
+    }
     if (emtEngine._mainfile != nullptr)
     {
         for (auto itm : emtEngine._mainfile->_metadata->_timelineControl)
@@ -1041,20 +1548,52 @@ void EmotePlayer::setTimelineBlendRatio(tTJSString name,
                                         tjs_real time,
                                         tjs_real easing)
 {
+    if (emtEngine.integratedAnimation())
+    {
+        emtEngine.ensureAnimationState(); std::string label(name.AsStdString().c_str()); label.append(1, '\0');
+        emtEngine._animation.setBlend(label, ratio, time, easing); return;
+    }
     TVPConsoleLog("EmotePlayer::setTimelineBlendRatio TODO");
 }
 void EmotePlayer::fadeInTimeline(tTJSString name, tjs_real time, tjs_real easing)
 {
+    if (emtEngine.integratedAnimation())
+    {
+        emtEngine.ensureAnimationState(); std::string label(name.AsStdString().c_str()); label.append(1, '\0');
+        emtEngine._animation.fadeIn(label, time, easing); return;
+    }
     playTimeline(name);
 }
 void EmotePlayer::fadeOutTimeline(tTJSString name, tjs_real time, tjs_real easing)
 {
+    if (emtEngine.integratedAnimation())
+    {
+        emtEngine.ensureAnimationState(); std::string label(name.AsStdString().c_str()); label.append(1, '\0');
+        emtEngine._animation.fadeOut(label, time, easing); return;
+    }
     stopTimeline(name);
 }
 tTJSVariant EmotePlayer::getPlayingTimelineInfoList()
 {
     iTJSDispatch2* array = TJSCreateArrayObject();
     tTJSVariant result(array, array);
+    if (emtEngine.integratedAnimation())
+    {
+        emtEngine.ensureAnimationState();
+        for (const auto& state : emtEngine._animation.states()) if (state.playing)
+        {
+            iTJSDispatch2* obj = TJSCreateDictionaryObject();
+            tTJSVariant entry(obj, obj); obj->Release();
+            tTJSVariant label(tTJSString(state.label.c_str())), flags(state.flags), ratio(state.blend.value), time(state.time);
+            obj->PropSet(TJS_MEMBERENSURE, TJS_N("label"), nullptr, &label, obj);
+            obj->PropSet(TJS_MEMBERENSURE, TJS_N("flags"), nullptr, &flags, obj);
+            obj->PropSet(TJS_MEMBERENSURE, TJS_N("blendRatio"), nullptr, &ratio, obj);
+            obj->PropSet(TJS_MEMBERENSURE, TJS_N("time"), nullptr, &time, obj);
+            tTJSVariant* args[] = {&entry};
+            array->FuncCall(0, TJS_N("add"), nullptr, nullptr, 1, args, array);
+        }
+        array->Release(); return result;
+    }
     if (emtEngine._mainfile != nullptr)
     {
         for (auto playingTimeline : emtEngine.currTimeline)
@@ -1077,42 +1616,7 @@ tTJSVariant EmotePlayer::getVariableFrameList(tTJSString name)
 {
     if (emtEngine._mainfile != nullptr)
     {
-        iTJSDispatch2* root = emtEngine._mainfile->root().AsObject();
-        tTJSVariant itm;
-        if (TJS_FAILED(root->PropGet(0, TJS_N("metadata"), NULL, &itm, root)))
-        {
-            TVPConsoleLog("emotefile donot contain metadata");
-            return tTJSVariant();
-        }
-        root->Release();
-        root = itm.AsObject();
-        if (TJS_FAILED(root->PropGet(0, TJS_N("variableList"), NULL, &itm, root)))
-        {
-            TVPConsoleLog("emotefile donot contain variableList");
-            return tTJSVariant();
-        }
-        root->Release();
-        root = itm.AsObjectThis();
-
-        tTJSVariant retNeed;
-        for (tjs_uint32 i = 0; i < emtEngine._mainfile->_metadata->_varList.size(); i++)
-        {
-            tTJSVariant varItem;
-            if (TJS_FAILED(root->PropGetByNum(TJS_MEMBERMUSTEXIST, i, &varItem, root)))
-                break;
-            iTJSDispatch2* rev = varItem.AsObjectThisNoAddRef();
-            tTJSVariant labelname;
-            if (TJS_FAILED(rev->PropGet(0, TJS_N("label"), NULL, &labelname, rev)))
-                continue;
-            if (labelname.Type() != tvtString || ttstr(labelname) != name)
-                continue;
-            if (TJS_FAILED(rev->PropGet(0, TJS_N("frameList"), NULL, &retNeed, rev)))
-                continue;
-            break;
-        }
-
-        root->Release();
-        return retNeed;
+        return emtEngine._mainfile->readVariableFrameList(name);
     }
     else
     {
@@ -1232,6 +1736,7 @@ void EmotePlayer::ResetDrawArea(tjs_int width, tjs_int height)
             }
             _target = renderer->CreateTarget(_width, _height);
             _maskTarget = renderer->CreateTarget(_width, _height);
+            _captureCache.reset(_width,_height);
         }
     }
 }

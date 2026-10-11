@@ -4,6 +4,7 @@
 #include <array>
 #include <string>
 #include <random>
+#include <memory>
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -28,6 +29,7 @@ struct emoteVar // 变量
 };
 
 class emotefile;
+struct EmoteDecodedResource;
 class emoteframe
 {
 public:
@@ -347,6 +349,7 @@ public:
     double scale = 1.0;
 
     std::map<std::string, float> _varList;
+    std::vector<std::string> _instantVariableList;
     std::vector<emoteattrcomp*> _attrcomp;
     // std::vector<std::string> _mirrorControl;
     std::vector<emoteselect*> _selectorControl;
@@ -418,7 +421,12 @@ public:
     void setSeed(tjs_int seed);
     void setFun(tTJSVariantClosure decryptClo);
     bool load(const ttstr& filePath);
+    bool WasSharedCacheHit() const { return _sharedCacheHit; }
+    bool BypassedSharedCacheForArchiveFilter() const { return _archiveFilterBypass; }
     tTJSVariant root();
+    // Materialize only this variable's frameList, preserving PSB fields and
+    // returning fresh mutable script objects on each call.
+    tTJSVariant readVariableFrameList(const ttstr& name);
     tTJSVariant readAllObjs(const ttstr& key, tjs_uint32 _objOffset);
     uint32_t readListInfo(std::vector<uint32_t>* target);
     void refreshListInfo(std::vector<uint32_t>* target1, std::vector<uint32_t>* target2);
@@ -470,6 +478,22 @@ public:
     void setVariable(const std::string& name, tjs_real value);
 
 private:
+    void LoadDecodedResource(std::shared_ptr<const EmoteDecodedResource> resource);
+    std::shared_ptr<const EmoteDecodedResource> SnapshotDecodedResource();
+    // Decoded name/string tables, read once per file instead of once per
+    // occurrence during whole-tree materialization. Entries stay in the VM's
+    // character encoding so each use converts exactly as the per-byte path did;
+    // the string table is only built for full-tree reads, so targeted metadata
+    // queries keep their minimal read set.
+    void EnsureTJSNameTable();
+    void EnsureTJSStringTable();
+    bool _sharedCacheHit = false;
+    bool _archiveFilterBypass = false;
+    bool _fullTreeMaterialization = false;
+    bool _tjsNameTableReady = false;
+    bool _tjsStringTableReady = false;
+    std::vector<std::string> namesCacheTJS;
+    std::vector<std::string> stringsCacheTJS;
     tTJSBinaryStream* filePtr = nullptr;
     tjs_int _seed = 0;
     tTJSVariantClosure _decryptClo = NULL;

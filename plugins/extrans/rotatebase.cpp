@@ -8,6 +8,8 @@
 #include <math.h>
 #include "rotatebase.h"
 #include "common.h"
+#include "metaltransition.h"
+#include <new>
 
 #include <stdio.h>
 
@@ -68,6 +70,7 @@ tjs_error tTVPBaseRotateTransHandler::StartProcess(tjs_uint64 tick)
         DrawData[i].region[0].type = 0; // 0 = 背景
     }
 
+    MetalRows.reset(); // A new frame owns new immutable parameters.
     CalcPosition(); // 下位クラスの CalcPosition メソッドを呼ぶ
 
     return TJS_S_TRUE;
@@ -93,6 +96,55 @@ tjs_error tTVPBaseRotateTransHandler::Process(tTVPDivisibleData* data)
 
     // data->Left, data->Top, data->Width, data->Height で示される矩形に
     // のみ転送する必要がある。
+
+    TVPSetTransitionMetadata("%s", TransitionMetadata.c_str());
+    if (TVPHasDivisibleMetalTransitionSupport(data))
+    {
+        TVPLayerTransitionOperation operation;
+        bool parametersReady = false;
+        try
+        {
+            if (!MetalRows)
+            {
+                std::vector<std::int32_t> rows(static_cast<size_t>(Height) * 26, 0);
+                for (int y = 0; y < Height; ++y)
+                {
+                    const auto &line = DrawData[y];
+                    auto *out = rows.data() + static_cast<size_t>(y) * 26;
+                    out[0] = line.count;
+                    // Only initialized source fields and occupied regions are copied.
+                    for (int i = 0; i < line.count; ++i)
+                    {
+                        const auto &region = line.region[i];
+                        out[11 + i * 3] = region.left;
+                        out[12 + i * 3] = region.right;
+                        out[13 + i * 3] = region.type;
+                        if (region.left == region.right || region.type == 0) continue;
+                        const auto &src = region.type == 1 ? line.src1 : line.src2;
+                        auto *d = out + (region.type == 1 ? 1 : 6);
+                        d[0] = src.start; d[1] = src.sx; d[2] = src.sy;
+                        d[3] = src.stepx; d[4] = src.stepy;
+                    }
+                }
+                MetalRows = TVPMakeTransitionBytes(rows.data(), rows.size() * sizeof(rows[0]));
+            }
+            auto &p = operation.params;
+            p.kind = static_cast<int>(TransitionKind);
+            p.frameWidth = Width; p.frameHeight = Height; p.color = BGColor;
+            operation.rows = MetalRows;
+            parametersReady = true;
+        }
+        catch (const std::bad_alloc &) {
+            krkrsdl3::layer_work::RecordTransitionResult(false, "allocationFailed",
+                static_cast<uint64_t>(data->Width) * static_cast<uint64_t>(data->Height));
+            /* Software DrawData remains available. */
+        }
+        // Once encoding begins, exceptions must propagate to the engine. A
+        // post-dispatch allocation failure must never replay this ROI on CPU.
+        if (parametersReady &&
+            TVPTryDivisibleMetalTransition(operation, data) == TVPLayerTransitionResult::Applied)
+            return TJS_S_OK;
+    }
 
     // 変数の準備
     tjs_int destxofs = data->DestLeft - data->Left;

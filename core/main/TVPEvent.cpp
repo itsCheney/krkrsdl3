@@ -1,4 +1,5 @@
 #include "tjsCommHead.h"
+#include "LayerWorkDiagnostics.h"
 #include "TVPEvent.h"
 
 #include "TVPSystem.h"
@@ -1042,6 +1043,7 @@ void TVPRemoveCompactEventHook(tTVPCompactEventCallbackIntf* cb)
 extern void TVPDoSaveSystemVariables();
 void TVPDeliverCompactEvent(tjs_int level)
 {
+    krkrsdl3::layer_work::StageScope stage(krkrsdl3::layer_work::Stage::Compact);
     // must be called by each platforms's implementation
     // std::vector<tTVPCompactEventCallbackIntf *>::iterator i;
     if (TVPCompactEventVector.size())
@@ -1078,6 +1080,19 @@ void TVPDeliverCompactEvent(tjs_int level)
                     i++;
             }
         }
+    }
+    // The idle compact fires every 4 s, and each save runs the game's
+    // kag.saveSystemVariables (serialize + write) and a full TJS GC. Stronger
+    // levels (deactivate, exit, script doCompact) still save every time; the
+    // iOS host also saves when the app moves to the background.
+    static tjs_uint64 lastIdleSaveTick = 0;
+    constexpr tjs_uint64 IdleSaveIntervalMS = 60000;
+    if (level == TVP_COMPACT_LEVEL_IDLE)
+    {
+        const tjs_uint64 now = TVPGetRoughTickCount();
+        if (lastIdleSaveTick && now - lastIdleSaveTick < IdleSaveIntervalMS)
+            return;
+        lastIdleSaveTick = now;
     }
     TVPDoSaveSystemVariables();
 }

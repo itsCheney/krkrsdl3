@@ -8,6 +8,8 @@
 #include <math.h>
 #include "mosaic.h"
 #include "common.h"
+#include "metaltransition.h"
+#include <new>
 
 #include <stdio.h>
 
@@ -172,6 +174,18 @@ tjs_error tTVPMosaicTransHandler::Process(tTVPDivisibleData* data)
     // 1: その転送矩形に含まれるモザイクのブロックの範囲を判定する
     // 2: まず辺境のブロックに対して転送矩形との積矩形を得てそこに色を塗りつぶす
     // 3: 残りのブロックははみ出しについて注意する必要がないので心おきなく色を塗りつぶす
+
+    TVPSetTransitionMetadata("{\"time\":%llu,\"maxsize\":%d}", static_cast<unsigned long long>(Time), MaxBlockSize);
+    if (TVPHasDivisibleMetalTransitionSupport(data))
+    {
+        TVPLayerTransitionOperation operation;
+        auto &p = operation.params;
+        p.kind = static_cast<int>(TVPLayerTransitionKind::Mosaic);
+        p.frameWidth = Width; p.frameHeight = Height; p.ratio = BlendRatio;
+        p.blockSize = CurBlockSize; p.offsetX = CurOfsX; p.offsetY = CurOfsY;
+        if (TVPTryDivisibleMetalTransition(operation, data) == TVPLayerTransitionResult::Applied)
+            return TJS_S_OK;
+    }
 
     // 変数の準備
     tjs_uint8* dest;
@@ -440,6 +454,11 @@ public:
         if (TJS_SUCCEEDED(options->GetValue(TJS_N("maxsize"), &tmp)))
             if (tmp.Type() != tvtVoid)
                 maxblocksize = (tjs_int)tmp;
+
+        // HalfTime is unsigned: maxsize=1 converts a negative numerator to
+        // uint64 and can produce a negative block size and overflow offsets.
+        if (!src1w || !src1h || maxblocksize < 2)
+            TVPThrowExceptionMessage(TJS_N("mosaic requires a nonempty image and maxsize >= 2"));
 
         // オブジェクトを作成
         *handler = new tTVPMosaicTransHandler(time, src1w, src1h, maxblocksize);

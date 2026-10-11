@@ -1,6 +1,9 @@
 #include "emotefile.h"
+#include "LayerWorkDiagnostics.h"
+#include "emoteresourcecache.h"
 
 #include "TVPStorage.h"
+#include "XP3Archive.h"
 #include "UtilStreams.h"
 #include "Platform.h"
 #include "tjsArray.h"
@@ -12,6 +15,8 @@
 
 #include <sstream>
 #include <algorithm>
+#include <limits>
+#include <stdexcept>
 
 struct EMoteCTX
 {
@@ -299,6 +304,124 @@ using namespace PSB;
 
 namespace emoteplayer
 {
+// Reads a NUL-terminated string with block reads; the original decoders issued
+// one virtual stream call per byte. Returns whether the terminator was found.
+// The trailing NUL is part of the result, matching the original byte loop.
+static bool ReadNulTerminatedBlock(tTJSBinaryStream* stream, std::string& out)
+{
+    out.clear();
+    tjs_uint8 buffer[256];
+    for (;;)
+    {
+        const tjs_uint64 position = stream->GetPosition();
+        const tjs_uint64 size = stream->GetSize();
+        const tjs_uint64 remaining = size > position ? size - position : 0;
+        const tjs_uint want =
+            static_cast<tjs_uint>(remaining < sizeof(buffer) ? remaining : sizeof(buffer));
+        const tjs_uint got = want ? stream->Read(buffer, want) : 0;
+        if (got == 0) return false;
+        for (tjs_uint i = 0; i < got; ++i)
+        {
+            out.append(1, static_cast<char>(buffer[i]));
+            if (buffer[i] == '\0') return true;
+        }
+        if (got < want) return false;
+    }
+}
+// Only decoded CPU data is shared. Runtime variables, motion references, script
+// objects, decoded icon pixels and GPU textures remain owned by each emotefile.
+struct EmoteDecodedResource
+{
+    std::vector<uint8_t> bytes;
+    PSB::PSBHeader header{};
+    std::vector<uint32_t> stringsOffset, namesData, charset, nameIndexes;
+    std::vector<std::string> namesCache;
+    std::vector<uint32_t> chunkOffsets, chunkLengths, extraChunkOffsets, extraChunkLengths;
+
+    size_t ByteCost() const
+    {
+        size_t cost = sizeof(*this) + bytes.capacity() + namesCache.capacity() * sizeof(std::string);
+        for (const auto* table : {&stringsOffset, &namesData, &charset, &nameIndexes,
+                                  &chunkOffsets, &chunkLengths, &extraChunkOffsets, &extraChunkLengths})
+            cost += table->capacity() * sizeof(uint32_t);
+        for (const auto& name : namesCache) cost += name.capacity() + 1;
+        return cost;
+    }
+};
+
+class EmoteReadOnlyStream final : public tTJSBinaryStream
+{
+    std::shared_ptr<const EmoteDecodedResource> resource;
+    size_t position = 0;
+public:
+    explicit EmoteReadOnlyStream(std::shared_ptr<const EmoteDecodedResource> value)
+        : resource(std::move(value)) {}
+    tjs_uint64 Seek(tjs_int64 offset, tjs_int whence) override
+    {
+        tjs_int64 base = 0;
+        if (whence == TJS_BS_SEEK_CUR) base = static_cast<tjs_int64>(position);
+        else if (whence == TJS_BS_SEEK_END) base = static_cast<tjs_int64>(resource->bytes.size());
+        else if (whence != TJS_BS_SEEK_SET) return position;
+        // Like tTVPMemoryStream, a failed seek leaves the cursor unchanged.
+        if (offset < -base || offset > static_cast<tjs_int64>(resource->bytes.size()) - base)
+            return position;
+        position = static_cast<size_t>(base + offset);
+        return position;
+    }
+    tjs_uint Read(void* buffer, tjs_uint requested) override
+    {
+        const auto count = static_cast<tjs_uint>(std::min<size_t>(requested, resource->bytes.size() - position));
+        if (count) std::memcpy(buffer, resource->bytes.data() + position, count);
+        position += count;
+        return count;
+    }
+    tjs_uint Write(const void*, tjs_uint) override { throw std::runtime_error("Emote resource is read-only"); }
+    void SetEndOfStorage() override { throw std::runtime_error("Emote resource is read-only"); }
+    bool Flush() override { return true; }
+    tjs_uint64 GetSize() override { return resource->bytes.size(); }
+};
+
+using EmoteDecodedCache = EmoteResourceCache<std::pair<std::string, tjs_int>, EmoteDecodedResource>;
+static EmoteDecodedCache& SharedEmoteCache()
+{
+    // Explicit session/compact hooks release retention. Avoid static teardown
+    // ordering dependencies on the application's shutdown callbacks.
+    static auto* cache = new EmoteDecodedCache(64 * 1024 * 1024);
+    return *cache;
+}
+void ClearSharedEmoteResourceCache(const char* reason)
+{
+    // One line per clear: clears are rare and the reason decides whether the
+    // reload that follows was avoidable (e.g. a routine script doCompact).
+    TVPConsoleLog("emote.resourceCache action=clear reason=%s",
+                  reason ? reason : "unspecified");
+    SharedEmoteCache().Clear();
+}
+void TrimSharedEmoteResourceCache(const char* reason)
+{
+    const auto keep = SharedEmoteCache().BudgetBytes() / 4;
+    const auto removed = SharedEmoteCache().TrimTo(keep);
+    if (removed)
+        TVPConsoleLog("emote.resourceCache action=trim reason=%s removed=%llu retainedBytes=%llu",
+                      reason ? reason : "unspecified",
+                      static_cast<unsigned long long>(removed),
+                      static_cast<unsigned long long>(SharedEmoteCache().GetStats().retainedBytes));
+}
+void InvalidateSharedEmoteResource(const std::string& canonicalPath)
+{
+    SharedEmoteCache().EraseIf([&](const auto& key) {
+        return key.first == canonicalPath ||
+            (key.first.size() > canonicalPath.size() &&
+             key.first.compare(0, canonicalPath.size(), canonicalPath) == 0 &&
+             key.first[canonicalPath.size()] == TVPArchiveDelimiter);
+    });
+}
+EmoteSharedResourceCacheStats GetSharedEmoteResourceCacheStats()
+{
+    const auto stats = SharedEmoteCache().GetStats();
+    return {stats.hits, stats.misses, stats.evictions, stats.retainedBytes, stats.entries, stats.generation};
+}
+
 #pragma region Base
 
 emoteframe::emoteframe(emotefile* filePtr, uint32_t startOffset) : _filePtr(filePtr)
@@ -1355,6 +1478,19 @@ emotemetadata::emotemetadata(emotefile* filePtr, uint32_t startOffset) : _filePt
         _eyebrowControl.push_back(tmp);
     }
 
+    // Optional controller metadata; absent in older PSB exports.
+    auto instant = _rootData.find("instantVariableList");
+    if (instant != _rootData.end())
+    {
+        std::vector<uint32_t> entries;
+        filePtr->parseList(entries, instant->second);
+        for (auto entry : entries)
+        {
+            std::string label;
+            if (filePtr->parseString(label, entry)) _instantVariableList.push_back(std::move(label));
+        }
+    }
+
     // bustControl
     _tmpList.clear();
     filePtr->parseList(_tmpList, _rootData["bustControl"]);
@@ -1597,6 +1733,7 @@ emotefile::~emotefile()
     if (filePtr != nullptr)
         delete filePtr;
     ClearAniTree();
+    _decryptClo.Release();
 }
 void emotefile::setSeed(tjs_int seed)
 {
@@ -1604,12 +1741,92 @@ void emotefile::setSeed(tjs_int seed)
 }
 void emotefile::setFun(tTJSVariantClosure decryptClo)
 {
+    // A file may outlive replacement of the manager's session callback.
+    // Retain both the callable and its bound context for this file's lifetime.
+    decryptClo.AddRef();
+    auto previous = _decryptClo;
     _decryptClo = decryptClo;
+    previous.Release();
+}
+void emotefile::LoadDecodedResource(std::shared_ptr<const EmoteDecodedResource> resource)
+{
+    auto stream = std::make_unique<EmoteReadOnlyStream>(resource);
+    _header = resource->header;
+    stringsOffset = resource->stringsOffset;
+    namesData = resource->namesData;
+    charset = resource->charset;
+    nameIndexes = resource->nameIndexes;
+    namesCache = resource->namesCache;
+    chunkOffsets = resource->chunkOffsets;
+    chunkLengths = resource->chunkLengths;
+    extraChunkOffsets = resource->extraChunkOffsets;
+    extraChunkLengths = resource->extraChunkLengths;
+    delete filePtr;
+    filePtr = stream.release();
+}
+std::shared_ptr<const EmoteDecodedResource> emotefile::SnapshotDecodedResource()
+{
+    const auto size = filePtr->GetSize();
+    const auto budget = SharedEmoteCache().BudgetBytes();
+    if (size > budget || size > std::numeric_limits<tjs_uint>::max()) return {};
+    auto resource = std::make_shared<EmoteDecodedResource>();
+    resource->header = _header;
+    resource->stringsOffset = stringsOffset;
+    resource->namesData = namesData;
+    resource->charset = charset;
+    resource->nameIndexes = nameIndexes;
+    resource->namesCache = namesCache;
+    resource->chunkOffsets = chunkOffsets;
+    resource->chunkLengths = chunkLengths;
+    resource->extraChunkOffsets = extraChunkOffsets;
+    resource->extraChunkLengths = extraChunkLengths;
+    if (resource->ByteCost() > budget - size) return {};
+    resource->bytes.resize(static_cast<size_t>(size));
+    const auto position = filePtr->GetPosition();
+    filePtr->SetPosition(0);
+    try {
+        filePtr->ReadBuffer(resource->bytes.data(), static_cast<tjs_uint>(size));
+    } catch (...) {
+        filePtr->SetPosition(position);
+        throw;
+    }
+    filePtr->SetPosition(position);
+    return resource;
 }
 bool emotefile::load(const ttstr& filePath)
 {
-    if (filePtr != NULL)
-        delete filePtr;
+    krkrsdl3::layer_work::SourceScope source("Emote.resource");
+    krkrsdl3::layer_work::StageScope stage(krkrsdl3::layer_work::Stage::ResourceLoad);
+    _sharedCacheHit = false;
+    _archiveFilterBypass = TVPHasXP3ArchiveFilters();
+    ClearAniTree();
+    delete filePtr;
+    filePtr = nullptr;
+    stringsOffset.clear(); namesData.clear(); charset.clear(); nameIndexes.clear(); namesCache.clear();
+    namesCacheTJS.clear(); stringsCacheTJS.clear();
+    _tjsNameTableReady = _tjsStringTableReady = false;
+    chunkOffsets.clear(); chunkLengths.clear(); extraChunkOffsets.clear(); extraChunkLengths.clear();
+    _header = {};
+    isKrkr = true; isMotion = false; colorType = 0; isMirror = false;
+    _screenSize = {}; _stereovisionProfile = {}; _zMax = _syncTime = 0;
+
+    // A script decrypt callback can depend on mutable state or have side
+    // effects. Always execute that path. Loose files can be changed by an open
+    // writer without another cache invalidation; only read-only archive members
+    // with deterministic seed decoding are eligible for cross-manager sharing.
+    const auto canonicalPath = TVPGetPlacedPath(filePath).AsStdString();
+    const bool cacheable = _decryptClo.Object == nullptr && !_archiveFilterBypass &&
+        canonicalPath.find(TVPArchiveDelimiter) != std::string::npos;
+    const auto key = std::make_pair(canonicalPath, _seed);
+    const auto generation = SharedEmoteCache().Generation();
+    if (cacheable) {
+        if (auto resource = SharedEmoteCache().Find(key)) {
+            LoadDecodedResource(std::move(resource));
+            _sharedCacheHit = true;
+            // Never share player variables, selection state or icon textures.
+            return GenerateAniTree();
+        }
+    }
     filePtr = TVPCreateStream(filePath);
     if (!filePtr)
         return false;
@@ -1632,6 +1849,9 @@ bool emotefile::load(const ttstr& filePath)
         if (TJS_strcasecmp(sign, "MDF") == 0)
         {
             // uncompress data
+            // The signature probe consumed five bytes for LZ4 detection. MDF
+            // stores its size after the four-byte magic, followed by data at 8.
+            filePtr->SetPosition(4);
             uLongf uncompressedSize = filePtr->ReadI32LE();
             tjs_uint8* _uncompress_buffer = new tjs_uint8[uncompressedSize];
             // compress data
@@ -1846,11 +2066,91 @@ bool emotefile::load(const ttstr& filePath)
             filePtr->ReadI8LE() - static_cast<tjs_int8>(PSB::PSBObjType::ArrayN1) + 1, filePtr);
     }
 
-    return GenerateAniTree();
+    const bool loaded = GenerateAniTree();
+    if (loaded && cacheable) {
+        try {
+            if (auto resource = SnapshotDecodedResource()) {
+                auto stream = std::make_unique<EmoteReadOnlyStream>(resource);
+                // Clearing storage caches during a reentrant load must prevent
+                // publication of the old contents after that invalidation.
+                SharedEmoteCache().Insert(key, resource, resource->ByteCost(), generation);
+                delete filePtr;
+                filePtr = stream.release();
+            }
+        } catch (const std::bad_alloc&) {
+            // Retention is optional; an otherwise successful load remains usable
+            // when the device cannot afford the shared snapshot allocation.
+        }
+    }
+    return loaded;
 }
 tTJSVariant emotefile::root()
 {
+    // Whole-tree materialization reads the shared string table once instead of
+    // once per occurrence. Targeted queries keep the original minimal read set.
+    struct FullTreeScope
+    {
+        bool& flag;
+        explicit FullTreeScope(bool& target) : flag(target) { flag = true; }
+        ~FullTreeScope() { flag = false; }
+    } fullTreeScope(_fullTreeMaterialization);
     return readAllObjs("root", _header.offsetEntries);
+}
+void emotefile::EnsureTJSNameTable()
+{
+    // A copy of the decoded table, not a reference: the per-occurrence ttstr
+    // built from it must match the per-byte path byte for byte.
+    if (_tjsNameTableReady) return;
+    namesCacheTJS = namesCache;
+    _tjsNameTableReady = true;
+}
+void emotefile::EnsureTJSStringTable()
+{
+    if (_tjsStringTableReady) return;
+    stringsCacheTJS.reserve(stringsOffset.size());
+    for (const auto offset : stringsOffset)
+    {
+        filePtr->SetPosition(_header.offsetStringsData + offset);
+        std::string str;
+        const bool terminated = ReadNulTerminatedBlock(filePtr, str);
+        // The decoder treats a stream that ends before the terminator as an
+        // empty string; preserve that instead of exposing the partial bytes.
+        stringsCacheTJS.emplace_back(terminated ? str : std::string());
+    }
+    _tjsStringTableReady = true;
+}
+tTJSVariant emotefile::readVariableFrameList(const ttstr& name)
+{
+    // Walk PSB offsets instead of constructing the entire animation/source
+    // object tree just to read one metadata array. Keep the existing decoder
+    // for returned values so unknown frame fields and script types survive.
+    if (!filePtr) return tTJSVariant();
+    std::map<std::string, uint32_t> properties;
+    if (!parseObject(properties, _header.offsetEntries)) return tTJSVariant();
+    auto metadata = properties.find("metadata");
+    if (metadata == properties.end()) return tTJSVariant();
+    const uint32_t metadataOffset = metadata->second;
+    properties.clear();
+    if (!parseObject(properties, metadataOffset)) return tTJSVariant();
+    auto variables = properties.find("variableList");
+    if (variables == properties.end()) return tTJSVariant();
+    std::vector<uint32_t> entries;
+    if (!parseList(entries, variables->second)) return tTJSVariant();
+    for (auto offset : entries)
+    {
+        properties.clear();
+        if (!parseObject(properties, offset)) continue;
+        auto label = properties.find("label");
+        if (label == properties.end()) continue;
+        const tTJSVariant value = readAllObjs("label", label->second);
+        if (value.Type() != tvtString || ttstr(value) != name) continue;
+        auto frames = properties.find("frameList");
+        // Dictionary.PropGet returns void for a missing member. The original
+        // script-tree lookup therefore stops at the first matching label too.
+        return frames != properties.end()
+            ? readAllObjs("frameList", frames->second) : tTJSVariant();
+    }
+    return tTJSVariant();
 }
 tTJSVariant emotefile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
 {
@@ -1950,15 +2250,23 @@ tTJSVariant emotefile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
             PSB::parsePSBArray(&tmp, typeByte - static_cast<tjs_int8>(PSB::PSBObjType::ArrayN1) + 1,
                                filePtr);
             iTJSDispatch2* array = TJSCreateArrayObject();
+            tTJSVariant result(array, array);
+            array->Release();
+            tTJSArrayNI* arrayInstance = nullptr;
+            if (TJS_SUCCEEDED(array->NativeInstanceSupport(TJS_NIS_GETINSTANCE, TJSGetArrayClassID(),
+                    reinterpret_cast<iTJSNativeInstance**>(&arrayInstance))) && arrayInstance)
+                arrayInstance->Items.reserve(std::max(arrayInstance->Items.size(), tmp.size()));
+            tjs_int index = 0;
             for (auto i : tmp)
             {
                 tTJSVariant tmp(static_cast<tjs_int32>(i));
-                tTJSVariant* args[] = {&tmp};
-                static tjs_uint addHint = 0;
-                array->FuncCall(0, TJS_N("add"), &addHint, nullptr, 1, args, array);
+                if (arrayInstance && arrayInstance->Items.size() == static_cast<size_t>(index) &&
+                    array->IsValid(0, nullptr, nullptr, array) == TJS_S_TRUE)
+                    static_cast<tTJSArrayObject*>(array)->Add(arrayInstance, tmp);
+                else
+                    array->PropSetByNum(TJS_MEMBERENSURE | TJS_IGNOREPROP, index, &tmp, array);
+                ++index;
             }
-            tTJSVariant result(array, array);
-            array->Release();
             return result;
         }
         case PSB::PSBObjType::StringN1:
@@ -1969,6 +2277,13 @@ tTJSVariant emotefile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
             tjs_int32 idx = 0;
             filePtr->ReadBuffer(&idx,
                                 typeByte - static_cast<tjs_int8>(PSB::PSBObjType::StringN1) + 1);
+            if (_fullTreeMaterialization)
+            {
+                EnsureTJSStringTable();
+                if (idx >= 0 && static_cast<size_t>(idx) < stringsCacheTJS.size())
+                    return tTJSVariant(stringsCacheTJS[idx]);
+                return tTJSVariant();
+            }
             filePtr->SetPosition(_header.offsetStringsData + stringsOffset[idx]);
             std::string str;
             tjs_uint8 val8 = 0;
@@ -2006,15 +2321,26 @@ tTJSVariant emotefile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
             tjs_uint32 _tmpOffset = this->readListInfo(&_objsOffset);
 
             iTJSDispatch2* array = TJSCreateArrayObject();
+            tTJSVariant result(array, array);
+            array->Release();
+            tTJSArrayNI* arrayInstance = nullptr;
+            if (TJS_SUCCEEDED(array->NativeInstanceSupport(TJS_NIS_GETINSTANCE, TJSGetArrayClassID(),
+                    reinterpret_cast<iTJSNativeInstance**>(&arrayInstance))) && arrayInstance)
+                arrayInstance->Items.reserve(std::max(arrayInstance->Items.size(), _objsOffset.size()));
+            tjs_int index = 0;
             for (auto _offset : _objsOffset)
             {
                 tTJSVariant obj = readAllObjs(ttstr(), _tmpOffset + _offset);
-                tTJSVariant* args[] = {&obj};
-                static tjs_uint addHint = 0;
-                array->FuncCall(0, TJS_N("add"), &addHint, nullptr, 1, args, array);
+                // Append fresh slots through the same primitive as Array.add.
+                // A customized constructor may prefill or invalidate the array;
+                // retain the prior indexed-write behavior in those cases.
+                if (arrayInstance && arrayInstance->Items.size() == static_cast<size_t>(index) &&
+                    array->IsValid(0, nullptr, nullptr, array) == TJS_S_TRUE)
+                    static_cast<tTJSArrayObject*>(array)->Add(arrayInstance, obj);
+                else
+                    array->PropSetByNum(TJS_MEMBERENSURE | TJS_IGNOREPROP, index, &obj, array);
+                ++index;
             }
-            tTJSVariant result(array, array);
-            array->Release();
             return result;
         }
         case PSB::PSBObjType::Objects:
@@ -2033,14 +2359,15 @@ tTJSVariant emotefile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
             }
 
             iTJSDispatch2* dsp = TJSCreateDictionaryObject();
+            tTJSVariant result(dsp, dsp);
+            dsp->Release();
+            EnsureTJSNameTable();
             for (tjs_int i = 0; i < _objsNamesIdx.size(); i++)
             {
-                ttstr keyName = namesCache.at(_objsNamesIdx.at(i));
+                const ttstr keyName = namesCacheTJS.at(_objsNamesIdx.at(i));
                 tTJSVariant obj = readAllObjs(keyName, _tmpOffset + _objsOffset.at(i));
                 dsp->PropSet(TJS_MEMBERENSURE, keyName.c_str(), nullptr, &obj, dsp);
             }
-            tTJSVariant result(dsp, dsp);
-            dsp->Release();
             return result;
         }
         default:
@@ -2314,21 +2641,9 @@ bool emotefile::parseString(std::string& output, uint32_t _objOffset)
             filePtr->ReadBuffer(&idx,
                                 typeByte - static_cast<tjs_int8>(PSB::PSBObjType::StringN1) + 1);
             filePtr->SetPosition(_header.offsetStringsData + stringsOffset[idx]);
-            std::string str;
-            tjs_uint8 val8 = 0;
-            while (true)
-            {
-                if (filePtr->Read(&val8, 1) == 0)
-                    break;
-
-                if (val8 == '\0')
-                {
-                    str.append(1, val8);
-                    break;
-                }
-                str.append(1, val8);
-            }
-            output = str;
+            // A truncated tail keeps the partial bytes here, unlike the script
+            // decoder which reports it as empty.
+            ReadNulTerminatedBlock(filePtr, output);
             return true;
         }
         default:
@@ -2522,6 +2837,7 @@ bool emotefile::ClearAniTree()
 {
     if (_metadata != nullptr)
         delete _metadata;
+    _metadata = nullptr;
     for (auto obj : _objects)
     {
         if (obj.second != nullptr)
@@ -2532,6 +2848,8 @@ bool emotefile::ClearAniTree()
         if (src.second != nullptr)
             delete src.second;
     }
+    _objects.clear();
+    _source.clear();
     return true;
 }
 void emotefile::updateZMax(float zMax)

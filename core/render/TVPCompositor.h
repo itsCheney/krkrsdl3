@@ -5,6 +5,13 @@
 #include <vector>
 
 #include "PlatformView.h"
+#include "LayerRenderOperation.h"
+#include "LayerTransition.h"
+#include "LayerShrink.h"
+#include "LayerSpanComposite.h"
+#include "AsyncLayerReadback.h"
+#include "LayerUploadBatch.h"
+#include "LayerHotspotContext.h"
 
 //---------------------------------------------------------------------------
 // TVPCompositor
@@ -13,6 +20,25 @@
 //---------------------------------------------------------------------------
 namespace krkrsdl3
 {
+struct TVPLayerGlyphUploadInfo {
+    uint64_t textureID=0, bytes=0;
+    int width=0,height=0;
+    const char* reason="unsupported";
+    bool targetWritten=false; // also observable if a post-encoding Submit throws
+};
+// GPU mesh-deformation input. Matrices are column-major and already include
+// inheritance/attach transforms. Keeping this representation renderer-neutral
+// lets plugins use an accelerated path without exposing their own types here.
+struct TVPMeshDeformSurface
+{
+    float matrix[16] = {0};
+    float originX = 0, originY = 0, width = 0, height = 0;
+    int32_t type = 0;
+    int32_t reserved[3] = {0, 0, 0};
+    float controlPts[32] = {0};
+};
+static_assert(sizeof(TVPMeshDeformSurface) == 224, "GPU deformation surface layout");
+
 //---------------------------------------------------------------------------
 // 渲染后端抽象层（合并接口）
 //
@@ -58,6 +84,9 @@ public:
     // ---- 帧控制（由 TVPRenderOnce 统一调度）----
     virtual void BeginFrame(int winWidth, int winHeight) = 0;
     virtual void EndFrame() = 0; // 提交并呈现（SwapBuffers / Present / vkQueuePresent）
+    // Lifecycle invalidation is optional; conservative static-present reuse
+    // must refresh after expose, resize, resume, capture and session changes.
+    virtual void InvalidatePresentation(const char* reason) {}
 
     // ---- 窗口贴图管理（上屏合成用；SW=SDL_Texture，GPU=与一般贴图同一实现）----
     // 句柄为后端持有的不透明指针，nullptr 表示无效
@@ -114,6 +143,21 @@ public:
                           float opacity,
                           const float* colorModulation = nullptr) = 0;
 
+    // Optional regular-grid deformation path. divX/divY define a static UV grid;
+    // the backend evaluates the surface chain per vertex. False means callers
+    // must use the CPU-generated DrawMesh path.
+    virtual bool SupportsMeshDeformation() const { return false; }
+    virtual bool DrawDeformedMesh(int divX,
+                                  int divY,
+                                  const TVPMeshDeformSurface* surfaces,
+                                  int surfaceCount,
+                                  void* texture,
+                                  float opacity,
+                                  const float* colorModulation = nullptr)
+    {
+        return false;
+    }
+
     // ---- Layer 合成（图层合成路径，供 DrawDeviceD3D 的 GPU RenderManager 使用）----
     // 与 2D 网格（DrawMesh，emoteplayer 用）的区别：混合公式遵循软件 RenderManager
     // （gl/tvpgl.cpp 的 bm* 方法语义），而非 emoteplayer 的混合约定。GL/VK/SW
@@ -151,6 +195,73 @@ public:
 
     // 后端信息采集（GL 的厂商/版本/扩展日志等），无操作默认实现
     virtual void FetchInfo() {}
+
+    // Optional ordinary-Layer resources. Rectangles use integer pixels, not
+    // normalized Emote UVs. Unsupported backends keep software RenderManager.
+    virtual bool SupportsLayerOperations() const { return false; }
+    virtual bool SupportsLayerTransitions() const { return false; }
+    virtual bool OperateLayerTransition(const TVPLayerTransitionOperation&, void*, void*, void*) { return false; }
+    virtual TVPLayerTransitionResult LastLayerTransitionResult() const { return TVPLayerTransitionResult::PipelineUnavailable; }
+    virtual bool SupportsLayerShrinks() const { return false; }
+    virtual bool SupportsLayerShrink64() const { return false; }
+    virtual bool OperateLayerShrink(const TVPLayerShrinkOperation&, void*, void*) { return false; }
+    virtual TVPLayerShrinkResult LastLayerShrinkResult() const { return TVPLayerShrinkResult::BackendFailure; }
+    virtual bool SupportsLayerSpanComposition() const { return false; }
+    virtual bool OperateLayerSpanComposite(const TVPLayerSpanCompositePacket&,void*) { return false; }
+    virtual TVPLayerSpanCompositeResult LastLayerSpanCompositeResult() const { return TVPLayerSpanCompositeResult::BackendFailure; }
+    virtual TVPLayerParameterUploadStats GetLayerParameterUploadStats() const { return {}; }
+    virtual bool SetLayerAlphaTables(const uint8_t*, const uint8_t*) { return false; }
+    virtual bool SetLayerPsTables(const uint8_t* softLight, const uint8_t* colorDodge,
+                                  const uint8_t* colorBurn) { return false; }
+    virtual void* CreateLayerTexture(int, int, TVPLayerTextureFormat) { return nullptr; }
+    virtual void DestroyLayerTexture(void*) {}
+    virtual void SetLayerDiagnosticIdentity(void*, const layer_hotspot::Identity&) {}
+    virtual bool UpdateLayerTexture(void*, const uint8_t*, int, const TVPLayerRect&) { return false; }
+    // Copies the borrowed R8 bytes synchronously, then draws using the ordinary
+    // integer operator. False guarantees no glyph target write; exceptions must
+    // propagate without replay. Atlas resources never escape this backend.
+    virtual bool OperateLayerGlyph(const TVPLayerOperation&,void*,const TVPLayerRect&,
+        const uint8_t*,int,int,int,int,TVPLayerGlyphUploadInfo&) { return false; }
+    virtual void ResetLayerGlyphResources() {}
+    virtual void RecordLayerGlyphRejection(layer_upload::GlyphReject) {}
+    // Fast full-surface copy from an offscreen render target into a Layer texture.
+    // Backends that cannot guarantee identical RGBA8 dimensions return false.
+    virtual bool CopyTargetToLayerTexture(void*, void*) { return false; }
+    // Same-size RGBA targets; preserve destination pixels outside region.
+    virtual bool CopyTargetToLayerTextureRegion(void*, void*, const TVPLayerRect&) { return false; }
+    virtual bool ReadLayerTexture(void*, std::vector<uint8_t>&, int&) { return false; }
+    virtual bool ReadLayerTextureRegion(void*, const TVPLayerRect&, std::vector<uint8_t>&, int&) { return false; }
+    // Last synchronous texture read only; querying this never blocks. Zero is
+    // also the default for unsupported backends, not an estimated wall time.
+    virtual uint64_t GetLastReadbackWaitNanoseconds() const { return 0; }
+    virtual std::shared_ptr<AsyncLayerPresentation> GetCurrentLayerPresentation() const { return {}; }
+    virtual uint64_t GetLastLayerPresentationSerial() const { return 0; }
+    // Encodes into normal frame work; never submits or waits for the GPU.
+    virtual bool RequestLayerTextureRegionRead(void*, const TVPLayerRect&,
+                                               const std::shared_ptr<AsyncLayerReadback>&) { return false; }
+    virtual bool OperateLayerRect(const TVPLayerOperation&, void*, const TVPLayerRect&,
+                                  void*, const TVPLayerRect&, int) { return false; }
+    // Prepared software warp subset: source snapshot on alias, then blend the
+    // previous target over the full clip (including transparent warp borders).
+    // Supported methods/flags are declared by TVPLayerOperationSupportsAffine.
+    virtual bool OperateLayerAffine(const TVPLayerOperation&, void*, const TVPLayerAffineCopy&,
+                                    void*, int) { return false; }
+    // Batch is ordered and transactional: false leaves the real target intact.
+    // Each aliased warp sees the result of preceding quads in this batch.
+    virtual bool OperateLayerPerspective(const TVPLayerOperation&, void*,
+                                         const TVPLayerPerspectiveQuad*, std::size_t,
+                                         void*, int) { return false; }
+    // Two-source ordinary Layer operation. Kept separate from OperateLayerRect
+    // so existing backends do not need to change their single-source ABI.
+    virtual bool OperateLayerRectDualSource(const TVPLayerOperation&, void*, const TVPLayerRect&,
+                                            void*, const TVPLayerRect&,
+                                            void*, const TVPLayerRect&) { return false; }
+    // Universal transitions read two RGBA sources and an R8 rule map.
+    // Other backends may keep the existing software path.
+    virtual bool OperateLayerRectTripleSource(const TVPLayerOperation&, void*, const TVPLayerRect&,
+                                              void*, const TVPLayerRect&,
+                                              void*, const TVPLayerRect&,
+                                              void*, const TVPLayerRect&) { return false; }
 
     // Duration of the last completed GPU submission, excluding queue wait.
     // Negative means unsupported/not available; reading never waits for GPU.
@@ -191,6 +302,155 @@ bool TVPRenderBackendAvailable(const std::string& name);
 //---------------------------------------------------------------------------
 void TVPSetRenderBackend(iTVPRenderBackend* backend);
 iTVPRenderBackend* TVPGetRenderBackend();
+void TVPInvalidatePresentation(const char* reason);
+
+struct TVPEmoteCaptureStats {
+    uint64_t calls = 0;
+    uint64_t cpuFallbacks = 0;
+    uint64_t cpuBytes = 0;
+    uint64_t gpuCopies = 0;
+    uint64_t gpuBytes = 0;
+    uint64_t skipped = 0;
+    uint64_t regionPixels = 0;
+    uint64_t fullPixels = 0;
+};
+void TVPRecordEmoteCaptureCall();
+void TVPRecordEmoteCaptureCPUFallback(uint64_t bytes);
+void TVPRecordEmoteCaptureGPUCopy(uint64_t bytes);
+void TVPRecordEmoteCaptureSkip();
+void TVPRecordEmoteCaptureRegion(uint64_t pixels, uint64_t fullPixels);
+TVPEmoteCaptureStats TVPGetEmoteCaptureStats();
+void TVPResetEmoteCaptureStats();
+
+struct TVPRuntimeProfileStats {
+    uint64_t emoteProgressCalls = 0;
+    uint64_t emoteProgressTimeNS = 0;
+    uint64_t emotePrepareCalls = 0;
+    uint64_t emotePrepareTimeNS = 0;
+    uint64_t emoteDrawCalls = 0;
+    uint64_t emoteDrawTimeNS = 0;
+    uint64_t emoteCaptureProfileCalls = 0;
+    uint64_t emoteCaptureTimeNS = 0;
+
+    // M6.2 Emote prepare breakdown. Node time is local work only (recursive
+    // children/submotions are measured by their own node records). Shape/mesh
+    // build time is intentionally a subset of node time.
+    uint64_t emotePrepareTransformTimeNS = 0;
+    uint64_t emotePrepareMotionProgressTimeNS = 0;
+    uint64_t emotePrepareSnapshotTimeNS = 0;
+    uint64_t emoteNodeProgressCalls = 0;
+    uint64_t emoteNodeProgressTimeNS = 0;
+    uint64_t emoteSubmotionCreates = 0;
+    uint64_t emoteSubmotionRebuildTimeNS = 0;
+    uint64_t emoteShapeBuildCalls = 0;
+    uint64_t emoteShapeBuildTimeNS = 0;
+    uint64_t emoteShapeVertices = 0;
+    uint64_t emoteMeshBuildCalls = 0;
+    uint64_t emoteMeshBuildTimeNS = 0;
+    uint64_t emoteMeshVerticesBuilt = 0;
+    uint64_t emoteDeformedVerticesBuilt = 0;
+    uint64_t emoteGPUDeformDraws = 0;
+    uint64_t emoteGPUDeformVertices = 0;
+
+    // Per-MikageKRKRStep Emote draw cadence. These distinguish multiple
+    // legitimate players from redundant repeated draws of the same player.
+    uint64_t emoteRenderSteps = 0;
+    uint64_t emotePlayerDraws = 0;
+    uint64_t emoteDistinctPlayerDraws = 0;
+    uint64_t emoteRepeatedPlayerDraws = 0;
+    uint64_t emoteDistinctTargets = 0;
+    uint64_t emoteMaxDrawsPerStep = 0;
+    uint64_t emoteMaxPlayersPerStep = 0;
+    uint64_t emoteMaxDrawsPerPlayerStep = 0;
+
+    uint64_t meshDrawCalls = 0;
+    uint64_t meshVertices = 0;
+    uint64_t meshIndices = 0;
+    uint64_t meshCPUTimeNS = 0;
+    uint64_t meshValidationTimeNS = 0;
+    uint64_t meshBufferAllocations = 0;
+    uint64_t meshBufferBytes = 0;
+    uint64_t meshBufferAllocationTimeNS = 0;
+    uint64_t metalSubmits = 0;
+    uint64_t metalSyncWaits = 0;
+    uint64_t metalSyncWaitTimeNS = 0;
+    uint64_t metalQueueWaitTimeNS = 0;
+
+    // Command-generation costs, accumulated for the current game session.
+    uint64_t metalRenderEncoders = 0;
+    uint64_t metalComputeEncoders = 0;
+    uint64_t metalBlitEncoders = 0;
+    uint64_t metalLayerRectSnapshots = 0;
+    uint64_t metalLayerRectSnapshotBytes = 0;
+    uint64_t metalSurfaceUploadBytes = 0;
+    uint64_t emoteMaskClears = 0;
+    uint64_t emoteMaskDraws = 0;
+    uint64_t emoteUniqueMaskGroups = 0;
+    uint64_t emoteLayerGPUCopies = 0;
+    uint64_t emoteLayerGPUCopyBytes = 0;
+    uint64_t emoteLayerCPUReadbacks = 0;
+    uint64_t emoteLayerCPUReadbackBytes = 0;
+    uint64_t emoteLayerCPUReadbackTimeNS = 0;
+
+    // Persistent transient-upload arena statistics.
+    uint64_t metalRingBytes = 0;
+    uint64_t metalRingSuballocs = 0;
+    uint64_t metalRingSuballocTimeNS = 0;
+    uint64_t metalRingWraps = 0;
+    uint64_t metalRingStallTimeNS = 0;
+    uint64_t metalRingHighWaterBytes = 0;
+    uint64_t metalRingFallbackAllocations = 0;
+    uint64_t metalRingFallbackBytes = 0;
+};
+void TVPRecordEmoteProgress(uint64_t nanoseconds);
+void TVPRecordEmotePrepare(uint64_t nanoseconds);
+void TVPRecordEmoteDraw(uint64_t nanoseconds);
+void TVPRecordEmoteCaptureTime(uint64_t nanoseconds);
+
+// Detailed M6.2 prepare profiling accumulates in thread-local storage during one
+// prepareFrame and commits once, avoiding atomics in the per-node hot path.
+void TVPBeginEmotePrepareDetail();
+void TVPRecordEmoteNodeProgress(uint64_t nanoseconds);
+void TVPRecordEmoteSubmotionRebuild(uint64_t nanoseconds, uint64_t creations);
+void TVPRecordEmoteShapeBuild(uint64_t nanoseconds, uint64_t vertices);
+void TVPRecordEmoteMeshBuild(uint64_t nanoseconds, uint64_t vertices,
+                             uint64_t deformedVertices);
+void TVPRecordEmoteGPUDeform(uint64_t vertices);
+
+// Mikage host brackets one SDL_AppIterate call with these. EmotePlayer records
+// its identity and render target when an actual render request is made.
+void TVPBeginRuntimeStep();
+void TVPRecordEmotePlayerDraw(uintptr_t playerIdentity, uintptr_t targetIdentity);
+void TVPRecordEmoteMaskGroup(uint64_t identityHash);
+void TVPRecordEmoteMaskClear();
+void TVPRecordEmoteMaskDraw();
+void TVPRecordEmoteLayerGPUCopy(uint64_t bytes);
+void TVPRecordEmoteLayerCPUReadback(uint64_t bytes, uint64_t nanoseconds);
+void TVPEndRuntimeStep();
+
+void TVPCommitEmotePrepareDetail(uint64_t transformTimeNS,
+                                 uint64_t motionProgressTimeNS,
+                                 uint64_t snapshotTimeNS);
+
+void TVPRecordMeshDraw(uint64_t vertices, uint64_t indices, uint64_t cpuTimeNS,
+                       uint64_t validationTimeNS, uint64_t bufferAllocations,
+                       uint64_t bufferBytes, uint64_t bufferAllocationTimeNS);
+void TVPRecordMetalSubmit();
+void TVPRecordMetalRenderEncoder();
+void TVPRecordMetalComputeEncoder();
+void TVPRecordMetalBlitEncoder();
+void TVPRecordMetalLayerRectSnapshot(uint64_t bytes);
+void TVPRecordMetalSurfaceUpload(uint64_t bytes);
+void TVPRecordMetalSyncWait(uint64_t nanoseconds);
+void TVPRecordMetalQueueWait(uint64_t nanoseconds);
+void TVPRecordMetalRingSuballoc(uint64_t bytes, uint64_t highWaterBytes,
+                                uint64_t nanoseconds);
+void TVPRecordMetalRingWrap();
+void TVPRecordMetalRingStall(uint64_t nanoseconds);
+void TVPRecordMetalRingFallback(uint64_t bytes);
+TVPRuntimeProfileStats TVPGetRuntimeProfileStats();
+void TVPResetRuntimeProfileStats();
+
 // 销毁当前后端并清空指针
 void TVPShutdownRenderBackend();
 

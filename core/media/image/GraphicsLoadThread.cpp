@@ -9,6 +9,11 @@
 #include "TVPMsg.h"
 #include "TVPDebug.h"
 #include "UtilStreams.h"
+#include "TVPSystem.h"
+#include "Platform.h"
+#include "CPUFrameDiagnostics.h"
+#include "LayerHotspotContext.h"
+#include <stdexcept>
 #include "NativeEventQueue.h"
 
 #include "tjsNativeBitmap.h"
@@ -54,6 +59,10 @@ static int TVPLoadGraphicAsync_SizeCallback(void* callbackdata,
                                             tTVPGraphicPixelFormat fmt)
 {
     tTVPTmpBitmapImage* img = (tTVPTmpBitmapImage*)callbackdata;
+    if (img->prefetch.id && (!w || !h ||
+        uint64_t(w) * uint64_t(h) > UINT64_MAX / 4 ||
+        !img->prefetchPolicy->Reserve(img->prefetch, uint64_t(w) * h * 4, TVPGetTickCount())))
+        throw std::runtime_error("prefetch byte/deadline/epoch budget");
     if (!img->bmp)
     {
         img->bmp = new tTVPBitmap(w, h, 32);
@@ -80,6 +89,8 @@ static int TVPLoadGraphicAsync_SizeCallback(void* callbackdata,
 static void* TVPLoadGraphicAsync_ScanLineCallback(void* callbackdata, tjs_int y)
 {
     tTVPTmpBitmapImage* img = (tTVPTmpBitmapImage*)callbackdata;
+    if(img->prefetch.id && !img->prefetchPolicy->Current(img->prefetch,TVPGetTickCount()))
+        throw std::runtime_error("prefetch cancelled or expired");
     if (y >= 0)
     {
         if (y < (tjs_int)img->bmp->GetHeight())
@@ -121,12 +132,14 @@ tTVPAsyncImageLoader::~tTVPAsyncImageLoader()
     {
         tTVPImageLoadCommand* cmd = CommandQueue.front();
         CommandQueue.pop();
+        PrefetchPolicy.Finish(cmd->prefetch_);
         delete cmd;
     }
     while (LoadedQueue.size() > 0)
     {
         tTVPImageLoadCommand* cmd = LoadedQueue.front();
         LoadedQueue.pop();
+        PrefetchPolicy.Finish(cmd->prefetch_);
         delete cmd;
     }
 }
@@ -173,8 +186,29 @@ void tTVPAsyncImageLoader::HandleLoadedImage()
         }
         if (cmd != NULL)
         {
+            if (cmd->prefetch_.id) {
+                // Touch commands own no Bitmap and never invoke TJS callbacks.
+                // Only the engine thread may commit a decoded image to cache.
+                if (PrefetchPolicy.Current(cmd->prefetch_, TVPGetTickCount()) &&
+                    !cmd->failed_ && cmd->result_.IsEmpty() && cmd->dest_->bmp &&
+                    !TVPHasImageCache(cmd->path_, glmNormal, 0, 0, TVP_clNone)) {
+                    auto* metadata = cmd->dest_->MetaInfo;
+                    cmd->dest_->MetaInfo = nullptr;
+                    try {TVPPushGraphicCache(cmd->path_, cmd->dest_->bmp, metadata);}
+                    catch (...) {} // demand loading remains authoritative
+                }
+                // Successful cache admission owns another bitmap reference.
+                // Release the worker's reference before the temporary holder's
+                // legacy destructor, which otherwise deletes it unconditionally.
+                if(cmd->dest_->bmp) {cmd->dest_->bmp->Release();cmd->dest_->bmp=nullptr;}
+                PrefetchPolicy.Finish(cmd->prefetch_);
+                delete cmd;
+                continue;
+            }
+            krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap.async",cmd->bmp_->GetReceiverDiagnosticID(),
+                krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);
             cmd->bmp_->SetLoading(false);
-            if (cmd->result_.length() > 0)
+            if (cmd->failed_ || cmd->result_.length() > 0)
             {
                 // error
                 TVPAddImportantLog(TJS_N("(error) Async image load failed: ") + cmd->path_ +
@@ -202,11 +236,13 @@ void tTVPAsyncImageLoader::HandleLoadedImage()
                 iTJSDispatch2* metainfo = TVPMetaInfoPairsToDictionary(cmd->dest_->MetaInfo);
 
                 cmd->bmp_->SetSizeAndImageBuffer(cmd->dest_->bmp);
+                TVPTagGraphicDiagnosticAsset(cmd->bmp_->GetBitmap(),cmd->path_);
                 // 読込み完了時にもキャッシュチェック(非同期なので完了前に読み込まれている可能性あり)
                 if (TVPHasImageCache(cmd->path_, glmNormal, 0, 0, TVP_clNone) == false)
                 {
-                    TVPPushGraphicCache(cmd->path_, cmd->dest_->bmp, cmd->dest_->MetaInfo);
+                    auto* cacheMetadata = cmd->dest_->MetaInfo;
                     cmd->dest_->MetaInfo = NULL;
+                    TVPPushGraphicCache(cmd->path_, cmd->dest_->bmp, cacheMetadata);
                 }
                 else
                 {
@@ -240,6 +276,7 @@ void tTVPAsyncImageLoader::HandleLoadedImage()
 // sync ( main thead )
 void tTVPAsyncImageLoader::LoadRequest(iTJSDispatch2* owner, tTJSNI_Bitmap* bmp, const ttstr& name)
 {
+    krkrsdl3::cpu_frame::EventScope cpuImage(krkrsdl3::cpu_frame::Kind::Image);
     // tTVPBaseBitmap* dest = new tTVPBaseBitmap( 32, 32, 32 );
     tTVPBaseBitmap dest(TVPGetInitialBitmap());
     iTJSDispatch2* metainfo = NULL;
@@ -250,6 +287,7 @@ void tTVPAsyncImageLoader::LoadRequest(iTJSDispatch2* owner, tTJSNI_Bitmap* bmp,
         if (bmp)
         {
             bmp->CopyFrom(&dest);
+            TVPTagGraphicDiagnosticAsset(bmp->GetBitmap(),nname);
             bmp->SetLoading(false);
         }
         if (!owner)
@@ -302,6 +340,24 @@ void tTVPAsyncImageLoader::PushLoadQueue(iTJSDispatch2* owner,
     // 追加したことをイベントで通知
     PushCommandQueueEvent.Set();
 }
+bool tTVPAsyncImageLoader::PushPrefetch(const ttstr& nname,
+    const std::shared_ptr<krkrsdl3::image_prefetch::Budget>& budget)
+{
+    auto ticket = PrefetchPolicy.Enqueue(nname, budget, TVPGetTickCount());
+    if (!ticket.id) return false;
+    tTVPImageLoadCommand* cmd = nullptr;
+    try {
+        cmd = new tTVPImageLoadCommand();
+        cmd->path_ = nname;
+        cmd->prefetch_ = ticket;
+        cmd->dest_ = new tTVPTmpBitmapImage();
+        cmd->dest_->prefetch = ticket;
+        cmd->dest_->prefetchPolicy = &PrefetchPolicy;
+        {tTJSCriticalSectionHolder cs(CommandQueueCS);CommandQueue.push(cmd);}
+    } catch (...) {PrefetchPolicy.Finish(ticket);delete cmd;return false;}
+    PushCommandQueueEvent.Set();
+    return true;
+}
 void tTVPAsyncImageLoader::LoadingThread()
 {
     while (!GetTerminated())
@@ -327,6 +383,11 @@ void tTVPAsyncImageLoader::LoadingThread()
             if (cmd)
             {
                 loading = true;
+                if (cmd->prefetch_.id && !PrefetchPolicy.Current(cmd->prefetch_, TVPGetTickCount())) {
+                    PrefetchPolicy.Finish(cmd->prefetch_);
+                    delete cmd;
+                    continue;
+                }
                 LoadImageFromCommand(cmd);
                 { // Lock
                     tTJSCriticalSectionHolder cs(ImageQueueCS);
@@ -340,25 +401,24 @@ void tTVPAsyncImageLoader::LoadingThread()
 }
 void tTVPAsyncImageLoader::LoadImageFromCommand(tTVPImageLoadCommand* cmd)
 {
-    tTVPRegisterGraphicInfo* handler = TVPGetGraphicLoadHandler(cmd->path_);
-    if (handler)
-    {
-        try
-        {
-            tTVPStreamHolder holder(cmd->path_);
-            handler->Load(handler->FormatData, (void*)cmd->dest_, TVPLoadGraphicAsync_SizeCallback,
-                          TVPLoadGraphicAsync_ScanLineCallback,
-                          TVPLoadGraphicAsync_MetaInfoPushCallback, holder.Get(), -1, glmNormal);
+    try {
+        tTVPRegisterGraphicInfo* handler = TVPGetGraphicLoadHandler(cmd->path_);
+        if (!handler) {
+            cmd->failed_ = true;
+            cmd->result_ = TVPFormatMessage(TVPUnknownGraphicFormat, cmd->path_);
+            return;
         }
-        catch (...)
-        {
-            // 例外は全てキャッチ
+        tTVPStreamHolder holder(cmd->path_);
+        handler->Load(handler->FormatData, (void*)cmd->dest_, TVPLoadGraphicAsync_SizeCallback,
+                      TVPLoadGraphicAsync_ScanLineCallback,
+                      TVPLoadGraphicAsync_MetaInfoPushCallback, holder.Get(), -1, glmNormal);
+        if (!cmd->dest_->bmp) {
+            cmd->failed_ = true;
             cmd->result_ = TVPFormatMessage(TVPImageLoadError, cmd->path_);
         }
-    }
-    else
-    {
-        // error
-        cmd->result_ = TVPFormatMessage(TVPUnknownGraphicFormat, cmd->path_);
+    } catch (...) {
+        cmd->failed_ = true;
+        try {cmd->result_ = TVPFormatMessage(TVPImageLoadError, cmd->path_);}
+        catch (...) {} // optional failure formatting cannot escape the worker
     }
 }

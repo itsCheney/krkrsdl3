@@ -20,6 +20,7 @@
 #include "TVPSystem.h"
 #include "TVPApplication.h"
 #include "LayerManager.h"
+#include "PointReadTrace.h"
 #include "Random.h"
 
 #include "Platform.h"
@@ -185,6 +186,7 @@ void TVPWindow::OnResize()
 //---------------------------------------------------------------------------
 void TVPWindow::OnClick(tjs_int x, tjs_int y)
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::Click, false);
     if (!GetVisible())
         return;
     LastMouseX = x;
@@ -201,6 +203,7 @@ void TVPWindow::OnClick(tjs_int x, tjs_int y)
 //---------------------------------------------------------------------------
 void TVPWindow::OnDoubleClick(tjs_int x, tjs_int y)
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::DoubleClick, false);
     if (!GetVisible())
         return;
     LastMouseX = x;
@@ -217,6 +220,7 @@ void TVPWindow::OnDoubleClick(tjs_int x, tjs_int y)
 //---------------------------------------------------------------------------
 void TVPWindow::OnMouseDown(tjs_int x, tjs_int y, tTVPMouseButton mb, tjs_uint32 flags)
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerDown, false);
     if (!GetVisible())
         return;
     LastMouseX = x;
@@ -233,6 +237,7 @@ void TVPWindow::OnMouseDown(tjs_int x, tjs_int y, tTVPMouseButton mb, tjs_uint32
 //---------------------------------------------------------------------------
 void TVPWindow::OnMouseUp(tjs_int x, tjs_int y, tTVPMouseButton mb, tjs_uint32 flags)
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerUp, false);
     if (!GetVisible())
         return;
     LastMouseX = x;
@@ -249,6 +254,7 @@ void TVPWindow::OnMouseUp(tjs_int x, tjs_int y, tTVPMouseButton mb, tjs_uint32 f
 //---------------------------------------------------------------------------
 void TVPWindow::OnMouseMove(tjs_int x, tjs_int y, tjs_uint32 flags)
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerMove, false);
     if (!GetVisible())
         return;
     LastMouseX = x;
@@ -268,6 +274,7 @@ void TVPWindow::OnMouseMove(tjs_int x, tjs_int y, tjs_uint32 flags)
 //---------------------------------------------------------------------------
 void TVPWindow::OnTouchDown(tjs_real x, tjs_real y, tjs_real cx, tjs_real cy, tjs_uint32 id)
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerDown, false);
     if (!GetVisible())
         return;
     if (Owner)
@@ -282,6 +289,7 @@ void TVPWindow::OnTouchDown(tjs_real x, tjs_real y, tjs_real cx, tjs_real cy, tj
 //---------------------------------------------------------------------------
 void TVPWindow::OnTouchUp(tjs_real x, tjs_real y, tjs_real cx, tjs_real cy, tjs_uint32 id)
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerUp, false);
     if (!GetVisible())
         return;
     if (Owner)
@@ -297,6 +305,7 @@ void TVPWindow::OnTouchUp(tjs_real x, tjs_real y, tjs_real cx, tjs_real cy, tjs_
 //---------------------------------------------------------------------------
 void TVPWindow::OnTouchMove(tjs_real x, tjs_real y, tjs_real cx, tjs_real cy, tjs_uint32 id)
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerMove, false);
     if (!GetVisible())
         return;
     if (Owner)
@@ -312,6 +321,7 @@ void TVPWindow::OnTouchMove(tjs_real x, tjs_real y, tjs_real cx, tjs_real cy, tj
 void TVPWindow::OnTouchScaling(
     tjs_real startdist, tjs_real curdist, tjs_real cx, tjs_real cy, tjs_int flag)
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerMove, false);
     if (!GetVisible())
         return;
     if (Owner)
@@ -327,6 +337,7 @@ void TVPWindow::OnTouchScaling(
 void TVPWindow::OnTouchRotate(
     tjs_real startangle, tjs_real curangle, tjs_real dist, tjs_real cx, tjs_real cy, tjs_int flag)
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerMove, false);
     if (!GetVisible())
         return;
     if (Owner)
@@ -360,12 +371,14 @@ void TVPWindow::OnReleaseCapture()
 //---------------------------------------------------------------------------
 void TVPWindow::OnMouseOutOfWindow()
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerMove, false);
     if (DrawDevice)
         DrawDevice->OnMouseOutOfWindow();
 }
 //---------------------------------------------------------------------------
 void TVPWindow::OnMouseEnter()
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerMove, false);
     if (!GetVisible())
         return;
     if (Owner)
@@ -377,6 +390,7 @@ void TVPWindow::OnMouseEnter()
 //---------------------------------------------------------------------------
 void TVPWindow::OnMouseLeave()
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerMove, false);
     if (!GetVisible())
         return;
     if (Owner)
@@ -444,6 +458,7 @@ void TVPWindow::OnFileDrop(const tTJSVariant& array)
 //---------------------------------------------------------------------------
 void TVPWindow::OnMouseWheel(tjs_uint32 shift, tjs_int delta, tjs_int x, tjs_int y)
 {
+    krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::Wheel, false);
     if (!GetVisible())
         return;
     if (Owner)
@@ -909,6 +924,16 @@ bool TVPWindow::DoClose()
         return true;
     }
     return false;
+}
+//---------------------------------------------------------------------------
+void TVPWindow::RequestUserClose()
+{
+    if (Closing || ProgramClosing)
+        return;
+    // With ProgramClosing false, OnCloseQuery queues the normal user-close
+    // input event. The game receives onCloseQuery and may cancel or show its UI.
+    if (OnCloseQuery())
+        Close();
 }
 //---------------------------------------------------------------------------
 void TVPWindow::Close()

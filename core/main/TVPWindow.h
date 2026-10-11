@@ -227,6 +227,10 @@ public:
     void BringToFront();
     void ShowWindowAsModal();
     void TickBeat();
+    // Update this capability when the native cursor or hint sinks below gain
+    // visible behavior. Built-in devices can avoid their property-only lookup
+    // while these sinks are no-ops; foreign draw devices remain conservative.
+    bool HasNativePointerPresentation() const { return false; }
     void SetDefaultMouseCursor() {}
     void SetMouseCursor(tjs_int) {}
     void GetCursorPos(tjs_int& x, tjs_int& y);
@@ -247,6 +251,7 @@ public:
 
     //----- close / modal
     void Close();
+    void RequestUserClose(); // native close-button path, including game confirmation/cancellation
     void OnCloseQueryCalled(bool b);
     void UpdateWindow(tTVPUpdateType type);
 

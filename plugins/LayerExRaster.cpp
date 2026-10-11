@@ -29,6 +29,7 @@ public:
         // レイヤ画像情報
         tjs_int width, height, pitch;
         unsigned char* buffer;
+        tTVPScopedLayerPixels source(layer.AsObjectNoAddRef(),false,"layerExRaster.read");
         {
             iTJSDispatch2* layerobj = layer.AsObjectNoAddRef();
             tTJSVariant var;
@@ -36,14 +37,13 @@ public:
             width = (tjs_int)var;
             layerobj->PropGet(0, TJS_N("imageHeight"), NULL, &var, layerobj);
             height = (tjs_int)var;
-            layerobj->PropGet(0, TJS_N("mainImageBuffer"), NULL, &var, layerobj);
-            buffer = (unsigned char*)(tjs_int64)var;
-            layerobj->PropGet(0, TJS_N("mainImageBufferPitch"), NULL, &var, layerobj);
-            pitch = (tjs_int)var;
+            buffer = static_cast<unsigned char*>(source.Data());
+            pitch = source.Pitch();
         }
 
         if (_width != width || _height != height)
         {
+            _pixels.Written(tTVPRect(0,0,0,0));
             return;
         }
 
@@ -92,6 +92,7 @@ public:
 
 NCB_GET_INSTANCE_HOOK(layerExRaster){
     // インスタンスゲッタ
+    ClassT* pixelsOwner=nullptr;
     NCB_INSTANCE_GETTER(objthis){
         // objthis を iTJSDispatch2* 型の引数とする
         ClassT* obj = GetNativeInstance(objthis); // ネイティブインスタンスポインタ取得
@@ -100,12 +101,15 @@ if (!obj)
     obj = new ClassT(objthis); // ない場合は生成する
     SetNativeInstance(objthis, obj); // objthis に obj をネイティブインスタンスとして登録する
 }
-obj->reset();
+pixelsOwner=obj;
+        obj->setPixelCaller("layerExRaster.write");
+        obj->reset();
 return obj;
 }
 // デストラクタ（実際のメソッドが呼ばれた後に呼ばれる）
 ~NCB_GET_INSTANCE_HOOK_CLASS()
 {
+        if(pixelsOwner) pixelsOwner->finishPixels();
 }
 }
 ;
