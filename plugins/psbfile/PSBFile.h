@@ -17,6 +17,7 @@ public:
     tTJSNI_PsbFile();
     tjs_error Construct(tjs_int numparams, tTJSVariant** param, iTJSDispatch2* tjs_obj);
     void Invalidate();
+    void Destruct() override;
 
     bool load(const ttstr& filePath);
     bool loadFromStream(tTJSBinaryStream* filePtr, const ttstr& filePath);
