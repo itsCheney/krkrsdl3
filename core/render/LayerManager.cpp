@@ -25,6 +25,8 @@
 #include "tjsNativeLayer.h"
 #include "AsyncAlphaTileCache.h"
 #include "MetalLayerRenderManager.h"
+#include "PrimaryCompletion.h"
+#include "UpdateRegionCoalescing.h"
 #include "../../plugins/emoteplayer/emoteperformance.h"
 #include <algorithm>
 #include <unordered_map>
@@ -471,6 +473,10 @@ void tTVPLayerManager::DrawCompleted(const tTVPRect& destrect,
         }
     }
 
+    // Children of an opaque Primary already drew into DrawBuffer; copying it
+    // onto itself is a no-op that costs GPU backends a snapshot and pass break.
+    if (krkrsdl3::primary_completion::IsIdentity(DrawBuffer, bmp, destrect, cliprect, type, opacity))
+        return;
     DrawBuffer->Blt(destrect.left, destrect.top, bmp, cliprect, type, opacity, HoldAlpha);
 }
 
@@ -1582,6 +1588,9 @@ void tTVPLayerManager::NotifyUpdateRegionFixed()
 {
     // called by primary layer, notifying final update region is fixed
     //	Window->NotifyUpdateRegionFixed(UpdateRegion);
+    // GPU composition pays per rectangle; merge slivers before completion.
+    if (TVPShouldCoalesceMetalLayerUpdates())
+        krkrsdl3::update_region::Coalesce(UpdateRegion);
 }
 //---------------------------------------------------------------------------
 void tTVPLayerManager::RequestInvalidation(const tTVPRect& r)

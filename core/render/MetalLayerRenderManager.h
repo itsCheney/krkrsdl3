@@ -30,6 +30,9 @@ bool TVPBindMetalLayerRenderManager(krkrsdl3::iTVPRenderBackend* backend);
 void TVPUnbindMetalLayerRenderManager();
 const char* TVPMetalLayerFallbackReason();
 bool TVPMetalLayerCompositionActive();
+// GPU composition pays per update rectangle; software keeps CPU-era regions.
+// MIKAGE_METAL_LAYER_COALESCE_UPDATES=0 restores the uncoalesced regions.
+bool TVPShouldCoalesceMetalLayerUpdates();
 TVPLayerRenderStats TVPGetMetalLayerRenderStats();
 enum class TVPLayerImageResult { Applied, Resource, CPUAccess, Geometry, BackendFailure };
 bool TVPHasMetalLayerImageLUTSupport();

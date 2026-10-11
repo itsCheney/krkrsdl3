@@ -1286,6 +1286,9 @@ void TVPUnbindMetalLayerRenderManager() {
     manager.session->backend=nullptr; manager.session.reset();
 }
 bool TVPMetalLayerCompositionActive() { return bool(Manager().session); }
+bool TVPShouldCoalesceMetalLayerUpdates() {
+    return Manager().session && SDL_GetHintBoolean("MIKAGE_METAL_LAYER_COALESCE_UPDATES",true);
+}
 bool TVPHasMetalLayerTransitionSupport() {
     const auto& session=Manager().session;
     return session && session->backend && session->backend->SupportsLayerTransitions();
