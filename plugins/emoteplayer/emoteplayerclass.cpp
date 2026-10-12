@@ -40,10 +40,10 @@ struct TargetReadLock
     TargetReadLock& operator=(const TargetReadLock&) = delete;
 };
 
-static void copyCanvasToLayer(tTJSNI_BaseLayer* layer,krkrsdl3::iTVPRenderBackend* renderer,
+static bool copyCanvasToLayer(tTJSNI_BaseLayer* layer,krkrsdl3::iTVPRenderBackend* renderer,
                              void* target,int width,int height,bool adaptor)
 {
-    if (!layer || !renderer || !target || width <= 0 || height <= 0) return;
+    if (!layer || !renderer || !target || width <= 0 || height <= 0) return false;
     auto& counters = performanceCounters();
     counters.captureRequests.fetch_add(1,std::memory_order_relaxed);
     const int layerWidth = layer->GetWidth(), layerHeight = layer->GetHeight();
@@ -69,19 +69,30 @@ static void copyCanvasToLayer(tTJSNI_BaseLayer* layer,krkrsdl3::iTVPRenderBacken
     {
         const Uint64 started = SDL_GetTicksNS();
         TargetReadLock read(renderer,target);
-        if (!read.pixels || read.pitch <= 0) return;
+        if (!read.pixels || read.pitch <= 0) return false;
         const auto bytes = std::uint64_t(read.pitch)*std::uint64_t(height);
         if (adaptor) krkrsdl3::TVPRecordEmoteCaptureCPUFallback(bytes);
         else krkrsdl3::TVPRecordEmoteLayerCPUReadback(bytes,SDL_GetTicksNS()-started);
         copied = layer->CopyMainImageFromCPU(read.pixels,read.pitch,copyWidth,copyHeight);
     }
-    if (!copied) return;
+    if (!copied) return false;
     counters.captureFullPixels.fetch_add(fullPixels,std::memory_order_relaxed);
     krkrsdl3::TVPRecordEmoteCaptureRegion(fullPixels,fullPixels);
     const auto layerPixels = std::uint64_t(std::max(0,layerWidth))*std::uint64_t(std::max(0,layerHeight));
     counters.captureUpdateFullPixels.fetch_add(layerPixels,std::memory_order_relaxed);
     counters.captureUpdatePixels.fetch_add(layerPixels,std::memory_order_relaxed);
     layer->Update();
+    return true;
+}
+
+std::function<bool(tjs_int, tjs_int)> emoteTransparencyHint(EmoteDrawnFrames frames)
+{
+    return [frames = std::move(frames)](tjs_int px, tjs_int py) {
+        for (const auto& [frame, serial] : frames)
+            if (!frame->player || frame->serial != serial || frame->player->mayCoverPixel(px, py))
+                return false;
+        return true;
+    };
 }
 
 static std::uint64_t nextEmoteManagerId()
@@ -612,7 +623,67 @@ void D3DAdaptor::captureCanvas(iTJSDispatch2* targetLayer)
         }
     } captureProfile;
     krkrsdl3::TVPRecordEmoteCaptureCall();
-    copyCanvasToLayer(ths,renderer,_target,_width,_height,true);
+    captureInto(ths, renderer);
+}
+void D3DAdaptor::captureInto(tTJSNI_BaseLayer* layer, krkrsdl3::iTVPRenderBackend* renderer)
+{
+    // Capturing twice without drawing must deliver the same frame again.
+    if (_lent) reclaimCanvas(renderer);
+    const bool whole = tjs_int(layer->GetWidth()) == _width && tjs_int(layer->GetHeight()) == _height;
+    const bool delivered = tryExchange(layer, renderer) ||
+                           copyCanvasToLayer(layer,renderer,_target,_width,_height,true);
+    // The layer now holds exactly the canvas: a cleared surface plus these frames.
+    if (delivered && whole)
+        layer->SetMainImageTransparencyHint(emoteTransparencyHint(_drawnSinceClear));
+    _afterCapture = true;
+}
+bool D3DAdaptor::tryExchange(tTJSNI_BaseLayer* layer, krkrsdl3::iTVPRenderBackend* renderer)
+{
+    if (_exchangeDisabled || _clearedCaptures < kClearedCapturesBeforeExchange || !_target ||
+        tjs_int(layer->GetWidth()) != _width || tjs_int(layer->GetHeight()) != _height)
+        return false;
+    void* exchanged = nullptr;
+    krkrsdl3::point_trace::WriterScope write("emote.captureExchange");
+    if (!layer->RenderMainImageOnGPU(renderer, _width, _height, [&](void* layerTarget) {
+            if (!renderer->ExchangeTargetTextures(_target, layerTarget)) return false;
+            exchanged = layerTarget;
+            return true;
+        }))
+        return false;
+    _lent = true;
+    _lentTo = exchanged;
+    if (!renderer->GetTargetContentVersion(_lentTo, _lentIdentity, _lentVersion))
+        _lentIdentity = _lentVersion = 0;
+    krkrsdl3::TVPRecordEmoteLayerDirectDraw();
+    layer->Update();
+    return true;
+}
+void D3DAdaptor::reclaimCanvas(krkrsdl3::iTVPRenderBackend* renderer)
+{
+    // The script used the canvas without clearing it, so it relies on the
+    // canvas keeping its frame: stop exchanging, and bring the frame back
+    // from the layer if that layer has not been written since.
+    _exchangeDisabled = true;
+    _lent = false;
+    uint64_t identity = 0, version = 0;
+    const bool unchanged = _lentIdentity && renderer->GetTargetContentVersion(_lentTo, identity, version) &&
+                           identity == _lentIdentity && version == _lentVersion;
+    if (!unchanged || !renderer->CopyTargetToLayerTexture(_lentTo, _target))
+    {
+        TVPConsoleLog("emote.captureExchange action=restoreLost");
+        renderer->SetTarget(_target);
+        renderer->ClearTarget(true);
+        _drawnSinceClear.clear();
+    }
+    _lentTo = nullptr;
+}
+void D3DAdaptor::prepareForDraw(krkrsdl3::iTVPRenderBackend* renderer,
+                                const std::shared_ptr<EmoteDrawnFrame>& frame)
+{
+    if (_lent && renderer) reclaimCanvas(renderer);
+    else if (_afterCapture) _exchangeDisabled = true; // drew on top of a captured frame
+    _afterCapture = false;
+    if (frame) _drawnSinceClear.emplace_back(frame, frame->serial);
 }
 void D3DAdaptor::unloadUnusedTextures()
 {
@@ -623,6 +694,12 @@ void D3DAdaptor::unloadUnusedTextures()
     {
         renderer->SetTarget(_target);
         renderer->ClearTarget(true);
+        // Cleared: whatever texture the canvas holds now has defined pixels.
+        if (_afterCapture && _clearedCaptures < kClearedCapturesBeforeExchange) ++_clearedCaptures;
+        _lent = false;
+        _lentTo = nullptr;
+        _afterCapture = false;
+        _drawnSinceClear.clear();
     }
 }
 
@@ -761,6 +838,7 @@ static tTJSVariant makeLayerGetter(EmotePlayer* player, emotemotionref* motion, 
 #define getprop(d, p) getprop_t(d, p, )
 EmotePlayer::~EmotePlayer()
 {
+    _drawnFrame->player = nullptr;
     // 渲染目标由 core/render 的 2D 渲染器统一管理
     krkrsdl3::iTVPRenderBackend* renderer = krkrsdl3::TVPGetRenderBackend();
     if (renderer)
@@ -1036,6 +1114,7 @@ void EmotePlayer::progress(tjs_real mstime)
 }
 void EmotePlayer::prepareFrame()
 {
+    ++_drawnFrame->serial; // geometry below is about to change
     emtEngine.recordAnimationDraw();
     const Uint64 profileStarted = SDL_GetTicksNS();
     krkrsdl3::TVPBeginEmotePrepareDetail();
@@ -1146,6 +1225,7 @@ void EmotePlayer::draw(iTJSDispatch2* objthis)
         };
         if (withD3DAdaptor)
         {
+            d3dAdaptor->prepareForDraw(renderer, _drawnFrame);
             drawFrame(target);
             return;
         }
@@ -1166,6 +1246,7 @@ void EmotePlayer::draw(iTJSDispatch2* objthis)
             {
                 krkrsdl3::TVPRecordEmoteLayerDirectDraw();
                 ths->Update();
+                ths->SetMainImageTransparencyHint(emoteTransparencyHint({{_drawnFrame, _drawnFrame->serial}}));
                 return;
             }
         }

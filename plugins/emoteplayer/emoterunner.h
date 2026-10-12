@@ -50,6 +50,8 @@ namespace emoteplayer
         void checkDrawStatus(float tick, std::vector<emoteRender>& renderList, emotelimit lim);
         void progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim);
         bool containsCurrentMesh(float x, float y) const;
+        // Whether this node's drawn mesh may have written the pixel at (x, y).
+        bool nearCurrentMesh(float x, float y, float margin) const;
         // 通过 core/render 的 2D 渲染抽象绘制（插件无渲染后端区分）
         bool draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget);
         float getCurrentRenderZ();
@@ -140,6 +142,9 @@ namespace emoteplayer
         void progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim);
         void draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget);
         bool contains(float x, float y, const char* label = nullptr) const;
+        // Whether any node drawn in the last frame may have written (x, y).
+        // Unlike contains, labelled shape areas are ignored: they draw nothing.
+        bool mayCover(float x, float y, float margin) const;
         // 根据emotenode*查找对应的emotenoderef
         emotenoderef* getNodeRef(emotenode* node);
         // Available after progress; the list is expanded and sorted only when
@@ -259,5 +264,7 @@ namespace emoteplayer
         glm::mat4 inputToClip = glm::mat4(1.0f);
         float width = 0, height = 0;
         bool contains(const char* label, float x, float y, bool local = false) const;
+        // Whether the last drawn frame may have written target pixel (px, py).
+        bool mayCoverPixel(int px, int py) const;
     };
 }

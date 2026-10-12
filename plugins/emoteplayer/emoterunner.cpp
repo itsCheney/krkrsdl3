@@ -612,6 +612,16 @@ bool emotenoderef::containsCurrentMesh(float x, float y) const
     return containsMesh(vertices, indices, x, y);
 }
 
+bool emotenoderef::nearCurrentMesh(float x, float y, float margin) const
+{
+    if (!_useGPUDeform)
+        return nearMesh(_meshVertices, _meshIndices, x, y, margin);
+    std::vector<EmoteVertex> vertices;
+    std::vector<uint16_t> indices;
+    buildSubdivMesh(renderMethod, _meshDivX, _meshDivY, vertices, indices);
+    return nearMesh(vertices, indices, x, y, margin);
+}
+
 bool emotenoderef::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget)
 {
     if (!isNeedDraw || !isIcon || renderMethod.size() < 1 || currentNode->removed)
@@ -951,6 +961,30 @@ bool emotemotionref::contains(float x, float y, const char* label) const
             if (node.wasDrawn && node.containsCurrentMesh(x, y))
                 return true;
     return false;
+}
+
+bool emotemotionref::mayCover(float x, float y, float margin) const
+{
+    for (const auto* sub : _subMotionRefs)
+        if (sub->mayCover(x, y, margin))
+            return true;
+    for (const auto& node : _nodeCache)
+        if (node.wasDrawn && node.nearCurrentMesh(x, y, margin))
+            return true;
+    return false;
+}
+
+bool EmoteHitFrame::mayCoverPixel(int px, int py) const
+{
+    if (width <= 0 || height <= 0)
+        return true; // no frame geometry to reason about
+    if (!motion)
+        return false; // nothing drawn
+    // Rasterizers write a pixel only when its centre is inside a triangle; a
+    // one-pixel margin absorbs CPU/GPU rounding of the same geometry.
+    const float x = (px + 0.5f) * 2 / width - 1, y = (py + 0.5f) * 2 / height - 1;
+    const float margin = std::max(2 / width, 2 / height);
+    return motion->mayCover(x, y, margin);
 }
 
 bool EmoteHitFrame::contains(const char* label, float x, float y, bool local) const

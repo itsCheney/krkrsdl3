@@ -6,6 +6,9 @@
 #include <map>
 #include <cstdint>
 #include <vector>
+#include <utility>
+#include <functional>
+#include <memory>
 #include <cmath>
 #include "emotefile.h"
 #include "emoterunner.h"
@@ -145,6 +148,19 @@ private:
     tjs_int _type = 0;
 };
 
+// One drawn frame of a player, for layers holding a transparency hint. The
+// player bumps `serial` whenever its geometry changes and clears `player`
+// when destroyed, so a hint never consults geometry of a different frame.
+struct EmoteDrawnFrame
+{
+    const EmotePlayer* player = nullptr;
+    uint64_t serial = 0;
+};
+using EmoteDrawnFrames = std::vector<std::pair<std::shared_ptr<EmoteDrawnFrame>, uint64_t>>;
+// For Layer::SetMainImageTransparencyHint on an image that started cleared and
+// then received exactly these frames: transparent where none of them drew.
+std::function<bool(tjs_int, tjs_int)> emoteTransparencyHint(EmoteDrawnFrames frames);
+
 // D3DAdaptor
 class D3DAdaptor
 {
@@ -155,6 +171,8 @@ public:
     void setClearColor(tjs_uint32 color);
     void captureCanvas(iTJSDispatch2* targetLayer);
     void unloadUnusedTextures();
+    // Called by EmotePlayer::draw before drawing `frame` into _target.
+    void prepareForDraw(krkrsdl3::iTVPRenderBackend* renderer, const std::shared_ptr<EmoteDrawnFrame>& frame);
 
     // 直接用于绘制的GPU目标
     tjs_int _width = 0, _height = 0;
@@ -162,6 +180,25 @@ public:
     uint32_t _clearColor = 0;
     void* _target = nullptr;
     void* _maskTarget = nullptr;
+
+private:
+    // A capture can hand the drawn texture to the layer instead of copying it,
+    // leaving the canvas with that layer's previous texture. That is only
+    // invisible when the script clears the canvas before using it again, so
+    // exchanging starts after the canvas has been cleared after a few
+    // captures, and stops for good the first time it is used uncleared.
+    static constexpr int kClearedCapturesBeforeExchange = 3;
+    bool _lent = false;          // _target currently holds another layer's old pixels
+    void* _lentTo = nullptr;     // layer texture now holding this canvas's frame
+    uint64_t _lentIdentity = 0, _lentVersion = 0;
+    bool _afterCapture = false;  // nothing but a capture since the last draw/clear
+    int _clearedCaptures = 0;
+    bool _exchangeDisabled = false;
+    // Frames drawn since the canvas was last cleared: its pixels are exactly these.
+    EmoteDrawnFrames _drawnSinceClear;
+    void captureInto(tTJSNI_BaseLayer* layer, krkrsdl3::iTVPRenderBackend* renderer);
+    bool tryExchange(tTJSNI_BaseLayer* layer, krkrsdl3::iTVPRenderBackend* renderer);
+    void reclaimCanvas(krkrsdl3::iTVPRenderBackend* renderer);
 };
 
 // EmotePlayer 和Player是一个玩意
@@ -174,7 +211,10 @@ public:
         TimelinePlayFlagDifference = 2
     };
 
-    EmotePlayer(ResourceManager* resourceManager) : _resourceManager(resourceManager){};
+    EmotePlayer(ResourceManager* resourceManager) : _resourceManager(resourceManager)
+    {
+        _drawnFrame->player = this;
+    };
     ~EmotePlayer();
 
     void AddRef()
@@ -260,6 +300,7 @@ public:
     static tjs_error cb_hitTest(tTJSVariant* result, tjs_int numparams, tTJSVariant** param,
                                 EmotePlayer* objthis);
     const EmoteHitFrame& getHitFrame() const { return _hitFrame; }
+    bool mayCoverPixel(int px, int py) const { return _hitFrame.mayCoverPixel(px, py); }
 
     void skip();
     void skipToSync();
@@ -333,6 +374,7 @@ private:
     glm::mat4 _affineTrans = glm::mat4(1.0f);
     glm::mat4 _targetTrans = glm::mat4(1.0f);
     EmoteHitFrame _hitFrame;
+    std::shared_ptr<EmoteDrawnFrame> _drawnFrame = std::make_shared<EmoteDrawnFrame>();
 
     ttstr _motionKey;
     ttstr _motion;

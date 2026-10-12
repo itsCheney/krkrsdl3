@@ -3397,6 +3397,47 @@ void tTJSNI_BaseLayer::SetImeMode(tTVPImeMode mode)
         Manager->NotifyImeModeChanged(this);
 }
 //---------------------------------------------------------------------------
+void tTJSNI_BaseLayer::SetMainImageTransparencyHint(std::function<bool(tjs_int, tjs_int)> transparent)
+{
+    TransparencyHint = nullptr;
+    iTVPTexture2D* texture = MainImage ? MainImage->GetTexture() : nullptr;
+    if (transparent && texture &&
+        texture->GetContentKey(TransparencyHintIdentity, TransparencyHintVersion))
+        TransparencyHint = std::move(transparent);
+}
+//---------------------------------------------------------------------------
+bool tTJSNI_BaseLayer::HintSaysTransparent(tjs_int px, tjs_int py)
+{
+    // The first answers are checked against a real read; one disagreement
+    // (a producer whose geometry does not match its pixels) turns hints off
+    // for the rest of the process instead of misrouting clicks.
+    static int verifiedAnswers = 0;
+    static bool hintsDisabled = false;
+    constexpr int kVerifiedAnswersBeforeTrust = 8;
+    if (!TransparencyHint || hintsDisabled)
+        return false;
+    uint64_t identity = 0, version = 0;
+    iTVPTexture2D* texture = MainImage->GetTexture();
+    if (!texture || !texture->GetContentKey(identity, version) ||
+        identity != TransparencyHintIdentity || version != TransparencyHintVersion)
+    {
+        TransparencyHint = nullptr;
+        return false;
+    }
+    if (!TransparencyHint(px, py))
+        return false;
+    if (verifiedAnswers >= kVerifiedAnswersBeforeTrust)
+        return true;
+    if (texture->GetPointAlpha(px, py) != 0)
+    {
+        hintsDisabled = true;
+        TVPAddLog(TJS_N("(warning) layer transparency hint disagreed with pixels; hints disabled"));
+        return false;
+    }
+    ++verifiedAnswers;
+    return true;
+}
+//---------------------------------------------------------------------------
 bool tTJSNI_BaseLayer::_HitTestNoVisibleCheck(tjs_int x, tjs_int y)
 {
     krkrsdl3::point_trace::OriginScope trace(krkrsdl3::point_trace::Source::LayerHitTest, this);
@@ -3418,6 +3459,8 @@ bool tTJSNI_BaseLayer::_HitTestNoVisibleCheck(tjs_int x, tjs_int y)
                 tjs_uint32 alpha;
                 if (MainImage->GetBPP() == 32)
                 {
+                    if (HintSaysTransparent(px, py))
+                        return false; // alpha 0 < HitThreshold
                     // RGB-only drawing leaves cached hit-test alpha valid.
                     // Uncached alpha still reads the current render texture.
                     alpha = MainImage->GetTexture()->GetPointAlpha(px, py);

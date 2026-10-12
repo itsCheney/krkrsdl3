@@ -229,6 +229,13 @@ public:
     virtual bool CopyTargetToLayerTexture(void*, void*) { return false; }
     // Same-size RGBA targets; preserve destination pixels outside region.
     virtual bool CopyTargetToLayerTextureRegion(void*, void*, const TVPLayerRect&) { return false; }
+    // Swaps the GPU images behind two same-size RGBA render targets (Layer
+    // textures included) without copying: each handle keeps its identity and
+    // takes the other's pixels. False leaves both unchanged.
+    virtual bool ExchangeTargetTextures(void*, void*) { return false; }
+    // A target's resource identity and write count, for checking later that
+    // its pixels are unchanged. False when the handle is unknown.
+    virtual bool GetTargetContentVersion(void*, uint64_t&, uint64_t&) { return false; }
     virtual bool ReadLayerTexture(void*, std::vector<uint8_t>&, int&) { return false; }
     virtual bool ReadLayerTextureRegion(void*, const TVPLayerRect&, std::vector<uint8_t>&, int&) { return false; }
     // Last synchronous texture read only; querying this never blocks. Zero is
@@ -391,7 +398,8 @@ struct TVPRuntimeProfileStats {
     uint64_t emoteLayerCPUReadbacks = 0;
     uint64_t emoteLayerCPUReadbackBytes = 0;
     uint64_t emoteLayerCPUReadbackTimeNS = 0;
-    // Frames rendered straight into the layer texture, with no canvas copy.
+    // Emote frames that reached their layer without a canvas copy: rendered in
+    // place, or a D3D-adaptor capture that exchanged textures.
     uint64_t emoteLayerDirectDraws = 0;
 
     // Persistent transient-upload arena statistics.
