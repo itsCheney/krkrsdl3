@@ -22,6 +22,7 @@
 #include "TVPSettings.h"
 #include "TVPCompositor.h"
 #include "TVPDebug.h"
+#include "emoteplayer/emoteresourcecache.h"
 
 #include "backend/SWRenderBackend.h"
 #ifdef _KRKRSDL3_USE_METAL
@@ -509,6 +510,11 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event)
                 tmpwind->Close();
             break;
         }
+        // iOS memory warning. Decoded Emote resources are only a cache; live
+        // players keep their own references.
+        case SDL_EVENT_LOW_MEMORY:
+            emoteplayer::ClearSharedEmoteResourceCache("lowMemory");
+            break;
         // 键盘事件
         case SDL_EVENT_KEY_DOWN:
         {

@@ -35,6 +35,8 @@ void ClearSharedEmoteResourceCache(const char* reason = "unspecified");
 void TrimSharedEmoteResourceCache(const char* reason = "unspecified");
 void InvalidateSharedEmoteResource(const std::string& canonicalPath);
 EmoteSharedResourceCacheStats GetSharedEmoteResourceCacheStats();
+// Retention budget for a device with `totalRAMBytes` (0 when unknown).
+std::size_t SharedEmoteCacheBudgetBytes(std::uint64_t totalRAMBytes);
 
 // A retention budget for immutable, fully constructed CPU resource data. Value
 // must not own script VM or GPU objects, and callers must not retain mutable
