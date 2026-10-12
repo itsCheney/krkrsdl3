@@ -1554,7 +1554,8 @@ namespace { unsigned alphaPresentationDepth=0; }
 void TVPBeginEmoteAlphaPresentation() { ++alphaPresentationDepth; }
 void TVPEndEmoteAlphaPresentation() { if(alphaPresentationDepth) --alphaPresentationDepth; }
 void TVPEncodeEmoteAsyncAlphaForPresentation(iTVPTexture2D* texture) {
-    if(!alphaPresentationDepth) return;
+    // Called for every drawn layer; skip the dynamic_cast when the experiment is off.
+    if(!alphaPresentationDepth || !emoteplayer::performanceEnabled("MIKAGE_EMOTE_ASYNC_ALPHA")) return;
     if(auto* metal=dynamic_cast<LayerTexture*>(texture)) metal->EncodeAlphaForPresentation();
 }
 void TVPEncodeFrozenEmoteAsyncAlpha(iTVPTexture2D* texture,

@@ -130,6 +130,9 @@ void tTVPLayerManager::CancelAlphaPointerChain(uint64_t chain) {
     for(auto& pending:PendingAlphaInput) if(pending->pointerChain==chain) pending->canceled=true;
 }
 void tTVPLayerManager::BindAlphaPresentation() {
+    // Getting the ticket creates one, and a ticket forces the next present.
+    // With no deferred input (always so with async alpha off) there is nothing to bind.
+    if(PendingAlphaInput.empty()) return;
     const auto ticket=TVPGetEmoteAlphaPresentation();
     if(!ticket) return;
     for(auto& frame:PendingAlphaInput) {
@@ -147,8 +150,11 @@ void tTVPLayerManager::BindAlphaPresentation() {
     }
 }
 void tTVPLayerManager::CaptureAlphaForPresentation(tTJSNI_BaseLayer* layer) {
+    // Runs for every DrawSelf/CopySelf. Check the queue before creating a
+    // presentation ticket; it is empty whenever async alpha is off.
+    if(PendingAlphaInput.empty() || !emoteplayer::performanceEnabled("MIKAGE_EMOTE_ASYNC_ALPHA")) return;
     const auto ticket=TVPGetEmoteAlphaPresentation();
-    if(!ticket || !emoteplayer::performanceEnabled("MIKAGE_EMOTE_ASYNC_ALPHA")) return;
+    if(!ticket) return;
     for(auto& frame:PendingAlphaInput) {
         if(frame->canceled || frame->presentation!=ticket) continue;
         auto found=frame->points.find(layer);
