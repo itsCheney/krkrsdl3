@@ -46,27 +46,6 @@ double resolveFrameCoordinate(double coordinate, double origin, double extent)
     if (std::isinf(coordinate)) return extent - origin;
     return coordinate;
 }
-std::array<double, 101> localPoseInputs(const emoteframe& frame, const emoteframe* next,
-                                     float tick, const emotelimit& limit)
-{
-    std::array<double, 101> values{};
-    const bool interpolate = next && (frame.type != 2 || next->type == 2);
-    values[0] = interpolate ? tick : 0;
-    values[1] = limit.originX; values[2] = limit.originY;
-    values[3] = limit.width; values[4] = limit.height;
-    auto append = [&](const emoteframe& f, size_t offset) {
-        const double scalars[] = {f.time, double(f.type), f.coordX, f.coordY,
-            f.coordZ, f.opa, f.angle, f.sx, f.sy, f.zx, f.zy, f.ox, f.oy,
-            f.timeOffset, double(f.hasbp), double(interpolate)};
-        std::copy(std::begin(scalars), std::end(scalars), values.begin() + offset);
-        // If either interpolated frame has deformation, both arrays are read,
-        // including default control points on the other frame.
-        std::copy(std::begin(f.bp), std::end(f.bp), values.begin() + offset + 16);
-    };
-    append(frame, 5);
-    if (interpolate) append(*next, 53);
-    return values;
-}
 } // namespace
 void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderList, emotelimit lim)
 {
@@ -313,20 +292,6 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
     }
     else
     {
-        bool reuseLocalPose = false;
-        if (refTop && refTop->localPoseCachingEnabled())
-        {
-            const auto inputs = localPoseInputs(*frame, nextframe, currTick, lim);
-            // Byte comparison treats unchanged NaN sentinels as equal. Both
-            // arrays are initialized and consist solely of doubles, no padding.
-            reuseLocalPose = _localPoseValid &&
-                std::memcmp(inputs.data(), _localPoseInputs.data(), inputs.size() * sizeof(double)) == 0;
-            _localPoseInputs = inputs; _localPoseValid = true;
-            (reuseLocalPose ? performanceCounters().localPoseCacheHits :
-                performanceCounters().localPoseCacheMisses).fetch_add(1, std::memory_order_relaxed);
-        }
-        else _localPoseValid = false;
-        if (!reuseLocalPose)
         {
         // 基础参数
         if (nextframe != nullptr &&
@@ -1274,9 +1239,6 @@ void emoteengine::recordAnimationDraw()
 void emoteengine::progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim)
 {
     _nodeCachingEnabled = performanceEnabled("MIKAGE_EMOTE_NODE_CACHE");
-    // Scalar comparison is an independent experiment: simple/static nodes can
-    // cost more to compare than to evaluate. Keep it opt-in for A/B measurement.
-    _localPoseCachingEnabled = _nodeCachingEnabled && performanceEnabled("MIKAGE_EMOTE_LOCAL_POSE_CACHE");
     // With all reuse features disabled a conservative generation suffices.
     // Avoid copying/comparing complete inherited signatures on that path.
     _contentTrackingEnabled = _nodeCachingEnabled || performanceEnabled("MIKAGE_EMOTE_CAPTURE_CACHE");

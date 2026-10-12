@@ -17,11 +17,11 @@ inline bool readPerformanceFlag(const char* name)
                      std::strcmp(value, "yes") == 0 || std::strcmp(value, "on") == 0);
 }
 
-// Same order as the host's per-launch options mask.
+// Same order as the host's per-launch options mask. Bits 5 (experimental
+// bounds) and 6 (local pose cache) were removed and stay reserved.
 inline constexpr const char* performanceFlagNames[] = {
     "MIKAGE_EMOTE_NODE_CACHE", "MIKAGE_EMOTE_CAPTURE_CACHE", "MIKAGE_EMOTE_LOCAL_UPDATE",
-    "MIKAGE_EMOTE_REGION_COPY", "MIKAGE_EMOTE_ASYNC_ALPHA", "MIKAGE_EMOTE_EXPERIMENTAL_BOUNDS",
-    "MIKAGE_EMOTE_LOCAL_POSE_CACHE"};
+    "MIKAGE_EMOTE_REGION_COPY", "MIKAGE_EMOTE_ASYNC_ALPHA"};
 // Bit 31 marks a valid snapshot.
 inline std::atomic<std::uint32_t>& performanceFlagSnapshot()
 {
@@ -49,14 +49,12 @@ inline bool performanceEnabled(const char* name)
 }
 
 #define EMOTE_PERFORMANCE_COUNTERS(X) \
-    X(nodeVisits) X(nodeCacheHits) X(nodeCacheMisses) X(localPoseCacheHits) X(localPoseCacheMisses) X(shapeCacheHits) X(meshCacheHits) \
+    X(nodeVisits) X(nodeCacheHits) X(nodeCacheMisses) X(shapeCacheHits) X(meshCacheHits) \
     X(drawListRebuilds) X(captureRequests) X(captureSkips) X(captureFull) X(captureRegions) \
     X(captureFullCopies) X(captureRegionCopies) X(captureInvalidDestinations) X(captureRegionFallbacks) \
     X(captureKnownBounds) X(captureUnknownBounds) X(captureRegionPixels) X(captureFullPixels) \
     X(captureBoundsNS) \
     X(captureUpdatePixels) X(captureUpdateFullPixels) \
-    X(captureExperimentalBoundsKnown) X(captureExperimentalBoundsUnknown) \
-    X(captureExperimentalBoundsPixels) X(captureExperimentalBoundsNS) \
     X(captureCOWFallbacks) X(alphaRequests) X(alphaCacheHits) X(alphaPendingEvents) \
     X(alphaReadBytes) X(alphaFailures) X(uiSyncReads) X(uiSyncWaitNS)
 

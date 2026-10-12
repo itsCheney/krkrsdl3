@@ -113,8 +113,6 @@ namespace emoteplayer
         // Selected-frame scalars are cached separately from inherited geometry.
         // Values (not just frame pointers) are compared so explicit resource
         // edits invalidate the cache, and viewport sentinel resolution is local.
-        std::array<double, 101> _localPoseInputs{};
-        bool _localPoseValid = false;
         emotelimit _geometryLimit;
         emoterect _shapeArea;
         std::uint64_t _geometryRevision = 0;
@@ -202,7 +200,6 @@ namespace emoteplayer
         // and clock-call counters. Never resets during the engine lifetime.
         std::uint64_t poseRevision() const { return _poseRevision; }
         bool nodeCachingEnabled() const { return _nodeCachingEnabled; }
-        bool localPoseCachingEnabled() const { return _localPoseCachingEnabled; }
         bool contentTrackingEnabled() const { return _contentTrackingEnabled; }
         // 查找数值
         bool getTickByName(const std::string& name, tjs_real& retVal);
@@ -259,7 +256,6 @@ namespace emoteplayer
     private:
         bool _integratedAnimation = false;
         bool _nodeCachingEnabled = false;
-        bool _localPoseCachingEnabled = false;
         bool _contentTrackingEnabled = false;
         std::uint64_t _poseRevision = 0, _preparedMotionRevision = 0;
     public:

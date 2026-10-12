@@ -57,18 +57,6 @@ static performance::TextureKey layerTextureKey(tTJSNI_BaseLayer* layer)
 }
 static performance::Bounds renderedBounds(emoteengine& engine,int width,int height)
 {
-    if (performanceEnabled("MIKAGE_EMOTE_EXPERIMENTAL_BOUNDS"))
-    {
-        const Uint64 started = SDL_GetTicksNS();
-        const auto& motion = engine._mainMotionRef;
-        const auto candidate = motion ? performance::submittedExperimentalBounds(motion->drawNodes(),width,height)
-                                      : performance::Bounds{};
-        auto& stats = performanceCounters();
-        (candidate.known ? stats.captureExperimentalBoundsKnown : stats.captureExperimentalBoundsUnknown)
-            .fetch_add(1,std::memory_order_relaxed);
-        if (candidate.known) stats.captureExperimentalBoundsPixels.fetch_add(candidate.rect.pixels(),std::memory_order_relaxed);
-        stats.captureExperimentalBoundsNS.fetch_add(SDL_GetTicksNS()-started,std::memory_order_relaxed);
-    }
     if (!performanceEnabled("MIKAGE_EMOTE_LOCAL_UPDATE") &&
         !performanceEnabled("MIKAGE_EMOTE_REGION_COPY")) return {false,{}};
     const Uint64 started = SDL_GetTicksNS();
@@ -1266,7 +1254,7 @@ void EmotePlayer::draw(iTJSDispatch2* objthis)
             const Uint64 drawStarted = SDL_GetTicksNS();
             emtEngine.draw(renderer, target, _limitArea, maskTarget);
             krkrsdl3::TVPRecordEmoteDraw(SDL_GetTicksNS() - drawStarted);
-            if (captureFeaturesEnabled() || performanceEnabled("MIKAGE_EMOTE_EXPERIMENTAL_BOUNDS"))
+            if (captureFeaturesEnabled())
                 canvas.recordDraw(token,renderedBounds(emtEngine,_width,_height));
             else canvas.invalidate(); // enabling an experiment later must not trust an old recipe.
         }
