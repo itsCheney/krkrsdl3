@@ -87,18 +87,71 @@ void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderL
     isIcon = false;
     isLayout = false;
     isShape = false;
-    emoteicon* tmpic = currentNode-> _filePtr->findsourceByName(frame->src);
-    if (tmpic == nullptr)
-        currentMtn = refTop->findmotionByName(frame->src);
-    else
-        currentMtn = nullptr;
-    if (tmpic != nullptr)
+    // Resolving frame->src parses it with istringstream and walks the source
+    // and motion maps. The answer only changes with the frame, its src text,
+    // the engine's main file or a newly attached file (_attach only grows),
+    // so resolve once and reuse it while the node keeps showing this frame.
+    using Source = SourceResolution::Kind;
+    const emotefile* mainFile = refTop->_mainfile;
+    const size_t attachCount = refTop->_attach.size();
+    if (_source.kind == Source::Unresolved || _source.frame != frame || _source.mainFile != mainFile ||
+        _source.attachCount != attachCount || _source.src != frame->src)
+    {
+        SourceResolution resolved;
+        resolved.frame = frame;
+        resolved.src = frame->src;
+        resolved.mainFile = mainFile;
+        resolved.attachCount = attachCount;
+        resolved.icon = currentNode->_filePtr->findsourceByName(frame->src);
+        if (resolved.icon != nullptr)
+            resolved.kind = Source::Icon;
+        else if ((resolved.motion = refTop->findmotionByName(frame->src)) != nullptr)
+            resolved.kind = Source::Motion;
+        else if (strcmp(frame->src.c_str(), "layout") == 0 || strcmp(frame->src.c_str(), "clip") == 0)
+            resolved.kind = Source::Layout;
+        else
+        {
+            std::istringstream iss(frame->src);
+            std::string token;
+            std::getline(iss, token, '/');
+            if (token == "src")
+            {
+                // emote 拼接前缀 "src/<type>/<name>"，跳过第一段。
+                // 此前直接拿 "src" 判类型，落入 unsupported 分支被丢弃，
+                // shape 判定层因此收集不到区域
+                std::getline(iss, token, '/');
+            }
+            if (strcmp(token.c_str(), "blank") == 0)
+            {
+                std::getline(iss, token, ':');
+                resolved.blankWidth = std::stoi(token);
+                std::getline(iss, token, ':');
+                resolved.blankHeight = std::stoi(token);
+                std::getline(iss, token, ':');
+                resolved.blankOriginX = std::stoi(token);
+                std::getline(iss, token, ':');
+                resolved.blankOriginY = std::stoi(token);
+                resolved.kind = Source::Blank;
+            }
+            else if (strcmp(token.c_str(), "shape") == 0)
+                resolved.kind = Source::Shape;
+            else
+            {
+                // Logged when the frame is first resolved, not on every tick.
+                TVPConsoleLog("source unsupported!!!--->%s", frame->src.c_str());
+                resolved.kind = Source::Unsupported;
+            }
+        }
+        _source = std::move(resolved);
+    }
+    currentMtn = _source.kind == Source::Motion ? _source.motion : nullptr;
+    if (_source.kind == Source::Icon)
     {
         isIcon = true;
 
-        if (tmpic != ic) // 直接比对ic
+        if (_source.icon != ic) // 直接比对ic
         {
-            ic = tmpic;
+            ic = _source.icon;
             ic->ensureLoad();
             width = ic->width;
             height = ic->height;
@@ -108,8 +161,7 @@ void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderL
         // 设置混色
         currbm = frame->bm;
     }
-    else if (currentMtn != nullptr || strcmp(frame->src.c_str(), "layout") == 0 ||
-             strcmp(frame->src.c_str(), "clip") == 0)
+    else if (_source.kind == Source::Motion || _source.kind == Source::Layout)
     {
         // 部分导出的 PSB 会剥离 shape 帧的 src 字段
         //（content 仅剩 coord/mask/zx/zy），解析后 src 落到默认值 "layout"，
@@ -138,54 +190,31 @@ void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderL
             }
         }
     }
+    else if (_source.kind == Source::Blank)
+    {
+        if (width != _source.blankWidth || height != _source.blankHeight)
+        {
+            width = _source.blankWidth;
+            height = _source.blankHeight;
+        }
+        originX = _source.blankOriginX;
+        originY = _source.blankOriginY;
+    }
+    else if (_source.kind == Source::Shape)
+    {
+        // shape节点: 不绘制但记录区域信息
+        // shape的像素尺寸 = zx/zy * 16 (PSB规范: 单元正方形为16x16)
+        // shape子类型从src的第二部分获取: rect(默认)、circle、point、quad
+        isShape = true; // 标记 shape 判定层
+        isNeedDraw = false;
+        width = height = 16.0f;
+        originX = width / 2;
+        originY = height / 2;
+    }
     else
     {
-        std::istringstream iss(frame->src);
-        std::string token;
-        std::getline(iss, token, '/');
-        if (token == "src")
-        {
-            // emote 拼接前缀 "src/<type>/<name>"，跳过第一段。
-            // 此前直接拿 "src" 判类型，落入 unsupported 分支被丢弃，
-            // shape 判定层因此收集不到区域
-            std::getline(iss, token, '/');
-        }
-        if (strcmp(token.c_str(), "blank") == 0)
-        {
-            std::getline(iss, token, ':');
-            int32_t w = std::stoi(token);
-            std::getline(iss, token, ':');
-            int32_t h = std::stoi(token);
-            std::getline(iss, token, ':');
-            int32_t ox = std::stoi(token);
-            std::getline(iss, token, ':');
-            int32_t oy = std::stoi(token);
-
-            if (width != w || height != h)
-            {
-                width = w;
-                height = h;
-            }
-            originX = ox;
-            originY = oy;
-        }
-        else if (strcmp(token.c_str(), "shape") == 0)
-        {
-            // shape节点: 不绘制但记录区域信息
-            // shape的像素尺寸 = zx/zy * 16 (PSB规范: 单元正方形为16x16)
-            // shape子类型从src的第二部分获取: rect(默认)、circle、point、quad
-            isShape = true; // 标记 shape 判定层
-            isNeedDraw = false;
-            width = height = 16.0f;
-            originX = width / 2;
-            originY = height / 2;
-        }
-        else
-        {
-            TVPConsoleLog("source unsupported!!!--->%s", frame->src.c_str());
-            isNeedDraw = false;
-            return;
-        }
+        isNeedDraw = false;
+        return;
     }
 }
 void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim)

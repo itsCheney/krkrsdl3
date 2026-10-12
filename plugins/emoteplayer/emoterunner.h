@@ -5,6 +5,8 @@
 #include <list>
 #include <memory>
 #include <array>
+#include <cstdint>
+#include <string>
 
 #include "emotefile.h"
 #include "emotegeometry.h"
@@ -78,6 +80,21 @@ namespace emoteplayer
         bool isShape = false;
         emoteframe* frame = nullptr;
         emoteframe* nextframe = nullptr;
+        // What frame->src names. Resolving it parses the path and walks the
+        // source/motion maps; this caches the result for the frame currently
+        // shown, keyed by everything the lookup reads (see checkDrawStatus).
+        struct SourceResolution
+        {
+            enum class Kind : uint8_t { Unresolved, Icon, Motion, Layout, Blank, Shape, Unsupported };
+            Kind kind = Kind::Unresolved;
+            const emoteframe* frame = nullptr;
+            std::string src;
+            const emotefile* mainFile = nullptr;
+            size_t attachCount = 0;
+            emoteicon* icon = nullptr;
+            emotemotion* motion = nullptr;
+            int32_t blankWidth = 0, blankHeight = 0, blankOriginX = 0, blankOriginY = 0;
+        } _source;
 
         // runtime (独立状态量，避免多次绘制串扰)
         float currTick = 0;
