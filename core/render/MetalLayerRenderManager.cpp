@@ -14,8 +14,6 @@
 #include "LayerTriangleTrace.h"
 #include "LayerAffineGeometry.h"
 #include "LayerPerspectiveGeometry.h"
-#include "AsyncAlphaTileCache.h"
-#include "../../plugins/emoteplayer/emoteperformance.h"
 #include "tjsDebug.h"
 #include <algorithm>
 #include <chrono>
@@ -26,6 +24,7 @@
 #include <unordered_map>
 #include <vector>
 #include <SDL3/SDL.h>
+#include "../../plugins/emoteplayer/emoteperformance.h"
 
 extern "C" {
 extern unsigned char TVPOpacityOnOpacityTable[65536];
@@ -133,8 +132,6 @@ class LayerTexture final : public iTVPTexture2D {
             // Diagnostics cannot turn an otherwise valid texture access into a failure.
         }
     }
-    bool emoteAlphaEligible = false;
-    krkrsdl3::AsyncAlphaTileCache alphaTiles;
     struct InvalidationInfo {
         point_trace::Invalidation reason = point_trace::Invalidation::Unknown;
         const char* writer = "initial";
@@ -332,7 +329,6 @@ public:
         session->textures.erase(this);
     }
     void Detach() {
-        alphaTiles.Cancel();
         try { Read(TVPLayerReadbackSource::Detach); }
         catch(const std::exception& error) {
             TVPConsoleLog("GPU Layer shutdown readback failed: %s",error.what());
@@ -344,29 +340,6 @@ public:
         if(!pinned) { pinned=true; ++session->stats.pinnedCPUTextures; }
     }
     bool Belongs(const std::shared_ptr<Session>& s) const { return session==s && handle; }
-    void MarkEmoteAlpha() { emoteAlphaEligible=true; }
-    bool HasEmoteAlpha() const { return format==TVPTextureFormat::RGBA && handle && session->backend && !pinned && !writeLeased && !scopedWrites; }
-    std::shared_ptr<krkrsdl3::AsyncAlphaTile> DemandAlpha(int x,int y) {
-        return alphaTiles.Demand(x,y,Width,Height);
-    }
-    void StopAlphaDemand() { alphaTiles.StopDemand(); }
-    void EncodeAlphaForPresentation(const std::shared_ptr<krkrsdl3::AsyncLayerPresentation>& frozen={}) {
-        if(!HasEmoteAlpha() || !emoteplayer::performanceEnabled("MIKAGE_EMOTE_ASYNC_ALPHA")) return;
-        // Upload CPU damage before recording the content key, then read exactly
-        // this MainImage version after the window's normal composition pass.
-        GetTextureHandle();
-        alphaTiles.EncodeDemanded(contentVersion,frozen ? frozen : session->backend->GetCurrentLayerPresentation(),
-            [&](const std::shared_ptr<krkrsdl3::AsyncLayerReadback>& read) {
-                const bool encoded=session->backend->RequestLayerTextureRegionRead(handle,read->region,read);
-                if(encoded) {
-                    auto& counters=emoteplayer::performanceCounters();
-                    counters.alphaRequests.fetch_add(1,std::memory_order_relaxed);
-                    counters.alphaReadBytes.fetch_add(uint64_t(read->region.Width())*read->region.Height()*4,
-                                                     std::memory_order_relaxed);
-                }
-                return encoded;
-            });
-    }
     // Used when building a borrowed software view for a CPU fallback, so the
     // readback is billed to the fallback rather than to ordinary pixel access.
     const void* ScanLineForFallback(TVPLayerFallbackReadbackRole role) {
@@ -1536,42 +1509,3 @@ std::string TVPGetMetalLayerUnsupportedMethodSummary() {
 
 const char* TVPMetalLayerFallbackReason() { return fallbackReason.c_str(); }
 
-void TVPMarkEmoteAlphaTexture(iTVPTexture2D* texture) {
-    if(auto* metal=dynamic_cast<LayerTexture*>(texture)) metal->MarkEmoteAlpha();
-}
-bool TVPIsEmoteAsyncAlphaTexture(iTVPTexture2D* texture) {
-    auto* metal=dynamic_cast<LayerTexture*>(texture);
-    return metal && metal->HasEmoteAlpha() &&
-        emoteplayer::performanceEnabled("MIKAGE_EMOTE_ASYNC_ALPHA");
-}
-bool TVPRequestEmoteAsyncAlpha(iTVPTexture2D* texture,int x,int y,
-                             std::shared_ptr<krkrsdl3::AsyncAlphaTile>& tile) {
-    if(!TVPIsEmoteAsyncAlphaTexture(texture)) return false;
-    tile=static_cast<LayerTexture*>(texture)->DemandAlpha(x,y);
-    return true;
-}
-namespace { unsigned alphaPresentationDepth=0; }
-void TVPBeginEmoteAlphaPresentation() { ++alphaPresentationDepth; }
-void TVPEndEmoteAlphaPresentation() { if(alphaPresentationDepth) --alphaPresentationDepth; }
-void TVPEncodeEmoteAsyncAlphaForPresentation(iTVPTexture2D* texture) {
-    // Called for every drawn layer; skip the dynamic_cast when the experiment is off.
-    if(!alphaPresentationDepth || !emoteplayer::performanceEnabled("MIKAGE_EMOTE_ASYNC_ALPHA")) return;
-    if(auto* metal=dynamic_cast<LayerTexture*>(texture)) metal->EncodeAlphaForPresentation();
-}
-void TVPEncodeFrozenEmoteAsyncAlpha(iTVPTexture2D* texture,
-    const std::shared_ptr<krkrsdl3::AsyncLayerPresentation>& presentation) {
-    if(!presentation || presentation->failed.load(std::memory_order_acquire)) return;
-    if(auto* metal=dynamic_cast<LayerTexture*>(texture)) metal->EncodeAlphaForPresentation(presentation);
-}
-void TVPStopEmoteAsyncAlphaDemand(iTVPTexture2D* texture) {
-    if(auto* metal=dynamic_cast<LayerTexture*>(texture)) metal->StopAlphaDemand();
-}
-uint64_t TVPGetEmoteAlphaPresentationSerial() {
-    auto& session=Manager().session;
-    auto presentation=session && session->backend ? session->backend->GetCurrentLayerPresentation() : nullptr;
-    return presentation ? presentation->frameSerial : 0;
-}
-std::shared_ptr<krkrsdl3::AsyncLayerPresentation> TVPGetEmoteAlphaPresentation() {
-    auto& session=Manager().session;
-    return session && session->backend ? session->backend->GetCurrentLayerPresentation() : nullptr;
-}

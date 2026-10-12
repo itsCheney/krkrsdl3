@@ -3388,17 +3388,8 @@ bool tTJSNI_BaseLayer::_HitTestNoVisibleCheck(tjs_int x, tjs_int y)
     // do hit test.
     // this function does not check layer's visiblity
 
-    tjs_int frameHitType=HitType;
-    if(Manager && Manager->IsAsyncAlphaQuery()) Manager->GetPinnedHitType(this,frameHitType);
-    if (frameHitType == htMask)
+    if (HitType == htMask)
     {
-        // The input preflight has already fixed one displayed alpha frame for
-        // every candidate. Never re-read the GPU after script callbacks begin.
-        if(Manager && Manager->IsAsyncAlphaQuery()) {
-            tjs_uint32 pinnedAlpha=0;
-            if(Manager->GetPinnedAlpha(this,pinnedAlpha))
-                return pinnedAlpha<=255 && (HitThreshold<=0 || tjs_int(pinnedAlpha)>=HitThreshold);
-        }
         // use mask
         if (MainImage)
         {
@@ -3445,7 +3436,7 @@ bool tTJSNI_BaseLayer::_HitTestNoVisibleCheck(tjs_int x, tjs_int y)
             return false;
         }
     }
-    else if (frameHitType == htProvince)
+    else if (HitType == htProvince)
     {
         // use province
 
@@ -3491,12 +3482,7 @@ bool tTJSNI_BaseLayer::HitTestNoVisibleCheck(tjs_int x, tjs_int y)
             param[1] = y;
             param[2] = true;
             static ttstr eventname(TJS_N("onHitTest"));
-            // Explicit script HitTest/getMaskPixel calls inside onHitTest keep
-            // their immediate semantics rather than borrowing this UI frame.
-            const bool priorQuery=Manager ? Manager->SetAsyncAlphaQuery(false) : false;
-            try { TVPPostEvent(Owner, Owner, eventname, 0, TVP_EPT_IMMEDIATE, 3, param); }
-            catch(...) { if(Manager) Manager->SetAsyncAlphaQuery(priorQuery); throw; }
-            if(Manager) Manager->SetAsyncAlphaQuery(priorQuery);
+            TVPPostEvent(Owner, Owner, eventname, 0, TVP_EPT_IMMEDIATE, 3, param);
 
             res = OnHitTest_Work;
         }
@@ -3519,13 +3505,8 @@ bool tTJSNI_BaseLayer::GetMostFrontChildAt(
         return false; // cannot hit invisible layer
 
     // convert coordinates ( the point is given by parent's coordinates )
-    if(Manager && Manager->IsAsyncAlphaQuery()) {
-        bool inside=false;
-        if(!Manager->GetPinnedLayerPoint(this,x,y,inside) || !inside) return false;
-    } else {
-        x -= Rect.left;
-        y -= Rect.top;
-    }
+    x -= Rect.left;
+    y -= Rect.top;
 
     // rectangle test
     if (x < 0 || y < 0 || x >= Rect.get_width() || y >= Rect.get_height())
@@ -6728,8 +6709,6 @@ void tTJSNI_BaseLayer::BltImage(iTVPBaseBitmap* dest,
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::DrawSelf(tTVPDrawable* target, tTVPRect& pr, tTVPRect& cr)
 {
-    if(Manager) Manager->CaptureAlphaForPresentation(this);
-    if(MainImage) TVPEncodeEmoteAsyncAlphaForPresentation(MainImage->GetTexture());
     if (!MainImage)
     {
         if (DisplayType == ltOpaque)
@@ -6794,8 +6773,6 @@ void tTJSNI_BaseLayer::CopySelfForRect(iTVPBaseBitmap* dest,
                                        tjs_int desty,
                                        const tTVPRect& srcrect)
 {
-    if(Manager) Manager->CaptureAlphaForPresentation(this);
-    if(MainImage) TVPEncodeEmoteAsyncAlphaForPresentation(MainImage->GetTexture());
     // copy self image to the target
     tTVPRect cr = srcrect;
     cr.add_offsets(-ImageLeft, -ImageTop);
@@ -6829,8 +6806,6 @@ void tTJSNI_BaseLayer::CopySelf(iTVPBaseBitmap* dest,
                                 tjs_int desty,
                                 const tTVPRect& r)
 {
-    if(Manager) Manager->CaptureAlphaForPresentation(this);
-    if(MainImage) TVPEncodeEmoteAsyncAlphaForPresentation(MainImage->GetTexture());
     const tTVPRect& uer = UpdateExcludeRect;
     if (uer.is_empty())
     {
@@ -6953,12 +6928,7 @@ void tTJSNI_BaseLayer::InternalDrawNoCache_CPU(tTVPDrawable* target, const tTVPR
             try
             {
                 // copy self image to the target
-                if (skipBinderTemporary)
-                {
-                    // CopySelf also binds image-less alpha input to this presentation.
-                    if (Manager) Manager->CaptureAlphaForPresentation(this);
-                }
-                else
+                if (!skipBinderTemporary)
                     CopySelf(UpdateBitmapForChild, updaterectforchild.left, updaterectforchild.top, cr);
 
                 TVP_LAYER_FOR_EACH_CHILD_BEGIN(child)
@@ -7248,12 +7218,7 @@ void tTJSNI_BaseLayer::Draw(tTVPDrawable* target, const tTVPRect& r, bool visibl
                 try
                 {
                     // copy self image to the target
-                    if (skipBinderTemporary)
-                    {
-                        // Preserve CopySelf's presentation side effect without a fill.
-                        if (Manager) Manager->CaptureAlphaForPresentation(this);
-                    }
-                    else
+                    if (!skipBinderTemporary)
                         CopySelf(UpdateBitmapForChild, updaterectforchild.left, updaterectforchild.top,
                                  cr);
 

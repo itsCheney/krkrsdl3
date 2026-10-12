@@ -9,7 +9,6 @@
 #include <cmath>
 #include "emotefile.h"
 #include "emoterunner.h"
-#include "emotecapturecache.h"
 
 #include "tjsNativeLayer.h"
 #include "TVPCompositor.h" // krkrsdl3::iTVPRenderBackend
@@ -140,7 +139,6 @@ public:
     void* target = nullptr;
     void* maskTarget = nullptr;
     tjs_int _width = 0, _height = 0;
-    performance::CanvasCaptureCache captureCache;
 
 private:
     tTJSNI_Layer* _this = nullptr;
@@ -164,7 +162,6 @@ public:
     uint32_t _clearColor = 0;
     void* _target = nullptr;
     void* _maskTarget = nullptr;
-    performance::CanvasCaptureCache captureCache;
 };
 
 // EmotePlayer 和Player是一个玩意
@@ -324,7 +321,7 @@ private:
     bool withoutAdaptor = false;
     // transform
     void updateTransMat();
-    bool prepareFrame();
+    void prepareFrame();
     void ResetDrawArea(tjs_int width, tjs_int height);
     tjs_int _width = 0, _height = 0;
     float currCoordx = 0, currCoordy = 0, currCoordz = 0; // 坐标
@@ -336,8 +333,6 @@ private:
     glm::mat4 _affineTrans = glm::mat4(1.0f);
     glm::mat4 _targetTrans = glm::mat4(1.0f);
     EmoteHitFrame _hitFrame;
-    const std::uint64_t _captureIdentity = performance::nextPlayerIdentity();
-    performance::CanvasCaptureCache _captureCache;
 
     ttstr _motionKey;
     ttstr _motion;
