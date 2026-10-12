@@ -10,6 +10,10 @@ bool TVPBindMetalLayerRenderManager(krkrsdl3::iTVPRenderBackend* backend);
 void TVPUnbindMetalLayerRenderManager();
 const char* TVPMetalLayerFallbackReason();
 bool TVPMetalLayerCompositionActive();
+// Call once per frame after script/event work and before presenting. Closes
+// script raw-pointer write leases and unpins textures whose raw pointer
+// script has stopped requesting, so they return to GPU composition.
+void TVPEndMetalLayerFrame();
 // GPU composition pays per update rectangle; software keeps CPU-era regions.
 // MIKAGE_METAL_LAYER_COALESCE_UPDATES=0 restores the uncoalesced regions.
 bool TVPShouldCoalesceMetalLayerUpdates();

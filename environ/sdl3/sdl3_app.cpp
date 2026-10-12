@@ -634,6 +634,7 @@ SDL_AppResult SDL_AppIterate(void* appstate)
     {
         tvp_noWindowFrames = 0;
     }
+    TVPEndMetalLayerFrame();
     // 写入缓冲区
     int RW = 1280, RH = 720;
     SDL_GetWindowSizeInPixels(tvp_window, &RW, &RH);

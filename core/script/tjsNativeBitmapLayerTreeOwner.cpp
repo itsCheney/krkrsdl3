@@ -2,6 +2,7 @@
 
 #include "TVPMsg.h"
 #include "tjsNativeLayer.h"
+#include "RenderManager.h"
 
 tTJSNI_BitmapLayerTreeOwner::tTJSNI_BitmapLayerTreeOwner()
   : Owner(NULL),
@@ -69,8 +70,14 @@ void tTJSNI_BitmapLayerTreeOwner::NotifyBitmapCompleted(class iTVPLayerManager* 
     {
         BitmapNI->SetSize(w, h);
     }
-    tjs_uint8* dstbits = (tjs_uint8*)BitmapNI->GetPixelBufferForWrite();
-    tjs_int dstpitch = BitmapNI->GetPixelBufferPitch();
+    // A scoped lock, not the script raw pointer: this copy finishes here, so
+    // the bitmap must not stay pinned to CPU composition afterwards.
+    tTVPScopedTexturePixels access;
+    access.Acquire(BitmapNI->GetTextureForCPUWrite(), true, "bitmapLayerTreeOwner.completed");
+    tjs_uint8* dstbits = (tjs_uint8*)access.Data();
+    if (!dstbits)
+        return;
+    tjs_int dstpitch = access.Pitch();
     // cliprect 偑偼傒弌偟偰偄偄側偄偙偲傪妋擣
     if (!(x < 0 || y < 0 || x + cliprect.get_width() > w || y + cliprect.get_height() > h) &&
         !(cliprect.left < 0 || cliprect.top < 0 || cliprect.right > bitmapinfo->GetWidth() ||
@@ -97,6 +104,7 @@ void tTJSNI_BitmapLayerTreeOwner::NotifyBitmapCompleted(class iTVPLayerManager* 
             void* destp = dstbits + dstpitch * dest_y + dest_x * 4;
             memcpy(destp, srcp, width_bytes);
         }
+        access.Written(tTVPRect(x, y, x + cliprect.get_width(), y + cliprect.get_height()));
     }
 }
 void tTJSNI_BitmapLayerTreeOwner::EndBitmapCompletion(iTVPLayerManager* manager)

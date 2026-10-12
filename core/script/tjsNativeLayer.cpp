@@ -3159,15 +3159,17 @@ bool tTJSNI_BaseLayer::CopyMainImageFromCPU(const void* pixels, tjs_int pitch,
     const tjs_int destinationPitch = texture->GetPitch();
     if (destinationPitch <= 0 || static_cast<size_t>(destinationPitch) < rowBytes)
         return false;
-    auto* destination = static_cast<uint8_t*>(fullOverwrite
-        ? texture->GetPersistentCPUDataForOverwrite() : texture->GetPersistentCPUData(true));
+    // A scoped lock, not a persistent raw pointer: the copy completes in this
+    // call, so the layer must not be pinned to CPU composition afterwards.
+    tTVPScopedTexturePixels access;
+    access.Acquire(texture, true, "layer.copyFromCPU", fullOverwrite);
+    auto* destination = static_cast<uint8_t*>(access.Data());
     if (!destination)
         return false;
     for (tjs_int y = 0; y < copyHeight; ++y)
         std::memcpy(destination + static_cast<size_t>(y) * destinationPitch,
                     static_cast<const uint8_t*>(pixels) + static_cast<size_t>(y) * pitch, rowBytes);
-    const tTVPRect written(0, 0, copyWidth, copyHeight);
-    texture->ReleasePersistentCPUData(&written);
+    access.Written(tTVPRect(0, 0, copyWidth, copyHeight));
     ImageModified = true;
     return true;
 }

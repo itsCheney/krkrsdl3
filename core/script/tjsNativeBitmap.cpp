@@ -260,6 +260,11 @@ void* tTJSNI_Bitmap::GetPixelBufferForWrite()
     return Bitmap->GetTextureForRender(true, nullptr)->GetPersistentCPUData(true);
 }
 //----------------------------------------------------------------------
+iTVPTexture2D* tTJSNI_Bitmap::GetTextureForCPUWrite()
+{
+    return Bitmap ? Bitmap->GetTextureForRender(true, nullptr) : nullptr;
+}
+//----------------------------------------------------------------------
 tjs_int tTJSNI_Bitmap::GetPixelBufferPitch() const
 {
     krkrsdl3::layer_hotspot::Scope receiverScope(0,"bitmap",ReceiverDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Bitmap);

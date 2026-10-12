@@ -92,10 +92,18 @@ public:
         ++counters.eligible;
         if(hasPresentationTicket) return Deny(Denial::Ticket);
         if(saturated || pending.size()>=Capacity) return Deny(Denial::Capacity);
-        // A confirmed A followed by pending B must not skip a new A.
-        if(!pending.empty()) return Deny(Denial::InFlight);
         if(forcedRefresh) return Deny(Denial::Refresh);
         if(!hasConfirmed) return Deny(Denial::Unconfirmed);
+        // Display confirmation usually arrives a frame or more after the next
+        // tick, so some present is almost always pending. Presents reach the
+        // screen in order, so the newest pending one is what will be shown;
+        // matching it is enough. A confirmed A followed by pending B still
+        // must not skip a new A. If that newest present fails, Reconcile
+        // forces a fresh present on the next frame.
+        if(!pending.empty()) {
+            if(!(signature==pending.back()->signature)) return Deny(Denial::InFlight);
+            ++counters.skipped; return true;
+        }
         if(!(signature==confirmed)) return Deny(Denial::Changed);
         ++counters.skipped; return true;
     }
