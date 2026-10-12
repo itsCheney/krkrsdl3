@@ -983,7 +983,9 @@ void emotemotionref::progress(float tick, std::vector<emoteRender>& renderList, 
         _previousSubMotions.clear(); _previousSubRevisions.clear();
     }
     if (_poseChanged) ++_poseRevision;
-    collectDrawNodes();
+    // The draw list is built once, by emoteengine::progress for the main ref.
+    // Its walk already descends into sub-motion node caches; building and
+    // sorting a list at every sub-motion level was never read.
 }
 void emotemotionref::collectDrawNodes()
 {
@@ -1292,6 +1294,7 @@ void emoteengine::progress(float tick, std::vector<emoteRender>& renderList, emo
         _mainMotionRef = std::make_shared<emotemotionref>(_mainmotion, this);
 
     _mainMotionRef->progress(tick, renderList, lim);
+    _mainMotionRef->collectDrawNodes();
     const auto revision = _mainMotionRef->poseRevision();
     if (replaced || revision != _preparedMotionRevision) ++_poseRevision;
     _preparedMotionRevision = revision;
