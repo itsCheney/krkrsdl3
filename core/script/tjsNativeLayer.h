@@ -9,6 +9,7 @@
 #include "ObjectList.h"
 #include "tjsNative.h"
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace krkrsdl3 { class iTVPRenderBackend; }
@@ -517,6 +518,11 @@ public:
                                     tjs_int width, tjs_int height);
     bool CopyMainImageFromGPUTargetRegion(krkrsdl3::iTVPRenderBackend* renderer, void* source,
                                         tjs_int width, tjs_int height, const tTVPRect& region);
+    // Full-surface GPU render into the main image; see
+    // tTVPNativeBaseBitmap::OverwriteOnGPU. Declines unless the image is
+    // exactly width x height.
+    bool RenderMainImageOnGPU(krkrsdl3::iTVPRenderBackend* renderer, tjs_int width, tjs_int height,
+                              const std::function<bool(void* target)>& write);
     // Copies the top-left source region, preserving image pixels outside it.
     bool CopyMainImageFromCPU(const void* pixels, tjs_int pitch, tjs_int width, tjs_int height);
     // Closes the write lease opened by GetMainImagePixelBufferForWrite so a GPU

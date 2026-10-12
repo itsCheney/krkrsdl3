@@ -1139,18 +1139,40 @@ void EmotePlayer::draw(iTJSDispatch2* objthis)
         krkrsdl3::TVPRecordEmotePlayerDraw(
             reinterpret_cast<uintptr_t>(this), reinterpret_cast<uintptr_t>(target));
         prepareFrame();
-        if (!withD3DAdaptor)
+        auto drawFrame = [&](void* frameTarget) {
+            const Uint64 drawStarted = SDL_GetTicksNS();
+            emtEngine.draw(renderer, frameTarget, _limitArea, maskTarget);
+            krkrsdl3::TVPRecordEmoteDraw(SDL_GetTicksNS() - drawStarted);
+        };
+        if (withD3DAdaptor)
         {
-            renderer->SetTarget(target);
-            renderer->ClearTarget(isSelfClear);
+            drawFrame(target);
+            return;
         }
-        const Uint64 drawStarted = SDL_GetTicksNS();
-        emtEngine.draw(renderer, target, _limitArea, maskTarget);
-        krkrsdl3::TVPRecordEmoteDraw(SDL_GetTicksNS() - drawStarted);
-        if (!withD3DAdaptor)
+        // A cleared canvas is copied over the whole layer, so a clearing player
+        // can render into the layer's own texture and skip the copy. A player
+        // that does not clear accumulates on its canvas between frames and
+        // keeps it. The canvas stays allocated for frames the layer declines.
+        if (isSelfClear && tjs_int(ths->GetWidth()) == _width && tjs_int(ths->GetHeight()) == _height)
         {
-            copyCanvasToLayer(ths,renderer,target,_width,_height,false);
+            krkrsdl3::point_trace::WriterScope write("emote.drawIntoLayer");
+            const bool direct = ths->RenderMainImageOnGPU(renderer, _width, _height, [&](void* layerTarget) {
+                renderer->SetTarget(layerTarget);
+                renderer->ClearTarget(true);
+                drawFrame(layerTarget);
+                return true;
+            });
+            if (direct)
+            {
+                krkrsdl3::TVPRecordEmoteLayerDirectDraw();
+                ths->Update();
+                return;
+            }
         }
+        renderer->SetTarget(target);
+        renderer->ClearTarget(isSelfClear);
+        drawFrame(target);
+        copyCanvasToLayer(ths,renderer,target,_width,_height,false);
     }
 }
 

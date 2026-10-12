@@ -391,6 +391,8 @@ struct TVPRuntimeProfileStats {
     uint64_t emoteLayerCPUReadbacks = 0;
     uint64_t emoteLayerCPUReadbackBytes = 0;
     uint64_t emoteLayerCPUReadbackTimeNS = 0;
+    // Frames rendered straight into the layer texture, with no canvas copy.
+    uint64_t emoteLayerDirectDraws = 0;
 
     // Persistent transient-upload arena statistics.
     uint64_t metalRingBytes = 0;
@@ -426,6 +428,7 @@ void TVPRecordEmoteMaskClear();
 void TVPRecordEmoteMaskDraw();
 void TVPRecordEmoteLayerGPUCopy(uint64_t bytes);
 void TVPRecordEmoteLayerCPUReadback(uint64_t bytes, uint64_t nanoseconds);
+void TVPRecordEmoteLayerDirectDraw();
 void TVPEndRuntimeStep();
 
 void TVPCommitEmotePrepareDetail(uint64_t transformTimeNS,

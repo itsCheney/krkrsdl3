@@ -2325,11 +2325,20 @@ bool tTVPNativeBaseBitmap::AssignTexture(iTVPTexture2D* tex)
 bool tTVPNativeBaseBitmap::CopyFromGPUTarget(krkrsdl3::iTVPRenderBackend* renderer,
                                           void* source)
 {
-    if (!renderer || !source || !Bitmap || !renderer->SupportsLayerOperations() ||
+    if (!source) return false;
+    return OverwriteOnGPU(renderer, [&](void* destination) {
+        return renderer->CopyTargetToLayerTexture(source, destination);
+    });
+}
+//---------------------------------------------------------------------------
+bool tTVPNativeBaseBitmap::OverwriteOnGPU(krkrsdl3::iTVPRenderBackend* renderer,
+                                       const std::function<bool(void* target)>& write)
+{
+    if (!renderer || !write || !Bitmap || !renderer->SupportsLayerOperations() ||
         Bitmap->GetFormat() != TVPTextureFormat::RGBA || Bitmap->IsCPUResident())
         return false;
 
-    // Do not sever sharing until the copy succeeds: a rejected copy must leave
+    // Do not sever sharing until the write succeeds: a rejected write must leave
     // both this image and any snapshots unchanged for the CPU fallback.
     auto release = [](iTVPTexture2D* texture) { if (texture) texture->Release(); };
     std::unique_ptr<iTVPTexture2D, decltype(release)> replacement(nullptr, release);
@@ -2343,8 +2352,18 @@ bool tTVPNativeBaseBitmap::CopyFromGPUTarget(krkrsdl3::iTVPRenderBackend* render
     // Exclusive pinned/leased images decline GPU writes so raw CPU pointers
     // remain authoritative. A shared snapshot retains its own old texture.
     void* handle = destination ? destination->GetTextureHandleForOverwrite() : nullptr;
-    if (!handle || !renderer->CopyTargetToLayerTexture(source, handle))
-        return false;
+    if (!handle) return false;
+    try
+    {
+        if (!write(handle)) return false;
+    }
+    catch (...)
+    {
+        // Some commands may already be encoded into this image's texture; its
+        // CPU copy is stale either way. A replacement is simply dropped.
+        if (!replacement) destination->CommitGPUOverwrite();
+        throw;
+    }
 
     destination->CommitGPUOverwrite();
     if (replacement)

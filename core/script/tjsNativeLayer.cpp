@@ -3111,6 +3111,21 @@ bool tTJSNI_BaseLayer::CopyMainImageFromGPUTarget(krkrsdl3::iTVPRenderBackend* r
     return true;
 }
 //---------------------------------------------------------------------------
+bool tTJSNI_BaseLayer::RenderMainImageOnGPU(krkrsdl3::iTVPRenderBackend* renderer,
+                                         tjs_int width, tjs_int height,
+                                         const std::function<bool(void* target)>& write)
+{
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.RenderMainImageOnGPU",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
+    if (!MainImage || width <= 0 || height <= 0 ||
+        MainImage->GetWidth() != static_cast<tjs_uint>(width) ||
+        MainImage->GetHeight() != static_cast<tjs_uint>(height))
+        return false;
+    if (!MainImage->OverwriteOnGPU(renderer, write))
+        return false;
+    ImageModified = true;
+    return true;
+}
+//---------------------------------------------------------------------------
 bool tTJSNI_BaseLayer::CopyMainImageFromGPUTargetRegion(krkrsdl3::iTVPRenderBackend* renderer,
                                                      void* source,tjs_int width,tjs_int height,
                                                      const tTVPRect& region)

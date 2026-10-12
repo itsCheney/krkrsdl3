@@ -18,6 +18,7 @@
 #include "TVPFontstruc.h"
 #include "drawable.h"
 #include "FontRasterizer.h"
+#include <functional>
 
 #ifndef TVP_REVRGB
 #define TVP_REVRGB(v) ((v & 0xFF00FF00) | ((v >> 16) & 0xFF) | ((v & 0xFF) << 16))
@@ -211,6 +212,12 @@ public:
     // Full RGBA surface copy. Shared/static images are replaced only after a
     // successful copy, without first copying the pixels that will be discarded.
     bool CopyFromGPUTarget(krkrsdl3::iTVPRenderBackend* renderer, void* source);
+    // Lets `write` replace every pixel of the image with backend GPU commands.
+    // It receives a backend target handle with the image's size and returns
+    // false only when it wrote nothing. Shared/static images get a new texture,
+    // assigned only after `write` succeeds.
+    bool OverwriteOnGPU(krkrsdl3::iTVPRenderBackend* renderer,
+                        const std::function<bool(void* target)>& write);
     // A partial copy preserves uncovered pixels. Shared/static destinations
     // decline it so callers retain the cheaper full-overwrite COW transaction.
     bool CopyFromGPUTargetRegion(krkrsdl3::iTVPRenderBackend* renderer, void* source,
