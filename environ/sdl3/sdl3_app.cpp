@@ -9,6 +9,8 @@
 #include <SDL3/SDL_log.h>
 #include <SDL3/SDL_timer.h>
 
+#include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <vector>
 #ifdef _KRKRSDL3_EMSCRIPTEN
@@ -348,13 +350,28 @@ struct Finger
 
     Finger() : id(0), x(0), y(0), startX(0), startY(0), downTime(0), active(false), moved(false) {}
 };
+// What a moving single finger turned into once it passed the move threshold.
+// A mostly vertical swipe scrolls like a mouse wheel (backlogs, scrolled
+// lists); any other drag holds the left button down so scroll bars, sliders
+// and draggable layers follow the finger. A finger that never moves is a tap.
+enum SingleFingerGesture
+{
+    GESTURE_NONE,
+    GESTURE_SCROLL,
+    GESTURE_DRAG
+};
+// Finger travel, as a fraction of the drawable height, per wheel notch.
+static const float SCROLL_STEP_FRACTION = 1.0f / 24.0f;
 static TouchState _state;
+static SingleFingerGesture _gesture = GESTURE_NONE;
+static float _scrollAnchorY = 0; // drawable pixels where the next notch is measured from
 static std::map<SDL_FingerID, Finger> fingers;
 static float rightClickX, rightClickY;
 static Uint64 rightClickStartTime;
 static const Uint32 RIGHT_CLICK_CONFIRM_DELAY = 150;
 void sendMouseEvent(int button, int eventType, float pX, float pY);
 void sendMouseMotion(float pX, float pY);
+void sendMouseWheel(int delta, float pX, float pY);
 void normalizedTouchToDrawable(float pX, float pY, int& pixelX, int& pixelY)
 {
     int drawableWidth = 1, drawableHeight = 1;
@@ -366,6 +383,12 @@ void normalizedTouchToDrawable(float pX, float pY, int& pixelX, int& pixelY)
 }
 void handleFingerDown(const SDL_TouchFingerEvent& e)
 {
+    if (_gesture != GESTURE_NONE)
+    {
+        // A swipe or drag already owns the input; extra fingers do not turn
+        // it into a right click or a menu halfway through.
+        return;
+    }
     Finger f;
     f.id = e.fingerID;
     f.x = f.startX = e.x;
@@ -415,9 +438,16 @@ void handleFingerUp(const SDL_TouchFingerEvent& e)
     {
         if (_state == STATE_SINGLE_FINGER)
         {
-            if (!f.moved)
+            if (_gesture == GESTURE_DRAG)
+            {
+                sendMouseEvent(SDL_BUTTON_LEFT, SDL_EVENT_MOUSE_BUTTON_UP, f.x, f.y);
+            }
+            else if (_gesture == GESTURE_NONE)
+            {
                 sendMouseEvent(SDL_BUTTON_LEFT, SDL_EVENT_MOUSE_BUTTON_DOWN, f.x, f.y);
-            sendMouseEvent(SDL_BUTTON_LEFT, SDL_EVENT_MOUSE_BUTTON_UP, f.x, f.y);
+                sendMouseEvent(SDL_BUTTON_LEFT, SDL_EVENT_MOUSE_BUTTON_UP, f.x, f.y);
+            }
+            // A scroll ends without a click, so it does not also advance text.
         }
         else if (_state == STATE_MULTI_FINGER)
         {
@@ -426,6 +456,7 @@ void handleFingerUp(const SDL_TouchFingerEvent& e)
             sendMouseEvent(SDL_BUTTON_RIGHT, SDL_EVENT_MOUSE_BUTTON_UP, f.x, f.y);
         }
         _state = STATE_IDLE;
+        _gesture = GESTURE_NONE;
     }
 
     fingers.erase(it);
@@ -451,8 +482,48 @@ void handleFingerMotion(const SDL_TouchFingerEvent& e)
 
         if (_state == STATE_SINGLE_FINGER)
         {
-            // 单指移动，发送鼠标移动
-            sendMouseMotion(f.x, f.y);
+            int startX = 0, startY = 0, pixelX = 0, pixelY = 0;
+            normalizedTouchToDrawable(f.startX, f.startY, startX, startY);
+            normalizedTouchToDrawable(f.x, f.y, pixelX, pixelY);
+            if (_gesture == GESTURE_NONE)
+            {
+                // Point at where the finger landed first: the wheel goes to
+                // the layer under the pointer, and a drag starts there.
+                sendMouseMotion(f.startX, f.startY);
+                if (std::abs(pixelY - startY) > std::abs(pixelX - startX))
+                {
+                    _gesture = GESTURE_SCROLL;
+                    _scrollAnchorY = static_cast<float>(startY);
+                }
+                else
+                {
+                    _gesture = GESTURE_DRAG;
+                    sendMouseEvent(SDL_BUTTON_LEFT, SDL_EVENT_MOUSE_BUTTON_DOWN, f.startX, f.startY);
+                }
+            }
+            if (_gesture == GESTURE_DRAG)
+            {
+                // 单指拖动，按住左键移动
+                sendMouseMotion(f.x, f.y);
+            }
+            else
+            {
+                int drawableWidth = 1, drawableHeight = 1;
+                SDL_GetWindowSizeInPixels(tvp_window, &drawableWidth, &drawableHeight);
+                const float step = std::max(drawableHeight, 1) * SCROLL_STEP_FRACTION;
+                // Content follows the finger: pulling down shows earlier
+                // content, which is a wheel turned up (positive delta).
+                while (pixelY - _scrollAnchorY >= step)
+                {
+                    sendMouseWheel(120, f.startX, f.startY);
+                    _scrollAnchorY += step;
+                }
+                while (_scrollAnchorY - pixelY >= step)
+                {
+                    sendMouseWheel(-120, f.startX, f.startY);
+                    _scrollAnchorY -= step;
+                }
+            }
         }
     }
 }
@@ -495,6 +566,12 @@ void sendMouseMotion(float pX, float pY)
     int pixelX = 0, pixelY = 0;
     normalizedTouchToDrawable(pX, pY, pixelX, pixelY);
     krkrsdl3::KRKR_Trig_MouseMove(pixelX,pixelY);
+}
+void sendMouseWheel(int delta, float pX, float pY)
+{
+    int pixelX = 0, pixelY = 0;
+    normalizedTouchToDrawable(pX, pY, pixelX, pixelY);
+    krkrsdl3::KRKR_Trig_MouseWheel(delta, pixelX, pixelY);
 }
 #endif
 
@@ -692,6 +769,8 @@ void SDL_AppQuit(void* appstate, SDL_AppResult result)
 #if defined(_KRKRSDL3_ANDROID) || defined(_KRKRSDL3_EMSCRIPTEN) || defined(_KRKRSDL3_IOS)
     fingers.clear();
     _state = STATE_IDLE;
+    _gesture = GESTURE_NONE;
+    _scrollAnchorY = 0;
     rightClickX = rightClickY = 0;
     rightClickStartTime = 0;
 #endif

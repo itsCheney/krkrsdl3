@@ -37,6 +37,8 @@ void KRKR_Trig_MouseDown(tTVPMouseButton mouseId, int x, int y);
 void KRKR_Trig_MouseUp(tTVPMouseButton mouseId, int x, int y);
 void KRKR_Trig_MouseMove(int x, int y);
 void KRKR_Trig_MouseScroll(int dx, int dy, int x, int y);
+// Wheel notch at drawable pixel (x, y); delta > 0 scrolls up, like WM_MOUSEWHEEL.
+void KRKR_Trig_MouseWheel(int delta, int x, int y);
 void KRKR_Trig_KeyDown(int vk);
 void KRKR_Trig_KeyUp(int vk);
 void KRKR_Trig_TextInput(std::string text);

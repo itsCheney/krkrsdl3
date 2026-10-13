@@ -291,6 +291,22 @@ void KRKR_Trig_MouseScroll(int dx, int dy, int x, int y)
     win->OnMouseWheel(TVPGetCurrentShiftKeyState(), dy > 0 ? -120 : 120, x, y);
 }
 //---------------------------------------------------------------------------
+void KRKR_Trig_MouseWheel(int delta, int x, int y)
+{
+    TVPWindow* win = TVPGetActiveWindow();
+    if (win == NULL)
+        return;
+    TVPSprite* tmp = win->pSprite;
+    if (tmp == NULL)
+        return;
+
+    // Queued behind the mouse moves before it, so the layer under the
+    // pointer is current when the wheel reaches it.
+    TVPPostInputEvent(new tTVPOnMouseWheelInputEvent(win, TVPGetCurrentShiftKeyState(), delta,
+                                                     (x - tmp->xPos) / tmp->scale,
+                                                     (y - tmp->yPos) / tmp->scale));
+}
+//---------------------------------------------------------------------------
 void KRKR_Trig_KeyDown(int vk)
 {
     TVPWindow* win = TVPGetActiveWindow();
