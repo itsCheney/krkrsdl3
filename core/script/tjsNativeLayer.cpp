@@ -3111,6 +3111,21 @@ bool tTJSNI_BaseLayer::CopyMainImageFromGPUTarget(krkrsdl3::iTVPRenderBackend* r
     return true;
 }
 //---------------------------------------------------------------------------
+bool tTJSNI_BaseLayer::RenderMainImageOnGPU(krkrsdl3::iTVPRenderBackend* renderer,
+                                         tjs_int width, tjs_int height,
+                                         const std::function<bool(void* target)>& write)
+{
+    krkrsdl3::layer_hotspot::Scope receiverScope(LayerDiagnosticID,"Layer.RenderMainImageOnGPU",LayerDiagnosticID,krkrsdl3::layer_hotspot::ReceiverKind::Layer);
+    if (!MainImage || width <= 0 || height <= 0 ||
+        MainImage->GetWidth() != static_cast<tjs_uint>(width) ||
+        MainImage->GetHeight() != static_cast<tjs_uint>(height))
+        return false;
+    if (!MainImage->OverwriteOnGPU(renderer, write))
+        return false;
+    ImageModified = true;
+    return true;
+}
+//---------------------------------------------------------------------------
 bool tTJSNI_BaseLayer::CopyMainImageFromGPUTargetRegion(krkrsdl3::iTVPRenderBackend* renderer,
                                                      void* source,tjs_int width,tjs_int height,
                                                      const tTVPRect& region)
@@ -3144,15 +3159,17 @@ bool tTJSNI_BaseLayer::CopyMainImageFromCPU(const void* pixels, tjs_int pitch,
     const tjs_int destinationPitch = texture->GetPitch();
     if (destinationPitch <= 0 || static_cast<size_t>(destinationPitch) < rowBytes)
         return false;
-    auto* destination = static_cast<uint8_t*>(fullOverwrite
-        ? texture->GetPersistentCPUDataForOverwrite() : texture->GetPersistentCPUData(true));
+    // A scoped lock, not a persistent raw pointer: the copy completes in this
+    // call, so the layer must not be pinned to CPU composition afterwards.
+    tTVPScopedTexturePixels access;
+    access.Acquire(texture, true, "layer.copyFromCPU", fullOverwrite);
+    auto* destination = static_cast<uint8_t*>(access.Data());
     if (!destination)
         return false;
     for (tjs_int y = 0; y < copyHeight; ++y)
         std::memcpy(destination + static_cast<size_t>(y) * destinationPitch,
                     static_cast<const uint8_t*>(pixels) + static_cast<size_t>(y) * pitch, rowBytes);
-    const tTVPRect written(0, 0, copyWidth, copyHeight);
-    texture->ReleasePersistentCPUData(&written);
+    access.Written(tTVPRect(0, 0, copyWidth, copyHeight));
     ImageModified = true;
     return true;
 }
@@ -3382,23 +3399,55 @@ void tTJSNI_BaseLayer::SetImeMode(tTVPImeMode mode)
         Manager->NotifyImeModeChanged(this);
 }
 //---------------------------------------------------------------------------
+void tTJSNI_BaseLayer::SetMainImageTransparencyHint(std::function<bool(tjs_int, tjs_int)> transparent)
+{
+    TransparencyHint = nullptr;
+    iTVPTexture2D* texture = MainImage ? MainImage->GetTexture() : nullptr;
+    if (transparent && texture &&
+        texture->GetContentKey(TransparencyHintIdentity, TransparencyHintVersion))
+        TransparencyHint = std::move(transparent);
+}
+//---------------------------------------------------------------------------
+bool tTJSNI_BaseLayer::HintSaysTransparent(tjs_int px, tjs_int py)
+{
+    // The first answers are checked against a real read; one disagreement
+    // (a producer whose geometry does not match its pixels) turns hints off
+    // for the rest of the process instead of misrouting clicks.
+    static int verifiedAnswers = 0;
+    static bool hintsDisabled = false;
+    constexpr int kVerifiedAnswersBeforeTrust = 8;
+    if (!TransparencyHint || hintsDisabled)
+        return false;
+    uint64_t identity = 0, version = 0;
+    iTVPTexture2D* texture = MainImage->GetTexture();
+    if (!texture || !texture->GetContentKey(identity, version) ||
+        identity != TransparencyHintIdentity || version != TransparencyHintVersion)
+    {
+        TransparencyHint = nullptr;
+        return false;
+    }
+    if (!TransparencyHint(px, py))
+        return false;
+    if (verifiedAnswers >= kVerifiedAnswersBeforeTrust)
+        return true;
+    if (texture->GetPointAlpha(px, py) != 0)
+    {
+        hintsDisabled = true;
+        TVPAddLog(TJS_N("(warning) layer transparency hint disagreed with pixels; hints disabled"));
+        return false;
+    }
+    ++verifiedAnswers;
+    return true;
+}
+//---------------------------------------------------------------------------
 bool tTJSNI_BaseLayer::_HitTestNoVisibleCheck(tjs_int x, tjs_int y)
 {
     krkrsdl3::point_trace::OriginScope trace(krkrsdl3::point_trace::Source::LayerHitTest, this);
     // do hit test.
     // this function does not check layer's visiblity
 
-    tjs_int frameHitType=HitType;
-    if(Manager && Manager->IsAsyncAlphaQuery()) Manager->GetPinnedHitType(this,frameHitType);
-    if (frameHitType == htMask)
+    if (HitType == htMask)
     {
-        // The input preflight has already fixed one displayed alpha frame for
-        // every candidate. Never re-read the GPU after script callbacks begin.
-        if(Manager && Manager->IsAsyncAlphaQuery()) {
-            tjs_uint32 pinnedAlpha=0;
-            if(Manager->GetPinnedAlpha(this,pinnedAlpha))
-                return pinnedAlpha<=255 && (HitThreshold<=0 || tjs_int(pinnedAlpha)>=HitThreshold);
-        }
         // use mask
         if (MainImage)
         {
@@ -3412,6 +3461,8 @@ bool tTJSNI_BaseLayer::_HitTestNoVisibleCheck(tjs_int x, tjs_int y)
                 tjs_uint32 alpha;
                 if (MainImage->GetBPP() == 32)
                 {
+                    if (HintSaysTransparent(px, py))
+                        return false; // alpha 0 < HitThreshold
                     // RGB-only drawing leaves cached hit-test alpha valid.
                     // Uncached alpha still reads the current render texture.
                     alpha = MainImage->GetTexture()->GetPointAlpha(px, py);
@@ -3445,7 +3496,7 @@ bool tTJSNI_BaseLayer::_HitTestNoVisibleCheck(tjs_int x, tjs_int y)
             return false;
         }
     }
-    else if (frameHitType == htProvince)
+    else if (HitType == htProvince)
     {
         // use province
 
@@ -3491,12 +3542,7 @@ bool tTJSNI_BaseLayer::HitTestNoVisibleCheck(tjs_int x, tjs_int y)
             param[1] = y;
             param[2] = true;
             static ttstr eventname(TJS_N("onHitTest"));
-            // Explicit script HitTest/getMaskPixel calls inside onHitTest keep
-            // their immediate semantics rather than borrowing this UI frame.
-            const bool priorQuery=Manager ? Manager->SetAsyncAlphaQuery(false) : false;
-            try { TVPPostEvent(Owner, Owner, eventname, 0, TVP_EPT_IMMEDIATE, 3, param); }
-            catch(...) { if(Manager) Manager->SetAsyncAlphaQuery(priorQuery); throw; }
-            if(Manager) Manager->SetAsyncAlphaQuery(priorQuery);
+            TVPPostEvent(Owner, Owner, eventname, 0, TVP_EPT_IMMEDIATE, 3, param);
 
             res = OnHitTest_Work;
         }
@@ -3519,13 +3565,8 @@ bool tTJSNI_BaseLayer::GetMostFrontChildAt(
         return false; // cannot hit invisible layer
 
     // convert coordinates ( the point is given by parent's coordinates )
-    if(Manager && Manager->IsAsyncAlphaQuery()) {
-        bool inside=false;
-        if(!Manager->GetPinnedLayerPoint(this,x,y,inside) || !inside) return false;
-    } else {
-        x -= Rect.left;
-        y -= Rect.top;
-    }
+    x -= Rect.left;
+    y -= Rect.top;
 
     // rectangle test
     if (x < 0 || y < 0 || x >= Rect.get_width() || y >= Rect.get_height())
@@ -6728,8 +6769,6 @@ void tTJSNI_BaseLayer::BltImage(iTVPBaseBitmap* dest,
 //---------------------------------------------------------------------------
 void tTJSNI_BaseLayer::DrawSelf(tTVPDrawable* target, tTVPRect& pr, tTVPRect& cr)
 {
-    if(Manager) Manager->CaptureAlphaForPresentation(this);
-    if(MainImage) TVPEncodeEmoteAsyncAlphaForPresentation(MainImage->GetTexture());
     if (!MainImage)
     {
         if (DisplayType == ltOpaque)
@@ -6794,8 +6833,6 @@ void tTJSNI_BaseLayer::CopySelfForRect(iTVPBaseBitmap* dest,
                                        tjs_int desty,
                                        const tTVPRect& srcrect)
 {
-    if(Manager) Manager->CaptureAlphaForPresentation(this);
-    if(MainImage) TVPEncodeEmoteAsyncAlphaForPresentation(MainImage->GetTexture());
     // copy self image to the target
     tTVPRect cr = srcrect;
     cr.add_offsets(-ImageLeft, -ImageTop);
@@ -6829,8 +6866,6 @@ void tTJSNI_BaseLayer::CopySelf(iTVPBaseBitmap* dest,
                                 tjs_int desty,
                                 const tTVPRect& r)
 {
-    if(Manager) Manager->CaptureAlphaForPresentation(this);
-    if(MainImage) TVPEncodeEmoteAsyncAlphaForPresentation(MainImage->GetTexture());
     const tTVPRect& uer = UpdateExcludeRect;
     if (uer.is_empty())
     {
@@ -6953,12 +6988,7 @@ void tTJSNI_BaseLayer::InternalDrawNoCache_CPU(tTVPDrawable* target, const tTVPR
             try
             {
                 // copy self image to the target
-                if (skipBinderTemporary)
-                {
-                    // CopySelf also binds image-less alpha input to this presentation.
-                    if (Manager) Manager->CaptureAlphaForPresentation(this);
-                }
-                else
+                if (!skipBinderTemporary)
                     CopySelf(UpdateBitmapForChild, updaterectforchild.left, updaterectforchild.top, cr);
 
                 TVP_LAYER_FOR_EACH_CHILD_BEGIN(child)
@@ -7248,12 +7278,7 @@ void tTJSNI_BaseLayer::Draw(tTVPDrawable* target, const tTVPRect& r, bool visibl
                 try
                 {
                     // copy self image to the target
-                    if (skipBinderTemporary)
-                    {
-                        // Preserve CopySelf's presentation side effect without a fill.
-                        if (Manager) Manager->CaptureAlphaForPresentation(this);
-                    }
-                    else
+                    if (!skipBinderTemporary)
                         CopySelf(UpdateBitmapForChild, updaterectforchild.left, updaterectforchild.top,
                                  cr);
 

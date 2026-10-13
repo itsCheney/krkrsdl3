@@ -423,6 +423,12 @@ static void _TVPDeliverEventByPrio(tjs_uint prio)
     {
         tTVPEvent* e;
 
+        // A handler in this pass may have begun termination (e.g. by closing
+        // the main window). Events still queued target objects that are being
+        // torn down, so they are dropped instead of delivered.
+        if (TVPTerminated)
+            break;
+
         // retrieve item to deliver
         if (TVPEventQueue.size() == 0)
             break;
@@ -523,6 +529,8 @@ static bool _TVPDeliverAllEvents()
 //---------------------------------------------------------------------------
 void TVPDeliverAllEvents()
 {
+    if (TVPTerminated)
+        return;
     bool r;
 
     if (!TVPEventInterrupting)
@@ -541,6 +549,11 @@ void TVPDeliverAllEvents()
         TJS_CONVERT_TO_TJS_EXCEPTION
     }
     TVP_CATCH_AND_SHOW_SCRIPT_EXCEPTION(TJS_N("event"));
+
+    // An event handler (or the error report for one) started termination:
+    // skip this pass's idle, continuous and window-update callbacks too.
+    if (TVPTerminated)
+        return;
 
     if (!r)
     {
@@ -953,7 +966,7 @@ static void _TVPDeliverContinuousEvent() // internal
 //---------------------------------------------------------------------------
 void TVPDeliverContinuousEvent()
 {
-    if (TVPContinuousEventProcessing)
+    if (TVPContinuousEventProcessing || TVPTerminated)
         return;
     TVPContinuousEventProcessing = true;
     try

@@ -12,32 +12,6 @@
 namespace emoteplayer
 {
 namespace {
-bool sameRenderMethods(const std::vector<emoteRender>& a, const std::vector<emoteRender>& b)
-{
-    if (a.size() != b.size()) return false;
-    for (size_t i = 0; i < a.size(); ++i)
-    {
-        const auto& x = a[i]; const auto& y = b[i];
-        if (x.type != y.type || x.opa != y.opa || x.hasStencil != y.hasStencil ||
-            x.layerNode != y.layerNode || x.originX != y.originX || x.originY != y.originY ||
-            x.width != y.width || x.height != y.height || x.currCoordx != y.currCoordx ||
-            x.currCoordy != y.currCoordy || x.currCoordz != y.currCoordz ||
-            x.currAngle != y.currAngle || x.currZx != y.currZx || x.currZy != y.currZy ||
-            x.currSx != y.currSx || x.currSy != y.currSy || x.currOx != y.currOx ||
-            x.currOy != y.currOy || x.currInheritMask != y.currInheritMask || x.label != y.label)
-            return false;
-        for (int j = 0; j < 16; ++j)
-            if (glm::value_ptr(x.attachMat)[j] != glm::value_ptr(y.attachMat)[j]) return false;
-        for (int j = 0; j < 32; ++j)
-            if (x.controlPts[j] != y.controlPts[j]) return false;
-    }
-    return true;
-}
-bool sameLimit(const emotelimit& a, const emotelimit& b)
-{
-    return a.originX == b.originX && a.originY == b.originY && a.width == b.width &&
-           a.height == b.height && a.zMax == b.zMax && a.viewW == b.viewW && a.viewH == b.viewH;
-}
 double resolveFrameCoordinate(double coordinate, double origin, double extent)
 {
     // Decoded frames are shared between players. Viewport-relative sentinels
@@ -45,27 +19,6 @@ double resolveFrameCoordinate(double coordinate, double origin, double extent)
     if (std::isnan(coordinate)) return -origin;
     if (std::isinf(coordinate)) return extent - origin;
     return coordinate;
-}
-std::array<double, 101> localPoseInputs(const emoteframe& frame, const emoteframe* next,
-                                     float tick, const emotelimit& limit)
-{
-    std::array<double, 101> values{};
-    const bool interpolate = next && (frame.type != 2 || next->type == 2);
-    values[0] = interpolate ? tick : 0;
-    values[1] = limit.originX; values[2] = limit.originY;
-    values[3] = limit.width; values[4] = limit.height;
-    auto append = [&](const emoteframe& f, size_t offset) {
-        const double scalars[] = {f.time, double(f.type), f.coordX, f.coordY,
-            f.coordZ, f.opa, f.angle, f.sx, f.sy, f.zx, f.zy, f.ox, f.oy,
-            f.timeOffset, double(f.hasbp), double(interpolate)};
-        std::copy(std::begin(scalars), std::end(scalars), values.begin() + offset);
-        // If either interpolated frame has deformation, both arrays are read,
-        // including default control points on the other frame.
-        std::copy(std::begin(f.bp), std::end(f.bp), values.begin() + offset + 16);
-    };
-    append(frame, 5);
-    if (interpolate) append(*next, 53);
-    return values;
 }
 } // namespace
 void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderList, emotelimit lim)
@@ -134,18 +87,71 @@ void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderL
     isIcon = false;
     isLayout = false;
     isShape = false;
-    emoteicon* tmpic = currentNode-> _filePtr->findsourceByName(frame->src);
-    if (tmpic == nullptr)
-        currentMtn = refTop->findmotionByName(frame->src);
-    else
-        currentMtn = nullptr;
-    if (tmpic != nullptr)
+    // Resolving frame->src parses it with istringstream and walks the source
+    // and motion maps. The answer only changes with the frame, its src text,
+    // the engine's main file or a newly attached file (_attach only grows),
+    // so resolve once and reuse it while the node keeps showing this frame.
+    using Source = SourceResolution::Kind;
+    const emotefile* mainFile = refTop->_mainfile;
+    const size_t attachCount = refTop->_attach.size();
+    if (_source.kind == Source::Unresolved || _source.frame != frame || _source.mainFile != mainFile ||
+        _source.attachCount != attachCount || _source.src != frame->src)
+    {
+        SourceResolution resolved;
+        resolved.frame = frame;
+        resolved.src = frame->src;
+        resolved.mainFile = mainFile;
+        resolved.attachCount = attachCount;
+        resolved.icon = currentNode->_filePtr->findsourceByName(frame->src);
+        if (resolved.icon != nullptr)
+            resolved.kind = Source::Icon;
+        else if ((resolved.motion = refTop->findmotionByName(frame->src)) != nullptr)
+            resolved.kind = Source::Motion;
+        else if (strcmp(frame->src.c_str(), "layout") == 0 || strcmp(frame->src.c_str(), "clip") == 0)
+            resolved.kind = Source::Layout;
+        else
+        {
+            std::istringstream iss(frame->src);
+            std::string token;
+            std::getline(iss, token, '/');
+            if (token == "src")
+            {
+                // emote 拼接前缀 "src/<type>/<name>"，跳过第一段。
+                // 此前直接拿 "src" 判类型，落入 unsupported 分支被丢弃，
+                // shape 判定层因此收集不到区域
+                std::getline(iss, token, '/');
+            }
+            if (strcmp(token.c_str(), "blank") == 0)
+            {
+                std::getline(iss, token, ':');
+                resolved.blankWidth = std::stoi(token);
+                std::getline(iss, token, ':');
+                resolved.blankHeight = std::stoi(token);
+                std::getline(iss, token, ':');
+                resolved.blankOriginX = std::stoi(token);
+                std::getline(iss, token, ':');
+                resolved.blankOriginY = std::stoi(token);
+                resolved.kind = Source::Blank;
+            }
+            else if (strcmp(token.c_str(), "shape") == 0)
+                resolved.kind = Source::Shape;
+            else
+            {
+                // Logged when the frame is first resolved, not on every tick.
+                TVPConsoleLog("source unsupported!!!--->%s", frame->src.c_str());
+                resolved.kind = Source::Unsupported;
+            }
+        }
+        _source = std::move(resolved);
+    }
+    currentMtn = _source.kind == Source::Motion ? _source.motion : nullptr;
+    if (_source.kind == Source::Icon)
     {
         isIcon = true;
 
-        if (tmpic != ic) // 直接比对ic
+        if (_source.icon != ic) // 直接比对ic
         {
-            ic = tmpic;
+            ic = _source.icon;
             ic->ensureLoad();
             width = ic->width;
             height = ic->height;
@@ -155,8 +161,7 @@ void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderL
         // 设置混色
         currbm = frame->bm;
     }
-    else if (currentMtn != nullptr || strcmp(frame->src.c_str(), "layout") == 0 ||
-             strcmp(frame->src.c_str(), "clip") == 0)
+    else if (_source.kind == Source::Motion || _source.kind == Source::Layout)
     {
         // 部分导出的 PSB 会剥离 shape 帧的 src 字段
         //（content 仅剩 coord/mask/zx/zy），解析后 src 落到默认值 "layout"，
@@ -185,60 +190,36 @@ void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderL
             }
         }
     }
+    else if (_source.kind == Source::Blank)
+    {
+        if (width != _source.blankWidth || height != _source.blankHeight)
+        {
+            width = _source.blankWidth;
+            height = _source.blankHeight;
+        }
+        originX = _source.blankOriginX;
+        originY = _source.blankOriginY;
+    }
+    else if (_source.kind == Source::Shape)
+    {
+        // shape节点: 不绘制但记录区域信息
+        // shape的像素尺寸 = zx/zy * 16 (PSB规范: 单元正方形为16x16)
+        // shape子类型从src的第二部分获取: rect(默认)、circle、point、quad
+        isShape = true; // 标记 shape 判定层
+        isNeedDraw = false;
+        width = height = 16.0f;
+        originX = width / 2;
+        originY = height / 2;
+    }
     else
     {
-        std::istringstream iss(frame->src);
-        std::string token;
-        std::getline(iss, token, '/');
-        if (token == "src")
-        {
-            // emote 拼接前缀 "src/<type>/<name>"，跳过第一段。
-            // 此前直接拿 "src" 判类型，落入 unsupported 分支被丢弃，
-            // shape 判定层因此收集不到区域
-            std::getline(iss, token, '/');
-        }
-        if (strcmp(token.c_str(), "blank") == 0)
-        {
-            std::getline(iss, token, ':');
-            int32_t w = std::stoi(token);
-            std::getline(iss, token, ':');
-            int32_t h = std::stoi(token);
-            std::getline(iss, token, ':');
-            int32_t ox = std::stoi(token);
-            std::getline(iss, token, ':');
-            int32_t oy = std::stoi(token);
-
-            if (width != w || height != h)
-            {
-                width = w;
-                height = h;
-            }
-            originX = ox;
-            originY = oy;
-        }
-        else if (strcmp(token.c_str(), "shape") == 0)
-        {
-            // shape节点: 不绘制但记录区域信息
-            // shape的像素尺寸 = zx/zy * 16 (PSB规范: 单元正方形为16x16)
-            // shape子类型从src的第二部分获取: rect(默认)、circle、point、quad
-            isShape = true; // 标记 shape 判定层
-            isNeedDraw = false;
-            width = height = 16.0f;
-            originX = width / 2;
-            originY = height / 2;
-        }
-        else
-        {
-            TVPConsoleLog("source unsupported!!!--->%s", frame->src.c_str());
-            isNeedDraw = false;
-            return;
-        }
+        isNeedDraw = false;
+        return;
     }
 }
 void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim)
 {
     const Uint64 nodeProfileStarted = SDL_GetTicksNS();
-    performanceCounters().nodeVisits.fetch_add(1, std::memory_order_relaxed);
     // 参数化时可能改变
     currTick = tick;
     // 对于motion，增加终结机制, 即无法越过selfSyncTime
@@ -313,20 +294,6 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
     }
     else
     {
-        bool reuseLocalPose = false;
-        if (refTop && refTop->localPoseCachingEnabled())
-        {
-            const auto inputs = localPoseInputs(*frame, nextframe, currTick, lim);
-            // Byte comparison treats unchanged NaN sentinels as equal. Both
-            // arrays are initialized and consist solely of doubles, no padding.
-            reuseLocalPose = _localPoseValid &&
-                std::memcmp(inputs.data(), _localPoseInputs.data(), inputs.size() * sizeof(double)) == 0;
-            _localPoseInputs = inputs; _localPoseValid = true;
-            (reuseLocalPose ? performanceCounters().localPoseCacheHits :
-                performanceCounters().localPoseCacheMisses).fetch_add(1, std::memory_order_relaxed);
-        }
-        else _localPoseValid = false;
-        if (!reuseLocalPose)
         {
         // 基础参数
         if (nextframe != nullptr &&
@@ -490,47 +457,9 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         renderMethod.push_back(emt);
     }
 
-    // Compare actual prepared inputs, not the clock or diagnostics sequence.
-    // Frame selection and recursive activity still run even on cache hits.
-    auto* backend = krkrsdl3::TVPGetRenderBackend();
-    const bool gpuCapable = backend && backend->SupportsMeshDeformation();
-    const int division = currentNode ? currentNode->meshDivision : 0;
-    const std::int64_t color = frame ? frame->color : 0;
-    const bool hasColor = frame && frame->hasColor;
-    const bool trackContent = refTop && refTop->contentTrackingEnabled();
-    const bool geometryChanged = !trackContent || !_geometryValid || !sameRenderMethods(_geometryMethods, renderMethod) ||
-        !sameLimit(_geometryLimit, lim) || _geometryGPUCapable != gpuCapable ||
-        _geometryDrawable != isNeedDraw || _geometryIcon != isIcon || _geometryShape != isShape ||
-        _geometryRemoved != currentNode->removed || _geometrySource != ic ||
-        _geometryTexture != (ic ? ic->selftexture : nullptr) || _geometryMotion != currentMtn ||
-        _geometryDivision != division || _geometryBlend != currbm ||
-        _geometryColor != color || _geometryHasColor != hasColor ||
-        _geometryFrameSource != (frame ? frame->src : std::string());
-    const bool reuseGeometry = refTop && refTop->nodeCachingEnabled() && !geometryChanged;
-    if (geometryChanged && trackContent)
-    {
-        _geometryMethods = renderMethod; _geometryLimit = lim;
-        _geometryGPUCapable = gpuCapable; _geometryDrawable = isNeedDraw;
-        _geometryIcon = isIcon; _geometryShape = isShape; _geometryRemoved = currentNode->removed;
-        _geometrySource = ic; _geometryTexture = ic ? ic->selftexture : nullptr;
-        _geometryMotion = currentMtn; _geometryDivision = division; _geometryBlend = currbm;
-        _geometryFrameSource = frame ? frame->src : std::string();
-        _geometryColor = color; _geometryHasColor = hasColor; _geometryValid = true;
-    }
-    if (!trackContent) _geometryValid = false;
-    if (geometryChanged)
-    {
-        ++_geometryRevision;
-        if (refMtn) refMtn->_poseChanged = true;
-    }
-    (reuseGeometry ? performanceCounters().nodeCacheHits : performanceCounters().nodeCacheMisses)
-        .fetch_add(1, std::memory_order_relaxed);
-
     if (isShape && frame && !currentNode->removed && refMtn && !renderMethod.empty())
     {
         auto& area = _shapeArea;
-        if (!reuseGeometry)
-        {
         area.label = currentNode->label;
         area.shapeType = 2;
         if (frame->src.find("shape/circle") != std::string::npos) area.shapeType = 1;
@@ -557,15 +486,13 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         area.top = (minY + 1) * 0.5f * vh;
         area.width = (maxX - minX) * 0.5f * vw;
         area.height = (maxY - minY) * 0.5f * vh;
-        }
-        else performanceCounters().shapeCacheHits.fetch_add(1, std::memory_order_relaxed);
         refMtn->recordShape(area);
     }
 
     // Deformed icon meshes can be evaluated directly in the Metal vertex
     // shader. Other backends retain the exact CPU geometry path.
-    if (!reuseGeometry)
-    {
+    auto* backend = krkrsdl3::TVPGetRenderBackend();
+    const bool gpuCapable = backend && backend->SupportsMeshDeformation();
     _useGPUDeform = false;
     _gpuDeformSurfaces.clear();
     if (isIcon && isNeedDraw && renderMethod.size() > 0)
@@ -623,9 +550,6 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         _useGPUDeform = false;
         _gpuDeformSurfaces.clear();
     }
-    }
-    else if (isIcon && isNeedDraw)
-        performanceCounters().meshCacheHits.fetch_add(1, std::memory_order_relaxed);
 
     // Local node work ends here. Recursive children/submotions account for
     // themselves so node time can be summed without double-counting recursion.
@@ -686,6 +610,16 @@ bool emotenoderef::containsCurrentMesh(float x, float y) const
     std::vector<uint16_t> indices;
     buildSubdivMesh(renderMethod, _meshDivX, _meshDivY, vertices, indices);
     return containsMesh(vertices, indices, x, y);
+}
+
+bool emotenoderef::nearCurrentMesh(float x, float y, float margin) const
+{
+    if (!_useGPUDeform)
+        return nearMesh(_meshVertices, _meshIndices, x, y, margin);
+    std::vector<EmoteVertex> vertices;
+    std::vector<uint16_t> indices;
+    buildSubdivMesh(renderMethod, _meshDivX, _meshDivY, vertices, indices);
+    return nearMesh(vertices, indices, x, y, margin);
 }
 
 bool emotenoderef::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget)
@@ -887,7 +821,6 @@ void emotemotionref::recordShape(const emoterect& area)
 void emotemotionref::progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim)
 {
     _shapeCount = 0;
-    _poseChanged = false;
     renderMethod = renderList;
 
     if (currentMotion == nullptr) return;
@@ -909,7 +842,6 @@ void emotemotionref::progress(float tick, std::vector<emoteRender>& renderList, 
     }
     if (topologyChanged)
     {
-        _poseChanged = true;
         _nodeCache.clear();
         _nodeIndex.clear();
         _nodeCache.reserve(count);
@@ -923,7 +855,7 @@ void emotemotionref::progress(float tick, std::vector<emoteRender>& renderList, 
         _subMotionRefs.clear();
         _subMotionUsed.clear();
         _subMotionPool.clear();
-        _drawInput.clear(); _drawNodes.clear(); _drawScratch.clear(); _drawStack.clear(); _drawZ.clear();
+        _drawNodes.clear(); _drawScratch.clear(); _drawStack.clear();
     }
 
     // The active sub-motion set can change with keyframes, so it is re-collected
@@ -965,25 +897,9 @@ void emotemotionref::progress(float tick, std::vector<emoteRender>& renderList, 
         }
     }
     shapeNodeAreas.resize(_shapeCount);
-    if (refTop && refTop->contentTrackingEnabled())
-    {
-        if (_previousSubMotions != _subMotionRefs || _previousSubRevisions.size() != _subMotionRefs.size())
-            _poseChanged = true;
-        for (size_t i = 0; i < _subMotionRefs.size(); ++i)
-            if (i >= _previousSubRevisions.size() ||
-                _previousSubRevisions[i] != _subMotionRefs[i]->poseRevision()) _poseChanged = true;
-        _previousSubMotions = _subMotionRefs;
-        _previousSubRevisions.resize(_subMotionRefs.size());
-        for (size_t i = 0; i < _subMotionRefs.size(); ++i)
-            _previousSubRevisions[i] = _subMotionRefs[i]->poseRevision();
-    }
-    else
-    {
-        _poseChanged = true;
-        _previousSubMotions.clear(); _previousSubRevisions.clear();
-    }
-    if (_poseChanged) ++_poseRevision;
-    collectDrawNodes();
+    // The draw list is built once, by emoteengine::progress for the main ref.
+    // Its walk already descends into sub-motion node caches; building and
+    // sorting a list at every sub-motion level was never read.
 }
 void emotemotionref::collectDrawNodes()
 {
@@ -1014,25 +930,10 @@ void emotemotionref::collectDrawNodes()
         }
     }
 
-    const bool caching = refTop && refTop->nodeCachingEnabled();
-    bool changed = !caching || _drawInput != _drawScratch ||
-        _drawZ.size() != _drawScratch.size();
-    if (!changed)
-        for (size_t i = 0; i < _drawScratch.size(); ++i)
-            if (_drawZ[i] != _drawScratch[i]->getCurrentRenderZ()) { changed = true; break; }
-    if (!changed) return;
     _drawNodes = _drawScratch;
-    if (caching)
-    {
-        _drawInput = _drawScratch; _drawZ.resize(_drawScratch.size());
-        for (size_t i = 0; i < _drawScratch.size(); ++i)
-            _drawZ[i] = _drawScratch[i]->getCurrentRenderZ();
-    }
-    else { _drawInput.clear(); _drawZ.clear(); }
     std::stable_sort(_drawNodes.begin(), _drawNodes.end(),
                      [](emotenoderef* a, emotenoderef* b)
                      { return a->getCurrentRenderZ() < b->getCurrentRenderZ(); });
-    performanceCounters().drawListRebuilds.fetch_add(1, std::memory_order_relaxed);
 }
 
 void emotemotionref::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget)
@@ -1060,6 +961,30 @@ bool emotemotionref::contains(float x, float y, const char* label) const
             if (node.wasDrawn && node.containsCurrentMesh(x, y))
                 return true;
     return false;
+}
+
+bool emotemotionref::mayCover(float x, float y, float margin) const
+{
+    for (const auto* sub : _subMotionRefs)
+        if (sub->mayCover(x, y, margin))
+            return true;
+    for (const auto& node : _nodeCache)
+        if (node.wasDrawn && node.nearCurrentMesh(x, y, margin))
+            return true;
+    return false;
+}
+
+bool EmoteHitFrame::mayCoverPixel(int px, int py) const
+{
+    if (width <= 0 || height <= 0)
+        return true; // no frame geometry to reason about
+    if (!motion)
+        return false; // nothing drawn
+    // Rasterizers write a pixel only when its centre is inside a triangle; a
+    // one-pixel margin absorbs CPU/GPU rounding of the same geometry.
+    const float x = (px + 0.5f) * 2 / width - 1, y = (py + 0.5f) * 2 / height - 1;
+    const float margin = std::max(2 / width, 2 / height);
+    return motion->mayCover(x, y, margin);
 }
 
 bool EmoteHitFrame::contains(const char* label, float x, float y, bool local) const
@@ -1271,30 +1196,20 @@ void emoteengine::recordAnimationDraw()
 
 void emoteengine::progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim)
 {
-    _nodeCachingEnabled = performanceEnabled("MIKAGE_EMOTE_NODE_CACHE");
-    // Scalar comparison is an independent experiment: simple/static nodes can
-    // cost more to compare than to evaluate. Keep it opt-in for A/B measurement.
-    _localPoseCachingEnabled = _nodeCachingEnabled && performanceEnabled("MIKAGE_EMOTE_LOCAL_POSE_CACHE");
-    // With all reuse features disabled a conservative generation suffices.
-    // Avoid copying/comparing complete inherited signatures on that path.
-    _contentTrackingEnabled = _nodeCachingEnabled || performanceEnabled("MIKAGE_EMOTE_CAPTURE_CACHE");
     if (!_mainmotion)
     {
-        if (_mainMotionRef) { ++_poseRevision; _preparedMotionRevision = 0; }
         _mainMotionRef.reset();
         return;
     }
 
     // Reuse the runtime tree while the selected motion is unchanged. The node
-    // cache owns the expensive mesh/vector capacity and is refreshed in-place.
+    // refs own the mesh/vector capacity and are refreshed in place.
     const bool replaced = !_mainMotionRef || _mainMotionRef->currentMotion != _mainmotion;
     if (replaced)
         _mainMotionRef = std::make_shared<emotemotionref>(_mainmotion, this);
 
     _mainMotionRef->progress(tick, renderList, lim);
-    const auto revision = _mainMotionRef->poseRevision();
-    if (replaced || revision != _preparedMotionRevision) ++_poseRevision;
-    _preparedMotionRevision = revision;
+    _mainMotionRef->collectDrawNodes();
 }
 void emoteengine::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget)
 {

@@ -119,8 +119,11 @@ public:
     virtual void MarkCPUModified(const tTVPRect& written) { MarkCPUModified(); }
     // 纹理已驻留 GPU，CPU 缓存失效
     virtual void InvalidateCPUCache() {}
-    // Raw script/plugin addresses may outlive a call. GPU adapters demote this
-    // texture to CPU authority before exposing a stable pointer.
+    // Raw script addresses may outlive a call. GPU adapters demote this
+    // texture to CPU authority before exposing the pointer. The Metal adapter
+    // closes a write lease at each frame boundary and returns the texture to
+    // the GPU once script stops requesting the pointer (TVPEndMetalLayerFrame),
+    // so native writers must use tTVPScopedTexturePixels instead.
     virtual void* GetPersistentCPUData(bool write) {
         return write ? GetScanLineForWrite(0) : const_cast<void*>(GetScanLineForRead(0));
     }

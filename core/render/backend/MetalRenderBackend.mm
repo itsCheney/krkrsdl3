@@ -2339,6 +2339,38 @@ bool MetalRenderBackend::CopyTargetToLayerTexture(void* sourceHandle, void* dest
         return true;
     }
 }
+bool MetalRenderBackend::ExchangeTargetTextures(void* firstHandle, void* secondHandle) {
+    @autoreleasepool {
+        auto& p=*impl_;
+        auto* a=p.Find(firstHandle);
+        auto* b=p.Find(secondHandle);
+        if(!a || !b || a==b || !a->target || !b->target || a->bytesPerPixel!=4 || b->bytesPerPixel!=4 ||
+           a->width!=b->width || a->height!=b->height || a->width<=0 || a->height<=0 ||
+           a->texture.pixelFormat!=b->texture.pixelFormat) return false;
+        // Close encoders that bound either texture so later commands resolve each
+        // handle afresh. Work already encoded keeps the textures it captured, so
+        // pixels (and their initialization state) travel with the texture.
+        p.EndUpload("exchange");
+        p.EndMesh();
+        p.EndOrdinary();
+        std::swap(a->texture,b->texture);
+        std::swap(a->initialization,b->initialization);
+        for(auto& draw:p.windows) {
+            if(draw.resource==a) draw.texture=a->texture;
+            else if(draw.resource==b) draw.texture=b->texture;
+        }
+        Impl::Write(a);
+        Impl::Write(b);
+        return true;
+    }
+}
+bool MetalRenderBackend::GetTargetContentVersion(void* handle, uint64_t& identity, uint64_t& version) {
+    auto* r=impl_->Find(handle);
+    if(!r || !r->target) return false;
+    identity=r->lifetimeID;
+    version=r->mutationVersion;
+    return true;
+}
 bool MetalRenderBackend::ReadLayerTexture(void* handle,std::vector<uint8_t>& pixels,int& pitch) {
     @autoreleasepool { impl_->lastReadbackWaitNS=0; auto* r=impl_->Find(handle); return r && impl_->Read(r->texture,pixels,pitch,nullptr,r); }
 }

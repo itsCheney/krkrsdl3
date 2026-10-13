@@ -23,315 +23,11 @@
 #include "LayerTreeOwner.h"
 
 #include "tjsNativeLayer.h"
-#include "AsyncAlphaTileCache.h"
 #include "MetalLayerRenderManager.h"
 #include "PrimaryCompletion.h"
 #include "UpdateRegionCoalescing.h"
-#include "../../plugins/emoteplayer/emoteperformance.h"
 #include <algorithm>
 #include <unordered_map>
-
-namespace {
-std::vector<tTVPLayerManager*> asyncInputManagers;
-
-bool TVPIsLiveAlphaLayer(const std::vector<tTJSNI_BaseLayer*>& nodes,
-                         tTJSNI_BaseLayer* layer, uint64_t lifetimeID) {
-    if(!layer) return false;
-    const auto it=std::find(nodes.begin(),nodes.end(),layer);
-    return it!=nodes.end() && layer->GetLifetimeID()==lifetimeID;
-}
-}
-struct tTVPLayerManager::AlphaPointerFrame {
-    struct Point {
-        tTJSNI_BaseLayer* layer = nullptr;
-        uint64_t lifetimeID = 0;
-        int x=0,y=0,width=0,height=0,px=0,py=0;
-        uint64_t textureID=0;
-        tjs_int hitType=0;
-        bool inside=false, async=false, mask=false, sourceBound=false;
-        tjs_uint32 alpha=0; // 256 means outside MainImage, independently of threshold.
-        std::shared_ptr<krkrsdl3::AsyncAlphaTile> tile;
-        std::shared_ptr<krkrsdl3::AsyncAlphaTileSnapshot> snapshot;
-        // No CPU full-image copy. Keeping the original GPU texture intrusive
-        // reference makes the existing Bitmap COW preserve F across animation.
-        std::shared_ptr<iTVPTexture2D> sourceTexture;
-    };
-    int x=0,y=0;
-    bool canceled=false;
-    uint64_t pointerChain=0;
-    std::shared_ptr<krkrsdl3::AsyncLayerPresentation> presentation;
-    std::function<void()> dispatch;
-    std::unordered_map<tTJSNI_BaseLayer*,Point> points;
-};
-tTVPLayerManager::AlphaPointerScope::AlphaPointerScope(tTVPLayerManager& m,
-    tjs_int x,tjs_int y,std::function<void()> dispatch,uint64_t pointerID,bool startsChain,bool endsChain) : manager(m) {
-    if(m.AlphaDispatching || !emoteplayer::performanceEnabled("MIKAGE_EMOTE_ASYNC_ALPHA")) return;
-    if(startsChain || !m.AlphaPointerChains.count(pointerID)) {
-        auto prior=m.AlphaPointerChains.find(pointerID);
-        if(prior!=m.AlphaPointerChains.end()) m.CanceledAlphaPointerChains.erase(prior->second);
-        m.AlphaPointerChains[pointerID]=m.NextAlphaPointerChain++;
-    }
-    if(m.CanceledAlphaPointerChains.count(m.AlphaPointerChains[pointerID])) {
-        if(endsChain) { m.CanceledAlphaPointerChains.erase(m.AlphaPointerChains[pointerID]); m.AlphaPointerChains.erase(pointerID); }
-        deferred=true; return;
-    }
-    auto frame=m.PrepareAlphaPointer(x,y,std::move(dispatch));
-    frame->pointerChain=m.AlphaPointerChains[pointerID];
-    if(endsChain) m.AlphaPointerChains.erase(pointerID); // Touch IDs do not accumulate across sessions.
-    if(frame->canceled) { deferred=true; return; }
-    const bool ready=m.ResolveAlphaPointer(frame);
-    if(frame->canceled) { deferred=true; return; }
-    if(!m.PendingAlphaInput.empty() || !ready) {
-        m.PendingAlphaInput.push_back(std::move(frame));
-        emoteplayer::performanceCounters().alphaPendingEvents.fetch_add(1,std::memory_order_relaxed);
-        deferred=true;
-        return;
-    }
-    m.ActiveAlphaInput=std::move(frame); m.AlphaDispatching=true; entered=true;
-}
-tTVPLayerManager::AlphaPointerScope::~AlphaPointerScope() {
-    if(entered) { manager.ActiveAlphaInput.reset(); manager.AlphaDispatching=false; manager.AlphaQuery=false; }
-}
-std::shared_ptr<tTVPLayerManager::AlphaPointerFrame> tTVPLayerManager::PrepareAlphaPointer(
-    tjs_int x,tjs_int y,std::function<void()> dispatch) {
-    auto frame=std::make_shared<AlphaPointerFrame>();
-    frame->x=x; frame->y=y; frame->dispatch=std::move(dispatch);
-    // Record even non-alpha ancestors: moving a parent while a read is pending
-    // must not make the replay chase a new tile indefinitely.
-    for(auto* layer:GetAllNodes()) {
-        if(!layer || !layer->GetOwnerNoAddRef() || !layer->GetNodeVisible()) continue;
-        AlphaPointerFrame::Point point;
-        point.layer=layer;
-        point.lifetimeID=layer->GetLifetimeID();
-        point.x=x; point.y=y; layer->FromPrimaryCoordinates(point.x,point.y);
-        point.width=layer->GetRect().get_width(); point.height=layer->GetRect().get_height();
-        point.inside=point.x>=0 && point.y>=0 && point.x<point.width && point.y<point.height;
-        point.hitType=tjs_int(layer->GetHitType()); point.mask=point.hitType==htMask;
-        auto* image=layer->GetMainImage();
-        if(point.inside && point.mask && image) {
-            auto* texture=image->GetTexture();
-            point.px=point.x-layer->GetImageLeft(); point.py=point.y-layer->GetImageTop();
-            uint64_t version=0;
-            texture->GetContentKey(point.textureID,version);
-            if(point.px<0 || point.py<0 || point.px>=int(image->GetWidth()) || point.py>=int(image->GetHeight()))
-                point.alpha=256;
-            else if(layer->GetHitThreshold()>0) {
-                point.async=TVPRequestEmoteAsyncAlpha(texture,point.px,point.py,point.tile);
-                if(!point.async) point.alpha=image->GetBPP()==32 ? texture->GetPointAlpha(point.px,point.py) :
-                    image->GetPoint(point.px,point.py)>>24;
-            }
-        }
-        frame->points.emplace(layer,std::move(point));
-    }
-    return frame;
-}
-void tTVPLayerManager::CancelAlphaPointerChain(uint64_t chain) {
-    CanceledAlphaPointerChains.insert(chain);
-    for(auto& pending:PendingAlphaInput) if(pending->pointerChain==chain) pending->canceled=true;
-}
-void tTVPLayerManager::BindAlphaPresentation() {
-    const auto ticket=TVPGetEmoteAlphaPresentation();
-    if(!ticket) return;
-    for(auto& frame:PendingAlphaInput) {
-        if(frame->canceled || frame->presentation) continue;
-        const auto& nodes=GetAllNodes();
-        bool removed=false;
-        for(const auto& pair:frame->points)
-            if(!TVPIsLiveAlphaLayer(nodes,pair.first,pair.second.lifetimeID)) { removed=true; break; }
-        if(removed) { frame->canceled=true; CancelAlphaPointerChain(frame->pointerChain); continue; }
-        // Bind only once, before callbacks. Resize/COW while waiting for this
-        // first composition use the new epoch and its actual coordinate map.
-        auto refreshed=PrepareAlphaPointer(frame->x,frame->y,{});
-        frame->points=std::move(refreshed->points);
-        frame->presentation=ticket;
-    }
-}
-void tTVPLayerManager::CaptureAlphaForPresentation(tTJSNI_BaseLayer* layer) {
-    const auto ticket=TVPGetEmoteAlphaPresentation();
-    if(!ticket || !emoteplayer::performanceEnabled("MIKAGE_EMOTE_ASYNC_ALPHA")) return;
-    for(auto& frame:PendingAlphaInput) {
-        if(frame->canceled || frame->presentation!=ticket) continue;
-        auto found=frame->points.find(layer);
-        if(found==frame->points.end() || found->second.sourceBound) continue;
-        auto& point=found->second;
-        const auto& nodes=GetAllNodes();
-        if(!TVPIsLiveAlphaLayer(nodes,layer,point.lifetimeID)) {
-            frame->canceled=true; CancelAlphaPointerChain(frame->pointerChain); continue;
-        }
-        point.x=frame->x; point.y=frame->y; layer->FromPrimaryCoordinates(point.x,point.y);
-        point.width=layer->GetRect().get_width(); point.height=layer->GetRect().get_height();
-        point.inside=layer->GetNodeVisible() && point.x>=0 && point.y>=0 &&
-            point.x<point.width && point.y<point.height;
-        point.hitType=tjs_int(layer->GetHitType()); point.mask=point.hitType==htMask;
-        point.alpha=0; point.async=false; point.tile.reset(); point.snapshot.reset(); point.sourceTexture.reset();
-        auto* image=layer->GetMainImage();
-        // GetImageLeft/Top throw "Not drawable layer type" without a MainImage;
-        // image-less candidates keep alpha 0 and no pixel coordinate.
-        point.px=0; point.py=0;
-        if(image) { point.px=point.x-layer->GetImageLeft(); point.py=point.y-layer->GetImageTop(); }
-        if(point.inside && point.mask && image && (point.px<0 || point.py<0 ||
-           point.px>=int(image->GetWidth()) || point.py>=int(image->GetHeight()))) point.alpha=256;
-        if(point.inside && point.mask && layer->GetHitThreshold()>0 && image &&
-           point.px>=0 && point.py>=0 && point.px<int(image->GetWidth()) && point.py<int(image->GetHeight())) {
-            uint64_t version=0; image->GetTexture()->GetContentKey(point.textureID,version);
-            point.async=TVPRequestEmoteAsyncAlpha(image->GetTexture(),point.px,point.py,point.tile);
-            if(point.async) {
-                auto* source=image->GetTexture(); source->AddRef();
-                point.sourceTexture=std::shared_ptr<iTVPTexture2D>(source,[](iTVPTexture2D* t){t->Release();});
-            }
-            if(!point.async) point.alpha=image->GetBPP()==32 ? image->GetTexture()->GetPointAlpha(point.px,point.py) :
-                image->GetPoint(point.px,point.py)>>24;
-        }
-        point.sourceBound=true;
-    }
-}
-void tTVPLayerManager::FinishAlphaPresentation() {
-    // First consume all ready requests, including later queued events. FIFO
-    // orders callbacks, not storage release; otherwise an earlier missing tile
-    // can be blocked forever by later events owning the bounded read budget.
-    for(auto& frame:PendingAlphaInput) for(auto& pair:frame->points) {
-        auto& point=pair.second;
-        if(point.snapshot && point.snapshot->Materialize()) point.sourceTexture.reset();
-    }
-    for(auto& frame:PendingAlphaInput) {
-        const auto& ticket=frame->presentation;
-        if(frame->canceled || !ticket || ticket->failed.load(std::memory_order_acquire)) continue;
-        for(auto& pair:frame->points) {
-            auto& point=pair.second;
-            if(!point.async || point.snapshot || !point.sourceBound) continue;
-            // Missing requests retry the retained source F on a subsequent
-            // normal frame. Never throw away the other candidates' F snapshots.
-            if(point.sourceTexture && point.tile) {
-                point.tile->demanded=true;
-                TVPEncodeFrozenEmoteAsyncAlpha(point.sourceTexture.get(),ticket);
-            }
-            point.snapshot=point.tile ? point.tile->RequestAtFrame(ticket->frameSerial) : nullptr;
-            if(point.snapshot && point.snapshot->Ticket()!=ticket) point.snapshot.reset();
-            if(point.snapshot && point.snapshot->Materialize()) point.sourceTexture.reset();
-        }
-    }
-}
-bool tTVPLayerManager::ResolveAlphaPointer(const std::shared_ptr<AlphaPointerFrame>& frame) {
-    if(frame->canceled) return true;
-    // Membership and generation identity precede every raw-pointer getter/update,
-    // including retry after a failed drawable. A recycled NI address cannot
-    // make an old event target a new native layer instance.
-    const auto& nodes=GetAllNodes();
-    for(const auto& pair:frame->points) {
-        if(!TVPIsLiveAlphaLayer(nodes,pair.first,pair.second.lifetimeID)) {
-            frame->canceled=true; CancelAlphaPointerChain(frame->pointerChain); return true;
-        }
-    }
-    if(frame->presentation && frame->presentation->failed.load(std::memory_order_acquire)) {
-        emoteplayer::performanceCounters().alphaFailures.fetch_add(1,std::memory_order_relaxed);
-        frame->presentation.reset();
-        for(auto& pair:frame->points) { pair.second.snapshot.reset(); pair.second.sourceTexture.reset(); pair.second.layer->Update(); }
-        return false;
-    }
-    bool async=false, ready=true;
-    for(auto& pair:frame->points) {
-        auto& point=pair.second;
-        if(!point.async) continue;
-        async=true;
-        if(!frame->presentation || !point.snapshot) { ready=false; continue; }
-        const auto& request=point.snapshot->read;
-        if(frame->presentation->failed.load(std::memory_order_acquire) ||
-           (request && (request->failed.load(std::memory_order_acquire) || request->canceled.load(std::memory_order_acquire)))) {
-            emoteplayer::performanceCounters().alphaFailures.fetch_add(1,std::memory_order_relaxed);
-            frame->presentation.reset();
-            for(auto& reset:frame->points) { reset.second.snapshot.reset(); reset.second.sourceTexture.reset(); }
-            ready=false; break;
-        }
-        if(!point.snapshot->Materialize()) { ready=false; continue; }
-        point.sourceTexture.reset();
-        point.alpha=point.snapshot->alpha[size_t(point.py-point.tile->region.top)*
-            point.tile->region.Width()+point.px-point.tile->region.left];
-    }
-    const bool displayed=!frame->presentation || frame->presentation->presented.load(std::memory_order_acquire);
-    if((!async || ready) && displayed) {
-        if(async) emoteplayer::performanceCounters().alphaCacheHits.fetch_add(1,std::memory_order_relaxed);
-        return true;
-    }
-    for(auto& pair:frame->points)
-        if(pair.second.async && (!frame->presentation || !pair.second.snapshot)) pair.second.layer->Update();
-    return false;
-}
-void tTVPLayerManager::ProcessPendingAlphaInput() {
-    if(AlphaDispatching || PendingAlphaInput.empty()) return;
-    if(!Primary || !emoteplayer::performanceEnabled("MIKAGE_EMOTE_ASYNC_ALPHA")) {
-        PendingAlphaInput.clear(); return;
-    }
-    // Bound work per host step; event order is preserved across all pointer IDs.
-    for(unsigned count=0;count<32 && !PendingAlphaInput.empty();++count) {
-        auto frame=PendingAlphaInput.front();
-        if(!ResolveAlphaPointer(frame)) break;
-        PendingAlphaInput.pop_front(); ActiveAlphaInput=std::move(frame); AlphaDispatching=true;
-        if(ActiveAlphaInput->canceled) {
-            const auto chain=ActiveAlphaInput->pointerChain;
-            ActiveAlphaInput.reset(); AlphaDispatching=false;
-            bool retained=false;
-            for(const auto& pending:PendingAlphaInput) retained|=pending->pointerChain==chain;
-            for(const auto& pointer:AlphaPointerChains) retained|=pointer.second==chain;
-            if(!retained) CanceledAlphaPointerChains.erase(chain);
-            continue;
-        }
-        try { ActiveAlphaInput->dispatch(); }
-        catch(...) { ActiveAlphaInput.reset(); AlphaDispatching=false; AlphaQuery=false; throw; }
-        ActiveAlphaInput.reset(); AlphaDispatching=false; AlphaQuery=false;
-    }
-}
-bool tTVPLayerManager::GetPinnedAlpha(tTJSNI_BaseLayer* layer,tjs_uint32& alpha) const {
-    if(!IsAsyncAlphaQuery() || !ActiveAlphaInput) return false;
-    auto it=ActiveAlphaInput->points.find(layer);
-    if(it==ActiveAlphaInput->points.end() || !it->second.mask ||
-       (it->second.async && !it->second.snapshot)) return false;
-    alpha=it->second.alpha; return true;
-}
-bool tTVPLayerManager::GetPinnedHitType(tTJSNI_BaseLayer* layer,tjs_int& hitType) const {
-    if(!IsAsyncAlphaQuery() || !ActiveAlphaInput) return false;
-    auto it=ActiveAlphaInput->points.find(layer);
-    if(it==ActiveAlphaInput->points.end()) return false;
-    hitType=it->second.hitType; return true;
-}
-bool tTVPLayerManager::GetPinnedLayerPoint(tTJSNI_BaseLayer* layer,tjs_int& x,tjs_int& y,bool& inside) const {
-    if(!IsAsyncAlphaQuery() || !ActiveAlphaInput) return false;
-    auto it=ActiveAlphaInput->points.find(layer);
-    if(it==ActiveAlphaInput->points.end()) return false;
-    x=it->second.x; y=it->second.y; inside=it->second.inside; return true;
-}
-bool tTVPLayerManager::HasPinnedLayer(tTJSNI_BaseLayer* layer) const {
-    return ActiveAlphaInput && ActiveAlphaInput->points.find(layer)!=ActiveAlphaInput->points.end();
-}
-void tTVPLayerManager::FromPinnedPrimaryCoordinates(tTJSNI_BaseLayer* layer,tjs_int& x,tjs_int& y) {
-    if(AlphaDispatching && ActiveAlphaInput) {
-        auto it=ActiveAlphaInput->points.find(layer);
-        if(it!=ActiveAlphaInput->points.end()) { x=it->second.x; y=it->second.y; return; }
-    }
-    layer->FromPrimaryCoordinates(x,y);
-}
-void tTVPLayerManager::FromPinnedPrimaryCoordinates(tTJSNI_BaseLayer* layer,tjs_real& x,tjs_real& y) {
-    if(AlphaDispatching && ActiveAlphaInput) {
-        auto it=ActiveAlphaInput->points.find(layer);
-        if(it!=ActiveAlphaInput->points.end()) {
-            x=it->second.x+(x-ActiveAlphaInput->x); y=it->second.y+(y-ActiveAlphaInput->y); return;
-        }
-    }
-    layer->FromPrimaryCoordinates(x,y);
-}
-void TVPProcessPendingLayerPointerEvents() {
-    auto managers=asyncInputManagers;
-    for(auto* manager:managers) manager->AddRef();
-    try { for(auto* manager:managers) manager->ProcessPendingAlphaInput(); }
-    catch(...) { for(auto* manager:managers) manager->Release(); throw; }
-    for(auto* manager:managers) manager->Release();
-}
-bool TVPHasPendingLayerPointerBackpressure() {
-    // SDL's pointer FIFO stays upstream while the GPU is behind. Lifecycle,
-    // keyboard and quit events continue through the host's complementary pump.
-    for(auto* manager:asyncInputManagers)
-        if(manager->PendingAlphaInput.size()>=128) return true;
-    return false;
-}
 
 //---------------------------------------------------------------------------
 // tTVPLayerManager
@@ -355,13 +51,10 @@ tTVPLayerManager::tTVPLayerManager(iTVPLayerTreeOwner* owner)
     LastMouseMoveX = -1;
     LastMouseMoveY = -1;
     InNotifyingHintOrCursorChange = false;
-    asyncInputManagers.push_back(this);
 }
 //---------------------------------------------------------------------------
 tTVPLayerManager::~tTVPLayerManager()
 {
-    PendingAlphaInput.clear(); ActiveAlphaInput.reset();
-    asyncInputManagers.erase(std::remove(asyncInputManagers.begin(),asyncInputManagers.end(),this),asyncInputManagers.end());
     if (DrawBuffer)
         delete DrawBuffer;
 }
@@ -513,8 +206,6 @@ void tTVPLayerManager::AttachPrimary(tTJSNI_BaseLayer* pri)
 //---------------------------------------------------------------------------
 void tTVPLayerManager::DetachPrimary()
 {
-    PendingAlphaInput.clear();
-    AlphaPointerChains.clear(); CanceledAlphaPointerChains.clear();
     // detach primary layer from the manager
     if (Primary)
     {
@@ -725,50 +416,40 @@ tTJSNI_BaseLayer* tTVPLayerManager::GetMostFrontChildAt(tjs_int x,
         return NULL;
 
     tTJSNI_BaseLayer* lay = NULL;
-    const bool priorQuery=AlphaQuery;
-    AlphaQuery=AlphaDispatching;
-    try { Primary->GetMostFrontChildAt(x, y, &lay, except, get_disabled); }
-    catch(...) { AlphaQuery=priorQuery; throw; }
-    AlphaQuery=priorQuery;
+    Primary->GetMostFrontChildAt(x, y, &lay, except, get_disabled);
     return lay;
 }
 //---------------------------------------------------------------------------
 void tTVPLayerManager::PrimaryClick(tjs_int x, tjs_int y)
 {
-    AlphaPointerScope alphaScope(*this,x,y,[this,x,y]{ PrimaryClick(x,y); });
-    if(alphaScope.Deferred()) return;
     krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::Click);
     tTJSNI_BaseLayer* l = GetMostFrontChildAt(x, y);
     if (l && CaptureOwner == l)
     {
-        FromPinnedPrimaryCoordinates(l,x,y);
+        l->FromPrimaryCoordinates(x, y);
         l->FireClick(x, y);
     }
 }
 //---------------------------------------------------------------------------
 void tTVPLayerManager::PrimaryDoubleClick(tjs_int x, tjs_int y)
 {
-    AlphaPointerScope alphaScope(*this,x,y,[this,x,y]{ PrimaryDoubleClick(x,y); });
-    if(alphaScope.Deferred()) return;
     krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::DoubleClick);
     tTJSNI_BaseLayer* l = GetMostFrontChildAt(x, y);
     if (l /*&& CaptureOwner == l*/)
     {
-        FromPinnedPrimaryCoordinates(l,x,y);
+        l->FromPrimaryCoordinates(x, y);
         l->FireDoubleClick(x, y);
     }
 }
 //---------------------------------------------------------------------------
 void tTVPLayerManager::PrimaryMouseDown(tjs_int x, tjs_int y, tTVPMouseButton mb, tjs_uint32 flags)
 {
-    AlphaPointerScope alphaScope(*this,x,y,[this,x,y,mb,flags]{ PrimaryMouseDown(x,y,mb,flags); },0,true);
-    if(alphaScope.Deferred()) return;
     krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerDown);
     PrimaryMouseMove(x, y, flags);
     tTJSNI_BaseLayer* l = CaptureOwner ? CaptureOwner : GetMostFrontChildAt(x, y);
     if (l)
     {
-        FromPinnedPrimaryCoordinates(l,x,y);
+        l->FromPrimaryCoordinates(x, y);
         ReleaseCaptureCalled = false;
         l->FireMouseDown(x, y, mb, flags);
         bool no_capture = ReleaseCaptureCalled;
@@ -795,8 +476,6 @@ void tTVPLayerManager::PrimaryMouseDown(tjs_int x, tjs_int y, tTVPMouseButton mb
 //---------------------------------------------------------------------------
 void tTVPLayerManager::PrimaryMouseUp(tjs_int x, tjs_int y, tTVPMouseButton mb, tjs_uint32 flags)
 {
-    AlphaPointerScope alphaScope(*this,x,y,[this,x,y,mb,flags]{ PrimaryMouseUp(x,y,mb,flags); });
-    if(alphaScope.Deferred()) return;
     krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerUp);
     tTJSNI_BaseLayer* l;
 
@@ -809,7 +488,7 @@ void tTVPLayerManager::PrimaryMouseUp(tjs_int x, tjs_int y, tTVPMouseButton mb, 
     {
         int orig_x = x, orig_y = y;
 
-        FromPinnedPrimaryCoordinates(l,x,y);
+        l->FromPrimaryCoordinates(x, y);
         l->FireMouseUp(x, y, mb, flags);
 
         if (!TVPIsAnyMouseButtonPressedInShiftStateFlags(flags))
@@ -822,8 +501,6 @@ void tTVPLayerManager::PrimaryMouseUp(tjs_int x, tjs_int y, tTVPMouseButton mb, 
 //---------------------------------------------------------------------------
 void tTVPLayerManager::PrimaryMouseMove(tjs_int x, tjs_int y, tjs_uint32 flags)
 {
-    AlphaPointerScope alphaScope(*this,x,y,[this,x,y,flags]{ PrimaryMouseMove(x,y,flags); });
-    if(alphaScope.Deferred()) return;
     krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerMove);
     bool poschanged = (LastMouseMoveX != x || LastMouseMoveY != y);
     LastMouseMoveX = x;
@@ -918,7 +595,7 @@ void tTVPLayerManager::PrimaryMouseMove(tjs_int x, tjs_int y, tjs_uint32 flags)
     {
         if (poschanged)
         {
-            FromPinnedPrimaryCoordinates(l,x,y);
+            l->FromPrimaryCoordinates(x, y);
             l->FireMouseMove(x, y, flags);
         }
     }
@@ -931,15 +608,13 @@ void tTVPLayerManager::PrimaryMouseMove(tjs_int x, tjs_int y, tjs_uint32 flags)
 void tTVPLayerManager::PrimaryTouchDown(
     tjs_real x, tjs_real y, tjs_real cx, tjs_real cy, tjs_uint32 id)
 {
-    AlphaPointerScope alphaScope(*this,tjs_int(x),tjs_int(y),[this,x,y,cx,cy,id]{ PrimaryTouchDown(x,y,cx,cy,id); },uint64_t(id)+1,true);
-    if(alphaScope.Deferred()) return;
     krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerDown);
     tjs_int ix = (tjs_int)x, iy = (tjs_int)y;
     ReleaseTouchCapture(id);
     tTJSNI_BaseLayer* l = GetMostFrontChildAt(ix, iy);
     if (l)
     {
-        FromPinnedPrimaryCoordinates(l,x,y);
+        l->FromPrimaryCoordinates(x, y);
         ReleaseTouchCaptureIDMark = (tjs_int64)id;
         l->FireTouchDown(x, y, cx, cy, id);
         if (ReleaseTouchCaptureIDMark == (tjs_int64)id)
@@ -952,14 +627,12 @@ void tTVPLayerManager::PrimaryTouchDown(
 void tTVPLayerManager::PrimaryTouchUp(
     tjs_real x, tjs_real y, tjs_real cx, tjs_real cy, tjs_uint32 id)
 {
-    AlphaPointerScope alphaScope(*this,tjs_int(x),tjs_int(y),[this,x,y,cx,cy,id]{ PrimaryTouchUp(x,y,cx,cy,id); },uint64_t(id)+1,false,true);
-    if(alphaScope.Deferred()) return;
     krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerUp);
     tjs_int ix = (tjs_int)x, iy = (tjs_int)y;
     tTJSNI_BaseLayer* l = GetTouchCapture(id) ? GetTouchCapture(id) : GetMostFrontChildAt(ix, iy);
     if (l)
     {
-        FromPinnedPrimaryCoordinates(l,x,y);
+        l->FromPrimaryCoordinates(x, y);
         l->FireTouchUp(x, y, cx, cy, id);
         ReleaseTouchCapture(id);
     }
@@ -968,14 +641,12 @@ void tTVPLayerManager::PrimaryTouchUp(
 void tTVPLayerManager::PrimaryTouchMove(
     tjs_real x, tjs_real y, tjs_real cx, tjs_real cy, tjs_uint32 id)
 {
-    AlphaPointerScope alphaScope(*this,tjs_int(x),tjs_int(y),[this,x,y,cx,cy,id]{ PrimaryTouchMove(x,y,cx,cy,id); },uint64_t(id)+1,false);
-    if(alphaScope.Deferred()) return;
     krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::PointerMove);
     tjs_int ix = (tjs_int)x, iy = (tjs_int)y;
     tTJSNI_BaseLayer* l = GetTouchCapture(id) ? GetTouchCapture(id) : GetMostFrontChildAt(ix, iy);
     if (l)
     {
-        FromPinnedPrimaryCoordinates(l,x,y);
+        l->FromPrimaryCoordinates(x, y);
         l->FireTouchMove(x, y, cx, cy, id);
     }
 }
@@ -983,8 +654,6 @@ void tTVPLayerManager::PrimaryTouchMove(
 void tTVPLayerManager::PrimaryTouchScaling(
     tjs_real startdist, tjs_real curdist, tjs_real cx, tjs_real cy, tjs_int flag)
 {
-    AlphaPointerScope alphaScope(*this,tjs_int(cx),tjs_int(cy),[this,startdist,curdist,cx,cy,flag]{ PrimaryTouchScaling(startdist,curdist,cx,cy,flag); });
-    if(alphaScope.Deferred()) return;
     if (FocusedLayer)
         FocusedLayer->FireTouchScaling(startdist, curdist, cx, cy, flag);
 }
@@ -992,16 +661,12 @@ void tTVPLayerManager::PrimaryTouchScaling(
 void tTVPLayerManager::PrimaryTouchRotate(
     tjs_real startangle, tjs_real curangle, tjs_real dist, tjs_real cx, tjs_real cy, tjs_int flag)
 {
-    AlphaPointerScope alphaScope(*this,tjs_int(cx),tjs_int(cy),[this,startangle,curangle,dist,cx,cy,flag]{ PrimaryTouchRotate(startangle,curangle,dist,cx,cy,flag); });
-    if(alphaScope.Deferred()) return;
     if (FocusedLayer)
         FocusedLayer->FireTouchRotate(startangle, curangle, dist, cx, cy, flag);
 }
 //---------------------------------------------------------------------------
 void tTVPLayerManager::PrimaryMultiTouch()
 {
-    AlphaPointerScope alphaScope(*this,LastMouseMoveX,LastMouseMoveY,[this]{ PrimaryMultiTouch(); });
-    if(alphaScope.Deferred()) return;
     if (FocusedLayer)
         FocusedLayer->FireMultiTouch();
 }
@@ -1534,8 +1199,6 @@ void tTVPLayerManager::PrimaryKeyPress(tjs_uint16 key)
 //---------------------------------------------------------------------------
 void tTVPLayerManager::PrimaryMouseWheel(tjs_uint32 shift, tjs_int delta, tjs_int x, tjs_int y)
 {
-    AlphaPointerScope alphaScope(*this,x,y,[this,shift,delta,x,y]{ PrimaryMouseWheel(shift,delta,x,y); });
-    if(alphaScope.Deferred()) return;
     krkrsdl3::point_trace::TriggerScope trace(krkrsdl3::point_trace::Trigger::Wheel);
     if (FocusedLayer)
         FocusedLayer->FireMouseWheel(shift, delta, x, y);
@@ -1561,27 +1224,7 @@ void tTVPLayerManager::UpdateToDrawDevice()
     // drawdevice -> layer
     if (!Primary)
         return;
-    TVPBeginEmoteAlphaPresentation();
-    struct EndAlphaPresentation { ~EndAlphaPresentation() { TVPEndEmoteAlphaPresentation(); } } endAlphaPresentation;
-    BindAlphaPresentation();
-    // Retry older frozen frames before new source reads can claim the bounded
-    // budget. Continually arriving pointer events must not starve FIFO's head.
-    FinishAlphaPresentation();
     Primary->CompleteForWindow(this);
-    if(emoteplayer::performanceEnabled("MIKAGE_EMOTE_ASYNC_ALPHA")) {
-        // Snapshot only a real window composition, never an arbitrary script
-        // GetTextureHandle. Pending candidates force their own Update first.
-        for(auto* layer:GetAllNodes()) {
-            if(!layer || !layer->GetNodeVisible()) continue;
-            auto* image=layer->GetMainImage();
-            CaptureAlphaForPresentation(layer);
-            if(image) TVPEncodeEmoteAsyncAlphaForPresentation(image->GetTexture());
-        }
-        FinishAlphaPresentation();
-        if(PendingAlphaInput.empty()) for(auto* layer:GetAllNodes()) {
-            if(auto* image=layer->GetMainImage()) TVPStopEmoteAsyncAlphaDemand(image->GetTexture());
-        }
-    }
 }
 //---------------------------------------------------------------------------
 void tTVPLayerManager::NotifyUpdateRegionFixed()

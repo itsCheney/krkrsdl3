@@ -2,7 +2,6 @@
 #include "emoteplayerclass.h"
 #include "emoteresourcecache.h"
 #include "emoteperformance.h"
-#include "emotegeometrybounds.h"
 #include "PointReadTrace.h"
 #include "RenderManager.h"
 #include "tjsArray.h"
@@ -41,107 +40,20 @@ struct TargetReadLock
     TargetReadLock& operator=(const TargetReadLock&) = delete;
 };
 
-static bool captureFeaturesEnabled()
+static bool copyCanvasToLayer(tTJSNI_BaseLayer* layer,krkrsdl3::iTVPRenderBackend* renderer,
+                             void* target,int width,int height,bool adaptor)
 {
-    return performanceEnabled("MIKAGE_EMOTE_CAPTURE_CACHE") ||
-           performanceEnabled("MIKAGE_EMOTE_LOCAL_UPDATE") ||
-           performanceEnabled("MIKAGE_EMOTE_REGION_COPY");
-}
-static performance::TextureKey layerTextureKey(tTJSNI_BaseLayer* layer)
-{
-    performance::TextureKey key;
-    auto* image = layer ? layer->GetMainImage() : nullptr;
-    auto* texture = image ? image->GetTexture() : nullptr;
-    if (texture) key.valid = texture->GetContentKey(key.identity,key.version);
-    return key;
-}
-static performance::Bounds renderedBounds(emoteengine& engine,int width,int height)
-{
-    if (performanceEnabled("MIKAGE_EMOTE_EXPERIMENTAL_BOUNDS"))
-    {
-        const Uint64 started = SDL_GetTicksNS();
-        const auto& motion = engine._mainMotionRef;
-        const auto candidate = motion ? performance::submittedExperimentalBounds(motion->drawNodes(),width,height)
-                                      : performance::Bounds{};
-        auto& stats = performanceCounters();
-        (candidate.known ? stats.captureExperimentalBoundsKnown : stats.captureExperimentalBoundsUnknown)
-            .fetch_add(1,std::memory_order_relaxed);
-        if (candidate.known) stats.captureExperimentalBoundsPixels.fetch_add(candidate.rect.pixels(),std::memory_order_relaxed);
-        stats.captureExperimentalBoundsNS.fetch_add(SDL_GetTicksNS()-started,std::memory_order_relaxed);
-    }
-    if (!performanceEnabled("MIKAGE_EMOTE_LOCAL_UPDATE") &&
-        !performanceEnabled("MIKAGE_EMOTE_REGION_COPY")) return {false,{}};
-    const Uint64 started = SDL_GetTicksNS();
-    const auto& motion = engine._mainMotionRef;
-    auto bounds = motion ? performance::submittedCPUBounds(motion->drawNodes(),width,height)
-                         : performance::Bounds{};
-    auto& counters = performanceCounters();
-    counters.captureBoundsNS.fetch_add(SDL_GetTicksNS()-started,std::memory_order_relaxed);
-    (bounds.known ? counters.captureKnownBounds : counters.captureUnknownBounds)
-        .fetch_add(1,std::memory_order_relaxed);
-    return bounds;
-}
-static void copyCanvasToLayer(tTJSNI_BaseLayer* layer,krkrsdl3::iTVPRenderBackend* renderer,
-                             void* target,int width,int height,
-                             performance::CanvasCaptureCache& cache,bool adaptor)
-{
-    if (!layer || !renderer || !target || width <= 0 || height <= 0) return;
+    if (!layer || !renderer || !target || width <= 0 || height <= 0) return false;
     auto& counters = performanceCounters();
     counters.captureRequests.fetch_add(1,std::memory_order_relaxed);
-    const bool cacheEnabled = performanceEnabled("MIKAGE_EMOTE_CAPTURE_CACHE");
-    const bool localEnabled = performanceEnabled("MIKAGE_EMOTE_LOCAL_UPDATE");
-    const bool regionEnabled = performanceEnabled("MIKAGE_EMOTE_REGION_COPY");
     const int layerWidth = layer->GetWidth(), layerHeight = layer->GetHeight();
     const int copyWidth = std::min(width,layerWidth), copyHeight = std::min(height,layerHeight);
     auto* image = layer->GetMainImage();
     const bool exact = image && layerWidth == width && layerHeight == height &&
                        image->GetWidth() == unsigned(width) && image->GetHeight() == unsigned(height);
-    const auto key = exact ? layerTextureKey(layer) : performance::TextureKey{};
-    const auto identity = reinterpret_cast<std::uintptr_t>(layer);
-    auto decision = cache.decide(identity,key);
-    if (!key.valid && captureFeaturesEnabled())
-        counters.captureInvalidDestinations.fetch_add(1,std::memory_order_relaxed);
-    if (cacheEnabled && decision.skip)
-    {
-        counters.captureSkips.fetch_add(1,std::memory_order_relaxed);
-        krkrsdl3::TVPRecordEmoteCaptureSkip();
-        return;
-    }
-    const performance::Rect full{0,0,width,height};
-    const auto damage = localEnabled && decision.canRegionCopy ? decision.update : full;
-    const auto copyRegion = regionEnabled && decision.canRegionCopy ? decision.update : full;
-    const auto fullPixels = full.pixels();
+    const auto fullPixels = std::uint64_t(width)*std::uint64_t(height);
     bool copied = false;
-    bool cpuFallback = false;
-    bool regionCopy = exact && regionEnabled && decision.canRegionCopy && copyRegion.pixels() < fullPixels;
-    if (regionCopy)
-    {
-        if (copyRegion.empty()) copied = true; // trusted destination and no changed visible pixels.
-        else
-        {
-            krkrsdl3::point_trace::WriterScope write(adaptor ? "emote.captureCanvas" : "emote.drawToLayer");
-            const tTVPRect rect(copyRegion.left,copyRegion.top,copyRegion.right,copyRegion.bottom);
-            copied = layer->CopyMainImageFromGPUTargetRegion(renderer,target,width,height,rect);
-        }
-        if (copied)
-        {
-            counters.captureRegionCopies.fetch_add(1,std::memory_order_relaxed);
-            counters.captureRegions.fetch_add(1,std::memory_order_relaxed);
-            counters.captureRegionPixels.fetch_add(copyRegion.pixels(),std::memory_order_relaxed);
-            krkrsdl3::TVPRecordEmoteCaptureRegion(copyRegion.pixels(),fullPixels);
-            if (adaptor) krkrsdl3::TVPRecordEmoteCaptureGPUCopy(copyRegion.pixels()*4);
-            else krkrsdl3::TVPRecordEmoteLayerGPUCopy(copyRegion.pixels()*4);
-        }
-        else
-        {
-            auto* texture = image ? image->GetTexture() : nullptr;
-            if (texture && (!texture->IsIndependent() || texture->IsStatic()))
-                counters.captureCOWFallbacks.fetch_add(1,std::memory_order_relaxed);
-            counters.captureRegionFallbacks.fetch_add(1,std::memory_order_relaxed);
-            regionCopy = false;
-        }
-    }
-    if (!copied && exact)
+    if (exact)
     {
         krkrsdl3::point_trace::WriterScope write(adaptor ? "emote.captureCanvas" : "emote.drawToLayer");
         copied = layer->CopyMainImageFromGPUTarget(renderer,target,width,height);
@@ -155,37 +67,32 @@ static void copyCanvasToLayer(tTJSNI_BaseLayer* layer,krkrsdl3::iTVPRenderBacken
     }
     if (!copied)
     {
-        cpuFallback = true;
         const Uint64 started = SDL_GetTicksNS();
         TargetReadLock read(renderer,target);
-        if (!read.pixels || read.pitch <= 0) return;
+        if (!read.pixels || read.pitch <= 0) return false;
         const auto bytes = std::uint64_t(read.pitch)*std::uint64_t(height);
         if (adaptor) krkrsdl3::TVPRecordEmoteCaptureCPUFallback(bytes);
         else krkrsdl3::TVPRecordEmoteLayerCPUReadback(bytes,SDL_GetTicksNS()-started);
         copied = layer->CopyMainImageFromCPU(read.pixels,read.pitch,copyWidth,copyHeight);
-        regionCopy = false;
     }
-    if (!copied) return; // never cache a rejected copy: the next call must retry.
+    if (!copied) return false;
     counters.captureFullPixels.fetch_add(fullPixels,std::memory_order_relaxed);
-    if (!regionCopy) krkrsdl3::TVPRecordEmoteCaptureRegion(fullPixels,fullPixels);
-    if (exact && captureFeaturesEnabled()) cache.commit(identity,layerTextureKey(layer),decision.sourceVersion);
+    krkrsdl3::TVPRecordEmoteCaptureRegion(fullPixels,fullPixels);
     const auto layerPixels = std::uint64_t(std::max(0,layerWidth))*std::uint64_t(std::max(0,layerHeight));
     counters.captureUpdateFullPixels.fetch_add(layerPixels,std::memory_order_relaxed);
-    if (localEnabled && decision.canRegionCopy && !cpuFallback)
-    {
-        if (!damage.empty())
-        {
-            const int x = layer->GetImageLeft(), y = layer->GetImageTop();
-            const auto update = performance::clip({damage.left+x,damage.top+y,damage.right+x,damage.bottom+y},layerWidth,layerHeight);
-            counters.captureUpdatePixels.fetch_add(update.pixels(),std::memory_order_relaxed);
-            layer->Update(tTVPRect(damage.left+x,damage.top+y,damage.right+x,damage.bottom+y));
-        }
-    }
-    else
-    {
-        counters.captureUpdatePixels.fetch_add(layerPixels,std::memory_order_relaxed);
-        layer->Update();
-    }
+    counters.captureUpdatePixels.fetch_add(layerPixels,std::memory_order_relaxed);
+    layer->Update();
+    return true;
+}
+
+std::function<bool(tjs_int, tjs_int)> emoteTransparencyHint(EmoteDrawnFrames frames)
+{
+    return [frames = std::move(frames)](tjs_int px, tjs_int py) {
+        for (const auto& [frame, serial] : frames)
+            if (!frame->player || frame->serial != serial || frame->player->mayCoverPixel(px, py))
+                return false;
+        return true;
+    };
 }
 
 static std::uint64_t nextEmoteManagerId()
@@ -661,7 +568,6 @@ void SeparateLayerAdaptor::checkDrawArea(tjs_int width, tjs_int height)
         _height = height;
         target = renderer->CreateTarget(width, height);
         maskTarget = renderer->CreateTarget(width, height); // 蒙版目标（与主体同尺寸）
-        captureCache.reset(width,height);
     }
 }
 
@@ -677,7 +583,6 @@ D3DAdaptor::D3DAdaptor(
         _height = height;
         _orgX = orgX;
         _orgY = orgY;
-        captureCache.reset(width,height);
     }
 }
 D3DAdaptor::~D3DAdaptor()
@@ -699,7 +604,6 @@ D3DAdaptor::~D3DAdaptor()
 }
 void D3DAdaptor::setClearColor(tjs_uint32 color)
 {
-    if (_clearColor != color) captureCache.invalidate();
     _clearColor = color;
 }
 void D3DAdaptor::captureCanvas(iTJSDispatch2* targetLayer)
@@ -719,7 +623,67 @@ void D3DAdaptor::captureCanvas(iTJSDispatch2* targetLayer)
         }
     } captureProfile;
     krkrsdl3::TVPRecordEmoteCaptureCall();
-    copyCanvasToLayer(ths,renderer,_target,_width,_height,captureCache,true);
+    captureInto(ths, renderer);
+}
+void D3DAdaptor::captureInto(tTJSNI_BaseLayer* layer, krkrsdl3::iTVPRenderBackend* renderer)
+{
+    // Capturing twice without drawing must deliver the same frame again.
+    if (_lent) reclaimCanvas(renderer);
+    const bool whole = tjs_int(layer->GetWidth()) == _width && tjs_int(layer->GetHeight()) == _height;
+    const bool delivered = tryExchange(layer, renderer) ||
+                           copyCanvasToLayer(layer,renderer,_target,_width,_height,true);
+    // The layer now holds exactly the canvas: a cleared surface plus these frames.
+    if (delivered && whole)
+        layer->SetMainImageTransparencyHint(emoteTransparencyHint(_drawnSinceClear));
+    _afterCapture = true;
+}
+bool D3DAdaptor::tryExchange(tTJSNI_BaseLayer* layer, krkrsdl3::iTVPRenderBackend* renderer)
+{
+    if (_exchangeDisabled || _clearedCaptures < kClearedCapturesBeforeExchange || !_target ||
+        tjs_int(layer->GetWidth()) != _width || tjs_int(layer->GetHeight()) != _height)
+        return false;
+    void* exchanged = nullptr;
+    krkrsdl3::point_trace::WriterScope write("emote.captureExchange");
+    if (!layer->RenderMainImageOnGPU(renderer, _width, _height, [&](void* layerTarget) {
+            if (!renderer->ExchangeTargetTextures(_target, layerTarget)) return false;
+            exchanged = layerTarget;
+            return true;
+        }))
+        return false;
+    _lent = true;
+    _lentTo = exchanged;
+    if (!renderer->GetTargetContentVersion(_lentTo, _lentIdentity, _lentVersion))
+        _lentIdentity = _lentVersion = 0;
+    krkrsdl3::TVPRecordEmoteLayerDirectDraw();
+    layer->Update();
+    return true;
+}
+void D3DAdaptor::reclaimCanvas(krkrsdl3::iTVPRenderBackend* renderer)
+{
+    // The script used the canvas without clearing it, so it relies on the
+    // canvas keeping its frame: stop exchanging, and bring the frame back
+    // from the layer if that layer has not been written since.
+    _exchangeDisabled = true;
+    _lent = false;
+    uint64_t identity = 0, version = 0;
+    const bool unchanged = _lentIdentity && renderer->GetTargetContentVersion(_lentTo, identity, version) &&
+                           identity == _lentIdentity && version == _lentVersion;
+    if (!unchanged || !renderer->CopyTargetToLayerTexture(_lentTo, _target))
+    {
+        TVPConsoleLog("emote.captureExchange action=restoreLost");
+        renderer->SetTarget(_target);
+        renderer->ClearTarget(true);
+        _drawnSinceClear.clear();
+    }
+    _lentTo = nullptr;
+}
+void D3DAdaptor::prepareForDraw(krkrsdl3::iTVPRenderBackend* renderer,
+                                const std::shared_ptr<EmoteDrawnFrame>& frame)
+{
+    if (_lent && renderer) reclaimCanvas(renderer);
+    else if (_afterCapture) _exchangeDisabled = true; // drew on top of a captured frame
+    _afterCapture = false;
+    if (frame) _drawnSinceClear.emplace_back(frame, frame->serial);
 }
 void D3DAdaptor::unloadUnusedTextures()
 {
@@ -730,7 +694,12 @@ void D3DAdaptor::unloadUnusedTextures()
     {
         renderer->SetTarget(_target);
         renderer->ClearTarget(true);
-        captureCache.beginClear();
+        // Cleared: whatever texture the canvas holds now has defined pixels.
+        if (_afterCapture && _clearedCaptures < kClearedCapturesBeforeExchange) ++_clearedCaptures;
+        _lent = false;
+        _lentTo = nullptr;
+        _afterCapture = false;
+        _drawnSinceClear.clear();
     }
 }
 
@@ -869,6 +838,7 @@ static tTJSVariant makeLayerGetter(EmotePlayer* player, emotemotionref* motion, 
 #define getprop(d, p) getprop_t(d, p, )
 EmotePlayer::~EmotePlayer()
 {
+    _drawnFrame->player = nullptr;
     // 渲染目标由 core/render 的 2D 渲染器统一管理
     krkrsdl3::iTVPRenderBackend* renderer = krkrsdl3::TVPGetRenderBackend();
     if (renderer)
@@ -1090,7 +1060,6 @@ void EmotePlayer::clear(iTJSDispatch2* layer, tjs_uint32 neutralColor)
         {
             renderer->SetTarget(target);
             renderer->ClearTarget(true);
-            (self ? self->captureCache : _captureCache).beginClear();
             _hitFrame = {};
         }
     }
@@ -1143,9 +1112,9 @@ void EmotePlayer::progress(tjs_real mstime)
     emtEngine.recordAnimationProgress(mstime, clockPassed, _playing);
     krkrsdl3::TVPRecordEmoteProgress(SDL_GetTicksNS() - profileStarted);
 }
-bool EmotePlayer::prepareFrame()
+void EmotePlayer::prepareFrame()
 {
-    const auto previousRevision = emtEngine.poseRevision();
+    ++_drawnFrame->serial; // geometry below is about to change
     emtEngine.recordAnimationDraw();
     const Uint64 profileStarted = SDL_GetTicksNS();
     krkrsdl3::TVPBeginEmotePrepareDetail();
@@ -1171,7 +1140,6 @@ bool EmotePlayer::prepareFrame()
 
     krkrsdl3::TVPCommitEmotePrepareDetail(transformTimeNS, motionTimeNS, snapshotTimeNS);
     krkrsdl3::TVPRecordEmotePrepare(SDL_GetTicksNS() - profileStarted);
-    return previousRevision != emtEngine.poseRevision();
 }
 
 void EmotePlayer::draw(iTJSDispatch2* objthis)
@@ -1250,30 +1218,42 @@ void EmotePlayer::draw(iTJSDispatch2* objthis)
         krkrsdl3::TVPRecordEmotePlayerDraw(
             reinterpret_cast<uintptr_t>(this), reinterpret_cast<uintptr_t>(target));
         prepareFrame();
-        auto& canvas = withD3DAdaptor ? d3dAdaptor->captureCache
-                                    : (withoutAdaptor ? _captureCache : self->captureCache);
-        const performance::DrawToken token{_captureIdentity,emtEngine.poseRevision()};
-        const bool retainDrawing = withoutAdaptor && isSelfClear &&
-            performanceEnabled("MIKAGE_EMOTE_CAPTURE_CACHE") && canvas.canRetainSingleDraw(token);
-        if (!retainDrawing)
-        {
-            if (!withD3DAdaptor)
-            {
-                renderer->SetTarget(target);
-                renderer->ClearTarget(isSelfClear);
-                if (isSelfClear) canvas.beginClear();
-            }
+        auto drawFrame = [&](void* frameTarget) {
             const Uint64 drawStarted = SDL_GetTicksNS();
-            emtEngine.draw(renderer, target, _limitArea, maskTarget);
+            emtEngine.draw(renderer, frameTarget, _limitArea, maskTarget);
             krkrsdl3::TVPRecordEmoteDraw(SDL_GetTicksNS() - drawStarted);
-            if (captureFeaturesEnabled() || performanceEnabled("MIKAGE_EMOTE_EXPERIMENTAL_BOUNDS"))
-                canvas.recordDraw(token,renderedBounds(emtEngine,_width,_height));
-            else canvas.invalidate(); // enabling an experiment later must not trust an old recipe.
-        }
-        if (!withD3DAdaptor)
+        };
+        if (withD3DAdaptor)
         {
-            copyCanvasToLayer(ths,renderer,target,_width,_height,canvas,false);
+            d3dAdaptor->prepareForDraw(renderer, _drawnFrame);
+            drawFrame(target);
+            return;
         }
+        // A cleared canvas is copied over the whole layer, so a clearing player
+        // can render into the layer's own texture and skip the copy. A player
+        // that does not clear accumulates on its canvas between frames and
+        // keeps it. The canvas stays allocated for frames the layer declines.
+        if (isSelfClear && tjs_int(ths->GetWidth()) == _width && tjs_int(ths->GetHeight()) == _height)
+        {
+            krkrsdl3::point_trace::WriterScope write("emote.drawIntoLayer");
+            const bool direct = ths->RenderMainImageOnGPU(renderer, _width, _height, [&](void* layerTarget) {
+                renderer->SetTarget(layerTarget);
+                renderer->ClearTarget(true);
+                drawFrame(layerTarget);
+                return true;
+            });
+            if (direct)
+            {
+                krkrsdl3::TVPRecordEmoteLayerDirectDraw();
+                ths->Update();
+                ths->SetMainImageTransparencyHint(emoteTransparencyHint({{_drawnFrame, _drawnFrame->serial}}));
+                return;
+            }
+        }
+        renderer->SetTarget(target);
+        renderer->ClearTarget(isSelfClear);
+        drawFrame(target);
+        copyCanvasToLayer(ths,renderer,target,_width,_height,false);
     }
 }
 
@@ -1736,7 +1716,6 @@ void EmotePlayer::ResetDrawArea(tjs_int width, tjs_int height)
             }
             _target = renderer->CreateTarget(_width, _height);
             _maskTarget = renderer->CreateTarget(_width, _height);
-            _captureCache.reset(_width,_height);
         }
     }
 }

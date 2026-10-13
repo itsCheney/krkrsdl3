@@ -1356,13 +1356,23 @@ void TVPShowScriptException(eTJS& e)
     TVPSetSystemEventDisabledState(true);
     TVPOnError();
 
+    if (TVPTerminated)
+    {
+        // Already shutting down: the error came from a late handler and the
+        // player cannot act on it. Log it and let the shutdown finish.
+        TVPAddLog(ttstr(TVPScriptExceptionRaised) + TJS_N(" during termination\n") + e.GetMessage());
+        return;
+    }
     if (!TVPSystemUninitCalled)
     {
         ttstr errstr = (ttstr(TVPScriptExceptionRaised) + TJS_N("\n") + e.GetMessage());
         TVPAddLog(ttstr(TVPScriptExceptionRaised) + TJS_N("\n") + e.GetMessage());
         TVPShowSimpleMessageBox(errstr, TVPGetErrorDialogTitle());
         // Application->MessageDlg( errstr.AsStdString(), std::wstring(), mtError, mbOK );
-        TVPTerminateSync(1);
+        // Terminate through the normal application loop: TVPTerminateSync
+        // calls exit(), which would close the whole host app on iOS rather
+        // than ending this game session.
+        TVPTerminateAsync(1);
     }
 }
 //---------------------------------------------------------------------------
@@ -1371,6 +1381,13 @@ void TVPShowScriptException(eTJSScriptError& e)
     TVPSetSystemEventDisabledState(true);
     TVPOnError();
 
+    if (TVPTerminated)
+    {
+        TVPAddLog(ttstr(TVPScriptExceptionRaised) + TJS_N(" during termination\n") + e.GetMessage());
+        if (e.GetTrace().GetLen() != 0)
+            TVPAddLog(ttstr(TJS_N("trace : ")) + e.GetTrace());
+        return;
+    }
     if (!TVPSystemUninitCalled)
     {
         ttstr errstr = (ttstr(TVPScriptExceptionRaised) + TJS_N("\n") + e.GetMessage());
@@ -1448,7 +1465,7 @@ void TVPShowScriptException(eTJSScriptError& e)
             }
         }
 #endif
-        TVPTerminateSync(1);
+        TVPTerminateAsync(1); // see TVPShowScriptException(eTJS&)
     }
 }
 //---------------------------------------------------------------------------

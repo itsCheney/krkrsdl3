@@ -2,32 +2,15 @@
 
 #include <atomic>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
-#include <SDL3/SDL.h>
 
 namespace emoteplayer {
-// Experimental optimizations are opt-in until the Apple A/B acceptance run.
-// SDL hints take precedence over environment variables, including an explicit 0.
-inline bool performanceEnabled(const char* name)
-{
-    const char* value = SDL_GetHint(name);
-    if (!value) value = std::getenv(name);
-    return value && (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
-                     std::strcmp(value, "yes") == 0 || std::strcmp(value, "on") == 0);
-}
+// Session counters for Emote canvas capture and synchronous UI alpha reads.
+// The opt-in caching/async-alpha experiments that used to live here were
+// removed after they cost more than they saved; see EMOTE-PERFORMANCE-STATUS.md.
 
 #define EMOTE_PERFORMANCE_COUNTERS(X) \
-    X(nodeVisits) X(nodeCacheHits) X(nodeCacheMisses) X(localPoseCacheHits) X(localPoseCacheMisses) X(shapeCacheHits) X(meshCacheHits) \
-    X(drawListRebuilds) X(captureRequests) X(captureSkips) X(captureFull) X(captureRegions) \
-    X(captureFullCopies) X(captureRegionCopies) X(captureInvalidDestinations) X(captureRegionFallbacks) \
-    X(captureKnownBounds) X(captureUnknownBounds) X(captureRegionPixels) X(captureFullPixels) \
-    X(captureBoundsNS) \
-    X(captureUpdatePixels) X(captureUpdateFullPixels) \
-    X(captureExperimentalBoundsKnown) X(captureExperimentalBoundsUnknown) \
-    X(captureExperimentalBoundsPixels) X(captureExperimentalBoundsNS) \
-    X(captureCOWFallbacks) X(alphaRequests) X(alphaCacheHits) X(alphaPendingEvents) \
-    X(alphaReadBytes) X(alphaFailures) X(uiSyncReads) X(uiSyncWaitNS)
+    X(captureRequests) X(captureFull) X(captureFullCopies) X(captureFullPixels) \
+    X(captureUpdatePixels) X(captureUpdateFullPixels) X(uiSyncReads) X(uiSyncWaitNS)
 
 struct EmotePerformanceStats {
 #define EMOTE_VALUE(name) std::uint64_t name = 0;

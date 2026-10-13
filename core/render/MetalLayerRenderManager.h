@@ -3,26 +3,6 @@
 #include <string>
 #include <memory>
 class iTVPTexture2D;
-namespace krkrsdl3 { struct AsyncAlphaTile; struct AsyncLayerPresentation; }
-// UI preflight only. False means an ordinary/non-Metal texture; a null tile
-// means the bounded async cache is busy, never permission for a sync read.
-bool TVPRequestEmoteAsyncAlpha(iTVPTexture2D*, int x, int y,
-                             std::shared_ptr<krkrsdl3::AsyncAlphaTile>&);
-void TVPMarkEmoteAlphaTexture(iTVPTexture2D*);
-bool TVPIsEmoteAsyncAlphaTexture(iTVPTexture2D*);
-// Explicit window-composition snapshot. Ordinary texture handle acquisition
-// (including script GPU writes) must never publish a displayed alpha version.
-void TVPEncodeEmoteAsyncAlphaForPresentation(iTVPTexture2D*);
-// The texture is an intrusive-ref-held immutable MainImage epoch from F. The
-// copy may be encoded in a later normal command buffer, but its input/display
-// version remains F rather than the current mutable Layer texture.
-void TVPEncodeFrozenEmoteAsyncAlpha(iTVPTexture2D*,
-    const std::shared_ptr<krkrsdl3::AsyncLayerPresentation>&);
-void TVPStopEmoteAsyncAlphaDemand(iTVPTexture2D*);
-uint64_t TVPGetEmoteAlphaPresentationSerial();
-std::shared_ptr<krkrsdl3::AsyncLayerPresentation> TVPGetEmoteAlphaPresentation();
-void TVPBeginEmoteAlphaPresentation();
-void TVPEndEmoteAlphaPresentation();
 namespace krkrsdl3 { class iTVPRenderBackend; }
 // The facade and software methods have process lifetime; only the binding is
 // session scoped. Unbind after clearing layers and recycling deleted textures.
@@ -30,6 +10,10 @@ bool TVPBindMetalLayerRenderManager(krkrsdl3::iTVPRenderBackend* backend);
 void TVPUnbindMetalLayerRenderManager();
 const char* TVPMetalLayerFallbackReason();
 bool TVPMetalLayerCompositionActive();
+// Call once per frame after script/event work and before presenting. Closes
+// script raw-pointer write leases and unpins textures whose raw pointer
+// script has stopped requesting, so they return to GPU composition.
+void TVPEndMetalLayerFrame();
 // GPU composition pays per update rectangle; software keeps CPU-era regions.
 // MIKAGE_METAL_LAYER_COALESCE_UPDATES=0 restores the uncoalesced regions.
 bool TVPShouldCoalesceMetalLayerUpdates();

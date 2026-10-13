@@ -300,6 +300,43 @@ inline void buildShapeMesh(const std::vector<emoteRender>& methods, int shapeTyp
     }
 }
 
+// True when (x, y) is inside a non-degenerate triangle or within `margin` of
+// one: a conservative superset of the pixels a rasterizer may write, so CPU
+// and GPU rounding differences cannot turn a covered pixel into an uncovered one.
+inline bool nearMesh(const std::vector<EmoteVertex>& vertices,
+                     const std::vector<uint16_t>& indices, float x, float y, float margin)
+{
+    if (!std::isfinite(x) || !std::isfinite(y))
+        return true;
+    const auto edge = [](const EmoteVertex& a, const EmoteVertex& b, double px, double py)
+    { return (double(b.x) - a.x) * (py - a.y) - (double(b.y) - a.y) * (px - a.x); };
+    for (size_t i = 0; i + 2 < indices.size(); i += 3)
+    {
+        if (indices[i] >= vertices.size() || indices[i + 1] >= vertices.size() ||
+            indices[i + 2] >= vertices.size())
+            continue;
+        const auto& a = vertices[indices[i]];
+        const auto& b = vertices[indices[i + 1]];
+        const auto& c = vertices[indices[i + 2]];
+        const double area = edge(a, b, c.x, c.y);
+        if (!std::isfinite(area))
+            return true; // unknown geometry: assume it may cover the point
+        if (area == 0 ||
+            x < std::min({a.x, b.x, c.x}) - margin || x > std::max({a.x, b.x, c.x}) + margin ||
+            y < std::min({a.y, b.y, c.y}) - margin || y > std::max({a.y, b.y, c.y}) + margin)
+            continue;
+        const double sign = area > 0 ? 1.0 : -1.0;
+        const auto inside = [&](const EmoteVertex& p, const EmoteVertex& q)
+        {
+            const double length = std::hypot(double(q.x) - p.x, double(q.y) - p.y);
+            return length == 0 || sign * edge(p, q, x, y) / length >= -double(margin);
+        };
+        if (inside(a, b) && inside(b, c) && inside(c, a))
+            return true;
+    }
+    return false;
+}
+
 // Query the actual triangles, including rotation, reflection and mesh deformation.
 // Degenerate/non-finite triangles cannot be hit; edges are included.
 inline bool containsMesh(const std::vector<EmoteVertex>& vertices,

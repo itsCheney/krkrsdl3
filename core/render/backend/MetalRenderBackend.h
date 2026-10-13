@@ -115,6 +115,8 @@ public:
     void RecordLayerGlyphRejection(layer_upload::GlyphReject) override;
     bool CopyTargetToLayerTexture(void*, void*) override;
     bool CopyTargetToLayerTextureRegion(void*, void*, const TVPLayerRect&) override;
+    bool ExchangeTargetTextures(void*, void*) override;
+    bool GetTargetContentVersion(void*, uint64_t&, uint64_t&) override;
     bool ReadLayerTexture(void*, std::vector<uint8_t>&, int&) override;
     bool ReadLayerTextureRegion(void*, const TVPLayerRect&, std::vector<uint8_t>&, int&) override;
     uint64_t GetLastReadbackWaitNanoseconds() const override;

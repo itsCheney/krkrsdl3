@@ -9,6 +9,7 @@
 #include "ObjectList.h"
 #include "tjsNative.h"
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace krkrsdl3 { class iTVPRenderBackend; }
@@ -517,6 +518,15 @@ public:
                                     tjs_int width, tjs_int height);
     bool CopyMainImageFromGPUTargetRegion(krkrsdl3::iTVPRenderBackend* renderer, void* source,
                                         tjs_int width, tjs_int height, const tTVPRect& region);
+    // Full-surface GPU render into the main image; see
+    // tTVPNativeBaseBitmap::OverwriteOnGPU. Declines unless the image is
+    // exactly width x height.
+    bool RenderMainImageOnGPU(krkrsdl3::iTVPRenderBackend* renderer, tjs_int width, tjs_int height,
+                              const std::function<bool(void* target)>& write);
+    // A GPU producer that just wrote the whole main image may name pixels it
+    // left fully transparent, so htMask hit tests there skip a blocking GPU
+    // readback. The hint is dropped once the image changes in any way.
+    void SetMainImageTransparencyHint(std::function<bool(tjs_int px, tjs_int py)> transparent);
     // Copies the top-left source region, preserving image pixels outside it.
     bool CopyMainImageFromCPU(const void* pixels, tjs_int pitch, tjs_int width, tjs_int height);
     // Closes the write lease opened by GetMainImagePixelBufferForWrite so a GPU
@@ -532,6 +542,9 @@ public:
 private:
     tTVPHitType HitType;
     tjs_int HitThreshold;
+    std::function<bool(tjs_int, tjs_int)> TransparencyHint;
+    uint64_t TransparencyHintIdentity = 0, TransparencyHintVersion = 0;
+    bool HintSaysTransparent(tjs_int px, tjs_int py);
     bool OnHitTest_Work;
     bool Enabled;        // is layer enabled for input?
     bool EnabledWork;    // work are for delivering onNodeEnabled or onNodeDisabled
