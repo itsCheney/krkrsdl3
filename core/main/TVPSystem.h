@@ -48,6 +48,10 @@ extern void TVPAfterSystemUninit();
 extern void TVPTerminateAsync(int code = 0); // do acynchronous teminating of application
 extern void TVPTerminateSync(
     int code = 0);                 // do synchronous teminating of application(never return)
+// Set by a host that embeds the runtime and outlives it (Mikage on iOS). Then
+// TVPTerminateSync (System.exit) requests asynchronous termination and unwinds
+// to the host with eTJSSilent, instead of ending the whole process.
+extern bool TVPHostOwnsProcess;
 extern void TVPMainWindowClosed(); // called from WindowManager.cpp, caused by closing main window.
 // this function must shutdown the application, unless the controller window is visible.
 //---------------------------------------------------------------------------

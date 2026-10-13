@@ -721,9 +721,17 @@ void TVPTerminateAsync(int code)
         TVPSystemControl->CallDeliverAllEventsOnIdle();
 }
 //---------------------------------------------------------------------------
+bool TVPHostOwnsProcess = false;
 void TVPTerminateSync(int code)
 {
     // do synchronous temination of application (never return)
+    if (TVPHostOwnsProcess)
+    {
+        // eTJSSilent passes through script try/catch and engine handlers
+        // unchanged; the host ends the session as a normal exit.
+        TVPTerminateAsync(code);
+        throw eTJSSilent();
+    }
     TVPSystemUninit();
     TVPAbortApplication(code);
 }

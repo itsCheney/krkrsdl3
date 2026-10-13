@@ -3,6 +3,8 @@
 #include "tjsNative.h"
 #include "LayerHotspotContext.h"
 
+class iTVPTexture2D;
+
 class tTVPBitmap;
 class tTVPBaseBitmap;
 class tTJSNI_Bitmap : public tTJSNativeInstance
@@ -50,6 +52,8 @@ public:
 
     const void* GetPixelBuffer() const;
     void* GetPixelBufferForWrite();
+    // For a native writer that finishes within one call (scoped lock).
+    iTVPTexture2D* GetTextureForCPUWrite();
     tjs_int GetPixelBufferPitch() const;
 
     // copy on wirte

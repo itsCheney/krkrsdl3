@@ -69,6 +69,7 @@ std::atomic<uint64_t> profileEmoteUniqueMaskGroups{0};
 std::atomic<uint64_t> profileEmoteLayerGPUCopies{0}, profileEmoteLayerGPUCopyBytes{0};
 std::atomic<uint64_t> profileEmoteLayerCPUReadbacks{0}, profileEmoteLayerCPUReadbackBytes{0};
 std::atomic<uint64_t> profileEmoteLayerCPUReadbackTimeNS{0};
+std::atomic<uint64_t> profileEmoteLayerDirectDraws{0};
 
 struct EmoteStepAccumulator {
     bool active = false;
@@ -250,6 +251,9 @@ void TVPRecordEmoteLayerCPUReadback(uint64_t bytes, uint64_t ns) {
     profileEmoteLayerCPUReadbackBytes.fetch_add(bytes, std::memory_order_relaxed);
     profileEmoteLayerCPUReadbackTimeNS.fetch_add(ns, std::memory_order_relaxed);
 }
+void TVPRecordEmoteLayerDirectDraw() {
+    profileEmoteLayerDirectDraws.fetch_add(1, std::memory_order_relaxed);
+}
 void TVPEndRuntimeStep() {
     if (!emoteStepDetail.active) return;
     profileEmoteUniqueMaskGroups.fetch_add(emoteStepDetail.maskGroups.size(),
@@ -385,6 +389,7 @@ TVPRuntimeProfileStats TVPGetRuntimeProfileStats() {
     s.emoteLayerCPUReadbacks=profileEmoteLayerCPUReadbacks.load(std::memory_order_relaxed);
     s.emoteLayerCPUReadbackBytes=profileEmoteLayerCPUReadbackBytes.load(std::memory_order_relaxed);
     s.emoteLayerCPUReadbackTimeNS=profileEmoteLayerCPUReadbackTimeNS.load(std::memory_order_relaxed);
+    s.emoteLayerDirectDraws=profileEmoteLayerDirectDraws.load(std::memory_order_relaxed);
     s.meshDrawCalls=profileMeshDrawCalls.load(std::memory_order_relaxed);
     s.meshVertices=profileMeshVertices.load(std::memory_order_relaxed);
     s.meshIndices=profileMeshIndices.load(std::memory_order_relaxed);
@@ -454,6 +459,7 @@ void TVPResetRuntimeProfileStats() {
     profileEmoteLayerCPUReadbacks.store(0,std::memory_order_relaxed);
     profileEmoteLayerCPUReadbackBytes.store(0,std::memory_order_relaxed);
     profileEmoteLayerCPUReadbackTimeNS.store(0,std::memory_order_relaxed);
+    profileEmoteLayerDirectDraws.store(0,std::memory_order_relaxed);
     emoteStepDetail = {};
     emotePrepareDetail = {};
     profileMeshDrawCalls.store(0,std::memory_order_relaxed);

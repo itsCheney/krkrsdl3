@@ -14,8 +14,6 @@
 #include "LayerTriangleTrace.h"
 #include "LayerAffineGeometry.h"
 #include "LayerPerspectiveGeometry.h"
-#include "AsyncAlphaTileCache.h"
-#include "../../plugins/emoteplayer/emoteperformance.h"
 #include "tjsDebug.h"
 #include <algorithm>
 #include <chrono>
@@ -26,6 +24,7 @@
 #include <unordered_map>
 #include <vector>
 #include <SDL3/SDL.h>
+#include "../../plugins/emoteplayer/emoteperformance.h"
 
 extern "C" {
 extern unsigned char TVPOpacityOnOpacityTable[65536];
@@ -90,6 +89,10 @@ struct Session {
     iTVPRenderBackend* backend;
     TVPLayerRenderStats stats;
     std::set<LayerTexture*> textures;
+    // Render frames seen by TVPEndMetalLayerFrame, and the textures that handed
+    // a raw pointer to script and still need frame-boundary release.
+    uint64_t frame = 0;
+    std::set<LayerTexture*> rawAccess;
     std::unordered_map<std::string,uint64_t> multipleInputMethods;
     std::unordered_map<std::string,uint64_t> unsupportedMethods;
     TriangleInterval triangles;
@@ -109,8 +112,16 @@ class LayerTexture final : public iTVPTexture2D {
     std::vector<uint8_t> pixels;
     bool valid = false, dirty = false, pinned = false, readonly;
     // An outstanding raw write pointer may be written at any time without
-    // telling us, so such a texture re-uploads until the lease is released.
+    // telling us, so such a texture re-uploads (at most once per frame) until
+    // the lease is released.
     bool writeLeased = false;
+    // Script raw pointers are opaque integers to TJS, and no native code in
+    // this build dereferences them (native callers use scoped locks). A write
+    // lease therefore closes at the frame boundary, and the pin is dropped
+    // once script stops asking for the pointer for kRawPointerIdleFrames.
+    static constexpr uint64_t kRawPointerIdleFrames = 60;
+    uint64_t rawAccessFrame = 0, leaseUploadFrame = ~uint64_t(0);
+    void NoteRawAccess() { rawAccessFrame=session->frame; session->rawAccess.insert(this); }
     unsigned locks = 0;
     unsigned scopedWrites = 0;
     char uploadOrigin[48]="initial", rawWriteOrigin[48]="script.rawWrite";
@@ -133,8 +144,6 @@ class LayerTexture final : public iTVPTexture2D {
             // Diagnostics cannot turn an otherwise valid texture access into a failure.
         }
     }
-    bool emoteAlphaEligible = false;
-    krkrsdl3::AsyncAlphaTileCache alphaTiles;
     struct InvalidationInfo {
         point_trace::Invalidation reason = point_trace::Invalidation::Unknown;
         const char* writer = "initial";
@@ -329,10 +338,9 @@ public:
         if(handle) session->stats.gpuResidentBytes-=Bytes();
         if(valid) session->stats.cpuCacheBytes-=Bytes();
         if(pinned) --session->stats.pinnedCPUTextures;
-        session->textures.erase(this);
+        session->textures.erase(this); session->rawAccess.erase(this);
     }
     void Detach() {
-        alphaTiles.Cancel();
         try { Read(TVPLayerReadbackSource::Detach); }
         catch(const std::exception& error) {
             TVPConsoleLog("GPU Layer shutdown readback failed: %s",error.what());
@@ -344,29 +352,6 @@ public:
         if(!pinned) { pinned=true; ++session->stats.pinnedCPUTextures; }
     }
     bool Belongs(const std::shared_ptr<Session>& s) const { return session==s && handle; }
-    void MarkEmoteAlpha() { emoteAlphaEligible=true; }
-    bool HasEmoteAlpha() const { return format==TVPTextureFormat::RGBA && handle && session->backend && !pinned && !writeLeased && !scopedWrites; }
-    std::shared_ptr<krkrsdl3::AsyncAlphaTile> DemandAlpha(int x,int y) {
-        return alphaTiles.Demand(x,y,Width,Height);
-    }
-    void StopAlphaDemand() { alphaTiles.StopDemand(); }
-    void EncodeAlphaForPresentation(const std::shared_ptr<krkrsdl3::AsyncLayerPresentation>& frozen={}) {
-        if(!HasEmoteAlpha() || !emoteplayer::performanceEnabled("MIKAGE_EMOTE_ASYNC_ALPHA")) return;
-        // Upload CPU damage before recording the content key, then read exactly
-        // this MainImage version after the window's normal composition pass.
-        GetTextureHandle();
-        alphaTiles.EncodeDemanded(contentVersion,frozen ? frozen : session->backend->GetCurrentLayerPresentation(),
-            [&](const std::shared_ptr<krkrsdl3::AsyncLayerReadback>& read) {
-                const bool encoded=session->backend->RequestLayerTextureRegionRead(handle,read->region,read);
-                if(encoded) {
-                    auto& counters=emoteplayer::performanceCounters();
-                    counters.alphaRequests.fetch_add(1,std::memory_order_relaxed);
-                    counters.alphaReadBytes.fetch_add(uint64_t(read->region.Width())*read->region.Height()*4,
-                                                     std::memory_order_relaxed);
-                }
-                return encoded;
-            });
-    }
     // Used when building a borrowed software view for a CPU fallback, so the
     // readback is billed to the fallback rather than to ordinary pixel access.
     const void* ScanLineForFallback(TVPLayerFallbackReadbackRole role) {
@@ -433,6 +418,7 @@ public:
     }
     void* GetPersistentCPUData(bool write) override {
         Read(TVPLayerReadbackSource::Persistent); if(!pinned) { pinned=true; ++session->stats.pinnedCPUTextures; }
+        NoteRawAccess();
         if(write) {
             rawWriteOriginOversize=std::strlen(krkrsdl3::layer_work::source)>=sizeof(rawWriteOrigin) ||
                 (writeLeased && rawWriteOriginOversize);
@@ -452,6 +438,7 @@ public:
             valid=true; session->stats.cpuCacheBytes+=Bytes();
         }
         if(!pinned) { pinned=true; ++session->stats.pinnedCPUTextures; }
+        NoteRawAccess();
         if(!writeLeased) { leaseHadDamage=dirty; leaseDamage=damage; writeLeased=true; }
         MarkDirtyAll();
         return pixels.data();
@@ -473,8 +460,12 @@ public:
         if(!session->backend || !handle) return nullptr;
         // Only actual CPU writes need an upload. A pinned texture keeps its raw
         // pointer alive but is not itself a reason to re-send unchanged pixels.
-        if(dirty || writeLeased || scopedWrites) {
-            if(writeLeased || scopedWrites) MarkDirtyAll();
+        // An open raw write lease uploads in full at most once per frame;
+        // writes after that upload are caught when the lease closes at the
+        // frame boundary.
+        const bool leaseUpload=writeLeased && leaseUploadFrame!=session->frame;
+        if(dirty || leaseUpload || scopedWrites) {
+            if(leaseUpload || scopedWrites) MarkDirtyAll();
             Read(TVPLayerReadbackSource::Pixels);
             const int bpp=format==TVPTextureFormat::Gray ? 1 : 4;
             const auto* source=pixels.data()+size_t(damage.top)*GetPitch()+size_t(damage.left)*bpp;
@@ -491,9 +482,22 @@ public:
                 writeLeased ? rawWriteOrigin : uploadOrigin,diagnosticEpoch,
                 writeLeased ? rawWriteOriginOversize : uploadOriginOversize);
             dirty=false; leaseHadDamage=false;
+            if(writeLeased) leaseUploadFrame=session->frame;
         }
         PublishDiagnosticIdentity();
         return handle;
+    }
+    // Called once per render frame for textures in session->rawAccess.
+    // Returns whether the texture still needs frame-boundary attention.
+    bool EndRawAccessFrame() {
+        if(writeLeased) ReleasePersistentCPUData(nullptr);
+        if(pinned && handle && !locks && !scopedWrites &&
+           session->frame-rawAccessFrame>=kRawPointerIdleFrames) {
+            // The CPU copy stays valid; pending damage uploads on next use
+            // and the next GPU write releases it, as for any unpinned texture.
+            pinned=false; --session->stats.pinnedCPUTextures;
+        }
+        return pinned;
     }
     bool GetContentKey(uint64_t& identity,uint64_t& version) const override {
         identity=textureID; version=contentVersion; return true;
@@ -1286,6 +1290,13 @@ void TVPUnbindMetalLayerRenderManager() {
     manager.session->backend=nullptr; manager.session.reset();
 }
 bool TVPMetalLayerCompositionActive() { return bool(Manager().session); }
+void TVPEndMetalLayerFrame() {
+    const auto& session=Manager().session;
+    if(!session) return;
+    ++session->frame;
+    for(auto it=session->rawAccess.begin();it!=session->rawAccess.end();)
+        if((*it)->EndRawAccessFrame()) ++it; else it=session->rawAccess.erase(it);
+}
 bool TVPShouldCoalesceMetalLayerUpdates() {
     return Manager().session && SDL_GetHintBoolean("MIKAGE_METAL_LAYER_COALESCE_UPDATES",true);
 }
@@ -1536,41 +1547,3 @@ std::string TVPGetMetalLayerUnsupportedMethodSummary() {
 
 const char* TVPMetalLayerFallbackReason() { return fallbackReason.c_str(); }
 
-void TVPMarkEmoteAlphaTexture(iTVPTexture2D* texture) {
-    if(auto* metal=dynamic_cast<LayerTexture*>(texture)) metal->MarkEmoteAlpha();
-}
-bool TVPIsEmoteAsyncAlphaTexture(iTVPTexture2D* texture) {
-    auto* metal=dynamic_cast<LayerTexture*>(texture);
-    return metal && metal->HasEmoteAlpha() &&
-        emoteplayer::performanceEnabled("MIKAGE_EMOTE_ASYNC_ALPHA");
-}
-bool TVPRequestEmoteAsyncAlpha(iTVPTexture2D* texture,int x,int y,
-                             std::shared_ptr<krkrsdl3::AsyncAlphaTile>& tile) {
-    if(!TVPIsEmoteAsyncAlphaTexture(texture)) return false;
-    tile=static_cast<LayerTexture*>(texture)->DemandAlpha(x,y);
-    return true;
-}
-namespace { unsigned alphaPresentationDepth=0; }
-void TVPBeginEmoteAlphaPresentation() { ++alphaPresentationDepth; }
-void TVPEndEmoteAlphaPresentation() { if(alphaPresentationDepth) --alphaPresentationDepth; }
-void TVPEncodeEmoteAsyncAlphaForPresentation(iTVPTexture2D* texture) {
-    if(!alphaPresentationDepth) return;
-    if(auto* metal=dynamic_cast<LayerTexture*>(texture)) metal->EncodeAlphaForPresentation();
-}
-void TVPEncodeFrozenEmoteAsyncAlpha(iTVPTexture2D* texture,
-    const std::shared_ptr<krkrsdl3::AsyncLayerPresentation>& presentation) {
-    if(!presentation || presentation->failed.load(std::memory_order_acquire)) return;
-    if(auto* metal=dynamic_cast<LayerTexture*>(texture)) metal->EncodeAlphaForPresentation(presentation);
-}
-void TVPStopEmoteAsyncAlphaDemand(iTVPTexture2D* texture) {
-    if(auto* metal=dynamic_cast<LayerTexture*>(texture)) metal->StopAlphaDemand();
-}
-uint64_t TVPGetEmoteAlphaPresentationSerial() {
-    auto& session=Manager().session;
-    auto presentation=session && session->backend ? session->backend->GetCurrentLayerPresentation() : nullptr;
-    return presentation ? presentation->frameSerial : 0;
-}
-std::shared_ptr<krkrsdl3::AsyncLayerPresentation> TVPGetEmoteAlphaPresentation() {
-    auto& session=Manager().session;
-    return session && session->backend ? session->backend->GetCurrentLayerPresentation() : nullptr;
-}

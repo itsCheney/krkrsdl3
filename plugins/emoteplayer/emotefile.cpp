@@ -382,11 +382,25 @@ public:
 };
 
 using EmoteDecodedCache = EmoteResourceCache<std::pair<std::string, tjs_int>, EmoteDecodedResource>;
+// One decoded character is ~8-10 MB and a scene can cycle through a dozen,
+// so the former fixed 64 MB evicted characters the scene was about to show
+// again, each costing a 50-70 ms archive read and parse on the main thread.
+// Scale with device RAM (1/24, 64-192 MB); low-memory warnings clear it.
+std::size_t SharedEmoteCacheBudgetBytes(std::uint64_t totalRAMBytes)
+{
+    constexpr std::uint64_t MB = 1024 * 1024;
+    if (!totalRAMBytes) return static_cast<std::size_t>(64 * MB);
+    return static_cast<std::size_t>(std::clamp<std::uint64_t>(totalRAMBytes / 24, 64 * MB, 192 * MB));
+}
 static EmoteDecodedCache& SharedEmoteCache()
 {
     // Explicit session/compact hooks release retention. Avoid static teardown
     // ordering dependencies on the application's shutdown callbacks.
-    static auto* cache = new EmoteDecodedCache(64 * 1024 * 1024);
+    static auto* cache = new EmoteDecodedCache([] {
+        TVPMemoryInfo memory{};
+        TVPGetMemoryInfo(memory);
+        return SharedEmoteCacheBudgetBytes(static_cast<std::uint64_t>(memory.MemTotal) * 1024);
+    }());
     return *cache;
 }
 void ClearSharedEmoteResourceCache(const char* reason)
