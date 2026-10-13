@@ -12,10 +12,9 @@
 | --- | --- |
 | `mikage` | Mikage `main` 使用的稳定版运行时 |
 | `mikage-beta` | Mikage `beta` 使用的测试版运行时 |
-| `metal_dev` | 日常开发，改动先在这里完成，再合并到 `mikage-beta` 和 `mikage` |
 | `main` | 跟踪上游 krkrsdl3 |
 
-合并方向固定为 `metal_dev` → `mikage-beta` → `mikage`。
+合并方向固定为 `mikage-beta` → `mikage`。
 
 ## 相对上游的主要改动
 
