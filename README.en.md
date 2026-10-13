@@ -12,10 +12,9 @@ This repository holds the engine source only and does not build on its own. Buil
 | --- | --- |
 | `mikage` | Stable runtime, used by Mikage `main` |
 | `mikage-beta` | Test runtime, used by Mikage `beta` |
-| `metal_dev` | Day-to-day development; changes land here first, then merge into `mikage-beta` and `mikage` |
 | `main` | Tracks upstream krkrsdl3 |
 
-Merges always go `metal_dev` → `mikage-beta` → `mikage`.
+Merges always go `mikage-beta` → `mikage`.
 
 ## What this fork changes
 
