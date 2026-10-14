@@ -34,7 +34,9 @@ namespace krkrsdl3
 {
 TVPSprite* KRKR_Get_Current_Sprite();
 void KRKR_Trig_MouseDown(tTVPMouseButton mouseId, int x, int y);
-void KRKR_Trig_MouseUp(tTVPMouseButton mouseId, int x, int y);
+// click = false releases the button without onClick, as at the end of a
+// drag, so a swipe does not count as a click (text does not advance).
+void KRKR_Trig_MouseUp(tTVPMouseButton mouseId, int x, int y, bool click = true);
 void KRKR_Trig_MouseMove(int x, int y);
 void KRKR_Trig_MouseScroll(int dx, int dy, int x, int y);
 void KRKR_Trig_KeyDown(int vk);
