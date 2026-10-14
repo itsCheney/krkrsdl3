@@ -300,6 +300,9 @@ void TVPRegisterRenderBackend(const TVPRenderBackendDesc& desc);
 // 画面比例：false=保持比例 letterbox（默认），true=把比 16:9 窄的横屏画面拉伸到 16:9 后再 letterbox
 void TVPSetStretchMode(bool enable);
 bool TVPGetStretchMode();
+// GPU 后端每发出一次 draw call 计数一次；累计值供宿主算每帧 draw call 数
+void TVPCountDrawCall();
+uint64_t TVPGetDrawCallCount();
 // 探测通过的可用后端名列表
 std::vector<std::string> TVPListRenderBackends();
 bool TVPRenderBackendAvailable(const std::string& name);

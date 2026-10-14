@@ -610,6 +610,7 @@ struct MetalRenderBackend::Impl
             ordinaryBoundRenderPipeline=pipeline;
         }
         [ordinaryRenderEncoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        TVPCountDrawCall();
         layerPipelineStats.Record(selected,uint64_t(parameters.clip.z-parameters.clip.x)*
                                           uint64_t(parameters.clip.w-parameters.clip.y));
         hotspots.Count([](layer_hotspot::Totals& t){t.Add(t.actualDraws);});
@@ -1434,6 +1435,7 @@ struct MetalRenderBackend::Impl
             [e setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
             [e setFragmentTexture:draw.texture atIndex:0];
             [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+            TVPCountDrawCall();
             hotspots.Count([](layer_hotspot::Totals& t){t.Add(t.actualDraws);});
             Trace(layer_hotspot::Access::Window,0,nullptr,draw.resource,{}, {}, {},true);
             if (diagnosticSampled) ++diagnosticWorkload.windowDraws;
@@ -1953,6 +1955,7 @@ void MetalRenderBackend::DrawMesh(const float* vertices, int vertexCount, const 
         [e setFragmentTexture:p.mask ? (p.mask == p.current ? snapshot : p.mask->texture) : source atIndex:1];
         [e drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:indexCount indexType:MTLIndexTypeUInt16
                      indexBuffer:upload.buffer indexBufferOffset:upload.offset + indexOffset];
+        TVPCountDrawCall();
         p.hotspots.Count([](layer_hotspot::Totals& t){t.Add(t.actualDraws);});
         if (p.diagnosticSampled) {
             ++p.diagnosticWorkload.meshDraws;
@@ -2015,6 +2018,7 @@ bool MetalRenderBackend::DrawDeformedMesh(int divX, int divY,
                         indexType:MTLIndexTypeUInt16
                       indexBuffer:topology->indices
                 indexBufferOffset:0];
+        TVPCountDrawCall();
         p.hotspots.Count([](layer_hotspot::Totals& t){t.Add(t.actualDraws);});
         if (p.diagnosticSampled) {
             ++p.diagnosticWorkload.deformDraws;
