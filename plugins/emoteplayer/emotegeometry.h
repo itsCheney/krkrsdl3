@@ -39,6 +39,7 @@ struct emoteRender // 渲染方式
     float currSx = 0, currSy = 0;
     float currOx = 0, currOy = 0;
     uint32_t currInheritMask = 0x20007FC;
+    int32_t transformOrder[4] = {0, 1, 2, 3};
     // 辅助信息
     std::string label;
 };
@@ -69,92 +70,117 @@ inline void evalBezierSurface(const float controlPts[32], float u, float v,
     outY = ry;
 }
 
-// Evaluate the full surface chain (same logic as the old tess eval shader)
-// Start with UV (u,v), iterate surfaces from innermost to outermost,
-// applying bezier deformation and matrix transform at each level.
-// The outermost surface (index 0) includes projection and outputs clip space [-1,1].
-// Inner surfaces have model-only matrices and output pixel space (relative to parent);
-// their output is normalized back to UV [0,1] (with axis swap) for the next surface.
-inline void evaluateSurfaceChain(
-    const std::vector<emoteRender>& renderMethod,
-    float u, float v,
-    float& outClipX, float& outClipY)
+// inheritMask filters the linear transform, never the node's placement.
+inline glm::mat4 buildMotionLinear(const emoteRender& method, uint32_t inheritMask)
 {
-    float lastX = 0;
-    float lastY = 0;
-    glm::vec4 trans = glm::vec4(1.0f);
-    int surfaceCount = (int)renderMethod.size();
-    uint32_t currInheritMask = 0xFFFFFFF;
+    const float angle = (inheritMask & 0x10) ? method.currAngle : 0.0f;
+    const float zoomX = (inheritMask & 0x20) ? method.currZx : 1.0f;
+    const float zoomY = (inheritMask & 0x40) ? method.currZy : 1.0f;
+    const float slantX = (inheritMask & 0x80) ? method.currSx : 0.0f;
+    const float slantY = (inheritMask & 0x100) ? method.currSy : 0.0f;
 
-    // Iterate in reverse: renderMethod[surfaceCount-1] is innermost (first in shader)
-    for (int i = surfaceCount - 1; i >= 0; i--)
+    glm::mat4 linear(1.0f);
+    for (const auto operation : method.transformOrder)
     {
-        // inheritMask
-        currInheritMask &= renderMethod[i].currInheritMask;
-        const auto& surface = renderMethod[i];
-        // Only ancestors inside the player obey the accumulated inheritance mask.
-        const uint32_t mask = (i > 0 && i < surfaceCount - 1) ? currInheritMask : 0xFFFFFFFF;
-        glm::mat4 model = glm::translate(glm::mat4(1.0f),
-            glm::vec3(surface.currCoordx, surface.currCoordy, 0));
-        if (mask & 0x10)
-            model = glm::rotate(model, glm::radians(surface.currAngle), glm::vec3(0, 0, 1));
-        model = glm::scale(model, glm::vec3(mask & 0x20 ? surface.currZx : 1,
-                                           mask & 0x40 ? surface.currZy : 1, 1));
-        glm::mat4 shear(1.0f);
-        if (mask & 0x80) shear[1][0] = surface.currSx;
-        if (mask & 0x100) shear[0][1] = surface.currSy;
-        model = shear * model;
-        // 非layout补充计算矩阵
-        if (renderMethod[i].type >= 1 && renderMethod[i].type <= 2)
+        if (operation == 1 && angle != 0.0f)
+            linear =
+                glm::rotate(glm::mat4(1.0f), glm::radians(angle), glm::vec3(0.0f, 0.0f, 1.0f)) *
+                linear;
+        if (operation == 2 && (zoomX != 1.0f || zoomY != 1.0f))
+            linear = glm::scale(glm::mat4(1.0f), glm::vec3(zoomX, zoomY, 1.0f)) * linear;
+        if (operation == 3 && (slantX != 0.0f || slantY != 0.0f))
         {
-            model = glm::translate(
-                model, glm::vec3(-renderMethod[i].originX - renderMethod[i].currOx,
-                                 -renderMethod[i].originY - renderMethod[i].currOy, 0.0f));
-            model =
-                glm::scale(model, glm::vec3(renderMethod[i].width, renderMethod[i].height, 1.0f));
-        }
-        // 加入attach矩阵
-        model = renderMethod[i].attachMat * model;
-
-        if (renderMethod[i].type == 3)
-        {
-            // Layout层 直接计算
-            trans = model * trans;
-        }
-        else
-        {
-            // 获取 lastX,lastY
-            if (i < surfaceCount - 1)
-            {
-                // Inner surfaces have model-only matrices; output is in parent's pixel space.
-                // Normalize back to UV [0,1] (with axis swap: parent-Y→U, parent-X→V)
-                // for the next (outer) surface's Bezier input.
-                lastX = (trans.y + renderMethod[i].originY) / renderMethod[i].height; // Y → U
-                lastY = (trans.x + renderMethod[i].originX) / renderMethod[i].width;  // X → V
-            }
-            else
-            {
-                lastX = u;
-                lastY = v;
-            }
-
-            // Evaluate bezier surface
-            float bx, by;
-            if (renderMethod[i].type == 1)
-            {
-                evalBezierSurface(renderMethod[i].controlPts, lastX, lastY, bx, by);
-            }
-            else
-            {
-                bx = lastY, by = lastX;
-            }
-
-            // Apply transformation matrix
-            trans = model * glm::vec4(bx, by, 0.0f, 1.0f);
+            glm::mat4 shear(1.0f);
+            shear[1][0] = slantX;
+            shear[0][1] = slantY;
+            linear = shear * linear;
         }
     }
+    return linear;
+}
 
-    // Final Y flip (same as shader: gl_Position = lastPt * vec4(1, -1, 1, 1))
+// A point consists of its local geometry and the placements of its ancestors.
+// Each placement starts inheriting at its parent, one level later than geometry.
+// Keeping these contributions separate lets the reverse surface walk preserve
+// spacing even when the leaf opts out of its parents' rotation/scale/shear.
+struct emoteSurfaceContribution
+{
+    glm::vec4 offset;
+    uint32_t inheritMask;
+};
+
+inline constexpr uint32_t emoteLinearInheritMask = 0x1F0;
+
+// Walk every chain from the innermost surface to the player root. Bezier patches
+// consume parent-local pixel coordinates, normalized to UV with the axis swap.
+inline void evaluateSurfaceChain(const std::vector<emoteRender>& renderMethod,
+                                 float u,
+                                 float v,
+                                 float& outClipX,
+                                 float& outClipY)
+{
+    std::vector<emoteSurfaceContribution> points;
+    points.reserve(renderMethod.size() + 1);
+    uint32_t geometryMask = emoteLinearInheritMask;
+    glm::vec4 trans(0.0f);
+    const int surfaceCount = (int)renderMethod.size();
+
+    for (int i = surfaceCount - 1; i >= 0; --i)
+    {
+        const emoteRender& surface = renderMethod[i];
+        const bool innermost = i == surfaceCount - 1;
+        if (innermost || surface.type == 1)
+        {
+            float bx = u, by = v;
+            if (surface.type != 3)
+            {
+                const float lastU = innermost ? u : (trans.y + surface.originY) / surface.height;
+                const float lastV = innermost ? v : (trans.x + surface.originX) / surface.width;
+                if (surface.type == 1)
+                    evalBezierSurface(surface.controlPts, lastU, lastV, bx, by);
+                else
+                {
+                    bx = lastV;
+                    by = lastU;
+                }
+                bx = bx * surface.width - surface.originX - surface.currOx;
+                by = by * surface.height - surface.originY - surface.currOy;
+            }
+            // A deformation adds a displacement to the existing local point;
+            // it must not turn the ancestor placements into leaf geometry.
+            points.push_back({glm::vec4(bx, by, 0.0f, 0.0f) - trans, geometryMask});
+        }
+        // Affine ancestors transform their child coordinates directly. Their
+        // sprite origin/offset belongs to their own geometry, not their children.
+        trans = glm::vec4(0.0f);
+        uint32_t previousMask = 0;
+        glm::mat4 model(1.0f);
+        for (auto& point : points)
+        {
+            const uint32_t mask = i == 0 || innermost ? emoteLinearInheritMask : point.inheritMask;
+            if (&point == &points.front() || mask != previousMask)
+            {
+                model = surface.attachMat * buildMotionLinear(surface, mask);
+                previousMask = mask;
+            }
+            point.offset = model * point.offset;
+            point.inheritMask &= surface.currInheritMask;
+            trans += point.offset;
+        }
+
+        glm::vec4 position =
+            surface.attachMat * glm::vec4(surface.currCoordx, surface.currCoordy, 0.0f, 1.0f);
+        position.w = 0.0f;
+        // Coalesce fully inherited placements; the usual affine chain keeps
+        // only the geometry and one placement contribution.
+        if (!points.empty() && points.back().inheritMask == emoteLinearInheritMask)
+            points.back().offset += position;
+        else
+            points.push_back({position, emoteLinearInheritMask});
+        trans += position;
+        geometryMask &= surface.currInheritMask;
+    }
+
     outClipX = trans.x;
     outClipY = -trans.y;
 }

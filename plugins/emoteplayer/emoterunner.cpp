@@ -423,6 +423,8 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         emt.currOx = currOx;
         emt.currOy = currOy;
         emt.currInheritMask = currentNode->inheritMask;
+        std::copy(std::begin(currentNode->transformOrder), std::end(currentNode->transformOrder),
+                  std::begin(emt.transformOrder));
         // fbo信息
         emt.originX = originX;
         emt.originY = originY;
