@@ -39,6 +39,10 @@ void KRKR_Trig_MouseMove(int x, int y);
 void KRKR_Trig_MouseScroll(int dx, int dy, int x, int y);
 // Wheel notch at drawable pixel (x, y); delta > 0 scrolls up, like WM_MOUSEWHEEL.
 void KRKR_Trig_MouseWheel(int delta, int x, int y);
+// Whether drawable pixel (x, y) is on a vertical scroll bar: a tall, narrow
+// layer under the point, or the parent of the thumb there. Touch drags that
+// start on one move the bar instead of scrolling the content.
+bool KRKR_IsVerticalScrollBarAt(int x, int y);
 void KRKR_Trig_KeyDown(int vk);
 void KRKR_Trig_KeyUp(int vk);
 void KRKR_Trig_TextInput(std::string text);
