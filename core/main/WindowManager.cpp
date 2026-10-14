@@ -302,11 +302,19 @@ void KRKR_Trig_MouseWheel(int delta, int x, int y)
     if (tmp == NULL)
         return;
 
-    // Queued behind the mouse moves before it, so the layer under the
-    // pointer is current when the wheel reaches it.
+    // Queued like the mouse events, so it reaches the focused layer and the
+    // window's onMouseWheel in order with them.
     TVPPostInputEvent(new tTVPOnMouseWheelInputEvent(win, TVPGetCurrentShiftKeyState(), delta,
                                                      (x - tmp->xPos) / tmp->scale,
                                                      (y - tmp->yPos) / tmp->scale));
+}
+//---------------------------------------------------------------------------
+void KRKR_Trig_MouseOutOfWindow()
+{
+    TVPWindow* win = TVPGetActiveWindow();
+    if (win == NULL)
+        return;
+    TVPPostInputEvent(new tTVPOnMouseOutOfWindowInputEvent(win));
 }
 //---------------------------------------------------------------------------
 static bool TVPIsVerticalBarShape(const tTJSNI_BaseLayer* layer, tjs_int primaryWidth,

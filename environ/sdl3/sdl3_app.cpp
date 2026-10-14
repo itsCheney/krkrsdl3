@@ -367,10 +367,10 @@ static const float SCROLL_STEP_FRACTION = 1.0f / 24.0f;
 // A swipe released faster than this (drawable heights per second) keeps
 // scrolling and slows down like a UIScrollView, until it drops below the stop
 // speed or another finger lands.
-static const float MOMENTUM_START_SPEED = 0.6f;
+static const float MOMENTUM_START_SPEED = 1.0f;
 static const float MOMENTUM_STOP_SPEED = 0.25f;
-static const float MOMENTUM_MAX_SPEED = 6.0f;
-static const float MOMENTUM_TIME_CONSTANT = 0.5f; // seconds, UIScrollView's normal deceleration
+static const float MOMENTUM_MAX_SPEED = 3.0f;
+static const float MOMENTUM_TIME_CONSTANT = 0.3f; // seconds
 static const float MOMENTUM_MAX_IDLE = 0.08f;     // a finger held still this long before lifting flings nothing
 static const int MOMENTUM_MAX_NOTCHES_PER_FRAME = 6;
 static TouchState _state;
@@ -570,14 +570,16 @@ void handleFingerMotion(const SDL_TouchFingerEvent& e)
             normalizedTouchToDrawable(f.x, f.y, pixelX, pixelY);
             if (_gesture == GESTURE_NONE)
             {
-                // Point at where the finger landed first: the wheel goes to
-                // the layer under the pointer, and a drag starts there.
-                sendMouseMotion(f.startX, f.startY);
                 // A vertical drag on a scroll bar moves the bar; anywhere
                 // else it scrolls the content under the finger.
                 if (std::abs(pixelY - startY) > std::abs(pixelX - startX) &&
                     !krkrsdl3::KRKR_IsVerticalScrollBarAt(startX, startY))
                 {
+                    // A finger does not hover: take the pointer off the
+                    // screen so rows scrolling under it do not light up or
+                    // play their hover sounds. The wheel carries its own
+                    // position.
+                    krkrsdl3::KRKR_Trig_MouseOutOfWindow();
                     _gesture = GESTURE_SCROLL;
                     _scrollAnchorY = _scrollLastY = static_cast<float>(startY);
                     _scrollLastNS = e.timestamp;
@@ -588,6 +590,8 @@ void handleFingerMotion(const SDL_TouchFingerEvent& e)
                 else
                 {
                     _gesture = GESTURE_DRAG;
+                    // The drag starts where the finger landed.
+                    sendMouseMotion(f.startX, f.startY);
                     sendMouseEvent(SDL_BUTTON_LEFT, SDL_EVENT_MOUSE_BUTTON_DOWN, f.startX, f.startY);
                 }
             }
