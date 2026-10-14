@@ -9,10 +9,6 @@
 #include <SDL3/SDL_log.h>
 #include <SDL3/SDL_timer.h>
 
-#include <algorithm>
-#include <climits>
-#include <cmath>
-#include <cstdlib>
 #include <map>
 #include <vector>
 #ifdef _KRKRSDL3_EMSCRIPTEN
@@ -352,45 +348,16 @@ struct Finger
 
     Finger() : id(0), x(0), y(0), startX(0), startY(0), downTime(0), active(false), moved(false) {}
 };
-// What a moving single finger turned into once it passed the move threshold.
-// A mostly vertical swipe scrolls like a mouse wheel (backlogs, scrolled
-// lists); any other drag holds the left button down so scroll bars, sliders
-// and draggable layers follow the finger. A finger that never moves is a tap.
-enum SingleFingerGesture
-{
-    GESTURE_NONE,
-    GESTURE_SCROLL,
-    GESTURE_DRAG
-};
-// Finger travel, as a fraction of the drawable height, per wheel notch.
-static const float SCROLL_STEP_FRACTION = 1.0f / 24.0f;
-// A swipe released faster than this (drawable heights per second) keeps
-// scrolling and slows down like a UIScrollView, until it drops below the stop
-// speed or another finger lands.
-static const float MOMENTUM_START_SPEED = 1.0f;
-static const float MOMENTUM_STOP_SPEED = 0.25f;
-static const float MOMENTUM_MAX_SPEED = 3.0f;
-static const float MOMENTUM_TIME_CONSTANT = 0.3f; // seconds
-static const float MOMENTUM_MAX_IDLE = 0.08f;     // a finger held still this long before lifting flings nothing
-static const int MOMENTUM_MAX_NOTCHES_PER_FRAME = 6;
+// How far a finger travels, in points, before it stops being a tap and
+// becomes a drag. Kirikiroid2 uses about a tenth of an inch.
+static const float DRAG_THRESHOLD_POINTS = 12.0f;
 static TouchState _state;
-static SingleFingerGesture _gesture = GESTURE_NONE;
-static float _scrollAnchorY = 0; // drawable pixels where the next notch is measured from
-static float _scrollLastY = 0;   // drawable pixels
-static Uint64 _scrollLastNS = 0;
-static float _scrollVelocity = 0; // drawable pixels per second, positive downwards
-static float _scrollPointerX = 0, _scrollPointerY = 0; // normalized, where the wheel is aimed
-static bool _momentumActive = false;
-static float _momentumY = 0;
-static Uint64 _momentumLastNS = 0;
-static bool _momentumCaught = false; // the finger down stopped a fling; its tap is not a click
 static std::map<SDL_FingerID, Finger> fingers;
 static float rightClickX, rightClickY;
 static Uint64 rightClickStartTime;
 static const Uint32 RIGHT_CLICK_CONFIRM_DELAY = 150;
-void sendMouseEvent(int button, int eventType, float pX, float pY);
+void sendMouseEvent(int button, int eventType, float pX, float pY, bool click = true);
 void sendMouseMotion(float pX, float pY);
-void sendMouseWheel(int delta, float pX, float pY);
 void normalizedTouchToDrawable(float pX, float pY, int& pixelX, int& pixelY)
 {
     int drawableWidth = 1, drawableHeight = 1;
@@ -400,64 +367,14 @@ void normalizedTouchToDrawable(float pX, float pY, int& pixelX, int& pixelY)
     pixelX = static_cast<int>(pX * drawableWidth);
     pixelY = static_cast<int>(pY * drawableHeight);
 }
-float drawableHeightInPixels()
-{
-    int drawableWidth = 1, drawableHeight = 1;
-    SDL_GetWindowSizeInPixels(tvp_window, &drawableWidth, &drawableHeight);
-    return static_cast<float>(std::max(drawableHeight, 1));
-}
-// Sends a wheel notch for every step the scroll position has travelled from
-// the anchor. Content follows the finger: pulling down shows earlier content,
-// which is a wheel turned up (positive delta).
-void emitScrollNotches(float pixelY, int maxNotches)
-{
-    const float step = drawableHeightInPixels() * SCROLL_STEP_FRACTION;
-    for (int i = 0; i < maxNotches && pixelY - _scrollAnchorY >= step; ++i)
-    {
-        sendMouseWheel(120, _scrollPointerX, _scrollPointerY);
-        _scrollAnchorY += step;
-    }
-    for (int i = 0; i < maxNotches && _scrollAnchorY - pixelY >= step; ++i)
-    {
-        sendMouseWheel(-120, _scrollPointerX, _scrollPointerY);
-        _scrollAnchorY -= step;
-    }
-}
-void stopScrollMomentum()
-{
-    _momentumActive = false;
-    _momentumY = 0;
-    _momentumLastNS = 0;
-}
-// Runs once per frame: carries a released swipe on, slowing down
-// exponentially.
-void updateScrollMomentum()
-{
-    if (!_momentumActive)
-        return;
-    const Uint64 now = SDL_GetTicksNS();
-    const float dt = std::min((now - _momentumLastNS) / 1e9f, 0.1f);
-    _momentumLastNS = now;
-    if (dt <= 0)
-        return;
-    const float decay = std::exp(-dt / MOMENTUM_TIME_CONSTANT);
-    // Distance covered while decaying over dt, not just v * dt.
-    _momentumY += _scrollVelocity * MOMENTUM_TIME_CONSTANT * (1.0f - decay);
-    _scrollVelocity *= decay;
-    emitScrollNotches(_momentumY, MOMENTUM_MAX_NOTCHES_PER_FRAME);
-    if (std::abs(_scrollVelocity) < drawableHeightInPixels() * MOMENTUM_STOP_SPEED)
-        stopScrollMomentum();
-}
 void handleFingerDown(const SDL_TouchFingerEvent& e)
 {
-    if (_gesture != GESTURE_NONE)
+    if (_state == STATE_SINGLE_FINGER && fingers.size() == 1 && fingers.begin()->second.moved)
     {
-        // A swipe or drag already owns the input; extra fingers do not turn
-        // it into a right click or a menu halfway through.
+        // A drag holds the left button; extra fingers do not turn it into
+        // a right click or a menu halfway through.
         return;
     }
-    _momentumCaught = _momentumActive;
-    stopScrollMomentum();
     Finger f;
     f.id = e.fingerID;
     f.x = f.startX = e.x;
@@ -507,29 +424,17 @@ void handleFingerUp(const SDL_TouchFingerEvent& e)
     {
         if (_state == STATE_SINGLE_FINGER)
         {
-            if (_gesture == GESTURE_DRAG)
-            {
-                sendMouseEvent(SDL_BUTTON_LEFT, SDL_EVENT_MOUSE_BUTTON_UP, f.x, f.y);
-            }
-            else if (_gesture == GESTURE_SCROLL)
-            {
-                const float idle = (e.timestamp - _scrollLastNS) / 1e9f;
-                const float height = drawableHeightInPixels();
-                const float maxSpeed = height * MOMENTUM_MAX_SPEED;
-                if (idle <= MOMENTUM_MAX_IDLE && std::abs(_scrollVelocity) >= height * MOMENTUM_START_SPEED)
-                {
-                    _scrollVelocity = std::max(-maxSpeed, std::min(_scrollVelocity, maxSpeed));
-                    _momentumActive = true;
-                    _momentumY = _scrollLastY;
-                    _momentumLastNS = SDL_GetTicksNS();
-                }
-            }
-            else if (_gesture == GESTURE_NONE && !_momentumCaught)
+            if (!f.moved)
             {
                 sendMouseEvent(SDL_BUTTON_LEFT, SDL_EVENT_MOUSE_BUTTON_DOWN, f.x, f.y);
                 sendMouseEvent(SDL_BUTTON_LEFT, SDL_EVENT_MOUSE_BUTTON_UP, f.x, f.y);
             }
-            // A scroll ends without a click, so it does not also advance text.
+            else
+            {
+                // The end of a drag is not a click, so swiping through a
+                // backlog or across the screen does not advance text.
+                sendMouseEvent(SDL_BUTTON_LEFT, SDL_EVENT_MOUSE_BUTTON_UP, f.x, f.y, false);
+            }
         }
         else if (_state == STATE_MULTI_FINGER)
         {
@@ -538,8 +443,6 @@ void handleFingerUp(const SDL_TouchFingerEvent& e)
             sendMouseEvent(SDL_BUTTON_RIGHT, SDL_EVENT_MOUSE_BUTTON_UP, f.x, f.y);
         }
         _state = STATE_IDLE;
-        _gesture = GESTURE_NONE;
-        _momentumCaught = false;
     }
 
     fingers.erase(it);
@@ -552,72 +455,37 @@ void handleFingerMotion(const SDL_TouchFingerEvent& e)
 
     Finger& f = it->second;
 
-    // 检查是否移动
-    float dx = e.x - f.startX;
-    float dy = e.y - f.startY;
-    float moveDist = dx * dx + dy * dy;
+    // 检查是否移动（以点为单位，与屏幕尺寸无关）
+    int windowWidth = 1, windowHeight = 1;
+    SDL_GetWindowSize(tvp_window, &windowWidth, &windowHeight);
+    float dx = (e.x - f.startX) * windowWidth;
+    float dy = (e.y - f.startY) * windowHeight;
 
-    if (moveDist > 0.0001f)
+    if (!f.moved && dx * dx + dy * dy > DRAG_THRESHOLD_POINTS * DRAG_THRESHOLD_POINTS)
     { // 移动阈值
         f.moved = true;
-        f.x = e.x;
-        f.y = e.y;
-
         if (_state == STATE_SINGLE_FINGER)
         {
-            int startX = 0, startY = 0, pixelX = 0, pixelY = 0;
-            normalizedTouchToDrawable(f.startX, f.startY, startX, startY);
-            normalizedTouchToDrawable(f.x, f.y, pixelX, pixelY);
-            if (_gesture == GESTURE_NONE)
-            {
-                // A vertical drag on a scroll bar moves the bar; anywhere
-                // else it scrolls the content under the finger.
-                if (std::abs(pixelY - startY) > std::abs(pixelX - startX) &&
-                    !krkrsdl3::KRKR_IsVerticalScrollBarAt(startX, startY))
-                {
-                    // A finger does not hover: take the pointer off the
-                    // screen so rows scrolling under it do not light up or
-                    // play their hover sounds. The wheel carries its own
-                    // position.
-                    krkrsdl3::KRKR_Trig_MouseOutOfWindow();
-                    _gesture = GESTURE_SCROLL;
-                    _scrollAnchorY = _scrollLastY = static_cast<float>(startY);
-                    _scrollLastNS = e.timestamp;
-                    _scrollVelocity = 0;
-                    _scrollPointerX = f.startX;
-                    _scrollPointerY = f.startY;
-                }
-                else
-                {
-                    _gesture = GESTURE_DRAG;
-                    // The drag starts where the finger landed.
-                    sendMouseMotion(f.startX, f.startY);
-                    sendMouseEvent(SDL_BUTTON_LEFT, SDL_EVENT_MOUSE_BUTTON_DOWN, f.startX, f.startY);
-                }
-            }
-            if (_gesture == GESTURE_DRAG)
-            {
-                // 单指拖动，按住左键移动
-                sendMouseMotion(f.x, f.y);
-            }
-            else
-            {
-                // Smoothed finger speed, for the fling when it lifts.
-                const float dt = (e.timestamp - _scrollLastNS) / 1e9f;
-                if (dt > 0)
-                {
-                    const float instant = (pixelY - _scrollLastY) / dt;
-                    _scrollVelocity = dt >= MOMENTUM_MAX_IDLE ? instant : 0.6f * instant + 0.4f * _scrollVelocity;
-                    _scrollLastY = static_cast<float>(pixelY);
-                    _scrollLastNS = e.timestamp;
-                }
-                emitScrollNotches(static_cast<float>(pixelY), INT_MAX);
-            }
+            // Like Kirikiroid2, a moving finger is a mouse drag: press where
+            // it landed, then follow it. Backlogs, scroll bars and sliders
+            // handle the drag themselves.
+            sendMouseMotion(f.startX, f.startY);
+            sendMouseEvent(SDL_BUTTON_LEFT, SDL_EVENT_MOUSE_BUTTON_DOWN, f.startX, f.startY);
+        }
+    }
+    if (f.moved)
+    {
+        f.x = e.x;
+        f.y = e.y;
+        if (_state == STATE_SINGLE_FINGER)
+        {
+            // 单指拖动，按住左键移动
+            sendMouseMotion(f.x, f.y);
         }
     }
 }
 
-void sendMouseEvent(int button, int eventType, float pX, float pY)
+void sendMouseEvent(int button, int eventType, float pX, float pY, bool click)
 {
     int pixelX = 0, pixelY = 0;
     normalizedTouchToDrawable(pX, pY, pixelX, pixelY);
@@ -646,7 +514,7 @@ void sendMouseEvent(int button, int eventType, float pX, float pY)
         }
         else if (eventType == SDL_EVENT_MOUSE_BUTTON_UP)
         {
-            krkrsdl3::KRKR_Trig_MouseUp(tmp, pixelX,pixelY);
+            krkrsdl3::KRKR_Trig_MouseUp(tmp, pixelX, pixelY, click);
         }
     }
 }
@@ -655,12 +523,6 @@ void sendMouseMotion(float pX, float pY)
     int pixelX = 0, pixelY = 0;
     normalizedTouchToDrawable(pX, pY, pixelX, pixelY);
     krkrsdl3::KRKR_Trig_MouseMove(pixelX,pixelY);
-}
-void sendMouseWheel(int delta, float pX, float pY)
-{
-    int pixelX = 0, pixelY = 0;
-    normalizedTouchToDrawable(pX, pY, pixelX, pixelY);
-    krkrsdl3::KRKR_Trig_MouseWheel(delta, pixelX, pixelY);
 }
 #endif
 
@@ -789,9 +651,6 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event)
 
 SDL_AppResult SDL_AppIterate(void* appstate)
 {
-#if defined(_KRKRSDL3_ANDROID) || defined(_KRKRSDL3_EMSCRIPTEN) || defined(_KRKRSDL3_IOS)
-    updateScrollMomentum();
-#endif
     if (!::Application->Run())
         return SDL_APP_SUCCESS;
     if (TVPGetWindowCount() == 0)
@@ -861,13 +720,6 @@ void SDL_AppQuit(void* appstate, SDL_AppResult result)
 #if defined(_KRKRSDL3_ANDROID) || defined(_KRKRSDL3_EMSCRIPTEN) || defined(_KRKRSDL3_IOS)
     fingers.clear();
     _state = STATE_IDLE;
-    _gesture = GESTURE_NONE;
-    _scrollAnchorY = _scrollLastY = 0;
-    _scrollLastNS = 0;
-    _scrollVelocity = 0;
-    _scrollPointerX = _scrollPointerY = 0;
-    stopScrollMomentum();
-    _momentumCaught = false;
     rightClickX = rightClickY = 0;
     rightClickStartTime = 0;
 #endif

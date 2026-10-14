@@ -34,18 +34,11 @@ namespace krkrsdl3
 {
 TVPSprite* KRKR_Get_Current_Sprite();
 void KRKR_Trig_MouseDown(tTVPMouseButton mouseId, int x, int y);
-void KRKR_Trig_MouseUp(tTVPMouseButton mouseId, int x, int y);
+// click = false releases the button without onClick, as at the end of a
+// drag, so a swipe does not count as a click (text does not advance).
+void KRKR_Trig_MouseUp(tTVPMouseButton mouseId, int x, int y, bool click = true);
 void KRKR_Trig_MouseMove(int x, int y);
 void KRKR_Trig_MouseScroll(int dx, int dy, int x, int y);
-// Wheel notch at drawable pixel (x, y); delta > 0 scrolls up, like WM_MOUSEWHEEL.
-void KRKR_Trig_MouseWheel(int delta, int x, int y);
-// Moves the pointer off every layer, as when a mouse leaves the window, so
-// nothing stays hovered while content scrolls under it.
-void KRKR_Trig_MouseOutOfWindow();
-// Whether drawable pixel (x, y) is on a vertical scroll bar: a tall, narrow
-// layer under the point, or the parent of the thumb there. Touch drags that
-// start on one move the bar instead of scrolling the content.
-bool KRKR_IsVerticalScrollBarAt(int x, int y);
 void KRKR_Trig_KeyDown(int vk);
 void KRKR_Trig_KeyUp(int vk);
 void KRKR_Trig_TextInput(std::string text);

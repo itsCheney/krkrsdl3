@@ -15,8 +15,6 @@
 #include "TVPSystem.h"
 #include "TVPApplication.h"
 #include "Random.h"
-#include "DrawDevice.h"
-#include "tjsNativeLayer.h"
 
 //---------------------------------------------------------------------------
 // Window List
@@ -246,7 +244,7 @@ void KRKR_Trig_MouseDown(tTVPMouseButton mouseId, int x, int y)
                                                     TVPGetCurrentShiftKeyState()));
 }
 //---------------------------------------------------------------------------
-void KRKR_Trig_MouseUp(tTVPMouseButton mouseId, int x, int y)
+void KRKR_Trig_MouseUp(tTVPMouseButton mouseId, int x, int y, bool click)
 {
     TVPWindow* win = TVPGetActiveWindow();
     if (win == NULL)
@@ -259,7 +257,7 @@ void KRKR_Trig_MouseUp(tTVPMouseButton mouseId, int x, int y)
     int ly = (y - tmp->yPos) / tmp->scale;
 
     _mouseBtn = mouseId;
-    if (mouseId == mbLeft)
+    if (mouseId == mbLeft && click)
     {
         TVPPostInputEvent(new tTVPOnClickInputEvent(win, lx, ly));
     }
@@ -291,72 +289,6 @@ void KRKR_Trig_MouseScroll(int dx, int dy, int x, int y)
     if (win == NULL)
         return;
     win->OnMouseWheel(TVPGetCurrentShiftKeyState(), dy > 0 ? -120 : 120, x, y);
-}
-//---------------------------------------------------------------------------
-void KRKR_Trig_MouseWheel(int delta, int x, int y)
-{
-    TVPWindow* win = TVPGetActiveWindow();
-    if (win == NULL)
-        return;
-    TVPSprite* tmp = win->pSprite;
-    if (tmp == NULL)
-        return;
-
-    // Queued like the mouse events, so it reaches the focused layer and the
-    // window's onMouseWheel in order with them.
-    TVPPostInputEvent(new tTVPOnMouseWheelInputEvent(win, TVPGetCurrentShiftKeyState(), delta,
-                                                     (x - tmp->xPos) / tmp->scale,
-                                                     (y - tmp->yPos) / tmp->scale));
-}
-//---------------------------------------------------------------------------
-void KRKR_Trig_MouseOutOfWindow()
-{
-    TVPWindow* win = TVPGetActiveWindow();
-    if (win == NULL)
-        return;
-    TVPPostInputEvent(new tTVPOnMouseOutOfWindowInputEvent(win));
-}
-//---------------------------------------------------------------------------
-static bool TVPIsVerticalBarShape(const tTJSNI_BaseLayer* layer, tjs_int primaryWidth,
-                                  tjs_int primaryHeight)
-{
-    const tjs_int w = (tjs_int)layer->GetWidth();
-    const tjs_int h = (tjs_int)layer->GetHeight();
-    // A track: at least three times taller than wide, at most 15% of the
-    // screen wide and at least a quarter of it tall.
-    return w > 0 && h >= 3 * w && w * 100 <= primaryWidth * 15 && h * 4 >= primaryHeight;
-}
-
-bool KRKR_IsVerticalScrollBarAt(int x, int y)
-{
-    TVPWindow* win = TVPGetActiveWindow();
-    if (win == NULL || win->pSprite == NULL || win->GetDrawDevice() == NULL)
-        return false;
-    tTJSNI_BaseLayer* primary = win->GetDrawDevice()->GetPrimaryLayer();
-    if (primary == NULL)
-        return false;
-    TVPSprite* tmp = win->pSprite;
-    const tjs_int lx = (x - tmp->xPos) / tmp->scale;
-    const tjs_int ly = (y - tmp->yPos) / tmp->scale;
-    const tjs_int primaryWidth = (tjs_int)primary->GetWidth();
-    const tjs_int primaryHeight = (tjs_int)primary->GetHeight();
-
-    // The thumb is usually on top of its track, either as a child or as a
-    // sibling, so look at the hit layer and its parents, then at the layer
-    // right beneath it and its parents.
-    tTJSNI_BaseLayer* hit = primary->GetMostFrontChildAt(lx, ly, false, true);
-    for (int pass = 0; pass < 2 && hit && hit != primary; ++pass)
-    {
-        for (tTJSNI_BaseLayer* layer = hit; layer && layer != primary; layer = layer->GetParent())
-        {
-            if (TVPIsVerticalBarShape(layer, primaryWidth, primaryHeight))
-                return true;
-        }
-        tjs_int hx = lx, hy = ly;
-        hit->FromPrimaryCoordinates(hx, hy);
-        hit = hit->GetMostFrontChildAt(hx, hy, true, true);
-    }
-    return false;
 }
 //---------------------------------------------------------------------------
 void KRKR_Trig_KeyDown(int vk)
