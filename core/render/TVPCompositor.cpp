@@ -506,18 +506,6 @@ bool TVPGetStretchMode()
     return GetStretchModeRef();
 }
 
-static std::atomic<uint64_t> drawCallCount{0};
-
-void TVPCountDrawCall()
-{
-    drawCallCount.fetch_add(1, std::memory_order_relaxed);
-}
-
-uint64_t TVPGetDrawCallCount()
-{
-    return drawCallCount.load(std::memory_order_relaxed);
-}
-
 void TVPRegisterRenderBackend(const TVPRenderBackendDesc& desc)
 {
     if (!desc.name)

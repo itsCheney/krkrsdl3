@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -301,8 +302,10 @@ void TVPRegisterRenderBackend(const TVPRenderBackendDesc& desc);
 void TVPSetStretchMode(bool enable);
 bool TVPGetStretchMode();
 // GPU 后端每发出一次 draw call 计数一次；累计值供宿主算每帧 draw call 数
-void TVPCountDrawCall();
-uint64_t TVPGetDrawCallCount();
+// 定义在头文件里，独立的 Metal 后端测试不链接 TVPCompositor.cpp 也能用
+inline std::atomic<uint64_t> TVPDrawCallCount{0};
+inline void TVPCountDrawCall() { TVPDrawCallCount.fetch_add(1, std::memory_order_relaxed); }
+inline uint64_t TVPGetDrawCallCount() { return TVPDrawCallCount.load(std::memory_order_relaxed); }
 // 探测通过的可用后端名列表
 std::vector<std::string> TVPListRenderBackends();
 bool TVPRenderBackendAvailable(const std::string& name);
