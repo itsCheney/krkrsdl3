@@ -240,7 +240,7 @@ void KRKR_Trig_MouseDown(tTVPMouseButton mouseId, int x, int y)
     _mouseBtn = mouseId;
     _scancode[TVPConvertMouseBtnToVKCode(mouseId)] = 0x11;
     TVPPostInputEvent(new tTVPOnMouseDownInputEvent(win, (x - tmp->xPos) / tmp->scale,
-                                                    (y - tmp->yPos) / tmp->scale, mouseId,
+                                                    (y - tmp->yPos) / tmp->scaleY, mouseId,
                                                     TVPGetCurrentShiftKeyState()));
 }
 //---------------------------------------------------------------------------
@@ -254,7 +254,7 @@ void KRKR_Trig_MouseUp(tTVPMouseButton mouseId, int x, int y)
         return;
 
     int lx = (x - tmp->xPos) / tmp->scale;
-    int ly = (y - tmp->yPos) / tmp->scale;
+    int ly = (y - tmp->yPos) / tmp->scaleY;
 
     _mouseBtn = mouseId;
     if (mouseId == mbLeft)
@@ -276,7 +276,7 @@ void KRKR_Trig_MouseMove(int x, int y)
         return;
 
     int lx = (x - tmp->xPos) / tmp->scale;
-    int ly = (y - tmp->yPos) / tmp->scale;
+    int ly = (y - tmp->yPos) / tmp->scaleY;
     TVPPostInputEvent(
         new tTVPOnMouseMoveInputEvent(win, lx, ly, TVPGetCurrentShiftKeyState()), TVP_EPT_DISCARDABLE);
     int pos = (ly << 16) + lx;
