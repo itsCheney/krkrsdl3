@@ -487,6 +487,10 @@ private:
     //---------------------------------------------------------------------
 public:
     void Clear() { DeleteAllMembers(); }
+
+    // Used by TJSClearObjectHeap() when the last engine shuts down.
+    void ClearForShutdown();
+    void DetachFromObjectHeap();
     /**
      * rebuild hash table
      */
