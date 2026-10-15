@@ -1451,6 +1451,8 @@ tjs_uint tTJSNI_WaveSoundBuffer::ReadL2Buffer(void* buffer, tTVPWaveSegmentQueue
         tTJSCriticalSectionHolder holder(L2BufferRemainCS);
         L2BufferRemain--;
     }
+    // A unit is free again; decode workers wait for this instead of polling.
+    TVPWakeDecodeSoundBuffer();
 
     return decoded;
 }
