@@ -81,6 +81,7 @@ class DrawDeviceD3D : public iTVPDrawDevice
 
     bool WindowReady = false;
     bool Initialized = false;
+    bool RequestingComposition = false;
 
 public:
     DrawDeviceD3D(tjs_int w, tjs_int h);

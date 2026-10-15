@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -113,96 +114,147 @@ inline constexpr uint32_t emoteLinearInheritMask = 0x1F0;
 
 // Walk every chain from the innermost surface to the player root. Bezier patches
 // consume parent-local pixel coordinates, normalized to UV with the axis swap.
+class emoteSurfaceEvaluator
+{
+    struct SurfaceTransform
+    {
+        glm::vec4 position;
+        std::array<int, 32> linear;
+        SurfaceTransform() { linear.fill(-1); }
+    };
+    const std::vector<emoteRender>& renderMethod;
+    std::vector<emoteSurfaceContribution> points;
+    std::vector<SurfaceTransform> transforms;
+    std::vector<glm::mat4> models;
+
+    const glm::mat4& getModel(int index, uint32_t mask)
+    {
+        // Contributions contain only the five linear inheritance flags (4..8).
+        int& cached = transforms[index].linear[mask >> 4];
+        if (cached < 0)
+        {
+            cached = (int)models.size();
+            const auto& surface = renderMethod[index];
+            models.push_back(surface.attachMat * buildMotionLinear(surface, mask));
+        }
+        return models[cached];
+    }
+
+public:
+    // The chain is immutable while building one mesh. Cache its matrices and
+    // placements, and reuse contribution storage across all of its vertices.
+    explicit emoteSurfaceEvaluator(const std::vector<emoteRender>& methods)
+      : renderMethod(methods),
+        transforms(methods.size())
+    {
+        points.reserve(methods.size() + 1);
+        models.reserve(methods.size() * 2);
+        for (size_t i = 0; i < methods.size(); ++i)
+        {
+            const auto& surface = methods[i];
+            transforms[i].position =
+                surface.attachMat * glm::vec4(surface.currCoordx, surface.currCoordy, 0.0f, 1.0f);
+            transforms[i].position.w = 0.0f;
+        }
+    }
+
+    void evaluate(float u, float v, float& outClipX, float& outClipY)
+    {
+        points.clear();
+        uint32_t geometryMask = emoteLinearInheritMask;
+        glm::vec4 trans(0.0f);
+        const int surfaceCount = (int)renderMethod.size();
+
+        for (int i = surfaceCount - 1; i >= 0; --i)
+        {
+            const emoteRender& surface = renderMethod[i];
+            const bool innermost = i == surfaceCount - 1;
+            if (innermost || surface.type == 1)
+            {
+                float bx = u, by = v;
+                if (surface.type != 3)
+                {
+                    const float lastU =
+                        innermost ? u : (trans.y + surface.originY) / surface.height;
+                    const float lastV = innermost ? v : (trans.x + surface.originX) / surface.width;
+                    if (surface.type == 1)
+                        evalBezierSurface(surface.controlPts, lastU, lastV, bx, by);
+                    else
+                    {
+                        bx = lastV;
+                        by = lastU;
+                    }
+                    bx = bx * surface.width - surface.originX - surface.currOx;
+                    by = by * surface.height - surface.originY - surface.currOy;
+                }
+                // A deformation adds a displacement to the existing local point;
+                // it must not turn the ancestor placements into leaf geometry.
+                points.push_back({glm::vec4(bx, by, 0.0f, 0.0f) - trans, geometryMask});
+            }
+            // Affine ancestors transform their child coordinates directly. Their
+            // sprite origin/offset belongs to their own geometry, not their children.
+            trans = glm::vec4(0.0f);
+            uint32_t previousMask = 0;
+            glm::mat4 model(1.0f);
+            for (auto& point : points)
+            {
+                const uint32_t mask =
+                    i == 0 || innermost ? emoteLinearInheritMask : point.inheritMask;
+                if (&point == &points.front() || mask != previousMask)
+                {
+                    model = getModel(i, mask);
+                    previousMask = mask;
+                }
+                point.offset = model * point.offset;
+                point.inheritMask &= surface.currInheritMask;
+                trans += point.offset;
+            }
+
+            const glm::vec4& position = transforms[i].position;
+            // Coalesce fully inherited placements; the usual affine chain keeps
+            // only the geometry and one placement contribution.
+            if (!points.empty() && points.back().inheritMask == emoteLinearInheritMask)
+                points.back().offset += position;
+            else
+                points.push_back({position, emoteLinearInheritMask});
+            trans += position;
+            geometryMask &= surface.currInheritMask;
+        }
+
+        outClipX = trans.x;
+        outClipY = -trans.y;
+    }
+};
+
 inline void evaluateSurfaceChain(const std::vector<emoteRender>& renderMethod,
                                  float u,
                                  float v,
                                  float& outClipX,
                                  float& outClipY)
 {
-    std::vector<emoteSurfaceContribution> points;
-    points.reserve(renderMethod.size() + 1);
-    uint32_t geometryMask = emoteLinearInheritMask;
-    glm::vec4 trans(0.0f);
-    const int surfaceCount = (int)renderMethod.size();
-
-    for (int i = surfaceCount - 1; i >= 0; --i)
-    {
-        const emoteRender& surface = renderMethod[i];
-        const bool innermost = i == surfaceCount - 1;
-        if (innermost || surface.type == 1)
-        {
-            float bx = u, by = v;
-            if (surface.type != 3)
-            {
-                const float lastU = innermost ? u : (trans.y + surface.originY) / surface.height;
-                const float lastV = innermost ? v : (trans.x + surface.originX) / surface.width;
-                if (surface.type == 1)
-                    evalBezierSurface(surface.controlPts, lastU, lastV, bx, by);
-                else
-                {
-                    bx = lastV;
-                    by = lastU;
-                }
-                bx = bx * surface.width - surface.originX - surface.currOx;
-                by = by * surface.height - surface.originY - surface.currOy;
-            }
-            // A deformation adds a displacement to the existing local point;
-            // it must not turn the ancestor placements into leaf geometry.
-            points.push_back({glm::vec4(bx, by, 0.0f, 0.0f) - trans, geometryMask});
-        }
-        // Affine ancestors transform their child coordinates directly. Their
-        // sprite origin/offset belongs to their own geometry, not their children.
-        trans = glm::vec4(0.0f);
-        uint32_t previousMask = 0;
-        glm::mat4 model(1.0f);
-        for (auto& point : points)
-        {
-            const uint32_t mask = i == 0 || innermost ? emoteLinearInheritMask : point.inheritMask;
-            if (&point == &points.front() || mask != previousMask)
-            {
-                model = surface.attachMat * buildMotionLinear(surface, mask);
-                previousMask = mask;
-            }
-            point.offset = model * point.offset;
-            point.inheritMask &= surface.currInheritMask;
-            trans += point.offset;
-        }
-
-        glm::vec4 position =
-            surface.attachMat * glm::vec4(surface.currCoordx, surface.currCoordy, 0.0f, 1.0f);
-        position.w = 0.0f;
-        // Coalesce fully inherited placements; the usual affine chain keeps
-        // only the geometry and one placement contribution.
-        if (!points.empty() && points.back().inheritMask == emoteLinearInheritMask)
-            points.back().offset += position;
-        else
-            points.push_back({position, emoteLinearInheritMask});
-        trans += position;
-        geometryMask &= surface.currInheritMask;
-    }
-
-    outClipX = trans.x;
-    outClipY = -trans.y;
+    emoteSurfaceEvaluator evaluator(renderMethod);
+    evaluator.evaluate(u, v, outClipX, outClipY);
 }
 
 // Build subdivided mesh for a given icon node
-inline void buildSubdivMesh(
-    const std::vector<emoteRender>& renderMethod,
-    int divX, int divY,
-    std::vector<EmoteVertex>& outVerts,
-    std::vector<uint16_t>& outIndices)
+inline void buildSubdivMesh(const std::vector<emoteRender>& renderMethod,
+                            int divX,
+                            int divY,
+                            std::vector<EmoteVertex>& outVerts,
+                            std::vector<uint16_t>& outIndices)
 {
     outVerts.clear();
     outIndices.clear();
 
     // Generate vertices
     outVerts.reserve((divX + 1) * (divY + 1));
+    emoteSurfaceEvaluator evaluator(renderMethod);
     for (int gy = 0; gy <= divY; gy++) {
         float v = (float)gy / (float)divY;
         for (int gx = 0; gx <= divX; gx++) {
             float u = (float)gx / (float)divX;
             float clipX, clipY;
-            evaluateSurfaceChain(renderMethod, u, v, clipX, clipY);
+            evaluator.evaluate(u, v, clipX, clipY);
             // tessCoord in old shader was (gl_TessCoord.y, gl_TessCoord.x) = (v, u)
             outVerts.push_back({ clipX, clipY, v, u });
         }
@@ -237,10 +289,11 @@ inline void buildRectMesh(const std::vector<emoteRender>& renderMethod,
     float cornerUV[4][2] = {{0.0f, 0.0f}, {1.0f, 0.0f}, {0.0f, 1.0f}, {1.0f, 1.0f}};
 
     outVerts.reserve(4);
+    emoteSurfaceEvaluator evaluator(renderMethod);
     for (int i = 0; i < 4; i++)
     {
         float clipX, clipY;
-        evaluateSurfaceChain(renderMethod, cornerUV[i][0], cornerUV[i][1], clipX, clipY);
+        evaluator.evaluate(cornerUV[i][0], cornerUV[i][1], clipX, clipY);
         outVerts.push_back({clipX, clipY, cornerUV[i][1], cornerUV[i][0]});
     }
 

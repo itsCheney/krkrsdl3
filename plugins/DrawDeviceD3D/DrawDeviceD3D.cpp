@@ -161,7 +161,7 @@ void DrawDeviceD3D::NotifyLayerImageChange(iTVPLayerManager* manager)
 {
     // 层内容变化 → 请求窗口更新（与 tTVPBasicDrawDevice 行为一致），
     // 否则 UpdateContent 不会触发，画面不会刷新
-    if (Window)
+    if (Window && !RequestingComposition)
         Window->RequestUpdate();
 }
 
@@ -424,7 +424,18 @@ void DrawDeviceD3D::ComposeLayerManager(int index, void* target)
         return;
     tjs_int pw = buf->GetWidth(), ph = buf->GetHeight();
     buf->Fill(tTVPRect(0, 0, pw, ph), 0x00000000);
-    mgr->RequestInvalidation(tTVPRect(0, 0, pw, ph));
+    {
+        // This invalidation is consumed by the composition immediately below.
+        // Do not turn it into another window update while delivering this one.
+        struct RestoreFlag
+        {
+            bool& flag;
+            bool previous;
+            ~RestoreFlag() { flag = previous; }
+        } restore{RequestingComposition, RequestingComposition};
+        RequestingComposition = true;
+        mgr->RequestInvalidation(tTVPRect(0, 0, pw, ph));
+    }
     mgr->UpdateToDrawDevice();
 
     iTVPTexture2D* tex = buf->GetTexture();
@@ -702,8 +713,13 @@ void DrawDeviceD3D::update(tjs_real diffTime)
         if (l)
             l->DriveOnUpdate(diffTime);
     }
-    RenderFrame();
-    PresentToWindow();
+    // Script updates and Layer notifications share the window's update queue.
+    // The dispatcher coalesces them into one composition/presentation, instead
+    // of rendering here and again for each pending window invalidation.
+    if (Window)
+        Window->RequestUpdate();
+    else
+        RenderFrame();
 }
 
 void DrawDeviceD3D::capture(iTJSDispatch2* layerObj, tjs_int index)
