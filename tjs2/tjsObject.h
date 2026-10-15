@@ -24,6 +24,10 @@ namespace TJS
 //---------------------------------------------------------------------------
 extern void TJSCompactObjectHeap();
 extern void TJSClearObjectHeap();
+// While an engine is destroyed, errors thrown by script "finalize" methods and
+// native Invalidate are dropped: they would otherwise escape ~tTJS and abort.
+extern void TJSBeginEngineTeardown();
+extern void TJSEndEngineTeardown();
 
 //---------------------------------------------------------------------------
 // utility functions

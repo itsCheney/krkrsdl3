@@ -185,6 +185,7 @@ tTJS::tTJS()
 //---------------------------------------------------------------------------
 tTJS::~tTJS()
 {
+    TJSBeginEngineTeardown();
     // Returned VM registers retain object references. Drain them BEFORE
     // clearing Global: their finalize methods may resolve global properties
     // and allocate more registers. Disabling pooling prevents those finalizers
@@ -230,6 +231,7 @@ tTJS::~tTJS()
         TJSClearObjectHeap();
         TJSClearRegisterHeap();
     }
+    TJSEndEngineTeardown();
 }
 //---------------------------------------------------------------------------
 iTJSDispatch2* tTJS::GetGlobal()

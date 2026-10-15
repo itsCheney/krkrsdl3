@@ -23,6 +23,28 @@ namespace TJS
 // simple object heap manager
 //---------------------------------------------------------------------------
 static tTJSObjectPool<tTJSCustomObject> _allTJSObjects;
+static int _tjsEngineTeardownDepth = 0;
+void TJSBeginEngineTeardown()
+{
+    ++_tjsEngineTeardownDepth;
+}
+void TJSEndEngineTeardown()
+{
+    --_tjsEngineTeardownDepth;
+}
+template <typename Step>
+static void RunFinalizeStep(Step&& step)
+{
+    if (!_tjsEngineTeardownDepth)
+        return step();
+    try
+    {
+        step();
+    }
+    catch (...)
+    {
+    }
+}
 void TJSCompactObjectHeap()
 {
     // TODO
@@ -473,7 +495,9 @@ void tTJSCustomObject::Finalize(void)
     // call this object's "finalize"
     if (CallFinalize)
     {
-        FuncCall(0, finalize_name.c_str(), finalize_name.GetHint(), NULL, 0, NULL, this);
+        RunFinalizeStep([&] {
+            FuncCall(0, finalize_name.c_str(), finalize_name.GetHint(), NULL, 0, NULL, this);
+        });
     }
 
     for (tjs_int i = TJS_MAX_NATIVE_CLASS - 1; i >= 0; i--)
@@ -481,7 +505,7 @@ void tTJSCustomObject::Finalize(void)
         if (ClassIDs[i] != -1)
         {
             if (ClassInstances[i])
-                ClassInstances[i]->Invalidate();
+                RunFinalizeStep([&] { ClassInstances[i]->Invalidate(); });
         }
     }
     DeleteAllMembers();
