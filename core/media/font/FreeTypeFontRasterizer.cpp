@@ -3,6 +3,7 @@
 #include "FreeTypeImp.h"
 #include "TVPMsg.h"
 #include "TVPFont.h"
+#include <algorithm>
 
 extern void TVPUninitializeFreeFont();
 extern const ttstr& TVPGetDefaultFontName();
@@ -92,12 +93,11 @@ bool FreeTypeFontRasterizer::GetFallback(size_t i, tFreeTypeFace*& face)
 
 FreeTypeFontRasterizer::FreeTypeFontRasterizer() : RefCount(0), Face(NULL), LastBitmap(NULL)
 {
+    FaceCache.reserve(MaxCachedFaces);
     AddRef();
 }
 FreeTypeFontRasterizer::~FreeTypeFontRasterizer()
 {
-    if (Face)
-        delete Face;
     Face = NULL;
     ClearFallbacks();
 }
@@ -138,57 +138,33 @@ void FreeTypeFontRasterizer::ApplyFont(const tTVPFont& font)
     opt |= (font.Flags & TVP_TF_UNDERLINE) ? TVP_TF_UNDERLINE : 0;
     opt |= (font.Flags & TVP_TF_STRIKEOUT) ? TVP_TF_STRIKEOUT : 0;
     opt |= (font.Flags & TVP_TF_FONTFILE) ? TVP_FACE_OPTIONS_FILE : 0;
-    bool recreate = false;
-    if (Face)
+    if (!Face || Face->GetFontName() != stdname)
     {
-        if (Face->GetFontName() != stdname)
+        // Captions alternate font families frequently. Keep a small per-rasterizer
+        // LRU so switching does not reopen and parse the same font every time.
+        auto cached = std::find_if(FaceCache.begin(), FaceCache.end(),
+                                  [&](const auto& face)
+                                  { return face->GetFontName() == stdname; });
+        if (cached != FaceCache.end())
         {
-            delete Face;
-            Face = new tFreeTypeFace(stdname, opt);
-            recreate = true;
+            std::rotate(cached, cached + 1, FaceCache.end());
         }
+        else
+        {
+            // Construct first so an opening failure leaves the current face valid.
+            auto face = std::make_unique<tFreeTypeFace>(stdname, opt);
+            if (FaceCache.size() == MaxCachedFaces)
+                FaceCache.erase(FaceCache.begin());
+            FaceCache.push_back(std::move(face));
+        }
+        Face = FaceCache.back().get();
+        // A reused face must start with the same sampling options as a new one.
+        Face->ClearOption(TVP_FACE_OPTIONS_NO_ANTIALIASING | TVP_FACE_OPTIONS_NO_HINTING);
     }
-    else
-    {
-        Face = new tFreeTypeFace(stdname, opt);
-        recreate = true;
-    }
+    Face->ClearOption(TVP_TF_ITALIC | TVP_TF_BOLD | TVP_TF_UNDERLINE | TVP_TF_STRIKEOUT |
+                      TVP_FACE_OPTIONS_FILE);
+    Face->SetOption(opt);
     Face->SetHeight(font.Height < 0 ? -font.Height : font.Height);
-    if (recreate == false)
-    {
-        if (font.Flags & TVP_TF_ITALIC)
-        {
-            Face->SetOption(TVP_TF_ITALIC);
-        }
-        else
-        {
-            Face->ClearOption(TVP_TF_ITALIC);
-        }
-        if (font.Flags & TVP_TF_BOLD)
-        {
-            Face->SetOption(TVP_TF_BOLD);
-        }
-        else
-        {
-            Face->ClearOption(TVP_TF_BOLD);
-        }
-        if (font.Flags & TVP_TF_UNDERLINE)
-        {
-            Face->SetOption(TVP_TF_UNDERLINE);
-        }
-        else
-        {
-            Face->ClearOption(TVP_TF_UNDERLINE);
-        }
-        if (font.Flags & TVP_TF_STRIKEOUT)
-        {
-            Face->SetOption(TVP_TF_STRIKEOUT);
-        }
-        else
-        {
-            Face->ClearOption(TVP_TF_STRIKEOUT);
-        }
-    }
     // Pick up fonts registered since the last listing (addFont).
     FallbacksListed = false;
     LastBitmap = NULL;

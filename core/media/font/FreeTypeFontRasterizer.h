@@ -12,7 +12,9 @@
 class FreeTypeFontRasterizer : public FontRasterizer
 {
     tjs_int RefCount;
-    class tFreeTypeFace* Face; //!< Faceオブジェクト
+    static constexpr size_t MaxCachedFaces = 4;
+    class tFreeTypeFace* Face; //!< Non-owning pointer to the active cached face.
+    std::vector<std::unique_ptr<class tFreeTypeFace>> FaceCache;
     // Faces tried, in order, for characters Face lacks: the default font,
     // then every other registered font. Opened on first use.
     struct Fallback
