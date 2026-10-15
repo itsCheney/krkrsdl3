@@ -9,6 +9,43 @@ using namespace emoteplayer;
 #define ENUM(n) Variant(#n, (int)n)
 #define PROPERTY(name) NCB_PROPERTY(name, get_##name, set_##name);
 
+namespace
+{
+tjs_real realArg(tjs_int count, tTJSVariant** args, int index)
+{
+    return index < count && args[index]->Type() != tvtVoid ? (tjs_real)*args[index] : 0;
+}
+// The script API has optional transition arguments. Native default arguments do
+// not change ncbind's required arity, so dispatch these calls explicitly.
+template<class P, int Operation>
+tjs_error controlCall(tTJSVariant* result, tjs_int count, tTJSVariant** args, P* player)
+{
+    if (!player) return TJS_E_FAIL;
+    constexpr int required = Operation == 0 || Operation == 3 || Operation == 5 ? 2 :
+                             Operation == 4 ? 3 : Operation == 8 || Operation == 9 ? 0 : 1;
+    if (count < required) return TJS_E_BADPARAMCOUNT;
+    auto number = [&](int index) { return realArg(count, args, index); };
+    if constexpr (Operation == 0) player->setCoord(number(0), number(1), number(2), number(3));
+    if constexpr (Operation == 1) player->setScale(number(0), number(1), number(2));
+    if constexpr (Operation == 2) player->setRotate(number(0), number(1), number(2));
+    if constexpr (Operation == 3) player->setVariable(tTJSString(*args[0]), number(1), number(2), number(3));
+    if constexpr (Operation == 4) player->setOuterForce(tTJSString(*args[0]), number(1), number(2), number(3), number(4));
+    if constexpr (Operation == 5) player->setTimelineBlendRatio(tTJSString(*args[0]), number(1), number(2), number(3), number(4) != 0);
+    if constexpr (Operation == 6) player->fadeInTimeline(tTJSString(*args[0]), number(1), number(2));
+    if constexpr (Operation == 7) player->fadeOutTimeline(tTJSString(*args[0]), number(1), number(2));
+    if constexpr (Operation == 8) player->stopTimeline(count ? tTJSString(*args[0]) : tTJSString());
+    if constexpr (Operation == 9)
+    {
+        const bool playing = player->getTimelinePlaying(count ? tTJSString(*args[0]) : tTJSString());
+        if (result) *result = playing;
+    }
+    if constexpr (Operation == 10) player->playTimeline(tTJSString(*args[0]), (tjs_int)number(1));
+    return TJS_S_OK;
+}
+}
+
+#define CONTROL_METHOD(name, type, operation) NCB_METHOD_RAW_CALLBACK(name, (&controlCall<type, operation>), 0)
+
 NCB_REGISTER_SUBCLASS(ResourceManager)
 {
     NCB_CONSTRUCTOR((iTJSDispatch2*, tjs_int));
@@ -53,13 +90,13 @@ NCB_REGISTER_SUBCLASS(EmotePlayer)
     NCB_METHOD(progress);
     NCB_METHOD(draw);
     NCB_METHOD(assign);
-    NCB_METHOD(setCoord);
-    NCB_METHOD(setScale);
-    NCB_METHOD(setRotate);
+    CONTROL_METHOD(setCoord, EmotePlayer, 0);
+    CONTROL_METHOD(setScale, EmotePlayer, 1);
+    CONTROL_METHOD(setRotate, EmotePlayer, 2);
     NCB_METHOD(setColor);
-    NCB_METHOD(setVariable);
+    CONTROL_METHOD(setVariable, EmotePlayer, 3);
     NCB_METHOD(getVariable);
-    NCB_METHOD(setOuterForce);
+    CONTROL_METHOD(setOuterForce, EmotePlayer, 4);
     NCB_METHOD(setDrawAffineTranslateMatrix);
     NCB_METHOD(setCameraOffset);
     NCB_METHOD(startWind);
@@ -70,16 +107,16 @@ NCB_REGISTER_SUBCLASS(EmotePlayer)
     NCB_METHOD(skip);
     NCB_METHOD(skipToSync);
     NCB_METHOD(pass);
-    NCB_METHOD(playTimeline);
-    NCB_METHOD(stopTimeline);
-    NCB_METHOD(getTimelinePlaying);
+    CONTROL_METHOD(playTimeline, EmotePlayer, 10);
+    CONTROL_METHOD(stopTimeline, EmotePlayer, 8);
+    CONTROL_METHOD(getTimelinePlaying, EmotePlayer, 9);
     NCB_METHOD(getLoopTimeline);
     NCB_METHOD(getTimelineTotalFrameCount);
     NCB_METHOD(getMainTimelineLabelList);
     NCB_METHOD(getDiffTimelineLabelList);
-    NCB_METHOD(setTimelineBlendRatio);
-    NCB_METHOD(fadeInTimeline);
-    NCB_METHOD(fadeOutTimeline);
+    CONTROL_METHOD(setTimelineBlendRatio, EmotePlayer, 5);
+    CONTROL_METHOD(fadeInTimeline, EmotePlayer, 6);
+    CONTROL_METHOD(fadeOutTimeline, EmotePlayer, 7);
     NCB_METHOD(getPlayingTimelineInfoList);
     NCB_METHOD(getVariableFrameList);
     PROPERTY(animating);
@@ -88,6 +125,9 @@ NCB_REGISTER_SUBCLASS(EmotePlayer)
     PROPERTY(loopTime);
     PROPERTY(tickCount);
     PROPERTY(speed);
+    PROPERTY(bustScale);
+    PROPERTY(hairScale);
+    PROPERTY(partsScale);
     PROPERTY(outline);
     PROPERTY(motionKey);
     PROPERTY(motion);
@@ -108,13 +148,13 @@ NCB_REGISTER_SUBCLASS(Player)
     NCB_METHOD(progress);
     NCB_METHOD(draw);
     NCB_METHOD(assign);
-    NCB_METHOD(setCoord);
-    NCB_METHOD(setScale);
-    NCB_METHOD(setRotate);
+    CONTROL_METHOD(setCoord, Player, 0);
+    CONTROL_METHOD(setScale, Player, 1);
+    CONTROL_METHOD(setRotate, Player, 2);
     NCB_METHOD(setColor);
-    NCB_METHOD(setVariable);
+    CONTROL_METHOD(setVariable, Player, 3);
     NCB_METHOD(getVariable);
-    NCB_METHOD(setOuterForce);
+    CONTROL_METHOD(setOuterForce, Player, 4);
     NCB_METHOD(setDrawAffineTranslateMatrix);
     NCB_METHOD(setCameraOffset);
     NCB_METHOD(startWind);
@@ -126,16 +166,16 @@ NCB_REGISTER_SUBCLASS(Player)
     NCB_METHOD(skipToSync);
     NCB_METHOD(stop);
     NCB_METHOD(pass);
-    NCB_METHOD(playTimeline);
-    NCB_METHOD(stopTimeline);
-    NCB_METHOD(getTimelinePlaying);
+    CONTROL_METHOD(playTimeline, Player, 10);
+    CONTROL_METHOD(stopTimeline, Player, 8);
+    CONTROL_METHOD(getTimelinePlaying, Player, 9);
     NCB_METHOD(getLoopTimeline);
     NCB_METHOD(getTimelineTotalFrameCount);
     NCB_METHOD(getMainTimelineLabelList);
     NCB_METHOD(getDiffTimelineLabelList);
-    NCB_METHOD(setTimelineBlendRatio);
-    NCB_METHOD(fadeInTimeline);
-    NCB_METHOD(fadeOutTimeline);
+    CONTROL_METHOD(setTimelineBlendRatio, Player, 5);
+    CONTROL_METHOD(fadeInTimeline, Player, 6);
+    CONTROL_METHOD(fadeOutTimeline, Player, 7);
     NCB_METHOD(getPlayingTimelineInfoList);
     NCB_METHOD(getVariableFrameList);
     NCB_METHOD(getCommandList);
@@ -150,6 +190,9 @@ NCB_REGISTER_SUBCLASS(Player)
     PROPERTY(loopTime);
     PROPERTY(tickCount);
     PROPERTY(speed);
+    PROPERTY(bustScale);
+    PROPERTY(hairScale);
+    PROPERTY(partsScale);
     PROPERTY(outline);
     PROPERTY(motionKey);
     PROPERTY(motion);

@@ -147,8 +147,8 @@ class EmotePlayer
 public:
     enum EmotePlayerFlag
     {
-        TimelinePlayFlagParallel = 0,
-        TimelinePlayFlagDifference
+        TimelinePlayFlagParallel = 1,
+        TimelinePlayFlagDifference = 2
     };
 
     EmotePlayer(ResourceManager* resourceManager) : _resourceManager(resourceManager){};
@@ -166,7 +166,8 @@ public:
 
     property_marco(playing, bool, _playing);
     property_marco(allplaying, bool, _allplaying);
-    property_marco(animating, bool, _playing);
+    bool get_animating();
+    void set_animating(bool value) { _playing = value; }
     property_marco(useD3D, bool, _useD3D);
     int32_t get_loopTime();
     void set_loopTime(int32_t v) { throw "reject to set loopTime"; };
@@ -200,13 +201,19 @@ public:
     void draw(iTJSDispatch2* layer);
     void assign(iTJSDispatch2* anotherAdaptor);
 
-    void setCoord(tjs_real x, tjs_real y);
-    void setScale(tjs_real scale);
-    void setRotate(tjs_real rotate);
+    void setCoord(tjs_real x, tjs_real y, tjs_real time = 0, tjs_real easing = 0);
+    void setScale(tjs_real scale, tjs_real time = 0, tjs_real easing = 0);
+    void setRotate(tjs_real rotate, tjs_real time = 0, tjs_real easing = 0);
     void setColor(tjs_uint32 color);
-    void setVariable(tTJSString name, tjs_real value);
+    void setVariable(tTJSString name, tjs_real value, tjs_real time = 0, tjs_real easing = 0);
     tjs_real getVariable(tTJSString name);
-    void setOuterForce(tTJSString name, tjs_real ofx, tjs_real ofy);
+    void setOuterForce(tTJSString name, tjs_real ofx, tjs_real ofy, tjs_real time = 0, tjs_real easing = 0);
+    tjs_real get_bustScale() { return emtEngine.physics.bustScale; }
+    void set_bustScale(tjs_real value) { emtEngine.physics.bustScale = value; }
+    tjs_real get_hairScale() { return emtEngine.physics.hairScale; }
+    void set_hairScale(tjs_real value) { emtEngine.physics.hairScale = value; }
+    tjs_real get_partsScale() { return emtEngine.physics.partsScale; }
+    void set_partsScale(tjs_real value) { emtEngine.physics.partsScale = value; }
     void setDrawAffineTranslateMatrix(
         tjs_real a, tjs_real b, tjs_real c, tjs_real d, tjs_int tx, tjs_int ty);
     void setCameraOffset(tjs_int w, tjs_int h);
@@ -250,7 +257,8 @@ public:
     void setTimelineBlendRatio(tTJSString name,
                                tjs_real ratio,
                                tjs_real time = 0,
-                               tjs_real easing = 0);
+                               tjs_real easing = 0,
+                               bool stopWhenBlendDone = false);
     void fadeInTimeline(tTJSString name, tjs_real time = 0, tjs_real easing = 0);
     void fadeOutTimeline(tTJSString name, tjs_real time = 0, tjs_real easing = 0);
     tTJSVariant getPlayingTimelineInfoList();
@@ -271,7 +279,9 @@ private:
     ResourceManager* _resourceManager;
     emoteengine emtEngine;
     tjs_real clockPassed = -1.0;
-    tjs_real speedRatio = 20.0;
+    tjs_real speedRatio = 1000.0 / 60.0;
+    EmoteTween coordX, coordY, rotation, scale{1, 1}, scaleY{1, 1};
+    EmoteTween forces[3][2];
     bool isSelfClear = false; // true:draw使用完全copy(以实现自主clear) false:通过clear函数间接完成
                               // 其分别对应了两种emote的运行模式
     // canvas（渲染目标句柄，由 core/render 的 2D 渲染器管理）

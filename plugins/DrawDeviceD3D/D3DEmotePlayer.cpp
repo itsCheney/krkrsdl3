@@ -178,6 +178,9 @@ void D3DEmotePlayer::progress(tjs_real frames)
     // 脚本按 60fps 帧数传入 → 换算毫秒
     if (Impl && Impl->Player)
     {
+        Impl->Player->set_bustScale(BustScale);
+        Impl->Player->set_hairScale(HairScale);
+        Impl->Player->set_partsScale(PartsScale);
         Impl->Player->progress(frames * 1000.0 / 60.0);
         if (Layer && Device && Device->GetBackend())
         {
@@ -193,19 +196,19 @@ void D3DEmotePlayer::progress(tjs_real frames)
 void D3DEmotePlayer::setCoord(tjs_real x, tjs_real y, tjs_real z, tjs_real t)
 {
     if (Impl && Impl->Player)
-        Impl->Player->setCoord(x, y);
+        Impl->Player->setCoord(x, y, t);
 }
 
 void D3DEmotePlayer::setRot(tjs_real angle, tjs_real time, tjs_real easing)
 {
     if (Impl && Impl->Player)
-        Impl->Player->setRotate(angle * 360.0 / (3.14159265358979 * 2.0));
+        Impl->Player->setRotate(angle, time, easing);
 }
 
 void D3DEmotePlayer::setScale(tjs_real scale, tjs_real time, tjs_real easing)
 {
     if (Impl && Impl->Player)
-        Impl->Player->setScale(scale);
+        Impl->Player->setScale(scale, time, easing);
 }
 
 void D3DEmotePlayer::setColor(tjs_uint32 color, tjs_real time, tjs_real easing)
@@ -217,7 +220,7 @@ void D3DEmotePlayer::setColor(tjs_uint32 color, tjs_real time, tjs_real easing)
 void D3DEmotePlayer::setVariable(tTJSString name, tjs_real value, tjs_real time, tjs_real accel)
 {
     if (Impl && Impl->Player)
-        Impl->Player->setVariable(name, value);
+        Impl->Player->setVariable(name, value, time, accel);
 }
 
 tjs_real D3DEmotePlayer::getVariable(tTJSString name)

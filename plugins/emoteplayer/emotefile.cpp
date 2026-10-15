@@ -977,6 +977,10 @@ emotetimeline::emotetimeline(emotefile* filePtr, uint32_t startOffset)
         emoteTimeVar* tmp = new emoteTimeVar(filePtr, _tmpList.at(i));
         variableList.push_back(tmp);
     }
+    if (lastTime < 0 && !(loopBegin >= 0 && loopEnd > loopBegin))
+        for (const auto* variable : variableList)
+            for (const auto* frame : variable->frameList)
+                lastTime = std::max(lastTime, (int32_t)std::ceil(frame->time) - 1);
 }
 emotetimeline::~emotetimeline()
 {
@@ -996,6 +1000,14 @@ bustControl::bustControl(emotefile* filePtr, uint32_t startOffset)
     // dic
     std::map<std::string, uint32_t> _rootData;
     filePtr->parseObject(_rootData, startOffset);
+    filePtr->parseString(baseLayer, _rootData["baseLayer"]);
+    filePtr->parseString(label, _rootData["label"]);
+    if (_rootData.count("enabled"))
+    {
+        int64_t value = 1;
+        filePtr->parseNumber(value, _rootData["enabled"]);
+        enabled = value != 0;
+    }
     // friction/gravity/spring
     filePtr->parseReal(friction, _rootData["friction"]);
     filePtr->parseReal(gravity, _rootData["gravity"]);
@@ -1043,6 +1055,14 @@ uniControl::uniControl(emotefile* filePtr, uint32_t startOffset)
     // dic
     std::map<std::string, uint32_t> _rootData;
     filePtr->parseObject(_rootData, startOffset);
+    filePtr->parseString(baseLayer, _rootData["baseLayer"]);
+    filePtr->parseString(label, _rootData["label"]);
+    if (_rootData.count("enabled"))
+    {
+        int64_t value = 1;
+        filePtr->parseNumber(value, _rootData["enabled"]);
+        enabled = value != 0;
+    }
     // b_rate/bend_spd/bend_vol/friction_x/friction_y/gravity
     filePtr->parseReal(b_rate, _rootData["b_rate"]);
     filePtr->parseReal(bend_spd, _rootData["bend_spd"]);
@@ -1081,10 +1101,11 @@ uniControl::uniControl(emotefile* filePtr, uint32_t startOffset)
         filePtr->parseList(_p, _rootData["p"]);
         filePtr->parseList(_pv, _rootData["pv"]);
         // bp/p/pv
-        int cts = std::min(_bp.size(), std::min(_p.size(), _pv.size()));
+        const size_t cts = std::min({_bp.size(), _p.size(), _pv.size(),
+                                     _sx.size(), _sy.size(), _len.size()});
         for (int i = 0; i < cts; i++)
         {
-            uniSegment _psD;
+            uniSegment _psD{};
             filePtr->parseObject(_tmpData, _bp.at(i));
             filePtr->parseReal(_psD.bp.x, _tmpData["x"]);
             filePtr->parseReal(_psD.bp.y, _tmpData["y"]);
@@ -1200,6 +1221,7 @@ emotemetadata::emotemetadata(emotefile* filePtr, uint32_t startOffset) : _filePt
     filePtr->parseObject(_base, _rootData["base"]);
     filePtr->parseString(chara, _base["chara"]);
     filePtr->parseString(motion, _base["motion"]);
+    if (_rootData.count("scale")) filePtr->parseReal(scale, _rootData["scale"]);
 
     // attrcomp
     std::vector<uint32_t> _tmpList;
@@ -1281,6 +1303,15 @@ emotemetadata::emotemetadata(emotefile* filePtr, uint32_t startOffset) : _filePt
             _varList.insert(std::pair<std::string, float>(key, 0.0f));
         }
     }
+
+    _tmpList.clear();
+    if (_rootData.count("instantVariableList") && filePtr->parseList(_tmpList, _rootData["instantVariableList"]))
+        for (auto offset : _tmpList)
+        {
+            std::string label;
+            if (filePtr->parseString(label, offset))
+                instantVariables.push_back(label.substr(0, label.find('\0')));
+        }
 
     // eyeControl Simplified
     _tmpList.clear();
