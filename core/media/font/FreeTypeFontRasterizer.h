@@ -5,11 +5,15 @@
 #include "tjsCommHead.h"
 #include "CharacterData.h"
 #include "FontRasterizer.h"
+#include <memory>
+#include <vector>
 
 class FreeTypeFontRasterizer : public FontRasterizer
 {
     tjs_int RefCount;
-    class tFreeTypeFace* Face; //!< Faceオブジェクト
+    static constexpr size_t MaxCachedFaces = 4;
+    class tFreeTypeFace* Face; //!< Non-owning pointer to the active cached face.
+    std::vector<std::unique_ptr<tFreeTypeFace>> FaceCache;
     class tFreeTypeFace* FaceFallback = nullptr;
     class tTVPNativeBaseBitmap* LastBitmap;
     tTVPFont CurrentFont;
