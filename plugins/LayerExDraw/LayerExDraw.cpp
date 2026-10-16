@@ -1845,21 +1845,30 @@ void LayerExDraw::resetViewTransform()
     updateViewTransform();
 }
 
+// The rotate/scale/translate methods append to the current matrix and take
+// degrees, like GDI+ MatrixOrderAppend (the blend2d port replaced the
+// matrix and took radians).
 void LayerExDraw::rotateViewTransform(tjs_real angle)
 {
-    plutovg_matrix_init_rotate(&viewTransform, (float)angle);
+    plutovg_matrix_t op, current = viewTransform;
+    plutovg_matrix_init_rotate(&op, (float)(angle * 3.14159265358979323846 / 180.0));
+    plutovg_matrix_multiply(&viewTransform, &current, &op);
     updateViewTransform();
 }
 
 void LayerExDraw::scaleViewTransform(tjs_real sx, tjs_real sy)
 {
-    plutovg_matrix_init_scale(&viewTransform, (float)sx, (float)sy);
+    plutovg_matrix_t op, current = viewTransform;
+    plutovg_matrix_init_scale(&op, (float)sx, (float)sy);
+    plutovg_matrix_multiply(&viewTransform, &current, &op);
     updateViewTransform();
 }
 
 void LayerExDraw::translateViewTransform(tjs_real dx, tjs_real dy)
 {
-    plutovg_matrix_init_translate(&viewTransform, (float)dx, (float)dy);
+    plutovg_matrix_t op, current = viewTransform;
+    plutovg_matrix_init_translate(&op, (float)dx, (float)dy);
+    plutovg_matrix_multiply(&viewTransform, &current, &op);
     updateViewTransform();
 }
 
@@ -1885,19 +1894,25 @@ void LayerExDraw::resetTransform()
 
 void LayerExDraw::rotateTransform(tjs_real angle)
 {
-    plutovg_matrix_init_rotate(&transform, (float)angle);
+    plutovg_matrix_t op, current = transform;
+    plutovg_matrix_init_rotate(&op, (float)(angle * 3.14159265358979323846 / 180.0));
+    plutovg_matrix_multiply(&transform, &current, &op);
     updateTransform();
 }
 
 void LayerExDraw::scaleTransform(tjs_real sx, tjs_real sy)
 {
-    plutovg_matrix_init_scale(&transform, (float)sx, (float)sy);
+    plutovg_matrix_t op, current = transform;
+    plutovg_matrix_init_scale(&op, (float)sx, (float)sy);
+    plutovg_matrix_multiply(&transform, &current, &op);
     updateTransform();
 }
 
 void LayerExDraw::translateTransform(tjs_real dx, tjs_real dy)
 {
-    plutovg_matrix_init_translate(&transform, (float)dx, (float)dy);
+    plutovg_matrix_t op, current = transform;
+    plutovg_matrix_init_translate(&op, (float)dx, (float)dy);
+    plutovg_matrix_multiply(&transform, &current, &op);
     updateTransform();
 }
 
