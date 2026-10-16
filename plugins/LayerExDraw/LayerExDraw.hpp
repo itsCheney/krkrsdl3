@@ -898,6 +898,7 @@ public:
     void translateTransform(tjs_real dx, tjs_real dy);
 
 protected:
+    static void unionBounds(RectF& bounds, const plutovg_rect_t& rect, const plutovg_matrix_t& matrix);
     RectF getPathExtents(const Appearance* app, const plutovg_path_t* path);
     void draw(const SoftPen* pen, const plutovg_matrix_t* matrix, const plutovg_path_t* path);
     void fill(const SoftBrush* brush, const plutovg_matrix_t* matrix, const plutovg_path_t* path);
