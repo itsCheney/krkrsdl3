@@ -109,7 +109,7 @@ void GdiPlus::addPrivateFont(const tjs_char* fontFileName)
             plutovg_font_face_load_from_data(fileData, size, 0, fontDataDestroy, fileData);
         if (!face)
         {
-            delete[] fileData;
+            // plutovg already released fileData through fontDataDestroy.
             TVPThrowExceptionMessage(TJS_N("plutovg cannot load:%1"), fontFileName);
         }
 
@@ -221,7 +221,8 @@ void FontInfo::setFamilyName(const tjs_char* name)
     }
     if (!getFontFace())
     {
-        GdiPlus::addPrivateFont(name);
+        // A null name still loads the default fallback face.
+        GdiPlus::addPrivateFont(name ? name : TJS_N(""));
     }
 }
 
