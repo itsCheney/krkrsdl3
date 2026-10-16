@@ -249,6 +249,10 @@ tTVPCharacterData* FreeTypeFontRasterizer::GetBitmap(const tTVPFontAndCharacterD
     if (isDefaultIgnorableUnicode(font.Character))
     {
         tTVPCharacterData* data = new tTVPCharacterData();
+        data->OriginX = data->OriginY = 0;
+        data->Metrics.CellIncX = data->Metrics.CellIncY = 0;
+        data->Pitch = 0;
+        data->BlackBoxX = data->BlackBoxY = 0;
         data->Antialiased = font.Antialiased;
         data->FullColored = false;
         data->Blured = font.Blured;

@@ -670,6 +670,8 @@ class WindowSaveImage : public tTVPContinuousEventCallbackIntf
     iTJSDispatch2* objthis;
     std::vector<Slot> slots;
     std::shared_ptr<SaveQueue> queue = std::make_shared<SaveQueue>();
+    // Cleared by the destructor; a handler may invalidate the Window.
+    std::shared_ptr<bool> alive = std::make_shared<bool>(true);
     bool hooked = false;
 
     void SetHook(bool enable)
@@ -712,6 +714,7 @@ public:
 
     ~WindowSaveImage()
     {
+        *alive = false;
         SetHook(false);
         for (Slot& slot : slots)
             if (slot.job)
@@ -722,8 +725,10 @@ public:
     // queued for the next callback.
     void OnContinuousCallback(tjs_uint64) override
     {
+        std::shared_ptr<bool> live = alive;
+        std::shared_ptr<SaveQueue> events = queue;
         SaveEvent event;
-        while (queue->Pop(event))
+        while (*live && events->Pop(event))
         {
             int handler = FindSlot(event.job);
             if (handler < 0)
@@ -736,6 +741,8 @@ public:
                 slot.percent = event.percent;
                 tTJSVariant layer = slot.layer, filename = slot.filename;
                 Fire(TJS_N("onSaveLayerImageProgress"), handler, event.percent, layer, filename);
+                if (!*live)
+                    return;
                 continue;
             }
             std::shared_ptr<SaveJob> job = slot.job;
@@ -759,15 +766,56 @@ public:
             }
             Fire(TJS_N("onSaveLayerImageDone"), handler, canceled ? 1 : 0, layer, filename);
         }
-        if (!HasJobs())
+        if (*live && !HasJobs())
             SetHook(false);
     }
 
+    // Like the original, the events get a copy of the layer named
+    // "saveLayer:<filename>", so a handler may invalidate it.
+    tTJSVariant CopyLayer(const tTJSVariant& layer, const ttstr& filename)
+    {
+        iTJSDispatch2* global = TVPGetScriptDispatch();
+        tTJSVariant layerClass;
+        global->PropGet(0, TJS_N("Layer"), nullptr, &layerClass, global);
+        global->Release();
+        iTJSDispatch2* cls = layerClass.AsObjectNoAddRef();
+        tTJSVariant window(objthis, objthis), primary;
+        objthis->PropGet(0, TJS_N("primaryLayer"), nullptr, &primary, objthis);
+        tTJSVariant* args[] = {&window, &primary};
+        iTJSDispatch2* obj = nullptr;
+        if (!cls || TJS_FAILED(cls->CreateNew(0, nullptr, nullptr, &obj, 2, args, objthis)) || !obj)
+            TVPThrowExceptionMessage(TJS_N("%1:can't create the save layer"), filename);
+        tTJSVariant copy(obj, obj);
+        obj->Release();
+        tTJSVariant name(ttstr(TJS_N("saveLayer:")) + filename);
+        obj->PropSet(0, TJS_N("name"), nullptr, &name, obj);
+        tTJSVariant source = layer;
+        tTJSVariant* assign[] = {&source};
+        if (TJS_FAILED(obj->FuncCall(0, TJS_N("assignImages"), nullptr, nullptr, 1, assign, obj)))
+            TVPThrowExceptionMessage(TJS_N("%1:can't copy the layer image"), filename);
+        return copy;
+    }
+
+    // A raw callback skips the instance getter hook, so the first call on a
+    // Window creates the instance here.
     static tjs_error startSaveLayerImage(tTJSVariant* result, tjs_int numparams, tTJSVariant** param,
-                                         WindowSaveImage* self)
+                                         iTJSDispatch2* objthis)
     {
         if (numparams < 2)
             return TJS_E_BADPARAMCOUNT;
+        if (!objthis)
+            return TJS_E_NATIVECLASSCRASH;
+        typedef ncbInstanceAdaptor<WindowSaveImage> AdaptorT;
+        WindowSaveImage* self = AdaptorT::GetNativeInstance(objthis);
+        if (!self)
+        {
+            self = new WindowSaveImage(objthis);
+            if (!AdaptorT::SetAdaptorWithNativeInstance(objthis, self))
+            {
+                delete self;
+                return TJS_E_NATIVECLASSCRASH;
+            }
+        }
         iTJSDispatch2* lay = param[0]->AsObjectNoAddRef();
         ttstr filename = *param[1];
         const tTJSVariant* info = numparams > 2 ? param[2] : nullptr;
@@ -781,6 +829,7 @@ public:
         else if (info && info->Type() == tvtObject)
             job->tags = BuildTlgTags(info->AsObjectNoAddRef());
 
+        tTJSVariant copy = self->CopyLayer(*param[0], filename);
         size_t handler = 0;
         while (handler < self->slots.size() && self->slots[handler].job)
             handler++;
@@ -788,7 +837,7 @@ public:
             self->slots.emplace_back();
         Slot& slot = self->slots[handler];
         slot.job = job;
-        slot.layer = *param[0];
+        slot.layer = copy;
         slot.filename = filename;
         slot.percent = -1;
         self->SetHook(true);

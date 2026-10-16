@@ -265,10 +265,16 @@ bool tTJSNI_PsbFile::loadFromStream(tTJSBinaryStream* _filePtr, const ttstr& fil
         {
             std::string list;
             const auto index = nameIndexes[i];
-            auto chr = namesData[index];
-            while (chr != 0)
+            // A corrupt table can index past the arrays or loop; such a name
+            // ends where it goes wrong.
+            auto chr = index < namesData.size() ? namesData[index] : 0;
+            for (size_t steps = 0; chr != 0 && steps < namesData.size(); ++steps)
             {
+                if (chr >= namesData.size())
+                    break;
                 const auto code = namesData[chr];
+                if (code >= charset.size())
+                    break;
                 const auto d = charset[code];
                 const auto realChr = chr - d;
                 chr = code;
@@ -514,7 +520,8 @@ tTJSVariant tTJSNI_PsbFile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
             // Scripts expect the resource bytes in the tree. psb:// shares
             // this octet rather than keeping its own copy.
             tTJSVariant ret(fileData + offset, length);
-            _resources._resources[key] = {(tjs_uint32)offset, length, ret};
+            // The first entry for a key wins, as before.
+            _resources._resources.emplace(key, PSB::PSBMediaInfo::PSBMediaItemInfo{(tjs_uint32)offset, length, ret});
             return ret;
         }
         case PSB::PSBObjType::ExtraChunkN1:
@@ -530,8 +537,9 @@ tTJSVariant tTJSNI_PsbFile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
                                           static_cast<tjs_int8>(PSB::PSBObjType::ExtraChunkN1) + 1);
 
             if (idx >= 0 && (size_t)idx < extraChunkOffsets.size() && (size_t)idx < extraChunkLengths.size())
-                _resources._resources[key] = {_header.offsetExtraChunkData + extraChunkOffsets[idx],
-                                              extraChunkLengths[idx], tTJSVariant()};
+                _resources._resources.emplace(
+                    key, PSB::PSBMediaInfo::PSBMediaItemInfo{_header.offsetExtraChunkData + extraChunkOffsets[idx],
+                                                             extraChunkLengths[idx], tTJSVariant()});
             return tTJSVariant();
         }
         case PSB::PSBObjType::List:

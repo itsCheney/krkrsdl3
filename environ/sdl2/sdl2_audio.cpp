@@ -71,7 +71,9 @@ public:
         int idxVar = _bufferIdx;
         if (idxVar < 0)
             return;
-        if (dataVar < _frame_size)
+        // A resampled stream holds back a few frames (up to 7) until a
+        // flush, so a tail that small counts as played.
+        if (dataVar < _frame_size * 8)
         {
             queued = 0;
         }
@@ -184,6 +186,7 @@ public:
     }
     virtual void Reset() override
     {
+        tTJSCSH lk(_buffer_mtx);
         SDL_ClearQueuedAudio(sdl_audio_device);
         _sentBytes = 0;
         queued = 0;

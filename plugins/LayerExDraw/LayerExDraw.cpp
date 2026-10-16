@@ -51,18 +51,20 @@ static void appendUtf8(std::string& out, unsigned cp)
 static std::vector<std::string> readFontFamilies(const tjs_uint8* data, tjs_uint size)
 {
     std::vector<std::string> names;
-    auto u16 = [&](tjs_uint at) -> tjs_uint { return at + 2 <= size ? (tjs_uint)(data[at] << 8 | data[at + 1]) : 0; };
+    auto u16 = [&](tjs_uint at) -> tjs_uint { return at < size && size - at >= 2 ? (tjs_uint)(data[at] << 8 | data[at + 1]) : 0; };
     auto u32 = [&](tjs_uint at) -> tjs_uint {
-        return at + 4 <= size ? ((tjs_uint)data[at] << 24 | (tjs_uint)data[at + 1] << 16 | (tjs_uint)data[at + 2] << 8 | data[at + 3]) : 0;
+        return at < size && size - at >= 4 ? ((tjs_uint)data[at] << 24 | (tjs_uint)data[at + 1] << 16 | (tjs_uint)data[at + 2] << 8 | data[at + 3]) : 0;
     };
     tjs_uint font = 0;
     if (size >= 12 && !std::memcmp(data, "ttcf", 4))
         font = u32(12);
+    if (font >= size)
+        return names;
     tjs_uint tables = u16(font + 4), name = 0, nameSize = 0;
     for (tjs_uint i = 0; i < tables; ++i)
     {
         tjs_uint rec = font + 12 + i * 16;
-        if (rec + 16 > size)
+        if (rec >= size || size - rec < 16)
             break;
         if (!std::memcmp(data + rec, "name", 4))
         {
@@ -1289,6 +1291,7 @@ GdipImage* GdipImage::Clone()
             cloned->vectorGraph.push_back({app.get(),path.get(),info.matrix});app.release();path.release();
         }
         cloned->transMtx = transMtx;
+        cloned->bgColor = bgColor;
     }
     return cloned.release();
 }
@@ -2754,8 +2757,9 @@ bool LayerExDraw::redraw(GdipImage* image)
     // Clear and redraw
     plutovg_canvas_save(canvas);
     plutovg_canvas_reset_matrix(canvas);
+    // A record starts from the colour its last clear() used.
     plutovg_color_t clearColor;
-    plutovg_color_init_argb32(&clearColor, 0);
+    plutovg_color_init_argb32(&clearColor, image->_surface ? 0 : image->bgColor);
     plutovg_canvas_set_color(canvas, &clearColor);
     plutovg_canvas_set_operator(canvas, PLUTOVG_OPERATOR_SRC);
     plutovg_canvas_fill_rect(canvas, 0, 0, (float)width, (float)height);

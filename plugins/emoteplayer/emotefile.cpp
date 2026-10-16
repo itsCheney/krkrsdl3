@@ -2043,10 +2043,16 @@ bool emotefile::load(const ttstr& filePath)
         {
             std::string list;
             const auto index = nameIndexes[i];
-            auto chr = namesData[index];
-            while (chr != 0)
+            // A corrupt table can index past the arrays or loop; such a name
+            // ends where it goes wrong.
+            auto chr = index < namesData.size() ? namesData[index] : 0;
+            for (size_t steps = 0; chr != 0 && steps < namesData.size(); ++steps)
             {
+                if (chr >= namesData.size())
+                    break;
                 const auto code = namesData[chr];
+                if (code >= charset.size())
+                    break;
                 const auto d = charset[code];
                 const auto realChr = chr - d;
                 chr = code;
@@ -2298,6 +2304,8 @@ tTJSVariant emotefile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
                     return tTJSVariant(stringsCacheTJS[idx]);
                 return tTJSVariant();
             }
+            if (idx < 0 || static_cast<size_t>(idx) >= stringsOffset.size())
+                return tTJSVariant();
             filePtr->SetPosition(_header.offsetStringsData + stringsOffset[idx]);
             std::string str;
             tjs_uint8 val8 = 0;
@@ -2654,6 +2662,8 @@ bool emotefile::parseString(std::string& output, uint32_t _objOffset)
             tjs_int32 idx = 0;
             filePtr->ReadBuffer(&idx,
                                 typeByte - static_cast<tjs_int8>(PSB::PSBObjType::StringN1) + 1);
+            if (idx < 0 || static_cast<size_t>(idx) >= stringsOffset.size())
+                return false;
             filePtr->SetPosition(_header.offsetStringsData + stringsOffset[idx]);
             // A truncated tail keeps the partial bytes here, unlike the script
             // decoder which reports it as empty.
