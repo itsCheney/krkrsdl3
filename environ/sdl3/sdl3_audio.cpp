@@ -36,7 +36,8 @@ public:
     SDL_AudioStream* _stream = NULL;
     SDL_AudioSpec spec;
     tjs_int BitsPerSample = 0;
-    int _frame_size = 0;
+    int _frame_size = 0; // bytes per frame (all channels)
+    tjs_uint64 _sentBytes = 0; // bytes put into _stream since the last Reset
 
     void UpdateQueueData()
     {
@@ -81,13 +82,13 @@ public:
 
     tTVPSoundBufferSDL(tTVPWaveFormat& fmt, int bufcount)
       : _bufferLimitCount(bufcount),
-        _frame_size(fmt.BitsPerSample * fmt.Channels)
+        _frame_size((fmt.BytesPerSample ? fmt.BytesPerSample : fmt.BitsPerSample / 8) * fmt.Channels)
     {
         {
             tTJSCriticalSectionHolder holder(s_hostAudioBuffersCS);
             s_hostAudioBuffers.insert(this);
         }
-        _bufferSizeCache = new tjs_uint[bufcount];
+        _bufferSizeCache = new tjs_uint[bufcount]();
         memset(&spec, 0, sizeof(spec));
         spec.freq = fmt.SamplesPerSec;
         spec.channels = fmt.Channels;
@@ -119,6 +120,12 @@ public:
         }
 
         sdl_audio_device = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, NULL);
+        if (!sdl_audio_device)
+        {
+            SDL_Log("Couldn't open audio device: %s", SDL_GetError());
+            delete this;
+            return false;
+        }
 
         _stream = SDL_CreateAudioStream(&spec, NULL);
         if (!_stream)
@@ -178,6 +185,7 @@ public:
     virtual void Reset() override
     {
         SDL_ClearAudioStream(_stream);
+        _sentBytes = 0;
         queued = 0;
         processed = 0;
     }
@@ -209,6 +217,7 @@ public:
             _bufferIdx = 0;
 
         SDL_PutAudioStreamData(_stream, _inbuf, inlen);
+        _sentBytes += inlen;
         _bufferSizeCache[_bufferIdx] = inlen;
         totalBufferSize += inlen;
     }
@@ -231,7 +240,13 @@ public:
     }
     virtual tjs_uint GetCurrentPlaySamples() override
     {
-        return SDL_GetAudioStreamQueued(_stream) / _frame_size;
+        // Samples already played since the last Reset: what was sent minus
+        // what is still waiting in the stream.
+        tTJSCSH lk(_buffer_mtx);
+        int queuedBytes = SDL_GetAudioStreamQueued(_stream);
+        if (queuedBytes < 0 || (tjs_uint64)queuedBytes > _sentBytes)
+            return 0;
+        return (tjs_uint)((_sentBytes - queuedBytes) / _frame_size);
     }
     virtual int GetRemainBuffers() override
     {
