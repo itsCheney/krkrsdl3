@@ -6,6 +6,12 @@
 #include "PSBMedia.h"
 #include "PSBData.h"
 
+class tTVPMemoryStream;
+
+// Reads a whole PSB into memory, decompressing an MDF wrapper. Takes
+// ownership of src (deleted, also on failure). Returns null on failure.
+tTVPMemoryStream* PSBReadDecompressed(tTJSBinaryStream* src);
+
 //---------------------------------------------------------------------------
 // tTJSNI_PsbFile
 //---------------------------------------------------------------------------
@@ -28,7 +34,15 @@ public:
 
 private:
     iTJSDispatch2* Owner;
+    // The decompressed PSB, only while load parses it.
     tTJSBinaryStream* filePtr = nullptr;
+    const tjs_uint8* fileData = nullptr;
+    tjs_uint64 fileSize = 0;
+    // psb:// key this instance registered, if any.
+    ttstr _mediaKey;
+
+    void releaseLoad();
+    void detachMedia();
 
     PSB::PSBHeader _header;
     std::vector<tjs_uint32> stringsOffset;

@@ -63,27 +63,39 @@ bool PSBHeader::parsePSBHeader(TJS::tTJSBinaryStream* stream)
 
 bool parsePSBArray(std::vector<tjs_uint32>* target, tjs_int8 n, TJS::tTJSBinaryStream* stream)
 {
-    if (n < 0 || n > 8)
+    if (n < 1 || n > 8)
     {
         TVPConsoleLog("bad length type size");
         return false;
     }
-    tjs_uint32 count = 0;
-    stream->ReadBuffer(&count, n);
+    // The count can take up to 8 bytes; read it into 64 bits.
+    tjs_uint8 countBytes[8] = {0};
+    stream->ReadBuffer(countBytes, n);
+    tjs_uint64 count = 0;
+    for (int i = 0; i < n; ++i)
+        count |= static_cast<tjs_uint64>(countBytes[i]) << (i * 8);
     if (count > INT32_MAX)
     {
         TVPConsoleLog("Long array is not supported yet");
         return false;
     }
     tjs_uint32 entryLength = stream->ReadI8LE() - static_cast<tjs_uint32>(PSBObjType::NumberN8);
-    target->reserve(count);
+    // A corrupt count must not reserve more entries than the stream holds.
+    // (Corrupt entry widths are tolerated below; see the loop.)
+    const tjs_uint64 remaining = stream->GetSize() - stream->GetPosition();
+    if (count * (entryLength ? entryLength : 1) > remaining)
+    {
+        TVPConsoleLog("array runs past the end of the PSB");
+        return false;
+    }
+    target->reserve(target->size() + (size_t)count);
     // One stream read per entry; the previous loop issued one virtual call per
     // byte. Only the low four bytes can survive in the 32-bit target, but the
     // stream still advances by the whole entry so later entries stay aligned.
     tjs_uint8 bytes[8] = {0};
     const tjs_uint32 scratch = entryLength < sizeof(bytes) ? entryLength : sizeof(bytes);
     const tjs_uint32 used = entryLength < 4 ? entryLength : 4;
-    for (int i = 0; i < count; i++)
+    for (tjs_uint64 i = 0; i < count; i++)
     {
         const tjs_uint got = scratch ? stream->Read(bytes, scratch) : 0;
         for (tjs_uint32 j = got; j < scratch; ++j)

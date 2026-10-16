@@ -2,6 +2,7 @@
 #include "TVPStorage.h"
 
 #include <map>
+#include <mutex>
 
 namespace PSB
 {
@@ -9,10 +10,19 @@ struct PSBMediaInfo
 {
     struct PSBMediaItemInfo
     {
+        // Offset into the decompressed PSB.
         tjs_uint32 Offsets;
         tjs_uint32 Lengths;
+        // The resource octet that the PSBFile tree also holds, while its
+        // owner is alive. Void after the owner goes away; Open then reads
+        // the file again.
+        tTJSVariant Data;
     };
     std::map<ttstr, PSBMediaItemInfo> _resources;
+    // The path the PSB was loaded from, for reading it again.
+    ttstr Path;
+    // The PSBFile instance whose octets Data shares, or null.
+    const void* Owner = nullptr;
 };
 
 class PSBMedia : public iTVPStorageMedia
@@ -62,8 +72,15 @@ public:
     // if true, returns local OS native name. otherwise returns an empty string.
     virtual void GetLocallyAccessibleName(ttstr& name) override;
 
+    // Media key for a PSB load path: its file name, lower-cased. psb://
+    // domains cannot contain '/', so this is the only part they can name.
+    static ttstr KeyFor(const ttstr& path);
+
     void AddPSBFile(const ttstr& name, PSBMediaInfo data);
     void RemovePSBFile(const ttstr& name);
+    // Drops the shared octets of an entry this owner registered; the entry
+    // stays, served from the file.
+    void DetachPSBFile(const ttstr& name, const void* owner);
 
 protected:
     /**
@@ -73,7 +90,13 @@ protected:
 
 private:
     tjs_uint refCount; //< リファレンスカウント
+    // Open can run on image loading threads.
+    std::mutex _mutex;
     std::map<ttstr, PSBMediaInfo> _resources;
+
+    // Caller holds _mutex. Sets path to the entry's load path when the PSB
+    // is known, even if the resource is not.
+    PSBMediaInfo::PSBMediaItemInfo* FindLocked(const ttstr& name, ttstr& path);
 };
 } // namespace PSB
 
