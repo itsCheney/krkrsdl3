@@ -108,7 +108,6 @@ tTJSVariant D3DEmotePlayer::clone(iTJSDispatch2* newlayer)
         {
             emoteplayer::EmotePlayer* src = Impl->Player;
             emoteplayer::EmotePlayer* dst = np->Impl->Player;
-            dst->inheritAnimationModeFrom(*src);
             // clone 先给新播放器加载同一文件并增加引用计数，再恢复 motion/状态
             dst->set_motionKey(src->get_motionKey());
             tTJSString motion = src->get_motion();
@@ -117,10 +116,8 @@ tTJSVariant D3DEmotePlayer::clone(iTJSDispatch2* newlayer)
             dst->set_tickCount(src->get_tickCount());
             dst->set_speed(src->get_speed());
             dst->unserialize(src->serialize());
-            dst->copyAnimationStateFrom(*src);
             // 变量复制（按当前 motion 的变量表枚举）
-            tTJSVariant keys;
-            if (!src->usesIntegratedAnimation()) keys = src->get_variableKeys();
+            tTJSVariant keys = src->get_variableKeys();
             if (keys.Type() == tvtObject)
             {
                 iTJSDispatch2* arr = keys.AsObjectNoAddRef();

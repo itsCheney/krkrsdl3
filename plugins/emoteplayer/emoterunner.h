@@ -10,7 +10,6 @@
 
 #include "emotefile.h"
 #include "emotegeometry.h"
-#include "emoteanimation.h"
 #include "emoteperformance.h"
 
 namespace emoteplayer
@@ -179,7 +178,6 @@ namespace emoteplayer
     class emoteengine
     {
     public:
-        emoteengine();
 	    // 主file/motion
         emotefile* _mainfile = nullptr;
         emotemotion* _mainmotion = nullptr;
@@ -203,7 +201,6 @@ namespace emoteplayer
         // 控制系列
         emotemotion* findmotionByName(const std::string& name);
         void updateEyeControl(float tick, bool isMain = false);
-        void updateIntegratedEyeControl(float tick);
         struct PlayingTimeline
         {
             emotetimeline* timeline = nullptr;
@@ -236,27 +233,8 @@ namespace emoteplayer
         tTJSVariant serializeControls() const;
         void unserializeControls(const tTJSVariant& state);
 
-        bool integratedAnimation() const { return _integratedAnimation; }
-        void inheritAnimationMode(bool value) { _integratedAnimation = value; resetAnimationState(); }
-        void ensureAnimationState();
-        void resetAnimationState();
-        void advanceAnimation(double milliseconds, double speedDivisor);
-        void setAnimationVariable(const std::string& name, double value, double time, double easing);
-        void updateAnimationSelectors();
         void recordAnimationProgress(double milliseconds, double tick, bool mainPlaying);
         void recordAnimationDraw();
-        void copyAnimationStateFrom(const emoteengine& source);
-        std::string serializeAnimationState() const;
-        bool restoreAnimationState(const std::string& text);
-        bool getMotionParameter(emotemotion* motion, const std::string& id, double& value);
-        animation::Runtime _animation;
-        double _animationClock = 0;
-        bool _animationPaused = false;
-        // This pointer identifies a binding; the ResourceManager owns its lifetime.
-        emotefile* _animationFile = nullptr;
-        std::vector<eyeControl> _animationEyes;
-        std::vector<eyeControl*> _animationEyeRefs;
-        std::map<emotemotion*, std::map<std::string, std::string>> _animationParameterLabels;
         struct AnimationTrace {
             double inputMS = 0, tick = 0;
             std::uint64_t progressVersion = 0, drawVersion = 0;
@@ -268,9 +246,6 @@ namespace emoteplayer
         std::uint64_t _animationProgressVersion = 0, _animationDrawVersion = 0;
         std::uint64_t _animationDrawCalls = 0, _animationRepeatedDraws = 0;
         std::uint64_t _animationLogAt = 0;
-    private:
-        bool _integratedAnimation = false;
-    public:
 
         // Each draw owns its geometry, so shared players can render to multiple layers.
         std::shared_ptr<emotemotionref> _mainMotionRef;

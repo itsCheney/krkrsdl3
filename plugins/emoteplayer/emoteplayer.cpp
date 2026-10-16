@@ -94,8 +94,7 @@ NCB_REGISTER_SUBCLASS(EmotePlayer)
     CONTROL_METHOD(setScale, EmotePlayer, 1);
     CONTROL_METHOD(setRotate, EmotePlayer, 2);
     NCB_METHOD(setColor);
-    NCB_METHOD_RAW_CALLBACK(setVariable, &EmotePlayer::cb_setVariable, 0);
-    PROPERTY(queuing);
+    CONTROL_METHOD(setVariable, EmotePlayer, 3);
     NCB_METHOD(getVariable);
     CONTROL_METHOD(setOuterForce, EmotePlayer, 4);
     NCB_METHOD(setDrawAffineTranslateMatrix);
@@ -153,8 +152,7 @@ NCB_REGISTER_SUBCLASS(Player)
     CONTROL_METHOD(setScale, Player, 1);
     CONTROL_METHOD(setRotate, Player, 2);
     NCB_METHOD(setColor);
-    NCB_METHOD_RAW_CALLBACK(setVariable, &Player::cb_setVariable, 0);
-    PROPERTY(queuing);
+    CONTROL_METHOD(setVariable, Player, 3);
     NCB_METHOD(getVariable);
     CONTROL_METHOD(setOuterForce, Player, 4);
     NCB_METHOD(setDrawAffineTranslateMatrix);

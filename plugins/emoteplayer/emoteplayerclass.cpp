@@ -909,17 +909,6 @@ tTJSVariant EmotePlayer::serialize()
     transitionArray->Release();
     setprop(dict, transitions);
 
-    if (emtEngine.integratedAnimation())
-    {
-        emtEngine.ensureAnimationState();
-        tTJSVariant state(tTJSString(emtEngine.serializeAnimationState().c_str()));
-        dict->PropSet(TJS_MEMBERENSURE, TJS_N("emoteAnimationState"), nullptr, &state, dict);
-        tTJSVariant playing(_playing), clock(clockPassed), stopped(_isStop);
-        dict->PropSet(TJS_MEMBERENSURE, TJS_N("emoteMainClock"), nullptr, &clock, dict);
-        dict->PropSet(TJS_MEMBERENSURE, TJS_N("emoteMainPlaying"), nullptr, &playing, dict);
-        dict->PropSet(TJS_MEMBERENSURE, TJS_N("emoteStopped"), nullptr, &stopped, dict);
-    }
-
     auto res = tTJSVariant(dict, dict);
     dict->Release();
     return res;
@@ -968,30 +957,10 @@ void EmotePlayer::unserialize(tTJSVariant data)
             if (valid) *tween = {fields[0], fields[1], fields[2], std::max(0.0, fields[3]), fields[4]};
         }
     updateTransMat();
-    if (emtEngine.integratedAnimation())
-    {
-        tTJSVariant state;
-        if (TJS_SUCCEEDED(dict->PropGet(0, TJS_N("emoteAnimationState"), nullptr, &state, dict)) && state.Type() == tvtString)
-        {
-            emtEngine.ensureAnimationState();
-            if (emtEngine.restoreAnimationState(tTJSString(state).AsStdString()))
-            {
-                tTJSVariant field;
-                if (TJS_SUCCEEDED(dict->PropGet(0, TJS_N("emoteMainClock"), nullptr, &field, dict)))
-                {
-                    const double value = field.AsReal();
-                    if (std::isfinite(value) && value >= -1) clockPassed = value;
-                }
-                if (TJS_SUCCEEDED(dict->PropGet(0, TJS_N("emoteMainPlaying"), nullptr, &field, dict))) _playing = field.AsInteger() != 0;
-                if (TJS_SUCCEEDED(dict->PropGet(0, TJS_N("emoteStopped"), nullptr, &field, dict))) _isStop = field.AsInteger() != 0;
-            }
-        }
-    }
 }
 void EmotePlayer::play(tTJSString name, int flag)
 {
     _isStop = false;
-    emtEngine._animationPaused = false;
     const Uint64 started = SDL_GetTicksNS();
     if (emtEngine._mainfile != nullptr && !isMotion) // motionKey的启动模式
     {
@@ -1257,12 +1226,10 @@ void EmotePlayer::progress(tjs_real mstime)
         Vector3* force[] = {&emtEngine.physics.bustForce, &emtEngine.physics.hairForce, &emtEngine.physics.partsForce};
         for (int i = 0; i < 3; ++i)
             *force[i] = Vector3(forces[i][0].value(emtEngine.controlTick), forces[i][1].value(emtEngine.controlTick));
-        if (_playing && !emtEngine._animationPaused)
-            clockPassed += emtEngine.integratedAnimation() ? animation::millisecondsToFrames(mstime, speedRatio) : frames;
+        if (_playing)
+            clockPassed += frames;
         // condition
-        if (emtEngine.integratedAnimation())
-            emtEngine.advanceAnimation(mstime, speedRatio);
-        else if (!isMotion)
+        if (!isMotion)
         {
             // 更新控制参数(通过引擎调用)
             emtEngine.updateTimelineControl(emtEngine.controlTick, true);
@@ -1270,9 +1237,6 @@ void EmotePlayer::progress(tjs_real mstime)
         }
         // Physics samples model anchors before projection and the optional draw
         // affine. Sampling creates no textures or meshes and never advances time.
-        // It drives the legacy control variables; the integrated animation core
-        // does not read them.
-        if (!emtEngine.integratedAnimation())
         {
             emoteRender root;
             root.type = 3;
@@ -1536,22 +1500,6 @@ void EmotePlayer::setVariable(tTJSString name, tjs_real value, tjs_real time, tj
         emtEngine.setVariable(tmpName, value, time, easing);
     }
 }
-tjs_error EmotePlayer::cb_setVariable(tTJSVariant*, tjs_int count, tTJSVariant** args, EmotePlayer* self)
-{
-    if (!self) return TJS_E_INVALIDOBJECT;
-    if (count < 2 || count > 4) return TJS_E_BADPARAMCOUNT;
-    self->setVariable(tTJSString(*args[0]), args[1]->AsReal(),
-        count > 2 && args[2]->Type() != tvtVoid ? args[2]->AsReal() : 0,
-        count > 3 && args[3]->Type() != tvtVoid ? args[3]->AsReal() : 0);
-    return TJS_S_OK;
-}
-void EmotePlayer::copyAnimationStateFrom(const EmotePlayer& source)
-{
-    if (!usesIntegratedAnimation() || !source.usesIntegratedAnimation()) return;
-    emtEngine.copyAnimationStateFrom(source.emtEngine);
-    clockPassed = source.clockPassed; speedRatio = source.speedRatio;
-    _playing = source._playing; _allplaying = source._allplaying; _isStop = source._isStop;
-}
 tjs_real EmotePlayer::getVariable(tTJSString name)
 {
     if (emtEngine._mainfile != nullptr)
@@ -1634,7 +1582,6 @@ void EmotePlayer::pass()
 }
 void EmotePlayer::stop()
 {
-    if (emtEngine.integratedAnimation()) emtEngine._animation.stop();
     _isStop = true;
     _playing = false;
     _allplaying = false;
@@ -1644,8 +1591,7 @@ void EmotePlayer::playTimeline(tTJSString name, tjs_int flags)
 {
     if (emtEngine._mainfile != nullptr)
     {
-        emtEngine.startTimeline(emtEngine.integratedAnimation() ? clockPassed : emtEngine.controlTick,
-                                name.AsStdString(), flags);
+        emtEngine.startTimeline(emtEngine.controlTick, name.AsStdString(), flags);
     }
 }
 void EmotePlayer::stopTimeline(tTJSString name)
@@ -1667,12 +1613,6 @@ bool EmotePlayer::getTimelinePlaying(tTJSString name)
 }
 bool EmotePlayer::getLoopTimeline(tTJSString name)
 {
-    if (emtEngine.integratedAnimation())
-    {
-        emtEngine.ensureAnimationState(); std::string label(name.AsStdString().c_str()); label.append(1, '\0');
-        const auto* definition = emtEngine._animation.definition(label);
-        return definition && definition->loopBegin >= 0 && definition->loopEnd > definition->loopBegin;
-    }
     if (emtEngine._mainfile != nullptr)
     {
         for (auto itm : emtEngine._mainfile->_metadata->_timelineControl)
@@ -1687,12 +1627,6 @@ bool EmotePlayer::getLoopTimeline(tTJSString name)
 }
 tjs_real EmotePlayer::getTimelineTotalFrameCount(tTJSString name)
 {
-    if (emtEngine.integratedAnimation())
-    {
-        emtEngine.ensureAnimationState(); std::string label(name.AsStdString().c_str()); label.append(1, '\0');
-        const auto* definition = emtEngine._animation.definition(label);
-        return definition ? std::max(0.0, definition->lastTime) : 0;
-    }
     if (emtEngine._mainfile != nullptr)
     {
         for (auto itm : emtEngine._mainfile->_metadata->_timelineControl)
@@ -1754,20 +1688,10 @@ void EmotePlayer::setTimelineBlendRatio(tTJSString name,
                                         tjs_real easing,
                                         bool stopWhenBlendDone)
 {
-    if (emtEngine.integratedAnimation())
-    {
-        emtEngine.ensureAnimationState(); std::string label(name.AsStdString().c_str()); label.append(1, '\0');
-        emtEngine._animation.setBlend(label, ratio, time, easing); return;
-    }
     emtEngine.blendTimeline(name.AsStdString(), ratio, time, easing, stopWhenBlendDone);
 }
 void EmotePlayer::fadeInTimeline(tTJSString name, tjs_real time, tjs_real easing)
 {
-    if (emtEngine.integratedAnimation())
-    {
-        emtEngine.ensureAnimationState(); std::string label(name.AsStdString().c_str()); label.append(1, '\0');
-        emtEngine._animation.fadeIn(label, time, easing); return;
-    }
     if (!getTimelinePlaying(name))
     {
         playTimeline(name);
@@ -1777,34 +1701,12 @@ void EmotePlayer::fadeInTimeline(tTJSString name, tjs_real time, tjs_real easing
 }
 void EmotePlayer::fadeOutTimeline(tTJSString name, tjs_real time, tjs_real easing)
 {
-    if (emtEngine.integratedAnimation())
-    {
-        emtEngine.ensureAnimationState(); std::string label(name.AsStdString().c_str()); label.append(1, '\0');
-        emtEngine._animation.fadeOut(label, time, easing); return;
-    }
     setTimelineBlendRatio(name, 0, time, easing, true);
 }
 tTJSVariant EmotePlayer::getPlayingTimelineInfoList()
 {
     iTJSDispatch2* array = TJSCreateArrayObject();
     tTJSVariant result(array, array);
-    if (emtEngine.integratedAnimation())
-    {
-        emtEngine.ensureAnimationState();
-        for (const auto& state : emtEngine._animation.states()) if (state.playing)
-        {
-            iTJSDispatch2* obj = TJSCreateDictionaryObject();
-            tTJSVariant entry(obj, obj); obj->Release();
-            tTJSVariant label(tTJSString(state.label.c_str())), flags(state.flags), ratio(state.blend.value), time(state.time);
-            obj->PropSet(TJS_MEMBERENSURE, TJS_N("label"), nullptr, &label, obj);
-            obj->PropSet(TJS_MEMBERENSURE, TJS_N("flags"), nullptr, &flags, obj);
-            obj->PropSet(TJS_MEMBERENSURE, TJS_N("blendRatio"), nullptr, &ratio, obj);
-            obj->PropSet(TJS_MEMBERENSURE, TJS_N("time"), nullptr, &time, obj);
-            tTJSVariant* args[] = {&entry};
-            array->FuncCall(0, TJS_N("add"), nullptr, nullptr, 1, args, array);
-        }
-        array->Release(); return result;
-    }
     if (emtEngine._mainfile != nullptr)
     {
         for (const auto& playingTimeline : emtEngine.currTimeline)
