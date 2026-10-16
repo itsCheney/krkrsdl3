@@ -1,4 +1,5 @@
 #include "emoterunner.h"
+#include "emoteframeselect.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -36,51 +37,14 @@ void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderL
         isNeedDraw = false;
         return;
     }
-    frame = nullptr;
-    size_t currFrameIdx = -1;
-    for (size_t i = 0; i < currentNode->frameList.size(); i++)
-    {
-        if (currentNode->frameList.at(i)->time <= tick)
-        {
-            frame = currentNode->frameList.at(i);
-            currFrameIdx = i;
-        }
-        else
-            break;
-    }
-
+    const auto selected = selectEmoteNodeFrames(currentNode->frameList, tick, currentNode->type == 1);
+    frame = selected.first;
+    nextframe = selected.second;
     if (frame == nullptr || !frame->hasContent)
     {
-        // motion 末尾的"结束帧"（type0 无 content）被命中时
-        //（tick 超过 motion 末帧且无循环回绕），回退到最后一个有 content 的帧：
-        // 静态层（如触摸判定 shape）在任何 tick 下都应保持其几何；
-        // 中间的空帧仍保持"隐藏"语义。此前直接隐藏，导致主 motion 播完后
-        // 触摸判定层整体消失
-        emoteframe* saved = frame;
-        if (currFrameIdx != (size_t)-1 && currFrameIdx == currentNode->frameList.size() - 1)
-        {
-            for (int i = (int)currFrameIdx - 1; i >= 0; --i)
-            {
-                if (currentNode->frameList.at(i)->hasContent)
-                {
-                    frame = currentNode->frameList.at(i);
-                    break;
-                }
-            }
-        }
-        if (frame == nullptr || !frame->hasContent)
-        {
-            frame = saved;
-            isNeedDraw = false;
-            return;
-        }
-        nextframe = nullptr; // 静态保持，不再向后续帧插值
+        isNeedDraw = false;
+        return;
     }
-    nextframe = nullptr;
-    if (currFrameIdx >= 0 && currFrameIdx < currentNode->frameList.size() - 1)
-        nextframe = currentNode->frameList.at(currFrameIdx + 1);
-    if (nextframe != nullptr && !nextframe->hasContent)
-        nextframe = nullptr;
 
     // 节点基础信息获取
     isNeedDraw = true;
@@ -152,7 +116,7 @@ void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderL
         if (_source.icon != ic) // 直接比对ic
         {
             ic = _source.icon;
-            ic->ensureLoad();
+            if (!refTop->samplingPhysics) ic->ensureLoad();
             width = ic->width;
             height = ic->height;
             originX = ic->originX;
@@ -459,7 +423,10 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         renderMethod.push_back(emt);
     }
 
-    if (isShape && frame && !currentNode->removed && refMtn && !renderMethod.empty())
+    if (refTop->samplingPhysics && frame && !currentNode->removed)
+        refTop->recordPhysicsAnchor(currentNode->label, renderMethod);
+
+    if (!refTop->samplingPhysics && isShape && frame && !currentNode->removed && refMtn && !renderMethod.empty())
     {
         auto& area = _shapeArea;
         area.label = currentNode->label;
@@ -497,7 +464,7 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
     const bool gpuCapable = backend && backend->SupportsMeshDeformation();
     _useGPUDeform = false;
     _gpuDeformSurfaces.clear();
-    if (isIcon && isNeedDraw && renderMethod.size() > 0)
+    if (!refTop->samplingPhysics && isIcon && isNeedDraw && renderMethod.size() > 0)
     {
         // 确定细分等级
         int div = currentNode ? (int)currentNode->meshDivision : 0;
@@ -762,7 +729,8 @@ float emotemotionref::getTickByIdx(int32_t idx)
         }
     }
     // file系控制
-    if (!currentMotion->_filePtr->getTickByName(currentMotion->parameter.at(idx)->id, currVal))
+    if (!refTop->getControlVariable(currentMotion->parameter.at(idx)->id, currVal) &&
+        !currentMotion->_filePtr->getTickByName(currentMotion->parameter.at(idx)->id, currVal))
     {
         if (currentMotion->_filePtr->isMotion)
         {
@@ -1171,10 +1139,10 @@ void emoteengine::recordAnimationProgress(double milliseconds, double tick, bool
     }
     else if (_mainfile && _mainfile->_metadata)
     {
-        for (const auto& value : _mainfile->_metadata->_varList)
+        for (const auto& value : controlVariables)
             if (trace.variableCount < trace.variableValues.size()) trace.variableValues[trace.variableCount++] = value.second;
-        for (auto* timeline : currTimeline) if (trace.timelineCount < trace.timelineTimes.size())
-            trace.timelineTimes[trace.timelineCount++] = tick - currStartTick + timeline->loopBegin;
+        for (const auto& playing : currTimeline) if (trace.timelineCount < trace.timelineTimes.size())
+            trace.timelineTimes[trace.timelineCount++] = controlTick - playing.startTick;
     }
     const auto now = SDL_GetTicks();
     if (now - _animationLogAt < 1000) return;
@@ -1295,12 +1263,84 @@ emotemotion* emoteengine::findmotionByName(const std::string& name)
     }
     return nullptr;
 }
-void emoteengine::updateEyeControl(float tick, bool isMain)
+namespace
 {
-    if (integratedAnimation()) ensureAnimationState();
+std::string controlKey(const std::string& name)
+{
+    return name.substr(0, name.find('\0'));
+}
+
+bool instantVariable(const emotemetadata& metadata, const std::string& key)
+{
+    for (const auto& label : metadata._instantVariableList)
+        if (controlKey(label) == key) return true;
+    return false;
+}
+
+bool timelineValue(const emoteTimeVar& variable, double tick, double initial, bool instant, double& value)
+{
+    const emoteTimeVarFrame* current = nullptr;
+    const emoteTimeVarFrame* next = nullptr;
+    double previous = initial;
+    for (size_t i = 0; i < variable.frameList.size(); ++i)
+    {
+        const auto* frame = variable.frameList[i];
+        if (frame->time > tick) { next = frame; break; }
+        if (current && current->hasContent) previous = current->value;
+        current = frame;
+    }
+    if (!current) return false;
+    // Terminal empty keys delimit duration; interior empty keys hide the channel.
+    if (!current->hasContent && current == variable.frameList.back())
+    {
+        for (auto it = variable.frameList.rbegin(); it != variable.frameList.rend(); ++it)
+            if ((*it)->hasContent) { value = (*it)->value; return true; }
+    }
+    if (!current->hasContent) return false;
+    value = current->value;
+    // A timeline key requests a target to reach before the next key. It is
+    // different from a geometry key, which describes the pose at its own time.
+    if (!instant && next && next->time > current->time + 1)
+        value = previous + (value - previous) * emoteEase((tick - current->time) /
+                                      (next->time - current->time - 1), current->easing);
+    return true;
+}
+}
+
+void emoteengine::resetControls()
+{
+    controlTick = 0;
+    currTimeline.clear(); baseVariables.clear(); controlVariables.clear(); variableTweens.clear(); _varCache.clear();
+    eyes.clear();
+    if (!_mainfile || !_mainfile->_metadata) return;
+    const auto& metadata = *_mainfile->_metadata;
+    for (const auto& entry : metadata._varList) baseVariables[controlKey(entry.first)] = entry.second;
+    controlVariables = baseVariables;
+    for (const auto* eye : metadata._eyeControl)
+    {
+        eyes.push_back(*eye);
+        auto& copy = eyes.back();
+        copy.hasStart = copy.isBlinking = false;
+        copy.currWaitInterval = -1;
+    }
+    physics.reset(metadata._bustControl, metadata._hairControl, metadata._partsControl);
+}
+
+bool emoteengine::getControlVariable(const std::string& name, float& value) const
+{
+    const auto entry = controlVariables.find(controlKey(name));
+    if (entry == controlVariables.end()) return false;
+    value = entry->second;
+    return true;
+}
+
+// The integrated animation core keeps its own per-player eye state.
+void emoteengine::updateIntegratedEyeControl(float tick)
+{
+    ensureAnimationState();
     std::default_random_engine dre;
     // 眼动控制
-    for (auto itm : integratedAnimation() ? _animationEyeRefs : _mainfile->_metadata->_eyeControl)
+    for (auto itm : _animationEyeRefs)
     {
         // 初始化tick
         if (!itm->hasStart)
@@ -1325,10 +1365,7 @@ void emoteengine::updateEyeControl(float tick, bool isMain)
                 // 重置初始值
                 auto varPos = _mainfile->_metadata->_varList.find(itm->label);
                 if (varPos != _mainfile->_metadata->_varList.end())
-                {
-                    if (integratedAnimation()) _animation.setVariable(itm->label, itm->baseVal);
-                    else varPos->second = itm->baseVal;
-                }
+                    _animation.setVariable(itm->label, itm->baseVal);
             }
             else
             {
@@ -1349,10 +1386,7 @@ void emoteengine::updateEyeControl(float tick, bool isMain)
                 // 写入参数
                 auto varPos = _mainfile->_metadata->_varList.find(itm->label);
                 if (varPos != _mainfile->_metadata->_varList.end())
-                {
-                    if (integratedAnimation()) _animation.setVariable(itm->label, realVal);
-                    else varPos->second = realVal;
-                }
+                    _animation.setVariable(itm->label, realVal);
             }
         }
         else // 未播放时进行等待
@@ -1364,18 +1398,48 @@ void emoteengine::updateEyeControl(float tick, bool isMain)
                 // 获取初始值
                 auto varPos = _mainfile->_metadata->_varList.find(itm->label);
                 if (varPos != _mainfile->_metadata->_varList.end())
-                {
-                    itm->baseVal = integratedAnimation() ? _animation.variable(itm->label) : varPos->second;
-                }
+                    itm->baseVal = _animation.variable(itm->label);
             }
         }
     }
-    for (auto itm : _mainfile->_metadata->_eyeControl)
+}
+
+void emoteengine::updateEyeControl(float tick, bool isMain)
+{
+    if (integratedAnimation())
     {
-        // nothing to do
+        updateIntegratedEyeControl(tick);
+        return;
+    }
+    for (auto& eye : eyes)
+    {
+        const auto key = controlKey(eye.label);
+        if (!eye.hasStart)
+        {
+            eye.hasStart = true;
+            eye.lastTick = tick;
+        }
+        if (eye.currWaitInterval < 0) eye.currWaitInterval = eye.uid(random);
+        if (!eye.isBlinking)
+        {
+            if (tick - eye.lastTick < eye.currWaitInterval) continue;
+            eye.isBlinking = true;
+            eye.lastTick = tick;
+        }
+        const double elapsed = tick - eye.lastTick;
+        if (eye.blinkFrameCount <= 0 || elapsed >= eye.blinkFrameCount)
+        {
+            eye.isBlinking = false; eye.currWaitInterval = -1; eye.lastTick = tick;
+            continue;
+        }
+        const double ratio = 1 - std::abs(2 * elapsed / eye.blinkFrameCount - 1);
+        // Compose with this frame's expression, so a closed-eye pose stays closed.
+        auto& value = controlVariables[key];
+        value += (eye.endFrame - value) * ratio;
     }
 }
-void emoteengine::startTimeline(float tick, const std::string& name, bool isMain, int flags)
+
+void emoteengine::startTimeline(float tick, const std::string& name, int flags)
 {
     if (integratedAnimation())
     {
@@ -1384,16 +1448,20 @@ void emoteengine::startTimeline(float tick, const std::string& name, bool isMain
         _animation.play(label, flags);
         return;
     }
-    for (auto itm : _mainfile->_metadata->_timelineControl)
+    if (!_mainfile || !_mainfile->_metadata) return;
+    for (auto* timeline : _mainfile->_metadata->_timelineControl)
     {
-        if (strcmp(itm->label.c_str(), name.c_str()) == 0)
-        {
-            currTimeline.push_back(itm);
-            currStartTick = tick;
-            return;
-        }
+        if (controlKey(timeline->label) != controlKey(name)) continue;
+        stopTimeline(name);
+        PlayingTimeline playing;
+        playing.timeline = timeline; playing.startTick = tick;
+        playing.flags = flags | 1 | (timeline->diff ? 2 : 0);
+        if (!(playing.flags & 2)) playing.initialVariables = baseVariables;
+        currTimeline.push_back(playing);
+        return;
     }
 }
+
 void emoteengine::stopTimeline(const std::string& name, bool isMain)
 {
     if (integratedAnimation())
@@ -1402,17 +1470,12 @@ void emoteengine::stopTimeline(const std::string& name, bool isMain)
         std::string label(name.c_str()); if (!label.empty()) label.append(1, '\0');
         _animation.stop(label); return;
     }
-    for (auto itm : _mainfile->_metadata->_timelineControl)
-    {
-        if (strcmp(itm->label.c_str(), name.c_str()) == 0)
-        {
-            currTimeline.erase(std::remove(currTimeline.begin(), currTimeline.end(), itm),
-                               currTimeline.end());
-            currStartTick = -1.0f;
-            return;
-        }
-    }
+    const auto key = controlKey(name);
+    currTimeline.erase(std::remove_if(currTimeline.begin(), currTimeline.end(),
+        [&](const PlayingTimeline& playing) { return key.empty() || controlKey(playing.timeline->label) == key; }),
+        currTimeline.end());
 }
+
 bool emoteengine::checkTimline(const std::string& name, bool& result, bool isMain)
 {
     if (integratedAnimation())
@@ -1422,117 +1485,123 @@ bool emoteengine::checkTimline(const std::string& name, bool& result, bool isMai
         result = _animation.playing(label);
         return label.empty() || _animation.definition(label) != nullptr;
     }
-    emotetimeline* matchT = nullptr;
-    for (auto itm : _mainfile->_metadata->_timelineControl)
-    {
-        if (strcmp(itm->label.c_str(), name.c_str()) == 0)
-        {
-            matchT = itm;
-            break;
-        }
-    }
-    if (matchT == nullptr)
-        return false;
-    for (auto itm : currTimeline)
-    {
-        if (itm == matchT)
-        {
-            result = true;
-            return true;
-        }
-    }
     result = false;
+    const auto key = controlKey(name);
+    for (const auto& playing : currTimeline)
+        if (key.empty() || controlKey(playing.timeline->label) == key) { result = true; break; }
     return true;
 }
+
+void emoteengine::blendTimeline(const std::string& name, double ratio, double time, double easing, bool stopWhenDone)
+{
+    for (auto& playing : currTimeline)
+        if (controlKey(playing.timeline->label) == controlKey(name))
+        {
+            playing.blend.set(playing.blend.value(controlTick), ratio, controlTick, time, easing);
+            playing.stopWhenBlended = stopWhenDone;
+        }
+}
+
 void emoteengine::updateTimelineControl(float tick, bool isMain)
 {
     if (integratedAnimation()) return; // advanced once by advanceAnimation(dt)
-    if (currTimeline.size() < 1)
-        return;
-
-    for (auto timelineItm : currTimeline)
+    for (auto it = variableTweens.begin(); it != variableTweens.end();)
     {
-        // 考察时间
-        if (timelineItm->loopEnd > 0.0f &&
-            tick - currStartTick + timelineItm->loopBegin > timelineItm->loopEnd)
+        baseVariables[it->first] = it->second.value(tick);
+        if (it->second.done(tick)) it = variableTweens.erase(it);
+        else ++it;
+    }
+    controlVariables = baseVariables;
+    // Main channels establish the pose; difference channels add to it. Rebuild
+    // from the inputs every frame so a breathing loop never accumulates drift.
+    for (int difference = 0; difference < 2; ++difference)
+    {
+        for (auto& playing : currTimeline)
         {
-            // 重置时间戳
-            currStartTick = tick;
-        }
-        float currRelTime = tick - currStartTick + timelineItm->loopBegin;
-
-        // 遍历每一个变量
-        for (auto varItm : timelineItm->variableList)
-        {
-            // 跳过
-            if (varItm->frameList.size() == 0)
-                continue;
-
-            // 对于select变量进行跳过
-            bool isfindInSelect = false;
-            for (auto sleItm : _mainfile->_metadata->_selectorControl)
+            if (bool(playing.flags & 2) != bool(difference)) continue;
+            auto* timeline = playing.timeline;
+            double local = std::max(0.0, tick - playing.startTick);
+            if (timeline->loopBegin >= 0 && timeline->loopEnd > timeline->loopBegin && local >= timeline->loopEnd)
+                local = timeline->loopBegin + std::fmod(local - timeline->loopBegin,
+                                                      timeline->loopEnd - timeline->loopBegin);
+            else if (timeline->lastTime >= 0) local = std::min(local, double(timeline->lastTime));
+            const double ratio = playing.blend.value(tick);
+            for (const auto* variable : timeline->variableList)
             {
-                for (auto _sleItm : sleItm->selectItem)
-                {
-                    if (strcmp(_sleItm.label.c_str(), varItm->label.c_str()) == 0)
-                    {
-                        isfindInSelect = true;
-                        break;
-                    }
-                }
-                if (isfindInSelect)
-                    break;
-            }
-            if (isfindInSelect)
-                continue;
-
-            // 确定帧位置
-            emoteTimeVarFrame* currFrame = nullptr;
-            size_t currFrameIdx = -1;
-            for (size_t i = 0; i < varItm->frameList.size(); i++)
-            {
-                if (varItm->frameList.at(i)->time <= currRelTime)
-                {
-                    currFrame = varItm->frameList.at(i);
-                    currFrameIdx = i;
-                }
-                else
-                    break;
-            }
-            if (currFrame == nullptr || !currFrame->hasContent)
-                continue;
-            emoteTimeVarFrame* nextframe = nullptr;
-            if (currFrameIdx >= 0 && currFrameIdx < varItm->frameList.size() - 1)
-                nextframe = varItm->frameList.at(currFrameIdx + 1);
-            if (nextframe != nullptr && !nextframe->hasContent)
-                nextframe = nullptr;
-
-            // 插值
-            double realVal = 0.0;
-            if (nextframe != nullptr &&
-                ((currFrame->type != 2) ||
-                 (currFrame->type == 2 && nextframe->type == 2))) // 存在下一帧则对关键帧进行插值
-            {
-                // val
-                realVal = (currFrame->value + (nextframe->value - currFrame->value) /
-                                                  (nextframe->time - currFrame->time) *
-                                                  (currRelTime - currFrame->time));
-            }
-            else
-            {
-                // 计算坐标
-                realVal = currFrame->value;
-            }
-
-            // 赋予
-            auto varPos = _mainfile->_metadata->_varList.find(varItm->label);
-            if (varPos != _mainfile->_metadata->_varList.end())
-            {
-                varPos->second = realVal;
+                double value;
+                const auto initial = playing.initialVariables.find(controlKey(variable->label));
+                const bool immediate = instantVariable(*_mainfile->_metadata, controlKey(variable->label));
+                if (!timelineValue(*variable, local, initial == playing.initialVariables.end() ? 0 : initial->second, immediate, value)) continue;
+                auto& output = controlVariables[controlKey(variable->label)];
+                if (difference) output += value * ratio;
+                else output += (value - output) * ratio;
             }
         }
     }
+    currTimeline.erase(std::remove_if(currTimeline.begin(), currTimeline.end(), [&](const PlayingTimeline& playing)
+    {
+        const auto* timeline = playing.timeline;
+        const bool looping = timeline->loopBegin >= 0 && timeline->loopEnd > timeline->loopBegin;
+        const bool finished = !looping && timeline->lastTime >= 0 && tick - playing.startTick >= timeline->lastTime;
+        if (finished && !(playing.flags & 2))
+            for (const auto* variable : timeline->variableList)
+            {
+                const auto key = controlKey(variable->label);
+                const auto initial = playing.initialVariables.find(key);
+                const bool immediate = instantVariable(*_mainfile->_metadata, key);
+                double value;
+                if (timelineValue(*variable, timeline->lastTime,
+                                  initial == playing.initialVariables.end() ? 0 : initial->second, immediate, value))
+                    baseVariables[key] += (value - baseVariables[key]) * playing.blend.value(tick);
+            }
+        return finished || (playing.stopWhenBlended && playing.blend.done(tick));
+    }), currTimeline.end());
 }
+
+void emoteengine::samplePhysics(float tick, const emoteRender& root, emotelimit lim)
+{
+    if (physics.empty() || !_mainmotion) return;
+    physics.beginAnchors();
+    samplingPhysics = true;
+    struct Restore { bool& flag; ~Restore() { flag = false; } } restore{samplingPhysics};
+    std::vector<emoteRender> chain{root};
+    emotemotionref sample(_mainmotion, this);
+    sample.progress(tick, chain, lim);
+}
+
+void emoteengine::recordPhysicsAnchor(const std::string& name, const std::vector<emoteRender>& chain)
+{
+    if (chain.empty() || !physics.needsAnchor(name)) return;
+    float x, y;
+    // Shape/point is centered at UV (.5, .5); use the same inherited placement
+    // and Bezier evaluation as visible geometry, before camera/projection/affine.
+    evaluateSurfaceChain(chain, 0.5f, 0.5f, x, y);
+    physics.setAnchor(name, Vector3(x, -y));
+}
+
+void emoteengine::updatePhysics(float frames)
+{
+    physics.update(frames, [&](const std::string& name, double value)
+    {
+        if (!name.empty() && std::isfinite(value)) controlVariables[controlKey(name)] = value;
+    });
+}
+
+bool emoteengine::controlsAnimating() const
+{
+    if (!variableTweens.empty()) return true;
+    for (const auto& playing : currTimeline)
+        if (!playing.blend.done(controlTick)) return true;
+    return false;
+}
+
+void emoteengine::skipControls()
+{
+    for (auto& tween : variableTweens) tween.second.duration = 0;
+    for (auto& playing : currTimeline) playing.blend.duration = 0;
+    updateTimelineControl(controlTick);
+}
+
 emoteVar* emoteengine::findVarByName(const std::string& name)
 {
     for (auto obj : _mainfile->_objects)
@@ -1544,9 +1613,31 @@ emoteVar* emoteengine::findVarByName(const std::string& name)
     }
     return nullptr;
 }
-void emoteengine::setVariable(const std::string& name, tjs_real value)
+void emoteengine::setVariable(const std::string& name, tjs_real value, double time, double easing)
 {
-    if (integratedAnimation()) { setAnimationVariable(name, value, 0, 0); return; }
+    if (integratedAnimation()) { setAnimationVariable(name, value, time, easing); return; }
+    if (!std::isfinite(value)) return;
+    const auto key = controlKey(name);
+    if (_mainfile && !_mainfile->isMotion)
+    {
+        for (const auto* selector : _mainfile->_metadata->_selectorControl)
+        {
+            if (controlKey(selector->lable) != key) continue;
+            const int index = (int)value;
+            if (index >= 0 && index < (int)selector->selectItem.size())
+                for (size_t i = 0; i < selector->selectItem.size(); ++i)
+                {
+                    const auto& item = selector->selectItem[i];
+                    setVariable(item.label, i == index ? item.onValue : item.offValue, time, easing);
+                }
+            return;
+        }
+        const float current = baseVariables.count(key) ? baseVariables[key] : 0;
+        if (time > 0) variableTweens[key].set(current, value, controlTick, time, easing);
+        else { variableTweens.erase(key); baseVariables[key] = value; controlVariables[key] = value; }
+        _varCache[name] = value;
+        return;
+    }
     // 所有file
     std::vector<emotefile*> allFiles = _attach;
     allFiles.push_back(_mainfile);
@@ -1613,6 +1704,10 @@ void emoteengine::setVariable(const std::string& name, tjs_real value)
 tjs_real emoteengine::getVariable(const std::string& name)
 {
     if (integratedAnimation()) { ensureAnimationState(); return _animation.variable(name); }
+    const auto base = baseVariables.find(controlKey(name));
+    if (base != baseVariables.end()) return base->second;
+    float controlled;
+    if (getControlVariable(name, controlled)) return controlled;
     size_t pos = name.find('/');
     if (_mainfile->isMotion) // motion类
     {
@@ -1677,9 +1772,6 @@ tjs_real emoteengine::getVariable(const std::string& name)
         return ret;
     }
     return 0.0;
-}
-void emoteengine::updatePhysics(float tick)
-{
 }
 
 } // namespace emoteplayer

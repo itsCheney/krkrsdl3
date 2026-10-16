@@ -892,6 +892,22 @@ tTJSVariant EmotePlayer::serialize()
     setprop(dict, currAngle);
     setprop(dict, currZx);
     setprop(dict, currZy);
+    // State is also transferred from an empty player when changing storage.
+    // Playback belongs to play()/stop(), not to the pose being transferred.
+    auto controlState = emtEngine.serializeControls();
+    setprop(dict, controlState);
+    auto* transitionArray = TJSCreateArrayObject();
+    int transitionIndex = 0;
+    for (const auto* tween : {&coordX, &coordY, &rotation, &scale, &scaleY,
+                              &forces[0][0], &forces[0][1], &forces[1][0], &forces[1][1], &forces[2][0], &forces[2][1]})
+        for (double field : {tween->from, tween->to, tween->start, tween->duration, tween->easing})
+        {
+            tTJSVariant value(field);
+            transitionArray->PropSetByNum(TJS_MEMBERENSURE, transitionIndex++, &value, transitionArray);
+        }
+    tTJSVariant transitions(transitionArray, transitionArray);
+    transitionArray->Release();
+    setprop(dict, transitions);
 
     if (emtEngine.integratedAnimation())
     {
@@ -922,6 +938,36 @@ void EmotePlayer::unserialize(tTJSVariant data)
     getprop_t(dict, currAngle, static_cast<tjs_real>);
     getprop_t(dict, currZx, static_cast<tjs_real>);
     getprop_t(dict, currZy, static_cast<tjs_real>);
+    // Ignore legacy playback fields too: an empty snapshot contains tick -1
+    // and playing=false, which would disable progress on a freshly loaded PSB.
+    tTJSVariant controlState;
+    getprop(dict, controlState);
+    emtEngine.unserializeControls(controlState);
+    coordX.set(currCoordx, currCoordx, emtEngine.controlTick);
+    coordY.set(currCoordy, currCoordy, emtEngine.controlTick);
+    rotation.set(currAngle, currAngle, emtEngine.controlTick);
+    scale.set(currZx, currZx, emtEngine.controlTick);
+    scaleY.set(currZy, currZy, emtEngine.controlTick);
+    tTJSVariant transitions;
+    getprop(dict, transitions);
+    auto* transitionArray = transitions.Type() == tvtObject ? transitions.AsObjectNoAddRef() : nullptr;
+    int transitionIndex = 0;
+    if (transitionArray)
+        for (auto* tween : {&coordX, &coordY, &rotation, &scale, &scaleY,
+                            &forces[0][0], &forces[0][1], &forces[1][0], &forces[1][1], &forces[2][0], &forces[2][1]})
+        {
+            double fields[5]; bool valid = true;
+            for (auto& field : fields)
+            {
+                tTJSVariant value;
+                if (TJS_FAILED(transitionArray->PropGetByNum(0, transitionIndex++, &value, transitionArray)) || value.Type() == tvtVoid)
+                { valid = false; break; }
+                field = (tjs_real)value;
+                if (!std::isfinite(field)) valid = false;
+            }
+            if (valid) *tween = {fields[0], fields[1], fields[2], std::max(0.0, fields[3]), fields[4]};
+        }
+    updateTransMat();
     if (emtEngine.integratedAnimation())
     {
         tTJSVariant state;
@@ -1027,12 +1073,131 @@ void EmotePlayer::play(tTJSString name, int flag)
         _allplaying = true;
         isSelfClear = false;
     }
+    _isStop = false;
+    emtEngine.resetControls();
+    coordX.set(currCoordx, currCoordx, 0); coordY.set(currCoordy, currCoordy, 0);
+    rotation.set(currAngle, currAngle, 0);
+    scale.set(currZx, currZx, 0); scaleY.set(currZy, currZy, 0);
+    for (auto& force : forces)
+        for (auto& axis : force) axis.set(axis.to, axis.to, 0);
     recordSlowEmoteOperation(false, started);
 }
+namespace
+{
+tTJSVariant ruleMember(const tTJSVariant& object, const char* name)
+{
+    if (object.Type() != tvtObject || !object.AsObjectNoAddRef()) return {};
+    auto* dispatch = object.AsObjectNoAddRef();
+    tTJSVariant result;
+    dispatch->PropGet(0, ttstr(name).c_str(), nullptr, &result, dispatch);
+    return result;
+}
+void ruleNumber(const tTJSVariant& object, const char* name, double& target)
+{
+    const auto value = ruleMember(object, name);
+    if (value.Type() != tvtVoid && std::isfinite((tjs_real)value)) target = (tjs_real)value;
+}
+void ruleString(const tTJSVariant& object, const char* name, std::string& target)
+{
+    const auto value = ruleMember(object, name);
+    if (value.Type() != tvtVoid)
+    {
+        target = ttstr(value).AsStdString();
+        target = target.substr(0, target.find('\0'));
+        target.append(1, '\0'); // the native PSB names include their terminator
+    }
+}
+void ruleVector(const tTJSVariant& object, Vector3& target)
+{
+    ruleNumber(object, "x", target.x); ruleNumber(object, "y", target.y); ruleNumber(object, "z", target.z);
+}
+tTJSVariant ruleItem(const tTJSVariant& array, int index)
+{
+    if (array.Type() != tvtObject || !array.AsObjectNoAddRef()) return {};
+    auto* dispatch = array.AsObjectNoAddRef();
+    tTJSVariant result;
+    dispatch->PropGetByNum(0, index, &result, dispatch);
+    return result;
+}
+int ruleCount(const tTJSVariant& array)
+{
+    const auto value = ruleMember(array, "count");
+    return value.Type() == tvtVoid ? 0 : std::clamp((int)(tjs_int)value, 0, 1024);
+}
+template<class Rule> void commonRule(const tTJSVariant& value, Rule& rule)
+{
+    ruleString(value, "baseLayer", rule.baseLayer); ruleString(value, "label", rule.label);
+    ruleString(value, "var_lr", rule.var_lr); ruleString(value, "var_ud", rule.var_ud);
+    const auto enabled = ruleMember(value, "enabled");
+    if (enabled.Type() != tvtVoid) rule.enabled = (tjs_int)enabled != 0;
+    ruleNumber(value, "gravity", rule.gravity);
+}
+}
+
 void EmotePlayer::initPhysics(tTJSVariant metadata)
 {
-    TVPConsoleLog("EmotePlayer::initPhysics TODO");
+    if (!emtEngine._mainfile || !emtEngine._mainfile->_metadata) return;
+    auto* defaults = emtEngine._mainfile->_metadata;
+    if (metadata.Type() != tvtObject)
+    {
+        emtEngine.physics.reset(defaults->_bustControl, defaults->_hairControl, defaults->_partsControl);
+        return;
+    }
+    std::vector<bustControl> bust;
+    std::vector<uniControl> hair, parts;
+    const auto bustList = ruleMember(metadata, "bustControl");
+    for (int i = 0; i < ruleCount(bustList); ++i)
+    {
+        bustControl rule;
+        const auto value = ruleItem(bustList, i);
+        commonRule(value, rule);
+        ruleNumber(value, "spring", rule.spring); ruleNumber(value, "friction", rule.friction);
+        ruleNumber(value, "scale_x", rule.scale_x); ruleNumber(value, "scale_y", rule.scale_y);
+        const auto param = ruleMember(value, "param");
+        ruleVector(ruleMember(param, "op"), rule.param.op);
+        ruleVector(ruleMember(param, "p"), rule.param.p);
+        ruleVector(ruleMember(param, "pv"), rule.param.pv);
+        ruleNumber(param, "ofs", rule.param.ofs);
+        bust.push_back(std::move(rule));
+    }
+    auto readChains = [&](const char* name, std::vector<uniControl>& output)
+    {
+        const auto array = ruleMember(metadata, name);
+        for (int i = 0; i < ruleCount(array); ++i)
+        {
+            uniControl rule;
+            const auto value = ruleItem(array, i);
+            commonRule(value, rule); ruleString(value, "var_lrm", rule.var_lrm);
+            ruleNumber(value, "b_rate", rule.b_rate); ruleNumber(value, "bend_spd", rule.bend_spd);
+            ruleNumber(value, "bend_vol", rule.bend_vol); ruleNumber(value, "friction_x", rule.friction_x);
+            ruleNumber(value, "friction_y", rule.friction_y); ruleNumber(value, "ud_eft", rule.ud_eft);
+            ruleNumber(value, "v_bound", rule.v_bound);
+            const auto param = ruleMember(value, "param");
+            ruleVector(ruleMember(param, "op"), rule.op);
+            ruleNumber(param, "ofs", rule.ofs); ruleNumber(param, "bendR", rule.bendR); ruleNumber(param, "bendS", rule.bendS);
+            const auto lengths = ruleMember(value, "length"), sx = ruleMember(value, "scale_x"), sy = ruleMember(value, "scale_y");
+            const auto bp = ruleMember(param, "bp"), p = ruleMember(param, "p"), pv = ruleMember(param, "pv");
+            const int count = std::min({ruleCount(lengths), ruleCount(sx), ruleCount(sy), ruleCount(bp), ruleCount(p), ruleCount(pv)});
+            for (int j = 0; j < count; ++j)
+            {
+                uniSegment segment;
+                segment.length = (tjs_real)ruleItem(lengths, j);
+                segment.scale_x = (tjs_real)ruleItem(sx, j); segment.scale_y = (tjs_real)ruleItem(sy, j);
+                ruleVector(ruleItem(bp, j), segment.bp); ruleVector(ruleItem(p, j), segment.p); ruleVector(ruleItem(pv, j), segment.pv);
+                rule.segments.push_back(segment);
+            }
+            output.push_back(std::move(rule));
+        }
+    };
+    readChains("hairControl", hair); readChains("partsControl", parts);
+    std::vector<bustControl*> bustRefs;
+    std::vector<uniControl*> hairRefs, partRefs;
+    for (auto& rule : bust) bustRefs.push_back(&rule);
+    for (auto& rule : hair) hairRefs.push_back(&rule);
+    for (auto& rule : parts) partRefs.push_back(&rule);
+    emtEngine.physics.reset(bustRefs, hairRefs, partRefs);
 }
+
 void EmotePlayer::clear(iTJSDispatch2* layer, tjs_uint32 neutralColor)
 {
     auto* self = ncbInstanceAdaptor<SeparateLayerAdaptor>::GetNativeInstance(layer);
@@ -1064,24 +1229,67 @@ void EmotePlayer::clear(iTJSDispatch2* layer, tjs_uint32 neutralColor)
         }
     }
 }
+bool EmotePlayer::get_animating()
+{
+    const double tick = emtEngine.controlTick;
+    if (_playing || !coordX.done(tick) || !coordY.done(tick) || !rotation.done(tick) || !scale.done(tick) || !scaleY.done(tick)) return true;
+    if (emtEngine.controlsAnimating()) return true;
+    for (const auto& force : forces)
+        if (!force[0].done(tick) || !force[1].done(tick)) return true;
+    for (const auto& playing : emtEngine.currTimeline)
+        if (!(playing.flags & 2) && playing.timeline->lastTime >= 0) return true;
+    return false;
+}
 void EmotePlayer::progress(tjs_real mstime)
 {
-    if (_isStop)
+    if (_isStop || !std::isfinite(mstime) || mstime < 0 || !std::isfinite(speedRatio) || speedRatio <= 0)
         return;
     const Uint64 profileStarted = SDL_GetTicksNS();
-    if (emtEngine._mainfile != nullptr && emtEngine._mainmotion != nullptr && clockPassed > -1.0 &&
-        (emtEngine.integratedAnimation() || (_limitArea.width != _limitArea.originX && _limitArea.height != _limitArea.originY)))
+    if (emtEngine._mainfile != nullptr && emtEngine._mainmotion != nullptr && clockPassed > -1.0)
     {
+        const double frames = mstime / speedRatio;
+        emtEngine.controlTick += frames;
+        currCoordx = coordX.value(emtEngine.controlTick);
+        currCoordy = coordY.value(emtEngine.controlTick);
+        currAngle = rotation.value(emtEngine.controlTick);
+        currZx = scale.value(emtEngine.controlTick);
+        currZy = scaleY.value(emtEngine.controlTick);
+        Vector3* force[] = {&emtEngine.physics.bustForce, &emtEngine.physics.hairForce, &emtEngine.physics.partsForce};
+        for (int i = 0; i < 3; ++i)
+            *force[i] = Vector3(forces[i][0].value(emtEngine.controlTick), forces[i][1].value(emtEngine.controlTick));
         if (_playing && !emtEngine._animationPaused)
-            clockPassed += emtEngine.integratedAnimation() ? animation::millisecondsToFrames(mstime, speedRatio) : mstime / speedRatio;
+            clockPassed += emtEngine.integratedAnimation() ? animation::millisecondsToFrames(mstime, speedRatio) : frames;
         // condition
         if (emtEngine.integratedAnimation())
             emtEngine.advanceAnimation(mstime, speedRatio);
-        else if (emtEngine._mainfile->_metadata->_varList.size() > 0)
+        else if (!isMotion)
         {
             // 更新控制参数(通过引擎调用)
-            emtEngine.updateEyeControl(clockPassed, true);
-            emtEngine.updateTimelineControl(clockPassed, true);
+            emtEngine.updateTimelineControl(emtEngine.controlTick, true);
+            emtEngine.updateEyeControl(emtEngine.controlTick, true);
+        }
+        // Physics samples model anchors before projection and the optional draw
+        // affine. Sampling creates no textures or meshes and never advances time.
+        // It drives the legacy control variables; the integrated animation core
+        // does not read them.
+        if (!emtEngine.integratedAnimation())
+        {
+            emoteRender root;
+            root.type = 3;
+            root.currCoordx = currCoordx;
+            root.currCoordy = currCoordy;
+            root.currAngle = currAngle;
+            // Physics is authored in unscaled model units. Camera zoom must not
+            // change spring amplitudes; player placement still contributes inertia.
+            const double modelScale = emtEngine._mainfile->_metadata->scale;
+            root.currZx = root.currZy = std::isfinite(modelScale) && modelScale > 0 ? 1 / modelScale : 1;
+            emtEngine.physics.rotation = glm::radians(currAngle);
+            emotelimit physicsLimit = _limitArea;
+            if (physicsLimit.width <= 0) physicsLimit.width = emtEngine._mainfile->_screenSize.width;
+            if (physicsLimit.height <= 0) physicsLimit.height = emtEngine._mainfile->_screenSize.height;
+            const float tick = emtEngine._mainfile->_metadata->_varList.empty() ? clockPassed : 0;
+            emtEngine.samplePhysics(tick, root, physicsLimit);
+            emtEngine.updatePhysics(frames);
         }
         // 是否结束 —— 结束判定与 variableList 参数控制无关：
         // 若仅在 varList 为空分支判定，带眨眼/口型/时间线控制的立绘
@@ -1293,21 +1501,26 @@ void EmotePlayer::assign(iTJSDispatch2* anotherAdaptor)
 {
     TVPConsoleLog("EmotePlayer::assign TODO");
 }
-void EmotePlayer::setCoord(tjs_real x, tjs_real y)
+void EmotePlayer::setCoord(tjs_real x, tjs_real y, tjs_real time, tjs_real easing)
 {
-    currCoordx = x;
-    currCoordy = y;
+    coordX.set(currCoordx, x, emtEngine.controlTick, time, easing);
+    coordY.set(currCoordy, y, emtEngine.controlTick, time, easing);
+    if (time <= 0) { currCoordx = x; currCoordy = y; }
     updateTransMat();
 }
-void EmotePlayer::setScale(tjs_real scale)
+void EmotePlayer::setScale(tjs_real value, tjs_real time, tjs_real easing)
 {
-    currZx = scale;
-    currZy = scale;
+    scale.set(currZx, value, emtEngine.controlTick, time, easing);
+    scaleY.set(currZy, value, emtEngine.controlTick, time, easing);
+    if (time <= 0) currZx = currZy = value;
     updateTransMat();
 }
-void EmotePlayer::setRotate(tjs_real rotate)
+void EmotePlayer::setRotate(tjs_real rotate, tjs_real time, tjs_real easing)
 {
-    currAngle = rotate;
+    // Script API angles are radians; the shared mesh transform uses degrees.
+    rotate = glm::degrees(rotate);
+    rotation.set(currAngle, rotate, emtEngine.controlTick, time, easing);
+    if (time <= 0) currAngle = rotate;
     updateTransMat();
 }
 void EmotePlayer::setColor(tjs_uint32 color)
@@ -1320,8 +1533,7 @@ void EmotePlayer::setVariable(tTJSString name, tjs_real value, tjs_real time, tj
     {
         std::string tmpName = name.AsStdString();
         tmpName.append(1, '\0'); // 终有一天，我会把这sb字符串给优化掉
-        if (emtEngine.integratedAnimation()) emtEngine.setAnimationVariable(tmpName, value, time, easing);
-        else emtEngine.setVariable(tmpName, value);
+        emtEngine.setVariable(tmpName, value, time, easing);
     }
 }
 tjs_error EmotePlayer::cb_setVariable(tTJSVariant*, tjs_int count, tTJSVariant** args, EmotePlayer* self)
@@ -1350,9 +1562,13 @@ tjs_real EmotePlayer::getVariable(tTJSString name)
     }
     return 0.0;
 }
-void EmotePlayer::setOuterForce(tTJSString name, tjs_real ofx, tjs_real ofy)
+void EmotePlayer::setOuterForce(tTJSString name, tjs_real ofx, tjs_real ofy, tjs_real time, tjs_real easing)
 {
-    TVPConsoleLog("EmotePlayer::setOuterForce TODO");
+    const auto key = name.AsStdString();
+    const int index = key == "bust" ? 0 : key == "hair" ? 1 : key == "parts" ? 2 : -1;
+    if (index < 0 || !std::isfinite(ofx) || !std::isfinite(ofy)) return;
+    forces[index][0].set(forces[index][0].value(emtEngine.controlTick), ofx, emtEngine.controlTick, time, easing);
+    forces[index][1].set(forces[index][1].value(emtEngine.controlTick), ofy, emtEngine.controlTick, time, easing);
 }
 void EmotePlayer::setDrawAffineTranslateMatrix(
     tjs_real a, tjs_real b, tjs_real c, tjs_real d, tjs_int tx, tjs_int ty)
@@ -1372,11 +1588,11 @@ void EmotePlayer::setCameraOffset(tjs_int w, tjs_int h)
 void EmotePlayer::startWind(
     tjs_real start, tjs_real goal, tjs_real speed, tjs_real powMin, tjs_real powMax)
 {
-    TVPConsoleLog("EmotePlayer::startWind TODO");
+    emtEngine.physics.startWind(start, goal, speed, powMin, powMax);
 }
 void EmotePlayer::stopWind()
 {
-    TVPConsoleLog("EmotePlayer::stopWind TODO");
+    emtEngine.physics.stopWind();
 }
 tjs_error EmotePlayer::cb_contains(
     tTJSVariant* result, tjs_int numparams, tTJSVariant** param, EmotePlayer* objthis)
@@ -1396,7 +1612,13 @@ tjs_error EmotePlayer::cb_hitTest(
 }
 void EmotePlayer::skip()
 {
-    TVPConsoleLog("EmotePlayer::skip TODO");
+    const double tick = emtEngine.controlTick;
+    coordX.duration = coordY.duration = rotation.duration = scale.duration = scaleY.duration = 0;
+    currCoordx = coordX.value(tick); currCoordy = coordY.value(tick);
+    currAngle = rotation.value(tick); currZx = scale.value(tick); currZy = scaleY.value(tick);
+    for (auto& force : forces) force[0].duration = force[1].duration = 0;
+    emtEngine.skipControls();
+    updateTransMat();
 }
 void EmotePlayer::skipToSync()
 {
@@ -1422,8 +1644,8 @@ void EmotePlayer::playTimeline(tTJSString name, tjs_int flags)
 {
     if (emtEngine._mainfile != nullptr)
     {
-        emtEngine.startTimeline(emtEngine.integratedAnimation() ? clockPassed : -10000.0f,
-                                name.AsStdString(), true, flags);
+        emtEngine.startTimeline(emtEngine.integratedAnimation() ? clockPassed : emtEngine.controlTick,
+                                name.AsStdString(), flags);
     }
 }
 void EmotePlayer::stopTimeline(tTJSString name)
@@ -1457,7 +1679,7 @@ bool EmotePlayer::getLoopTimeline(tTJSString name)
         {
             if (strcmp(itm->label.c_str(), name.AsStdString().c_str()) == 0)
             {
-                return itm->lastTime < 0;
+                return itm->loopBegin >= 0 && itm->loopEnd > itm->loopBegin;
             }
         }
     }
@@ -1477,7 +1699,10 @@ tjs_real EmotePlayer::getTimelineTotalFrameCount(tTJSString name)
         {
             if (strcmp(itm->label.c_str(), name.AsStdString().c_str()) == 0)
             {
-                return itm->loopEnd - itm->loopBegin + 1;
+                double count = std::max(0, itm->lastTime + 1);
+                for (const auto* variable : itm->variableList)
+                    for (const auto* frame : variable->frameList) count = std::max(count, frame->time);
+                return count;
             }
         }
     }
@@ -1526,14 +1751,15 @@ tTJSVariant EmotePlayer::getDiffTimelineLabelList()
 void EmotePlayer::setTimelineBlendRatio(tTJSString name,
                                         tjs_real ratio,
                                         tjs_real time,
-                                        tjs_real easing)
+                                        tjs_real easing,
+                                        bool stopWhenBlendDone)
 {
     if (emtEngine.integratedAnimation())
     {
         emtEngine.ensureAnimationState(); std::string label(name.AsStdString().c_str()); label.append(1, '\0');
         emtEngine._animation.setBlend(label, ratio, time, easing); return;
     }
-    TVPConsoleLog("EmotePlayer::setTimelineBlendRatio TODO");
+    emtEngine.blendTimeline(name.AsStdString(), ratio, time, easing, stopWhenBlendDone);
 }
 void EmotePlayer::fadeInTimeline(tTJSString name, tjs_real time, tjs_real easing)
 {
@@ -1542,7 +1768,12 @@ void EmotePlayer::fadeInTimeline(tTJSString name, tjs_real time, tjs_real easing
         emtEngine.ensureAnimationState(); std::string label(name.AsStdString().c_str()); label.append(1, '\0');
         emtEngine._animation.fadeIn(label, time, easing); return;
     }
-    playTimeline(name);
+    if (!getTimelinePlaying(name))
+    {
+        playTimeline(name);
+        setTimelineBlendRatio(name, 0);
+    }
+    setTimelineBlendRatio(name, 1, time, easing);
 }
 void EmotePlayer::fadeOutTimeline(tTJSString name, tjs_real time, tjs_real easing)
 {
@@ -1551,7 +1782,7 @@ void EmotePlayer::fadeOutTimeline(tTJSString name, tjs_real time, tjs_real easin
         emtEngine.ensureAnimationState(); std::string label(name.AsStdString().c_str()); label.append(1, '\0');
         emtEngine._animation.fadeOut(label, time, easing); return;
     }
-    stopTimeline(name);
+    setTimelineBlendRatio(name, 0, time, easing, true);
 }
 tTJSVariant EmotePlayer::getPlayingTimelineInfoList()
 {
@@ -1576,11 +1807,15 @@ tTJSVariant EmotePlayer::getPlayingTimelineInfoList()
     }
     if (emtEngine._mainfile != nullptr)
     {
-        for (auto playingTimeline : emtEngine.currTimeline)
+        for (const auto& playingTimeline : emtEngine.currTimeline)
         {
             iTJSDispatch2* obj = TJSCreateDictionaryObject();
-            tTJSVariant val = tTJSVariant(playingTimeline->label);
+            tTJSVariant val = tTJSVariant(playingTimeline.timeline->label);
             obj->PropSet(TJS_MEMBERENSURE, TJS_N("label"), NULL, &val, obj);
+            val = playingTimeline.flags;
+            obj->PropSet(TJS_MEMBERENSURE, TJS_N("flags"), NULL, &val, obj);
+            val = playingTimeline.blend.value(emtEngine.controlTick);
+            obj->PropSet(TJS_MEMBERENSURE, TJS_N("blendRatio"), NULL, &val, obj);
             tTJSVariant objItm(obj, obj);
             obj->Release();
             tTJSVariant tmp(objItm);
@@ -1646,7 +1881,10 @@ tTJSVariant EmotePlayer::getLayerMotion(tTJSString name)
 void EmotePlayer::setFlip(bool isFlip)
 {
     if (isFlip)
+    {
         currZy = -currZy;
+        scaleY.set(currZy, currZy, emtEngine.controlTick);
+    }
 }
 void EmotePlayer::setSlant(tjs_real x, tjs_real y)
 {
@@ -1656,6 +1894,8 @@ void EmotePlayer::setZoom(tjs_real x, tjs_real y)
 {
     currZx = x;
     currZy = y;
+    scale.set(x, x, emtEngine.controlTick);
+    scaleY.set(y, y, emtEngine.controlTick);
     updateTransMat();
 }
 void EmotePlayer::updateTransMat()
@@ -1718,6 +1958,149 @@ void EmotePlayer::ResetDrawArea(tjs_int width, tjs_int height)
             _maskTarget = renderer->CreateTarget(_width, _height);
         }
     }
+}
+
+// Control snapshots are TJS values, so they live with the TJS-facing player
+// rather than in the TJS-free runner.
+namespace
+{
+tTJSVariant stateArray()
+{
+    auto* array = TJSCreateArrayObject();
+    tTJSVariant value(array, array); array->Release(); return value;
+}
+void stateAppend(tTJSVariant& array, const tTJSVariant& value)
+{
+    auto* object = array.AsObjectNoAddRef();
+    tTJSVariant item = value;
+    tTJSVariant* args[] = {&item};
+    object->FuncCall(0, TJS_N("add"), nullptr, nullptr, 1, args, object);
+}
+tTJSVariant stateItem(const tTJSVariant& array, int index)
+{
+    tTJSVariant value;
+    if (array.Type() == tvtObject && array.AsObjectNoAddRef())
+        array.AsObjectNoAddRef()->PropGetByNum(0, index, &value, array.AsObjectNoAddRef());
+    return value;
+}
+int stateCount(const tTJSVariant& array)
+{
+    tTJSVariant count;
+    if (array.Type() != tvtObject || !array.AsObjectNoAddRef() ||
+        TJS_FAILED(array.AsObjectNoAddRef()->PropGet(0, TJS_N("count"), nullptr, &count, array.AsObjectNoAddRef())) ||
+        count.Type() == tvtVoid) return 0;
+    return std::clamp(int((tjs_int)count), 0, 4096);
+}
+tTJSVariant saveTween(const EmoteTween& tween)
+{
+    auto value = stateArray();
+    for (double field : {tween.from, tween.to, tween.start, tween.duration, tween.easing})
+        stateAppend(value, tTJSVariant(field));
+    return value;
+}
+void loadTween(const tTJSVariant& value, EmoteTween& tween)
+{
+    if (stateCount(value) != 5) return;
+    double fields[5];
+    for (int i = 0; i < 5; ++i)
+    {
+        fields[i] = (tjs_real)stateItem(value, i);
+        if (!std::isfinite(fields[i])) return;
+    }
+    tween = {fields[0], fields[1], fields[2], std::max(0.0, fields[3]), fields[4]};
+}
+tTJSVariant saveVariables(const std::map<std::string, float>& variables)
+{
+    auto array = stateArray();
+    for (const auto& entry : variables)
+    {
+        auto pair = stateArray();
+        stateAppend(pair, tTJSVariant(ttstr(entry.first.c_str())));
+        stateAppend(pair, tTJSVariant(entry.second));
+        stateAppend(array, pair);
+    }
+    return array;
+}
+void loadVariables(const tTJSVariant& array, std::map<std::string, float>& variables)
+{
+    for (int i = 0; i < stateCount(array); ++i)
+    {
+        const auto pair = stateItem(array, i);
+        if (stateCount(pair) != 2) continue;
+        const auto key = ttstr(stateItem(pair, 0)).AsStdString();
+        const double number = (tjs_real)stateItem(pair, 1);
+        if (std::isfinite(number)) variables[key] = number;
+    }
+}
+}
+
+tTJSVariant emoteengine::serializeControls() const
+{
+    auto state = stateArray();
+    stateAppend(state, tTJSVariant(controlTick));
+    stateAppend(state, saveVariables(baseVariables));
+    auto tweens = stateArray();
+    for (const auto& entry : variableTweens)
+    {
+        auto pair = stateArray();
+        stateAppend(pair, tTJSVariant(ttstr(entry.first.c_str())));
+        stateAppend(pair, saveTween(entry.second)); stateAppend(tweens, pair);
+    }
+    stateAppend(state, tweens);
+    auto timelines = stateArray();
+    for (const auto& playing : currTimeline)
+    {
+        auto item = stateArray();
+        stateAppend(item, tTJSVariant(ttstr(playing.timeline->label.c_str())));
+        stateAppend(item, tTJSVariant(playing.flags));
+        stateAppend(item, tTJSVariant(playing.startTick));
+        stateAppend(item, saveTween(playing.blend));
+        stateAppend(item, tTJSVariant(playing.stopWhenBlended));
+        stateAppend(item, saveVariables(playing.initialVariables));
+        stateAppend(timelines, item);
+    }
+    stateAppend(state, timelines);
+    return state;
+}
+
+void emoteengine::unserializeControls(const tTJSVariant& state)
+{
+    if (stateCount(state) != 4) return;
+    const double tick = (tjs_real)stateItem(state, 0);
+    if (!std::isfinite(tick) || tick < 0) return;
+    // Keep the physics rules supplied to initPhysics(), including script edits.
+    // Restoring a pose must not replace them with the cached file's templates.
+    currTimeline.clear(); variableTweens.clear(); _varCache.clear(); baseVariables.clear();
+    if (_mainfile && _mainfile->_metadata)
+        for (const auto& entry : _mainfile->_metadata->_varList)
+            baseVariables[entry.first.substr(0, entry.first.find('\0'))] = entry.second;
+    controlTick = tick;
+    loadVariables(stateItem(state, 1), baseVariables);
+    controlVariables = baseVariables;
+    const auto tweens = stateItem(state, 2);
+    for (int i = 0; i < stateCount(tweens); ++i)
+    {
+        const auto pair = stateItem(tweens, i);
+        if (stateCount(pair) != 2) continue;
+        const auto key = ttstr(stateItem(pair, 0)).AsStdString();
+        loadTween(stateItem(pair, 1), variableTweens[key]);
+        _varCache[key + std::string(1, '\0')] = variableTweens[key].to;
+    }
+    const auto timelines = stateItem(state, 3);
+    for (int i = 0; i < stateCount(timelines); ++i)
+    {
+        const auto item = stateItem(timelines, i);
+        if (stateCount(item) != 6) continue;
+        const auto label = ttstr(stateItem(item, 0)).AsStdString();
+        const size_t before = currTimeline.size();
+        startTimeline((tjs_real)stateItem(item, 2), label, (tjs_int)stateItem(item, 1));
+        if (currTimeline.size() == before) continue;
+        auto& playing = currTimeline.back();
+        loadTween(stateItem(item, 3), playing.blend);
+        playing.stopWhenBlended = (tjs_int)stateItem(item, 4) != 0;
+        loadVariables(stateItem(item, 5), playing.initialVariables);
+    }
+    updateTimelineControl(controlTick);
 }
 
 } // namespace emoteplayer

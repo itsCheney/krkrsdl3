@@ -179,8 +179,8 @@ static ColorRGBA BlendPixels(
             break;
         case 3:
             outR = sr * sa + dr * (1 - sa);
-            outG = sg * sa + dg * (1 - sg);
-            outB = sb * sa + db * (1 - sb);
+            outG = sg * sa + dg * (1 - sa);
+            outB = sb * sa + db * (1 - sa);
             outA = std::max(sa, da);
             break;
         case 6:

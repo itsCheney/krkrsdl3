@@ -10,6 +10,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
+#include "emotephysics.h"
 #include "psbfile/PSBData.h"
 #include "TVPCompositor.h"
 
@@ -24,7 +25,7 @@ struct emoteVar // 变量
     std::string id;
     float transToTick(float currVal)
     {
-        return division * ((currVal - rangeBegin) / (rangeEnd - rangeBegin));
+        return emoteParameterTick(currVal, rangeBegin, rangeEnd, division);
     }
 };
 
@@ -211,94 +212,6 @@ public:
     int32_t lastTime = -1;
     int32_t loopBegin = -1;
     int32_t loopEnd = -1;
-};
-
-struct Vector3
-{
-    double x, y, z;
-
-    Vector3() : x(0), y(0), z(0) {}
-    Vector3(double x, double y, double z) : x(x), y(y), z(z) {}
-
-    Vector3 operator+(const Vector3& other) const
-    {
-        return Vector3(x + other.x, y + other.y, z + other.z);
-    }
-    Vector3 operator-(const Vector3& other) const
-    {
-        return Vector3(x - other.x, y - other.y, z - other.z);
-    }
-    Vector3 operator*(double scalar) const { return Vector3(x * scalar, y * scalar, z * scalar); }
-    Vector3 operator/(double scalar) const { return Vector3(x / scalar, y / scalar, z / scalar); }
-
-    double dot(const Vector3& other) const { return x * other.x + y * other.y + z * other.z; }
-    double magnitude() const { return std::sqrt(x * x + y * y + z * z); }
-    Vector3 normalized() const
-    {
-        double m = magnitude();
-        return m > 0 ? *this / m : *this;
-    }
-
-    static Vector3 zero() { return Vector3(0, 0, 0); }
-};
-class bustControl
-{
-public:
-    bustControl(emotefile* filePtr, uint32_t startOffset);
-    ~bustControl();
-    struct BustState
-    {
-        Vector3 op; // 静止位置 (op)
-        Vector3 p;  // 当前位置 (p)
-        Vector3 pv; // 当前速度 (pv)
-        double ofs; // 偏移量 (ofs)
-    };
-
-    BustState param;
-    double spring;      // 弹簧系数
-    double friction;    // 摩擦力
-    double gravity;     // 重力
-    double scale_x;     // X轴缩放
-    double scale_y;     // Y轴缩放
-    std::string var_lr; // 左右变量名
-    std::string var_ud; // 上下变量名
-};
-struct uniSegment
-{
-public:
-    Vector3 bp;
-    Vector3 p;
-    Vector3 pv;
-    double scale_x;
-    double scale_y;
-    double length;
-};
-class uniControl
-{
-public:
-    uniControl(emotefile* filePtr, uint32_t startOffset);
-    ~uniControl();
-
-    std::vector<uniSegment> segments;
-
-    double b_rate;
-    double gravity;
-    double friction_x;
-    double friction_y;
-    double bend_spd;
-    double bend_vol;
-
-    double bendR;
-    double bendS;
-    double ofs;
-    Vector3 op;
-
-    double ud_eft;
-    double v_bound;
-
-    std::string var_lr;
-    std::string var_lrm;
-    std::string var_ud;
 };
 
 struct emoteattrcompRemoveItem

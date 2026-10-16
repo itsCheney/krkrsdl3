@@ -203,16 +203,38 @@ namespace emoteplayer
         // 控制系列
         emotemotion* findmotionByName(const std::string& name);
         void updateEyeControl(float tick, bool isMain = false);
-        std::vector<emotetimeline*> currTimeline;
-        float currStartTick = -1.0f;
-        void startTimeline(float tick, const std::string& name, bool isMain = false, int flags = 0);
+        void updateIntegratedEyeControl(float tick);
+        struct PlayingTimeline
+        {
+            emotetimeline* timeline = nullptr;
+            double startTick = 0;
+            int flags = 0;
+            std::map<std::string, float> initialVariables;
+            EmoteTween blend{1, 1};
+            bool stopWhenBlended = false;
+        };
+        std::vector<PlayingTimeline> currTimeline;
+        double controlTick = 0;
+        void resetControls();
+        void startTimeline(float tick, const std::string& name, int flags = 0);
         void stopTimeline(const std::string& name, bool isMain = false);
         bool checkTimline(const std::string& name, bool& result, bool isMain = false);
         void updateTimelineControl(float tick, bool isMain = false);
+        void blendTimeline(const std::string& name, double ratio, double time, double easing,
+                           bool stopWhenDone = false);
         emoteVar* findVarByName(const std::string& name);
-        void setVariable(const std::string& name, tjs_real value);
+        void setVariable(const std::string& name, tjs_real value, double time = 0, double easing = 0);
         tjs_real getVariable(const std::string& name);
-        void updatePhysics(float tick);
+        bool getControlVariable(const std::string& name, float& value) const;
+        EmotePhysics physics;
+        bool samplingPhysics = false;
+        void samplePhysics(float tick, const emoteRender& root, emotelimit lim);
+        void recordPhysicsAnchor(const std::string& name, const std::vector<emoteRender>& chain);
+        void updatePhysics(float frames);
+        bool controlsAnimating() const;
+        void skipControls();
+        tTJSVariant serializeControls() const;
+        void unserializeControls(const tTJSVariant& state);
 
         bool integratedAnimation() const { return _integratedAnimation; }
         void inheritAnimationMode(bool value) { _integratedAnimation = value; resetAnimationState(); }
@@ -254,6 +276,11 @@ namespace emoteplayer
         std::shared_ptr<emotemotionref> _mainMotionRef;
         // 三重签名缓存变量数据
         std::map<std::string, tjs_real> _varCache;
+    private:
+        std::map<std::string, float> baseVariables, controlVariables;
+        std::map<std::string, EmoteTween> variableTweens;
+        std::vector<eyeControl> eyes;
+        std::default_random_engine random;
     };
     // A snapshot of one draw: queries never rebuild geometry or advance animation.
     struct EmoteHitFrame
