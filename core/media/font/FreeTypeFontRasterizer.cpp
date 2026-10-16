@@ -15,10 +15,19 @@ static bool isDefaultIgnorableUnicode(tjs_wchar ch)
            (ch >= 0xFE00 && ch <= 0xFE0F) || ch == 0xFEFF;
 }
 
-void FreeTypeFontRasterizer::ApplyFaceOptions(tFreeTypeFace* face)
+void FreeTypeFontRasterizer::ApplyFaceOptions(Fallback& fallback)
 {
-    face->SetHeight(CurrentFont.Height < 0 ? -CurrentFont.Height : CurrentFont.Height);
-    const tjs_uint32 styles[] = {TVP_TF_ITALIC, TVP_TF_BOLD, TVP_TF_UNDERLINE, TVP_TF_STRIKEOUT};
+    tFreeTypeFace* face = fallback.Face.get();
+    tjs_int height = CurrentFont.Height < 0 ? -CurrentFont.Height : CurrentFont.Height;
+    // FT_Set_Pixel_Sizes is not free; only resize when the size changed.
+    if (fallback.Height != height)
+    {
+        face->SetHeight(height);
+        fallback.Height = height;
+    }
+    // Underline and strikeout are left to Face so the line matches the rest
+    // of the run (GetBitmap, GetGlyphDrawRect).
+    const tjs_uint32 styles[] = {TVP_TF_ITALIC, TVP_TF_BOLD};
     for (tjs_uint32 style : styles)
     {
         if (CurrentFont.Flags & style)
@@ -38,57 +47,89 @@ void FreeTypeFontRasterizer::ApplyFaceOptions(tFreeTypeFace* face)
 
 void FreeTypeFontRasterizer::ListFallbacks()
 {
-    if (FallbacksListed)
+    // Relist only when fonts were registered since the last listing (addFont).
+    if (TVPFontNames.GetCount() == ListedFontCount)
         return;
-    FallbacksListed = true;
+    ListedFontCount = TVPFontNames.GetCount();
     std::vector<ttstr> names;
     names.push_back(TVPGetDefaultFontName());
-    TVPGetAllFontList(names);
+    // TVPFontNames iterates newest first; walk back for registration order.
+    for (auto it = TVPFontNames.GetLast(); !it.IsNull(); --it)
+        names.push_back(it.GetKey());
+    bool added = false;
     for (const ttstr& name : names)
     {
-        if (name.IsEmpty())
+        const TVPFontNamePathInfo* info = name.IsEmpty() ? nullptr : TVPFindFont(name);
+        if (!info)
             continue;
         bool known = false;
         for (const Fallback& fallback : Fallbacks)
-            known = known || fallback.Name == name;
+            known = known || (fallback.Path == info->Path && fallback.Index == info->Index);
         if (!known)
         {
             Fallbacks.emplace_back();
             Fallbacks.back().Name = name;
+            Fallbacks.back().Path = info->Path;
+            Fallbacks.back().Index = info->Index;
+            added = true;
         }
+    }
+    // New faces go last, so earlier hits stay valid; only misses may change.
+    if (added)
+    {
+        for (auto it = FallbackForChar.begin(); it != FallbackForChar.end();)
+            it = it->second < 0 ? FallbackForChar.erase(it) : std::next(it);
     }
 }
 
 void FreeTypeFontRasterizer::ClearFallbacks()
 {
     Fallbacks.clear();
-    FallbacksListed = false;
+    FallbackForChar.clear();
+    ListedFontCount = 0;
 }
 
-bool FreeTypeFontRasterizer::GetFallback(size_t i, tFreeTypeFace*& face)
+tFreeTypeFace* FreeTypeFontRasterizer::FindFallback(tjs_wchar ch)
 {
     ListFallbacks();
-    face = nullptr;
-    if (i >= Fallbacks.size())
-        return false;
-    Fallback& fallback = Fallbacks[i];
-    if (fallback.Failed || (Face && fallback.Name == Face->GetFontName()))
-        return true;
-    if (!fallback.Face)
+    int found = -1;
+    auto cached = FallbackForChar.find(ch);
+    if (cached != FallbackForChar.end())
     {
-        try
-        {
-            fallback.Face.reset(new tFreeTypeFace(fallback.Name, 0));
-        }
-        catch (...)
-        {
-            fallback.Failed = true;
-            return true;
-        }
+        found = cached->second;
     }
-    face = fallback.Face.get();
-    ApplyFaceOptions(face);
-    return true;
+    else
+    {
+        // Face itself lacks ch; don't open a second copy of it.
+        const TVPFontNamePathInfo* current =
+            Face ? TVPFindFontOrDefault(Face->GetFontName()) : nullptr;
+        for (size_t i = 0; found < 0 && i < Fallbacks.size(); i++)
+        {
+            Fallback& fallback = Fallbacks[i];
+            if (fallback.Failed ||
+                (current && fallback.Path == current->Path && fallback.Index == current->Index))
+                continue;
+            if (!fallback.Face)
+            {
+                try
+                {
+                    fallback.Face.reset(new tFreeTypeFace(fallback.Name, 0));
+                }
+                catch (...)
+                {
+                    fallback.Failed = true;
+                    continue;
+                }
+            }
+            if (fallback.Face->HasGlyph(ch))
+                found = static_cast<int>(i);
+        }
+        FallbackForChar[ch] = found;
+    }
+    if (found < 0)
+        return nullptr;
+    ApplyFaceOptions(Fallbacks[found]);
+    return Fallbacks[found].Face.get();
 }
 
 FreeTypeFontRasterizer::FreeTypeFontRasterizer() : RefCount(0), Face(NULL), LastBitmap(NULL)
@@ -165,8 +206,6 @@ void FreeTypeFontRasterizer::ApplyFont(const tTVPFont& font)
                       TVP_FACE_OPTIONS_FILE);
     Face->SetOption(opt);
     Face->SetHeight(font.Height < 0 ? -font.Height : font.Height);
-    // Pick up fonts registered since the last listing (addFont).
-    FallbacksListed = false;
     LastBitmap = NULL;
 }
 //---------------------------------------------------------------------------
@@ -190,15 +229,12 @@ void FreeTypeFontRasterizer::GetTextExtent(tjs_wchar ch, tjs_int& w, tjs_int& h)
     // advances by its own width rather than an em square.
     if (!isUnicodeSpace(ch))
     {
-        tFreeTypeFace* fallback;
-        for (size_t i = 0; GetFallback(i, fallback); i++)
+        tFreeTypeFace* fallback = FindFallback(ch);
+        if (fallback && fallback->GetGlyphSizeFromCharcode(ch, metrics))
         {
-            if (fallback && fallback->GetGlyphSizeFromCharcode(ch, metrics))
-            {
-                w = metrics.CellIncX;
-                h = metrics.CellIncY;
-                return;
-            }
+            w = metrics.CellIncX;
+            h = metrics.CellIncY;
+            return;
         }
     }
     w = Face->GetHeight();
@@ -260,16 +296,16 @@ tTVPCharacterData* FreeTypeFontRasterizer::GetBitmap(const tTVPFontAndCharacterD
     tTVPCharacterData* data = Face->GetGlyphFromCharcode(font.Character);
     if (!data && !isUnicodeSpace(font.Character))
     {
-        tFreeTypeFace* fallback;
-        for (size_t i = 0; !data && GetFallback(i, fallback); i++)
-        {
-            if (!fallback)
-                continue;
+        tFreeTypeFace* fallback = FindFallback(font.Character);
+        if (fallback)
             data = fallback->GetGlyphFromCharcode(font.Character);
+        if (data)
+        {
             // Glyph origins are relative to their own face's ascent; put a
-            // fallback glyph on the requested face's baseline.
-            if (data)
-                data->OriginY += Face->GetAscent() - fallback->GetAscent();
+            // fallback glyph on the requested face's baseline, and draw the
+            // requested face's underline / strikeout on it.
+            data->OriginY += Face->GetAscent() - fallback->GetAscent();
+            Face->AddLinesToGlyph(data);
         }
     }
     if (data == NULL)
@@ -338,14 +374,12 @@ void FreeTypeFontRasterizer::GetGlyphDrawRect(std::vector<tjs_wchar> text, tTVPR
         bool result = Face->GetGlyphRectFromCharcode(rt, ch, ax, ay);
         if (result == false && !isUnicodeSpace(ch))
         {
-            tFreeTypeFace* fallback;
-            for (size_t f = 0; !result && GetFallback(f, fallback); f++)
+            tFreeTypeFace* fallback = FindFallback(ch);
+            if (fallback && fallback->GetGlyphRectFromCharcode(rt, ch, ax, ay))
             {
-                if (fallback && fallback->GetGlyphRectFromCharcode(rt, ch, ax, ay))
-                {
-                    rt.add_offsets(0, Face->GetAscent() - fallback->GetAscent());
-                    result = true;
-                }
+                rt.add_offsets(0, Face->GetAscent() - fallback->GetAscent());
+                Face->AddLinesToRect(rt, ax);
+                result = true;
             }
         }
         if (result == false)

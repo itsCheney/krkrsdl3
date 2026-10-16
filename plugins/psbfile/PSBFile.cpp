@@ -65,6 +65,13 @@ void tTJSNI_PsbFile::detachMedia()
     _mediaKey.Clear();
 }
 
+void tTJSNI_PsbFile::dropMedia()
+{
+    if (psbVar != nullptr && !_mediaKey.IsEmpty())
+        psbVar->RemovePSBFile(_mediaKey, this);
+    _mediaKey.Clear();
+}
+
 tTVPMemoryStream* PSBReadDecompressed(tTJSBinaryStream* src)
 {
     if (!src)
@@ -144,66 +151,22 @@ bool tTJSNI_PsbFile::load(const ttstr& filePath)
     return loadFromStream(_filePtr, filePath);
 }
 
-bool tTJSNI_PsbFile::loadFromStream(tTJSBinaryStream* _filePtr, const ttstr& filePath)
+bool tTJSNI_PsbFile::parseTables()
 {
-    krkrsdl3::cpu_frame::EventScope cpuLoad(krkrsdl3::cpu_frame::Kind::PSBLoad);
-    if (!_filePtr)
-    {
-        cpuLoad.Finish(true);
-        return false;
-    }
-    releaseLoad();
-    detachMedia();
-    _resources._resources.clear();
-    stringsOffset.clear();
-    namesData.clear();
-    charset.clear();
-    nameIndexes.clear();
-    namesCache.clear();
-    chunkOffsets.clear();
-    chunkLengths.clear();
-    extraChunkOffsets.clear();
-    extraChunkLengths.clear();
-    _root.Clear();
-
-    cpuLoad.SetWorkBytes(_filePtr->GetSize());
-    tTVPMemoryStream* memory = PSBReadDecompressed(_filePtr);
-    if (!memory)
-    {
-        cpuLoad.Finish(true);
-        return false;
-    }
-    filePtr = memory;
-    fileData = static_cast<const tjs_uint8*>(memory->GetInternalBuffer());
-    fileSize = memory->GetSize();
-
-    {
-    krkrsdl3::cpu_frame::EventScope cpuTables(krkrsdl3::cpu_frame::Kind::PSBTables);
     // ReadHeader
     filePtr->SetPosition(0);
     if (!_header.parsePSBHeader(filePtr))
-    {
-        releaseLoad();
-        cpuTables.Finish(true);
-        cpuLoad.Finish(true);
         return false;
-    }
 
     // Encrypted
     if (_header.isEncrypted() && _header.getHeaderLength() > filePtr->GetSize())
     {
         TVPConsoleLog("psb file is encrypted");
-        releaseLoad();
-        cpuTables.Finish(true);
-        cpuLoad.Finish(true);
         return false;
     }
     if (_header.version > 3)
     {
         TVPConsoleLog("not support psb file format version > 3");
-        releaseLoad();
-        cpuTables.Finish(true);
-        cpuLoad.Finish(true);
         return false;
     }
 
@@ -308,6 +271,64 @@ bool tTJSNI_PsbFile::loadFromStream(tTJSBinaryStream* _filePtr, const ttstr& fil
             filePtr->ReadI8LE() - static_cast<tjs_int8>(PSB::PSBObjType::ArrayN1) + 1, filePtr);
     }
 
+    return true;
+}
+
+bool tTJSNI_PsbFile::loadFromStream(tTJSBinaryStream* _filePtr, const ttstr& filePath)
+{
+    krkrsdl3::cpu_frame::EventScope cpuLoad(krkrsdl3::cpu_frame::Kind::PSBLoad);
+    if (!_filePtr)
+    {
+        cpuLoad.Finish(true);
+        return false;
+    }
+    // The psb:// entry this instance registered stays until the new parse
+    // succeeds and replaces it. A failed parse removes it: the tree is gone,
+    // so psb:// must not keep serving the previous file.
+    releaseLoad();
+    _resources._resources.clear();
+    stringsOffset.clear();
+    namesData.clear();
+    charset.clear();
+    nameIndexes.clear();
+    namesCache.clear();
+    chunkOffsets.clear();
+    chunkLengths.clear();
+    extraChunkOffsets.clear();
+    extraChunkLengths.clear();
+    _root.Clear();
+
+    cpuLoad.SetWorkBytes(_filePtr->GetSize());
+    tTVPMemoryStream* memory;
+    try
+    {
+        memory = PSBReadDecompressed(_filePtr);
+    }
+    catch (...)
+    {
+        dropMedia();
+        throw;
+    }
+    if (!memory)
+    {
+        dropMedia();
+        cpuLoad.Finish(true);
+        return false;
+    }
+    filePtr = memory;
+    fileData = static_cast<const tjs_uint8*>(memory->GetInternalBuffer());
+    fileSize = memory->GetSize();
+
+    {
+        krkrsdl3::cpu_frame::EventScope cpuTables(krkrsdl3::cpu_frame::Kind::PSBTables);
+        if (!parseTables())
+        {
+            releaseLoad();
+            dropMedia();
+            cpuTables.Finish(true);
+            cpuLoad.Finish(true);
+            return false;
+        }
     }
 
     // Time only the outer materialization, not each recursive node/dispatch.
@@ -320,6 +341,7 @@ bool tTJSNI_PsbFile::loadFromStream(tTJSBinaryStream* _filePtr, const ttstr& fil
     {
         releaseLoad();
         _resources._resources.clear();
+        dropMedia();
         throw;
     }
     // The tree is complete and holds every resource as an octet; the
@@ -328,12 +350,49 @@ bool tTJSNI_PsbFile::loadFromStream(tTJSBinaryStream* _filePtr, const ttstr& fil
     // add To media
     if (psbVar != nullptr && !filePath.IsEmpty())
     {
-        _mediaKey = PSB::PSBMedia::KeyFor(filePath);
+        const ttstr key = PSB::PSBMedia::KeyFor(filePath);
+        // A different name than before: the previous file is served from disk.
+        if (key != _mediaKey)
+            detachMedia();
+        _mediaKey = key;
         _resources.Path = filePath;
         _resources.Owner = this;
         psbVar->AddPSBFile(_mediaKey, _resources);
     }
+    else
+    {
+        detachMedia();
+    }
     return true;
+}
+
+bool tTJSNI_PsbFile::scanResources(const tjs_uint8* data, tjs_uint64 size, PSB::PSBMediaInfo& out)
+{
+    if (!data || size > 0xFFFFFFFFull)
+        return false;
+    // A private parser, never registered: Owner stays null and _mediaKey
+    // empty, so neither its parse nor its destruction touches psb://.
+    tTJSNI_PsbFile scanner;
+    scanner._scanOnly = true;
+    // The stream only references data; several scans may share it.
+    scanner.filePtr = new tTVPMemoryStream(data, (tjs_uint)size);
+    scanner.fileData = data;
+    scanner.fileSize = size;
+    bool ok = false;
+    try
+    {
+        ok = scanner.parseTables();
+        if (ok)
+            scanner.readAllObjs("root", scanner._header.offsetEntries);
+    }
+    catch (...)
+    {
+        ok = false;
+    }
+    scanner.releaseLoad();
+    if (ok)
+        out._resources = std::move(scanner._resources._resources);
+    return ok;
 }
 
 tTJSVariant tTJSNI_PsbFile::root()
@@ -458,6 +517,8 @@ tTJSVariant tTJSNI_PsbFile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
         case PSB::PSBObjType::ArrayN7:
         case PSB::PSBObjType::ArrayN8:
         {
+            if (_scanOnly)
+                return tTJSVariant();
             std::vector<tjs_uint32> tmp;
             PSB::parsePSBArray(&tmp, typeByte - static_cast<tjs_int8>(PSB::PSBObjType::ArrayN1) + 1,
                                filePtr);
@@ -478,6 +539,8 @@ tTJSVariant tTJSNI_PsbFile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
         case PSB::PSBObjType::StringN3:
         case PSB::PSBObjType::StringN4:
         {
+            if (_scanOnly)
+                return tTJSVariant();
             tjs_int32 idx = 0;
             filePtr->ReadBuffer(&idx,
                                 typeByte - static_cast<tjs_int8>(PSB::PSBObjType::StringN1) + 1);
@@ -519,7 +582,9 @@ tTJSVariant tTJSNI_PsbFile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
                 return tTJSVariant();
             // Scripts expect the resource bytes in the tree. psb:// shares
             // this octet rather than keeping its own copy.
-            tTJSVariant ret(fileData + offset, length);
+            tTJSVariant ret;
+            if (!_scanOnly)
+                ret = tTJSVariant(fileData + offset, length);
             // The first entry for a key wins, as before.
             _resources._resources.emplace(key, PSB::PSBMediaInfo::PSBMediaItemInfo{(tjs_uint32)offset, length, ret});
             return ret;
@@ -536,10 +601,19 @@ tTJSVariant tTJSNI_PsbFile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
             filePtr->ReadBuffer(&idx, typeByte -
                                           static_cast<tjs_int8>(PSB::PSBObjType::ExtraChunkN1) + 1);
 
-            if (idx >= 0 && (size_t)idx < extraChunkOffsets.size() && (size_t)idx < extraChunkLengths.size())
-                _resources._resources.emplace(
-                    key, PSB::PSBMediaInfo::PSBMediaItemInfo{_header.offsetExtraChunkData + extraChunkOffsets[idx],
-                                                             extraChunkLengths[idx], tTJSVariant()});
+            if (idx < 0 || (size_t)idx >= extraChunkOffsets.size() || (size_t)idx >= extraChunkLengths.size() ||
+                _resources._resources.count(key))
+                return tTJSVariant();
+            const tjs_uint64 offset = (tjs_uint64)_header.offsetExtraChunkData + extraChunkOffsets[idx];
+            const tjs_uint32 length = extraChunkLengths[idx];
+            if (offset + length > fileSize)
+                return tTJSVariant();
+            // The tree has no value for extra chunks. psb:// keeps this copy
+            // while the owner is alive, so opens need not read the file.
+            tTJSVariant data;
+            if (!_scanOnly)
+                data = tTJSVariant(fileData + offset, length);
+            _resources._resources.emplace(key, PSB::PSBMediaInfo::PSBMediaItemInfo{(tjs_uint32)offset, length, data});
             return tTJSVariant();
         }
         case PSB::PSBObjType::List:
@@ -547,6 +621,12 @@ tTJSVariant tTJSNI_PsbFile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
             std::vector<tjs_uint32> _objsOffset;
             tjs_uint32 _tmpOffset = this->readListInfo(&_objsOffset);
 
+            if (_scanOnly)
+            {
+                for (auto _offset : _objsOffset)
+                    readAllObjs(ttstr(), _tmpOffset + _offset);
+                return tTJSVariant();
+            }
             iTJSDispatch2* array = TJSCreateArrayObject();
             for (auto _offset : _objsOffset)
             {
@@ -574,6 +654,12 @@ tTJSVariant tTJSNI_PsbFile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
                 _tmpOffset = this->readListInfo(&_objsOffset);
             }
 
+            if (_scanOnly)
+            {
+                for (tjs_int i = 0; i < _objsNamesIdx.size(); i++)
+                    readAllObjs(namesCache.at(_objsNamesIdx.at(i)), _tmpOffset + _objsOffset.at(i));
+                return tTJSVariant();
+            }
             iTJSDispatch2* dsp = TJSCreateDictionaryObject();
             for (tjs_int i = 0; i < _objsNamesIdx.size(); i++)
             {

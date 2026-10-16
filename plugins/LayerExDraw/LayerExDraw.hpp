@@ -585,7 +585,8 @@ public:
     plutovg_matrix_t transMtx;
     tjs_int width = 0, height = 0;
 
-    // Bitmap data
+    // Bitmap data; in a record, the base image loadRecord loaded, drawn
+    // before vectorGraph
     plutovg_surface_t* _surface; // owned (refcounted)
 
     // Vector graph data

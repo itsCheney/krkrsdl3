@@ -10,6 +10,16 @@ PSB::PSBMedia* psbVar = nullptr;
 namespace PSB
 {
 
+// The index of the '/' after the domain, or -1. (ttstr::IndexOf(tjs_char)
+// reads a character past its argument.)
+static tjs_int DomainEnd(const ttstr& name)
+{
+    for (tjs_int i = 0; i < name.GetLen(); i++)
+        if (name[i] == TJS_N('/'))
+            return i;
+    return -1;
+}
+
 void PSBMedia::NormalizeDomainName(ttstr& name)
 {
     // Keys are lower-cased file names (KeyFor), so the whole domain is too.
@@ -36,12 +46,17 @@ ttstr PSBMedia::KeyFor(const ttstr& path)
 
 PSBMediaInfo::PSBMediaItemInfo* PSBMedia::FindLocked(const ttstr& name, ttstr& path)
 {
-    tjs_int slash = name.IndexOf(TJS_N('/'));
+    tjs_int slash = DomainEnd(name);
     if (slash == -1)
         return nullptr;
-    auto entry = _resources.find(name.SubString(0, slash).AsLowerCase());
+    const ttstr key = name.SubString(0, slash).AsLowerCase();
+    auto entry = _resources.find(key);
     if (entry == _resources.end())
-        return nullptr;
+    {
+        entry = _probed.find(key);
+        if (entry == _probed.end())
+            return nullptr;
+    }
     path = entry->second.Path;
     const ttstr chunk = name.SubString(slash + 1, name.GetLen());
     auto item = entry->second._resources.find(chunk);
@@ -55,58 +70,49 @@ PSBMediaInfo::PSBMediaItemInfo* PSBMedia::FindLocked(const ttstr& name, ttstr& p
     return nullptr;
 }
 
-bool PSBMedia::CheckExistentStorage(const ttstr& name)
+std::shared_ptr<tTVPMemoryStream> PSBMedia::CachedLocked(const ttstr& path)
 {
-    tjs_int slash = name.IndexOf(TJS_N('/'));
-    if (slash == -1)
-        return false;
-    ttstr file;
+    for (auto it = _cache.begin(); it != _cache.end(); ++it)
     {
-        std::lock_guard<std::mutex> lock(_mutex);
-        if (FindLocked(name, file))
-            return true;
-        if (!file.IsEmpty())
-            return false; // the PSB is known; the resource is not in it
+        if (it->first == path)
+        {
+            _cache.splice(_cache.begin(), _cache, it);
+            return _cache.front().second;
+        }
     }
-    // Load the PSB once to learn its resources. Invalidate drops the parsed
-    // copy; the entry stays registered and is served from the file.
-    {
-        tTJSNI_PsbFile tmp;
-        tmp.load(name.SubString(0, slash));
-        tmp.Invalidate();
-    }
-    std::lock_guard<std::mutex> lock(_mutex);
-    return FindLocked(name, file) != nullptr;
+    return nullptr;
 }
 
-tTJSBinaryStream* PSBMedia::Open(const ttstr& name, tjs_uint32 flags)
+std::shared_ptr<tTVPMemoryStream> PSBMedia::CacheLocked(const ttstr& path, std::shared_ptr<tTVPMemoryStream> whole)
 {
-    ttstr file;
-    tjs_uint32 offset, length;
+    // Another thread may have read the same file meanwhile; keep one copy.
+    if (auto cached = CachedLocked(path))
+        return cached;
+    const tjs_uint64 size = whole->GetSize();
+    if (size > CacheByteLimit)
+        return whole;
+    _cache.emplace_front(path, whole);
+    _cacheBytes += size;
+    while (_cache.size() > CacheEntryLimit || _cacheBytes > CacheByteLimit)
+    {
+        _cacheBytes -= _cache.back().second->GetSize();
+        _cache.pop_back();
+    }
+    return whole;
+}
+
+std::shared_ptr<tTVPMemoryStream> PSBMedia::Load(const ttstr& path)
+{
     {
         std::lock_guard<std::mutex> lock(_mutex);
-        PSBMediaInfo::PSBMediaItemInfo* item = FindLocked(name, file);
-        if (!item)
-            return nullptr;
-        if (item->Data.Type() == tvtOctet)
-        {
-            tTJSVariantOctet* octet = item->Data.AsOctetNoAddRef();
-            const tjs_uint size = octet ? octet->GetLength() : 0;
-            tTVPMemoryStream* stream = new tTVPMemoryStream(nullptr, size);
-            if (size)
-                std::memcpy(stream->GetInternalBuffer(), octet->GetData(), size);
-            return stream;
-        }
-        offset = item->Offsets;
-        length = item->Lengths;
+        if (auto cached = CachedLocked(path))
+            return cached;
     }
-
-    // The owning PSBFile is gone: read the PSB again (decompressing MDF, so
-    // the offsets match) and copy the chunk out.
-    tTVPMemoryStream* whole = nullptr;
+    // Read without the lock; decompressing MDF keeps the offsets valid.
+    std::shared_ptr<tTVPMemoryStream> whole;
     try
     {
-        whole = PSBReadDecompressed(TVPCreateStream(file));
+        whole.reset(PSBReadDecompressed(TVPCreateStream(path)));
     }
     catch (...)
     {
@@ -114,17 +120,102 @@ tTJSBinaryStream* PSBMedia::Open(const ttstr& name, tjs_uint32 flags)
     }
     if (!whole)
         return nullptr;
-    if ((tjs_uint64)offset + length > whole->GetSize())
+    std::lock_guard<std::mutex> lock(_mutex);
+    return CacheLocked(path, std::move(whole));
+}
+
+bool PSBMedia::Probe(const ttstr& domain)
+{
+    // Only the resource list: no PSBFile tree, no TJS objects, and nothing
+    // in _resources, whose octets belong to the main thread.
+    std::shared_ptr<tTVPMemoryStream> whole = Load(domain);
+    if (!whole)
+        return false;
+    PSBMediaInfo info;
+    if (!tTJSNI_PsbFile::scanResources(static_cast<const tjs_uint8*>(whole->GetInternalBuffer()), whole->GetSize(),
+                                       info))
+        return false;
+    info.Path = domain;
+    std::lock_guard<std::mutex> lock(_mutex);
+    // A PSBFile that registered the name meanwhile wins; so does an earlier
+    // probe.
+    const ttstr key = domain.AsLowerCase();
+    if (_resources.find(key) == _resources.end())
+        _probed.emplace(key, std::move(info));
+    return true;
+}
+
+bool PSBMedia::CheckExistentStorage(const ttstr& name)
+{
+    tjs_int slash = DomainEnd(name);
+    if (slash == -1)
+        return false;
+    for (int attempt = 0;; attempt++)
     {
-        delete whole;
-        return nullptr;
+        {
+            ttstr file;
+            std::lock_guard<std::mutex> lock(_mutex);
+            if (FindLocked(name, file))
+                return true;
+            if (!file.IsEmpty())
+                return false; // the PSB is known; the resource is not in it
+        }
+        if (attempt || !Probe(name.SubString(0, slash)))
+            return false;
     }
-    tTVPMemoryStream* stream = new tTVPMemoryStream(nullptr, length);
-    if (length)
-        std::memcpy(stream->GetInternalBuffer(), static_cast<const tjs_uint8*>(whole->GetInternalBuffer()) + offset,
-                    length);
-    delete whole;
-    return stream;
+}
+
+tTJSBinaryStream* PSBMedia::Open(const ttstr& name, tjs_uint32 flags)
+{
+    tjs_int slash = DomainEnd(name);
+    if (slash == -1)
+        return nullptr;
+    for (int attempt = 0;; attempt++)
+    {
+        ttstr file;
+        tjs_uint32 offset, length;
+        std::shared_ptr<tTVPMemoryStream> whole;
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            PSBMediaInfo::PSBMediaItemInfo* item = FindLocked(name, file);
+            if (!item && !file.IsEmpty())
+                return nullptr; // the PSB is known; the resource is not in it
+            if (item)
+            {
+                if (item->Data.Type() == tvtOctet)
+                {
+                    tTJSVariantOctet* octet = item->Data.AsOctetNoAddRef();
+                    const tjs_uint size = octet ? octet->GetLength() : 0;
+                    tTVPMemoryStream* stream = new tTVPMemoryStream(nullptr, size);
+                    if (size)
+                        std::memcpy(stream->GetInternalBuffer(), octet->GetData(), size);
+                    return stream;
+                }
+                offset = item->Offsets;
+                length = item->Lengths;
+                whole = CachedLocked(file);
+            }
+        }
+        if (file.IsEmpty())
+        {
+            // No PSBFile registered this PSB: learn its resources once.
+            if (attempt || !Probe(name.SubString(0, slash)))
+                return nullptr;
+            continue;
+        }
+
+        // The owning PSBFile is gone: copy the chunk out of the PSB read
+        // again, or of a recent read of it.
+        if (!whole)
+            whole = Load(file);
+        if (!whole || (tjs_uint64)offset + length > whole->GetSize())
+            return nullptr;
+        tTVPMemoryStream* stream = new tTVPMemoryStream(nullptr, length);
+        if (length)
+            std::memcpy(stream->GetInternalBuffer(),
+                        static_cast<const tjs_uint8*>(whole->GetInternalBuffer()) + offset, length);
+        return stream;
+    }
 }
 
 void PSBMedia::GetListAt(const ttstr& name, iTVPStorageLister* lister)
@@ -142,14 +233,17 @@ void PSBMedia::GetLocallyAccessibleName(ttstr& name)
 void PSBMedia::AddPSBFile(const ttstr& name, PSBMediaInfo data)
 {
     std::lock_guard<std::mutex> lock(_mutex);
+    _probed.erase(name);
     // The newest load of a name wins.
     _resources[name] = std::move(data);
 }
 
-void PSBMedia::RemovePSBFile(const ttstr& name)
+void PSBMedia::RemovePSBFile(const ttstr& name, const void* owner)
 {
     std::lock_guard<std::mutex> lock(_mutex);
-    _resources.erase(name);
+    auto entry = _resources.find(name);
+    if (entry != _resources.end() && entry->second.Owner == owner)
+        _resources.erase(entry);
 }
 
 void PSBMedia::DetachPSBFile(const ttstr& name, const void* owner)

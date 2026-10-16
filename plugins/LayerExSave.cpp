@@ -438,8 +438,8 @@ void FilterRow(const tjs_uint8* cur, const tjs_uint8* prev, size_t rowBytes, siz
     PutBytes(out, candidates[best].data(), rowBytes);
 }
 
-// Returns true when canceled.
-bool Deflate(const Bytes& in, int level, Bytes& out, Progress* progress)
+// Returns true when canceled. Progress runs from base to base + span.
+bool Deflate(const Bytes& in, int level, Bytes& out, Progress* progress, int base = 0, int span = 99)
 {
     z_stream zs;
     std::memset(&zs, 0, sizeof(zs));
@@ -459,7 +459,7 @@ bool Deflate(const Bytes& in, int level, Bytes& out, Progress* progress)
             zs.next_in = const_cast<Bytef*>(in.data() + pos);
             zs.avail_in = (uInt)n;
             pos += n;
-            if (progress && (*progress)((int)(pos * 99 / in.size())))
+            if (progress && (*progress)(base + (int)(pos * span / in.size())))
             {
                 deflateEnd(&zs);
                 return true;
@@ -495,8 +495,12 @@ bool EncodePng(const Image& image, const PngOptions& options, Bytes& out, const 
     Bytes filtered;
     filtered.reserve((rowBytes + 1) * image.h);
     Bytes prev(rowBytes, 0), cur(rowBytes), candidates[5];
+    // Filtering reports 0-49% and deflating 50-99%, so a cancel is noticed
+    // before compression starts.
     for (long y = 0; y < image.h; y++)
     {
+        if (progress((int)((tjs_int64)y * 50 / image.h)))
+            return true;
         const tjs_uint8* p = image.Line(y);
         tjs_uint8* q = cur.data();
         for (long x = 0; x < image.w; x++, p += 4)
@@ -512,7 +516,7 @@ bool EncodePng(const Image& image, const PngOptions& options, Bytes& out, const 
     }
 
     Bytes idat;
-    if (Deflate(filtered, options.level, idat, &progress))
+    if (Deflate(filtered, options.level, idat, &progress, 50, 49))
         return true;
 
     PutPngHeader(out, image.w, image.h, alpha ? 6 : 2);
@@ -657,7 +661,7 @@ void RunSaveJob(std::shared_ptr<SaveJob> job, std::shared_ptr<SaveQueue> queue)
  * stopSaveLayerImage, with onSaveLayerImageProgress(handler, progress, layer,
  * filename) and onSaveLayerImageDone(handler, canceled, layer, filename).
  */
-class WindowSaveImage : public tTVPContinuousEventCallbackIntf
+class WindowSaveImage final : public tTVPContinuousEventCallbackIntf
 {
     struct Slot
     {
@@ -722,9 +726,12 @@ public:
     }
 
     // Events are taken one at a time so a script exception leaves the rest
-    // queued for the next callback.
+    // queued for the next callback. While TJS events are disabled they stay
+    // queued, as the original's window messages did.
     void OnContinuousCallback(tjs_uint64) override
     {
+        if (TVPEventDisabled || TVPGetSystemEventDisabledState())
+            return;
         std::shared_ptr<bool> live = alive;
         std::shared_ptr<SaveQueue> events = queue;
         SaveEvent event;

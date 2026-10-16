@@ -7,7 +7,8 @@ void TVPGetAllFontList(std::vector<ttstr>& list);
 void TVPInitFontNames();
 int TVPEnumFontsProc(const ttstr& FontPath);
 const ttstr& TVPGetDefaultFontName();
-tTJSBinaryStream* TVPCreateFontStream(const ttstr& fontname);
+// faceIndex receives the face the name was registered from within its file.
+tTJSBinaryStream* TVPCreateFontStream(const ttstr& fontname, int* faceIndex = nullptr);
 
 struct TVPFontNamePathInfo
 {
@@ -16,6 +17,8 @@ struct TVPFontNamePathInfo
     int Index;
 };
 TVPFontNamePathInfo* TVPFindFont(const ttstr& name);
+// The font TVPCreateFontStream opens for name: the registered one, else the default.
+TVPFontNamePathInfo* TVPFindFontOrDefault(const ttstr& name);
 
 //---------------------------------------------------------------------------
 // font enumeration and existence check
