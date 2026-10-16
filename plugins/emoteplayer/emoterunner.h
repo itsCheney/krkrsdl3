@@ -121,10 +121,8 @@ namespace emoteplayer
         std::vector<uint16_t> _meshIndices;
         bool _useGPUDeform = false;
         std::vector<krkrsdl3::TVPMeshDeformSurface> _gpuDeformSurfaces;
-        // Per-node scratch storage survives frames. Surface matrices are rebuilt
-        // once per mesh update, while index topology is retained until division
-        // or mesh mode actually changes.
-        std::vector<glm::mat4> _surfaceMatrices;
+        // Per-node scratch storage survives frames. Index topology is retained
+        // until division or mesh mode actually changes.
         emoterect _shapeArea;
     };
     // motion辅助类 - 管理按priority排序的nodeList并处理子motion展开

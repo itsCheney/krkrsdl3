@@ -45,10 +45,14 @@ const char* kShaders = R"MSL(
 using namespace metal;
 struct Vertex { float2 xy; float2 uv; };
 struct Varying { float4 position [[position]]; float2 uv; };
+// Mirrors TVPMeshDeformSurface (TVPCompositor.h).
 struct DeformSurface {
-    float4x4 matrix;
-    float4 geometry;
-    int4 flags;
+    float4x4 attach;
+    float4 geometry;  // originX, originY, width, height
+    float4 position;  // attach * (coord, 0, 1), w = 0
+    float4 motion;    // angle (degrees), zoomX, zoomY, slantX
+    float4 motion2;   // slantY, offsetX, offsetY, -
+    int4 flags;       // type, inheritMask, transformOrder bytes, -
     float2 control[16];
 };
 struct Params { float4 color, modulation, rect, uv; int4 flags; float4 values; };
@@ -71,29 +75,85 @@ float2 evalBezier(const device DeformSurface& surface, float u, float v) {
             result += surface.control[row * 4 + col] * bu[row] * bv[col];
     return result;
 }
+// emoteSurfaceEvaluator::evaluate (emotegeometry.h), one vertex at a time.
+// The CPU path allows at most emoteMaxGPUDeformSurfaces (16) surfaces, and each
+// surface adds at most two contributions.
+constant uint kLinearInheritMask = 0x1F0;
+float4x4 motionLinear(const device DeformSurface& s, uint mask) {
+    const float angle = (mask & 0x10) ? s.motion.x : 0.0;
+    const float zoomX = (mask & 0x20) ? s.motion.y : 1.0;
+    const float zoomY = (mask & 0x40) ? s.motion.z : 1.0;
+    const float slantX = (mask & 0x80) ? s.motion.w : 0.0;
+    const float slantY = (mask & 0x100) ? s.motion2.x : 0.0;
+    float4x4 linear = float4x4(1.0);
+    const uint order = uint(s.flags.z);
+    for (uint k = 0; k < 4; ++k) {
+        const uint op = (order >> (8 * k)) & 0xFF;
+        if (op == 1 && angle != 0.0) {
+            const float r = angle * (M_PI_F / 180.0);
+            const float c = cos(r), sn = sin(r);
+            linear = float4x4(float4(c, sn, 0, 0), float4(-sn, c, 0, 0),
+                              float4(0, 0, 1, 0), float4(0, 0, 0, 1)) * linear;
+        }
+        if (op == 2 && (zoomX != 1.0 || zoomY != 1.0))
+            linear = float4x4(float4(zoomX, 0, 0, 0), float4(0, zoomY, 0, 0),
+                              float4(0, 0, 1, 0), float4(0, 0, 0, 1)) * linear;
+        if (op == 3 && (slantX != 0.0 || slantY != 0.0))
+            linear = float4x4(float4(1, slantY, 0, 0), float4(slantX, 1, 0, 0),
+                              float4(0, 0, 1, 0), float4(0, 0, 0, 1)) * linear;
+    }
+    return linear;
+}
 vertex Varying deformVertexMain(uint i [[vertex_id]],
                                 const device float2* gridUV [[buffer(0)]],
                                 const device DeformSurface* surfaces [[buffer(1)]],
                                 constant uint& surfaceCount [[buffer(2)]]) {
-    float u = gridUV[i].x, v = gridUV[i].y;
-    float lastX = 0.0, lastY = 0.0;
-    float4 trans = float4(1.0);
-    for (int n = int(surfaceCount) - 1; n >= 0; --n) {
-        const device DeformSurface& surface = surfaces[n];
-        if (surface.flags.x == 3) {
-            trans = surface.matrix * trans;
-            continue;
+    const float u = gridUV[i].x, v = gridUV[i].y;
+    float4 offsets[32];
+    uint masks[32];
+    int count = 0;
+    uint geometryMask = kLinearInheritMask;
+    float4 trans = float4(0.0);
+    const int last = int(surfaceCount) - 1;
+    for (int n = last; n >= 0; --n) {
+        const device DeformSurface& s = surfaces[n];
+        const bool innermost = n == last;
+        if (innermost || s.flags.x == 1) {
+            float bx = u, by = v;
+            if (s.flags.x != 3) {
+                const float lastU = innermost ? u : (trans.y + s.geometry.y) / s.geometry.w;
+                const float lastV = innermost ? v : (trans.x + s.geometry.x) / s.geometry.z;
+                const float2 p = s.flags.x == 1 ? evalBezier(s, lastU, lastV)
+                                                : float2(lastV, lastU);
+                bx = p.x * s.geometry.z - s.geometry.x - s.motion2.y;
+                by = p.y * s.geometry.w - s.geometry.y - s.motion2.z;
+            }
+            offsets[count] = float4(bx, by, 0.0, 0.0) - trans;
+            masks[count] = geometryMask;
+            ++count;
         }
-        if (n < int(surfaceCount) - 1) {
-            lastX = (trans.y + surface.geometry.y) / surface.geometry.w;
-            lastY = (trans.x + surface.geometry.x) / surface.geometry.z;
+        trans = float4(0.0);
+        uint previousMask = 0;
+        float4x4 model = float4x4(1.0);
+        for (int k = 0; k < count; ++k) {
+            const uint mask = (n == 0 || innermost) ? kLinearInheritMask : masks[k];
+            if (k == 0 || mask != previousMask) {
+                model = s.attach * motionLinear(s, mask);
+                previousMask = mask;
+            }
+            offsets[k] = model * offsets[k];
+            masks[k] &= uint(s.flags.y);
+            trans += offsets[k];
+        }
+        if (count > 0 && masks[count - 1] == kLinearInheritMask) {
+            offsets[count - 1] += s.position;
         } else {
-            lastX = u;
-            lastY = v;
+            offsets[count] = s.position;
+            masks[count] = kLinearInheritMask;
+            ++count;
         }
-        float2 p = surface.flags.x == 1 ? evalBezier(surface, lastX, lastY)
-                                        : float2(lastY, lastX);
-        trans = surface.matrix * float4(p, 0.0, 1.0);
+        trans += s.position;
+        geometryMask &= uint(s.flags.y);
     }
     // CPU geometry stores y=-trans.y and vertexMain flips it again for Metal.
     // Emit the final Metal clip-space value directly here.

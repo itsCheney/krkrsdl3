@@ -27,18 +27,26 @@ struct TVPLayerGlyphUploadInfo {
     const char* reason="unsupported";
     bool targetWritten=false; // also observable if a post-encoding Submit throws
 };
-// GPU mesh-deformation input. Matrices are column-major and already include
-// inheritance/attach transforms. Keeping this representation renderer-neutral
-// lets plugins use an accelerated path without exposing their own types here.
+// GPU mesh-deformation input: one entry per surface of an Emote node chain,
+// innermost last. The vertex shader evaluates the same chain as the CPU path
+// (emoteSurfaceEvaluator). Matrices are column-major. Keeping this
+// representation renderer-neutral lets plugins use an accelerated path without
+// exposing their own types here.
 struct TVPMeshDeformSurface
 {
-    float matrix[16] = {0};
+    float attach[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     float originX = 0, originY = 0, width = 0, height = 0;
+    // attach * (coord, 0, 1); the w component is always 0 in the chain.
+    float positionX = 0, positionY = 0, positionZ = 0, reserved0 = 0;
+    float angle = 0, zoomX = 1, zoomY = 1, slantX = 0;
+    float slantY = 0, offsetX = 0, offsetY = 0, reserved1 = 0;
     int32_t type = 0;
-    int32_t reserved[3] = {0, 0, 0};
+    uint32_t inheritMask = 0;
+    uint32_t transformOrder = 0x03020100; // four operation bytes, first in the low byte
+    uint32_t reserved2 = 0;
     float controlPts[32] = {0};
 };
-static_assert(sizeof(TVPMeshDeformSurface) == 224, "GPU deformation surface layout");
+static_assert(sizeof(TVPMeshDeformSurface) == 272, "GPU deformation surface layout");
 
 //---------------------------------------------------------------------------
 // 渲染后端抽象层（合并接口）

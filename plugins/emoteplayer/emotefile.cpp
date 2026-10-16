@@ -740,6 +740,15 @@ emotenode::emotenode(emotemotion* rootmotion,
         filePtr->parseNumber(tmp, it->second);
         meshCombine = static_cast<uint8_t>(tmp);
     }
+    it = _rootData.find("transformOrder");
+    if (it != _rootData.end())
+    {
+        std::vector<uint32_t> order;
+        if (filePtr->parseList(order, it->second) && order.size() == 4)
+            for (size_t i = 0; i < 4; ++i)
+                if (filePtr->parseNumber(tmp, order[i]) && tmp >= 0 && tmp <= 3)
+                    transformOrder[i] = static_cast<int32_t>(tmp);
+    }
     it = _rootData.find("meshDivision");
     if (it != _rootData.end())
     {

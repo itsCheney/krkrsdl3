@@ -448,6 +448,8 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         emt.currOx = currOx;
         emt.currOy = currOy;
         emt.currInheritMask = currentNode->inheritMask;
+        std::copy(std::begin(currentNode->transformOrder), std::end(currentNode->transformOrder),
+                  std::begin(emt.transformOrder));
         // fbo信息
         emt.originX = originX;
         emt.originY = originY;
@@ -466,7 +468,7 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         else if (frame->src.find("shape/point") != std::string::npos) area.shapeType = 0;
         else if (frame->src.find("shape/quad") != std::string::npos) area.shapeType = 3;
         const Uint64 shapeBuildStarted = SDL_GetTicksNS();
-        buildShapeMesh(renderMethod, area.shapeType, area.vertices, area.indices, &_surfaceMatrices);
+        buildShapeMesh(renderMethod, area.shapeType, area.vertices, area.indices);
         krkrsdl3::TVPRecordEmoteShapeBuild(
             SDL_GetTicksNS() - shapeBuildStarted, area.vertices.size());
         const float vw = lim.viewW > 0 ? lim.viewW : renderMethod.front().width;
@@ -515,9 +517,9 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         const Uint64 meshBuildStarted = SDL_GetTicksNS();
         _meshDivX = div;
         _meshDivY = div;
-        if (containsMesh && gpuCapable)
+        if (containsMesh && gpuCapable &&
+            buildGPUDeformSurfaces(renderMethod, _gpuDeformSurfaces))
         {
-            buildGPUDeformSurfaces(renderMethod, _surfaceMatrices, _gpuDeformSurfaces);
             _useGPUDeform = true;
             _meshVertices.clear();
         }
@@ -526,13 +528,12 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
             const size_t expectedIndices = size_t(div) * size_t(div) * 6;
             const bool rebuildIndices = _meshIndices.size() != expectedIndices;
             buildSubdivMesh(renderMethod, _meshDivX, _meshDivY, _meshVertices, _meshIndices,
-                            &_surfaceMatrices, rebuildIndices);
+                            rebuildIndices);
         }
         else
         {
             const bool rebuildIndices = _meshIndices.size() != 6;
-            buildRectMesh(renderMethod, _meshVertices, _meshIndices, &_surfaceMatrices,
-                          rebuildIndices);
+            buildRectMesh(renderMethod, _meshVertices, _meshIndices, rebuildIndices);
         }
         const uint64_t meshVertexCount = containsMesh
             ? uint64_t(div + 1) * uint64_t(div + 1)

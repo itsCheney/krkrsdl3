@@ -101,6 +101,7 @@ public:
     uint8_t type = 0;
     bool isParameterize = false;
     int32_t parameterIdx = -1;
+    int32_t transformOrder[4] = {0, 1, 2, 3};
     std::string label;
     std::vector<std::string> stencilCompositeMaskLayerList;
     std::vector<emoteframe*> frameList;
