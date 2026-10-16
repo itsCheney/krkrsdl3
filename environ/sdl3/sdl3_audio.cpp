@@ -22,7 +22,7 @@ class tTVPSoundBufferSDL : public iTVPSoundBuffer
 public:
     bool _playing = false;
     float _volume = 1;
-    float _pan = 0;
+    std::atomic<float> _pan{0};
 
     tjs_uint _bufferLimitCount = 0;
     int totalBufferSize = 0;
@@ -135,6 +135,10 @@ public:
             return false;
         }
         SDL_BindAudioStream(sdl_audio_device, _stream);
+        // Each buffer has its own logical device, so its final mix is this
+        // buffer alone and pan applies at mix time.
+        if (!SDL_SetAudioPostmixCallback(sdl_audio_device, ApplyPan, this))
+            SDL_Log("Couldn't set audio pan callback: %s", SDL_GetError());
         if (s_hostAudioSuspended.load(std::memory_order_acquire))
             SDL_PauseAudioStreamDevice(_stream);
         return true;
@@ -146,6 +150,9 @@ public:
             tTJSCriticalSectionHolder holder(s_hostAudioBuffersCS);
             s_hostAudioBuffers.erase(this);
         }
+        // Blocks until a running callback returns.
+        if (sdl_audio_device)
+            SDL_SetAudioPostmixCallback(sdl_audio_device, NULL, NULL);
         Stop();
 
         if (_stream)
@@ -200,8 +207,42 @@ public:
         _volume = SDL_GetAudioStreamGain(_stream);
         return _volume;
     }
-    virtual void SetPan(float v) override { _pan = v; }
-    virtual float GetPan() override { return _pan; }
+    virtual void SetPan(float v) override { _pan.store(std::clamp(v, -1.0f, 1.0f)); }
+    virtual float GetPan() override { return _pan.load(); }
+
+    // KiriKiri pan (-1 left .. 1 right) attenuates the opposite side
+    // linearly, as AetherKrkr's RecalcVolume does. The mix is float in the
+    // device's channel layout; left/right pairs are FL/FR and, for 4/6/8
+    // channels, the back (and side) pairs too.
+    static void SDLCALL ApplyPan(void* userdata, const SDL_AudioSpec* spec, float* buffer,
+                                 int buflen)
+    {
+        const float pan = static_cast<tTVPSoundBufferSDL*>(userdata)->_pan.load();
+        const int channels = spec->channels;
+        if (pan == 0 || channels < 2)
+            return;
+        const float left = pan > 0 ? 1.0f - pan : 1.0f;
+        const float right = pan < 0 ? 1.0f + pan : 1.0f;
+        int pairs[4] = {0, -1, -1, -1};
+        if (channels == 4)
+            pairs[1] = 2;
+        else if (channels == 6)
+            pairs[1] = 4;
+        else if (channels == 8)
+            pairs[1] = 4, pairs[2] = 6;
+        const int frames = buflen / (int)sizeof(float) / channels;
+        for (int f = 0; f < frames; ++f)
+        {
+            float* frame = buffer + f * channels;
+            for (int pair : pairs)
+            {
+                if (pair < 0)
+                    break;
+                frame[pair] *= left;
+                frame[pair + 1] *= right;
+            }
+        }
+    }
     virtual void AppendBuffer(const void* _inbuf, unsigned int inlen /*, int tag = 0*/) override
     {
         if (inlen <= 0)

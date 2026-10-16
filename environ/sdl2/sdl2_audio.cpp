@@ -6,6 +6,8 @@
 #include <iomanip>
 #include <unordered_set>
 #include <algorithm>
+#include <cmath>
+#include <vector>
 
 #include <SDL.h>
 
@@ -27,7 +29,40 @@ public:
     SDL_AudioDeviceID sdl_audio_device = 0;
     SDL_AudioSpec spec;
     tjs_int BitsPerSample = 0;
-    int _frame_size = 0;
+    int _frame_size = 0; // bytes per frame (all channels)
+    tjs_uint64 _sentBytes = 0; // bytes queued since the last Reset
+    std::vector<tjs_uint8> _scaled;
+
+    // SDL2 queues have no gain, so volume and pan (the AetherKrkr
+    // RecalcVolume model: the opposite side fades linearly) scale the
+    // samples as they are queued.
+    template <typename T>
+    static void ScaleSamples(T* data, size_t samples, int channels, float left, float right,
+                             float other)
+    {
+        for (size_t i = 0; i < samples; ++i)
+        {
+            const int ch = channels < 2 ? 2 : (int)(i % channels);
+            const float gain = ch == 0 ? left : ch == 1 ? right : other;
+            data[i] = (T)std::lround(data[i] * (double)gain);
+        }
+    }
+    const void* ApplyGain(const void* in, unsigned int len)
+    {
+        const float left = _volume * (_pan > 0 ? 1.0f - _pan : 1.0f);
+        const float right = _volume * (_pan < 0 ? 1.0f + _pan : 1.0f);
+        if (left == 1.0f && right == 1.0f && _volume == 1.0f)
+            return in;
+        _scaled.assign((const tjs_uint8*)in, (const tjs_uint8*)in + len);
+        const int channels = spec.channels;
+        if (BitsPerSample == 8)
+            ScaleSamples((Sint8*)_scaled.data(), len, channels, left, right, _volume);
+        else if (BitsPerSample == 16)
+            ScaleSamples((Sint16*)_scaled.data(), len / 2, channels, left, right, _volume);
+        else
+            ScaleSamples((Sint32*)_scaled.data(), len / 4, channels, left, right, _volume);
+        return _scaled.data();
+    }
 
     void UpdateQueueData()
     {
@@ -70,9 +105,9 @@ public:
 
     tTVPSoundBufferSDL(tTVPWaveFormat& fmt, int bufcount)
       : _bufferLimitCount(bufcount),
-        _frame_size(fmt.BitsPerSample * fmt.Channels)
+        _frame_size((fmt.BytesPerSample ? fmt.BytesPerSample : fmt.BitsPerSample / 8) * fmt.Channels)
     {
-        _bufferSizeCache = new tjs_uint[bufcount];
+        _bufferSizeCache = new tjs_uint[bufcount]();
         memset(&spec, 0, sizeof(spec));
         spec.freq = fmt.SamplesPerSec;
         spec.channels = fmt.Channels;
@@ -150,6 +185,7 @@ public:
     virtual void Reset() override
     {
         SDL_ClearQueuedAudio(sdl_audio_device);
+        _sentBytes = 0;
         queued = 0;
         processed = 0;
     }
@@ -162,7 +198,7 @@ public:
     {
         return _volume;
     }
-    virtual void SetPan(float v) override { _pan = v; }
+    virtual void SetPan(float v) override { _pan = std::clamp(v, -1.0f, 1.0f); }
     virtual float GetPan() override { return _pan; }
     virtual void AppendBuffer(const void* _inbuf, unsigned int inlen /*, int tag = 0*/) override
     {
@@ -178,7 +214,8 @@ public:
         if (_bufferIdx >= _bufferLimitCount)
             _bufferIdx = 0;
 
-        SDL_QueueAudio(sdl_audio_device, _inbuf, inlen);
+        SDL_QueueAudio(sdl_audio_device, ApplyGain(_inbuf, inlen), inlen);
+        _sentBytes += inlen;
         _bufferSizeCache[_bufferIdx] = inlen;
         totalBufferSize += inlen;
     }
@@ -199,7 +236,12 @@ public:
     }
     virtual tjs_uint GetCurrentPlaySamples() override
     {
-        return SDL_GetQueuedAudioSize(sdl_audio_device) / _frame_size;
+        // Played frames: queued in total minus still waiting.
+        tTJSCSH lk(_buffer_mtx);
+        tjs_uint64 waiting = SDL_GetQueuedAudioSize(sdl_audio_device);
+        if (waiting > _sentBytes)
+            return 0;
+        return (tjs_uint)((_sentBytes - waiting) / _frame_size);
     }
     virtual int GetRemainBuffers() override
     {
