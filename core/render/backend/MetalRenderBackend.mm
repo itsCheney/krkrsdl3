@@ -76,8 +76,8 @@ float2 evalBezier(const device DeformSurface& surface, float u, float v) {
     return result;
 }
 // emoteSurfaceEvaluator::evaluate (emotegeometry.h), one vertex at a time.
-// The CPU path allows at most emoteMaxGPUDeformSurfaces (16) surfaces, and each
-// surface adds at most two contributions.
+// The CPU path only sends chains whose contribution list fits these arrays
+// (emoteMaxGPUDeformContributions, 32); the surface count is not limited.
 constant uint kLinearInheritMask = 0x1F0;
 float4x4 motionLinear(const device DeformSurface& s, uint mask) {
     const float angle = (mask & 0x10) ? s.motion.x : 0.0;

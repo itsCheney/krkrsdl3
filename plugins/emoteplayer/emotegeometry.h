@@ -238,8 +238,32 @@ inline void evaluateSurfaceChain(const std::vector<emoteRender>& renderMethod,
 }
 
 // The Metal vertex shader runs emoteSurfaceEvaluator::evaluate per vertex and
-// keeps its contributions in a fixed array, which this depth must fit.
-inline constexpr size_t emoteMaxGPUDeformSurfaces = 16;
+// keeps its contributions in a fixed array of this size. Chain depth itself is
+// not limited: fully inherited placements coalesce, so deep affine chains
+// (E-mote characters nest well past 16 surfaces) still need only a few slots.
+inline constexpr size_t emoteMaxGPUDeformContributions = 32;
+
+// The contribution list of emoteSurfaceEvaluator::evaluate depends only on the
+// surface types and inheritance masks, never on the vertex, so its length can
+// be known before any vertex is evaluated.
+inline size_t emoteSurfaceContributionCount(const std::vector<emoteRender>& renderMethod)
+{
+    std::vector<uint32_t> masks;
+    uint32_t geometryMask = emoteLinearInheritMask;
+    const int surfaceCount = (int)renderMethod.size();
+    for (int i = surfaceCount - 1; i >= 0; --i)
+    {
+        const emoteRender& surface = renderMethod[i];
+        if (i == surfaceCount - 1 || surface.type == 1)
+            masks.push_back(geometryMask);
+        for (auto& mask : masks)
+            mask &= surface.currInheritMask;
+        if (masks.empty() || masks.back() != emoteLinearInheritMask)
+            masks.push_back(emoteLinearInheritMask);
+        geometryMask &= surface.currInheritMask;
+    }
+    return masks.size();
+}
 
 // Per-frame inputs of emoteSurfaceEvaluator for the GPU. Placements are
 // resolved here; the shader builds the inheritance-masked linear part itself.
@@ -247,7 +271,8 @@ inline bool buildGPUDeformSurfaces(
     const std::vector<emoteRender>& renderMethod,
     std::vector<krkrsdl3::TVPMeshDeformSurface>& surfaces)
 {
-    if (renderMethod.empty() || renderMethod.size() > emoteMaxGPUDeformSurfaces)
+    if (renderMethod.empty() ||
+        emoteSurfaceContributionCount(renderMethod) > emoteMaxGPUDeformContributions)
         return false;
     surfaces.resize(renderMethod.size());
     for (size_t i = 0; i < renderMethod.size(); ++i)
