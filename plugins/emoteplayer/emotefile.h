@@ -405,6 +405,15 @@ public:
     bool readIconTobuffer(uint8_t* buff, uint32_t buffSize, uint32_t pitch, emoteicon* ic);
     bool getTickByName(const std::string& name, float& ret);
     void setVariable(const std::string& name, tjs_real value);
+    // Whether a released file may be kept for another resource manager
+    // (the same conditions as the shared decoded cache), and its key.
+    bool IsPoolable() const { return _poolable; }
+    const std::string& PoolPath() const { return _poolPath; }
+    tjs_int PoolSeed() const { return _seed; }
+    std::uint64_t PoolGeneration() const { return _poolGeneration; }
+    // Puts variables, selectors and motion parameters back to their state
+    // right after load, before a pooled file goes to a new manager.
+    void ResetPlayState();
 
 private:
     void LoadDecodedResource(std::shared_ptr<const EmoteDecodedResource> resource);
@@ -417,6 +426,9 @@ private:
     void EnsureTJSNameTable();
     void EnsureTJSStringTable();
     bool _sharedCacheHit = false;
+    bool _poolable = false;
+    std::string _poolPath;
+    std::uint64_t _poolGeneration = 0; // shared cache generation at load
     bool _archiveFilterBypass = false;
     bool _fullTreeMaterialization = false;
     bool _tjsNameTableReady = false;

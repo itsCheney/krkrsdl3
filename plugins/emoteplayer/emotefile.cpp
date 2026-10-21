@@ -403,6 +403,59 @@ static EmoteDecodedCache& SharedEmoteCache()
     }());
     return *cache;
 }
+namespace
+{
+// Most recently released first.
+std::vector<std::unique_ptr<emotefile>>& EmoteFilePool()
+{
+    static std::vector<std::unique_ptr<emotefile>> pool;
+    return pool;
+}
+// A scene shows a few characters; each pooled file holds its icon pixels and
+// textures, so the pool stays small.
+constexpr std::size_t kEmoteFilePoolSize = 6;
+constexpr std::size_t kEmoteFilePoolKeptOnTrim = 2;
+std::uint64_t emoteFilePoolHits = 0;
+void ClearEmoteFilePool(std::size_t keep)
+{
+    auto& pool = EmoteFilePool();
+    if (pool.size() > keep) pool.resize(keep);
+}
+} // namespace
+
+void ReleaseEmoteFile(emotefile* released)
+{
+    std::unique_ptr<emotefile> file(released);
+    if (!file || !file->IsPoolable() || file->PoolGeneration() != SharedEmoteCache().Generation() ||
+        TVPHasXP3ArchiveFilters())
+        return;
+    auto& pool = EmoteFilePool();
+    pool.insert(pool.begin(), std::move(file));
+    if (pool.size() > kEmoteFilePoolSize) pool.resize(kEmoteFilePoolSize);
+}
+emotefile* TakePooledEmoteFile(const std::string& canonicalPath, std::int32_t seed)
+{
+    if (TVPHasXP3ArchiveFilters()) return nullptr;
+    auto& pool = EmoteFilePool();
+    for (auto it = pool.begin(); it != pool.end(); ++it)
+    {
+        if ((*it)->PoolPath() != canonicalPath || (*it)->PoolSeed() != seed) continue;
+        emotefile* file = it->release();
+        pool.erase(it);
+        file->ResetPlayState();
+        ++emoteFilePoolHits;
+        return file;
+    }
+    return nullptr;
+}
+std::size_t PooledEmoteFileCount()
+{
+    return EmoteFilePool().size();
+}
+std::uint64_t PooledEmoteFileHits()
+{
+    return emoteFilePoolHits;
+}
 void ClearSharedEmoteResourceCache(const char* reason)
 {
     // One line per clear: clears are rare and the reason decides whether the
@@ -410,11 +463,13 @@ void ClearSharedEmoteResourceCache(const char* reason)
     TVPConsoleLog("emote.resourceCache action=clear reason=%s",
                   reason ? reason : "unspecified");
     SharedEmoteCache().Clear();
+    ClearEmoteFilePool(0);
 }
 void TrimSharedEmoteResourceCache(const char* reason)
 {
     const auto keep = SharedEmoteCache().BudgetBytes() / 4;
     const auto removed = SharedEmoteCache().TrimTo(keep);
+    ClearEmoteFilePool(kEmoteFilePoolKeptOnTrim);
     if (removed)
         TVPConsoleLog("emote.resourceCache action=trim reason=%s removed=%llu retainedBytes=%llu",
                       reason ? reason : "unspecified",
@@ -423,6 +478,8 @@ void TrimSharedEmoteResourceCache(const char* reason)
 }
 void InvalidateSharedEmoteResource(const std::string& canonicalPath)
 {
+    // The generation bump below also keeps files loaded before it out of the pool.
+    ClearEmoteFilePool(0);
     SharedEmoteCache().EraseIf([&](const auto& key) {
         return key.first == canonicalPath ||
             (key.first.size() > canonicalPath.size() &&
@@ -1872,6 +1929,9 @@ bool emotefile::load(const ttstr& filePath)
         canonicalPath.find(TVPArchiveDelimiter) != std::string::npos;
     const auto key = std::make_pair(canonicalPath, _seed);
     const auto generation = SharedEmoteCache().Generation();
+    _poolable = cacheable;
+    _poolPath = canonicalPath;
+    _poolGeneration = generation;
     if (cacheable) {
         if (auto resource = SharedEmoteCache().Find(key)) {
             LoadDecodedResource(std::move(resource));
@@ -3186,6 +3246,19 @@ bool emotefile::getTickByName(const std::string& name, float& ret)
         return false;
     ret = it->second;
     return true;
+}
+void emotefile::ResetPlayState()
+{
+    if (_metadata == nullptr) return;
+    // GenerateAniTree inserts every variable at 0, then selects option 0 of
+    // each selector; motion parameter writes start empty.
+    for (auto& variable : _metadata->_varList) variable.second = 0.0f;
+    for (auto& object : _objects)
+        if (object.second)
+            for (auto& motion : object.second->motion)
+                if (motion.second) motion.second->parameterCache.clear();
+    for (auto* selector : _metadata->_selectorControl)
+        selector->selectValue(0);
 }
 void emotefile::setVariable(const std::string& name, tjs_real value)
 {

@@ -139,7 +139,7 @@ static void recordEmoteCacheEvent(const char* action, const EmoteResourceDiagnos
                       "entries=%llu loads=%llu cacheHits=%llu cacheMisses=%llu failures=%llu "
                       "unloads=%llu unloadAlls=%llu clearCacheCalls=%llu suppressed=%llu "
                       "sharedHits=%llu sharedMisses=%llu sharedBytes=%llu "
-                      "sharedEntries=%llu sharedEvictions=%llu",
+                      "sharedEntries=%llu sharedEvictions=%llu pooledFiles=%llu pooledHits=%llu",
                       action, static_cast<unsigned long long>(diagnostic.managerId),
                       static_cast<unsigned long long>(resourceId),
                       static_cast<unsigned long long>(entries),
@@ -155,7 +155,9 @@ static void recordEmoteCacheEvent(const char* action, const EmoteResourceDiagnos
                       static_cast<unsigned long long>(shared.misses),
                       static_cast<unsigned long long>(shared.retainedBytes),
                       static_cast<unsigned long long>(shared.entries),
-                      static_cast<unsigned long long>(shared.evictions));
+                      static_cast<unsigned long long>(shared.evictions),
+                      static_cast<unsigned long long>(PooledEmoteFileCount()),
+                      static_cast<unsigned long long>(PooledEmoteFileHits()));
     } catch (...) {
         // Logging must never change resource lifetime or load behavior.
     }
@@ -326,6 +328,13 @@ tTJSVariant ResourceManager::loadInternal(tTJSString path, bool materializeRoot)
     Uint64 rootNS = 0;
     try {
         emotefile* file = cacheHit ? rst->second : nullptr;
+        // Another manager may have released this file moments ago; games
+        // create a manager per line and reload the same characters.
+        if (!file && _decryptClo.Object == nullptr) {
+            if (auto* pooled = TakePooledEmoteFile(placedPath.AsStdString(), _decryptkey)) {
+                file = cacheData.emplace(placedPath, pooled).first->second;
+            }
+        }
         if (!file) {
             auto pending = std::make_unique<emotefile>();
             pending->setSeed(_decryptkey);
@@ -368,8 +377,7 @@ void ResourceManager::unload(tTJSString path)
     auto it = cacheData.find(placedPath);
     if (it != cacheData.end())
     {
-        if (it->second != nullptr)
-            delete it->second;
+        ReleaseEmoteFile(it->second);
         cacheData.erase(it);
         ++_diagnostics.unloads;
     }
@@ -384,10 +392,7 @@ void ResourceManager::unloadAllInternal(const char* diagnosticAction)
     ++_diagnostics.unloadAlls;
     _diagnostics.unloads += cacheData.size();
     for (auto item : cacheData)
-    {
-        if (item.second != nullptr)
-            delete item.second;
-    }
+        ReleaseEmoteFile(item.second);
     cacheData.clear();
     recordEmoteCacheEvent(diagnosticAction, _diagnostics, 0);
 }

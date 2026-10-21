@@ -38,6 +38,19 @@ EmoteSharedResourceCacheStats GetSharedEmoteResourceCacheStats();
 // Retention budget for a device with `totalRAMBytes` (0 when unknown).
 std::size_t SharedEmoteCacheBudgetBytes(std::uint64_t totalRAMBytes);
 
+class emotefile;
+// Loaded files released by a resource manager, with their parse tree and icon
+// textures, for the next manager that loads the same archive member. Games
+// create a manager per line and reload the same characters several times a
+// second; reusing the file skips the tree build and texture uploads. The pool
+// is cleared with the shared cache and trimmed on memory compaction.
+// Takes ownership; deletes the file when it cannot be pooled.
+void ReleaseEmoteFile(emotefile* file);
+// A pooled file for (canonicalPath, seed), reset to its loaded state, or null.
+emotefile* TakePooledEmoteFile(const std::string& canonicalPath, std::int32_t seed);
+std::size_t PooledEmoteFileCount();
+std::uint64_t PooledEmoteFileHits();
+
 // A retention budget for immutable, fully constructed CPU resource data. Value
 // must not own script VM or GPU objects, and callers must not retain mutable
 // aliases to a published value. The budget covers caller-supplied resource cost;
