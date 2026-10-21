@@ -433,8 +433,8 @@ private:
     bool _fullTreeMaterialization = false;
     bool _tjsNameTableReady = false;
     bool _tjsStringTableReady = false;
-    std::vector<std::string> namesCacheTJS;
-    std::vector<std::string> stringsCacheTJS;
+    std::vector<ttstr> namesCacheTJS;
+    std::vector<tTJSVariant> stringsCacheTJS;
     tTJSBinaryStream* filePtr = nullptr;
     tjs_int _seed = 0;
     tTJSVariantClosure _decryptClo = NULL;

@@ -2217,10 +2217,10 @@ tTJSVariant emotefile::root()
 }
 void emotefile::EnsureTJSNameTable()
 {
-    // A copy of the decoded table, not a reference: the per-occurrence ttstr
-    // built from it must match the per-byte path byte for byte.
+    // Converted to TJS strings once per file, from the same bytes the
+    // per-occurrence conversion used; TJS strings are immutable and shared.
     if (_tjsNameTableReady) return;
-    namesCacheTJS = namesCache;
+    namesCacheTJS.assign(namesCache.begin(), namesCache.end());
     _tjsNameTableReady = true;
 }
 void emotefile::EnsureTJSStringTable()
@@ -2235,6 +2235,7 @@ void emotefile::EnsureTJSStringTable()
         // The decoder treats a stream that ends before the terminator as an
         // empty string; preserve that instead of exposing the partial bytes.
         stringsCacheTJS.emplace_back(terminated ? str : std::string());
+        // Each value converts once; every occurrence shares the TJS string.
     }
     _tjsStringTableReady = true;
 }
@@ -2485,7 +2486,7 @@ tTJSVariant emotefile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
             EnsureTJSNameTable();
             for (tjs_int i = 0; i < _objsNamesIdx.size(); i++)
             {
-                const ttstr keyName = namesCacheTJS.at(_objsNamesIdx.at(i));
+                const ttstr& keyName = namesCacheTJS.at(_objsNamesIdx.at(i));
                 tTJSVariant obj = readAllObjs(keyName, _tmpOffset + _objsOffset.at(i));
                 dsp->PropSet(TJS_MEMBERENSURE, keyName.c_str(), nullptr, &obj, dsp);
             }

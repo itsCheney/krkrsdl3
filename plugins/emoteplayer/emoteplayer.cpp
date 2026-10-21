@@ -42,6 +42,17 @@ tjs_error controlCall(tTJSVariant* result, tjs_int count, tTJSVariant** args, P*
     if constexpr (Operation == 10) player->playTimeline(tTJSString(*args[0]), (tjs_int)number(1));
     return TJS_S_OK;
 }
+// load() returns the file's whole PSB tree as a fresh dictionary, which
+// costs about 20 ms for a character. The VM passes no result slot when the
+// script discards the value, so that case skips building it.
+tjs_error loadCall(tTJSVariant* result, tjs_int count, tTJSVariant** args, ResourceManager* manager)
+{
+    if (!manager) return TJS_E_FAIL;
+    if (count < 1) return TJS_E_BADPARAMCOUNT;
+    if (result) *result = manager->load(tTJSString(*args[0]));
+    else manager->ensureLoaded(tTJSString(*args[0]));
+    return TJS_S_OK;
+}
 }
 
 #define CONTROL_METHOD(name, type, operation) NCB_METHOD_RAW_CALLBACK(name, (&controlCall<type, operation>), 0)
@@ -49,7 +60,7 @@ tjs_error controlCall(tTJSVariant* result, tjs_int count, tTJSVariant** args, P*
 NCB_REGISTER_SUBCLASS(ResourceManager)
 {
     NCB_CONSTRUCTOR((iTJSDispatch2*, tjs_int));
-    NCB_METHOD(load);
+    NCB_METHOD_RAW_CALLBACK(load, &loadCall, 0);
     NCB_METHOD(unload);
     NCB_METHOD(unloadAll);
     NCB_METHOD(clearCache);
