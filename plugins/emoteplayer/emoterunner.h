@@ -66,6 +66,14 @@ namespace emoteplayer
         bool nearCurrentMesh(float x, float y, float margin) const;
         // 通过 core/render 的 2D 渲染抽象绘制（插件无渲染后端区分）
         bool draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget);
+        // draw() split in two: whether the node draws at all and needs a mask,
+        // its stencil sources drawn into maskTarget (false when nothing was
+        // drawn, so the node is unmasked), and the node itself over an
+        // already prepared mask (nullptr for none).
+        bool canDraw(krkrsdl3::iTVPRenderBackend* renderer) const;
+        bool needsMask() const { return !renderMethod.empty() && renderMethod.front().hasStencil; }
+        bool renderMask(krkrsdl3::iTVPRenderBackend* renderer, void* maskTarget, emotelimit lim);
+        bool drawWithMask(krkrsdl3::iTVPRenderBackend* renderer, void* target, void* mask);
         float getCurrentRenderZ();
 
         // ref
@@ -149,6 +157,9 @@ namespace emoteplayer
 
         float getTickByIdx(int32_t parameterIdx);
         void progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim);
+        // Draws this frame's masks ahead of the canvas pass; draw() then uses
+        // them. Optional: draw() prepares them itself when not called.
+        bool prepareMasks(krkrsdl3::iTVPRenderBackend* renderer, emotelimit lim, void* maskTarget);
         void draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget);
         bool contains(float x, float y, const char* label = nullptr) const;
         // Whether any node drawn in the last frame may have written (x, y).
@@ -186,6 +197,9 @@ namespace emoteplayer
         std::vector<emoterect> shapeNodeAreas;
         size_t _shapeCount = 0;
         std::vector<emotenoderef*> _drawNodes, _drawScratch, _drawStack;
+        // Per draw node: the mask prepared for it before the canvas pass.
+        std::vector<void*> _drawMasks;
+        bool _masksPrepared = false;
     };
     // 核心模拟引擎
     class emoteengine
@@ -200,8 +214,18 @@ namespace emoteplayer
 
         ~emoteengine();
 
+        // Extra mask targets, so every masked node of a frame can have its
+        // mask drawn before the canvas pass (see emotemotionref::draw). Same
+        // size as the player's own mask target; owned here.
+        void* maskTargetFor(krkrsdl3::iTVPRenderBackend* renderer, size_t index, int width, int height);
+        void releaseMaskTargets();
+        static constexpr size_t kMaxPreparedMasks = 4;
+
         // progress/draw接口(替代_mainMotionRef)
         void progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim);
+        // Call after progress and before clearing the canvas (see
+        // emotemotionref::prepareMasks), with the mask target draw() gets.
+        void prepareMasks(krkrsdl3::iTVPRenderBackend* renderer, emotelimit lim, void* maskTarget);
         void draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget);
         // A monotonic prepared-content generation, independent of diagnostics
         // and clock-call counters. Never resets during the engine lifetime.
@@ -265,6 +289,9 @@ namespace emoteplayer
         // 三重签名缓存变量数据
         std::map<std::string, tjs_real> _varCache;
     private:
+        std::vector<void*> _maskPool;
+        krkrsdl3::iTVPRenderBackend* _maskPoolRenderer = nullptr;
+        int _maskPoolWidth = 0, _maskPoolHeight = 0;
         std::map<std::string, float> baseVariables, controlVariables;
         std::map<std::string, EmoteTween> variableTweens;
         std::vector<eyeControl> eyes;

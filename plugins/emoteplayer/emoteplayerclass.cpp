@@ -1391,6 +1391,8 @@ void EmotePlayer::draw(iTJSDispatch2* objthis)
         krkrsdl3::TVPRecordEmotePlayerDraw(
             reinterpret_cast<uintptr_t>(this), reinterpret_cast<uintptr_t>(target));
         prepareFrame();
+        // Masks first: the canvas below is cleared and drawn in one pass.
+        emtEngine.prepareMasks(renderer, _limitArea, maskTarget);
         auto drawFrame = [&](void* frameTarget) {
             const Uint64 drawStarted = SDL_GetTicksNS();
             emtEngine.draw(renderer, frameTarget, _limitArea, maskTarget);
@@ -1456,6 +1458,7 @@ void EmotePlayer::drawToTarget(krkrsdl3::iTVPRenderBackend* renderer,
     krkrsdl3::TVPRecordEmotePlayerDraw(
         reinterpret_cast<uintptr_t>(this), reinterpret_cast<uintptr_t>(target));
     prepareFrame();
+    emtEngine.prepareMasks(renderer, _limitArea, maskTarget);
     renderer->SetTarget(target);
     renderer->ClearTarget(selfClear);
     const Uint64 drawStarted = SDL_GetTicksNS();

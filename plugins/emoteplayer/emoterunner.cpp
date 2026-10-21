@@ -571,52 +571,60 @@ bool emotenoderef::nearCurrentMesh(float x, float y, float margin) const
     return nearMesh(vertices, indices, x, y, margin);
 }
 
-bool emotenoderef::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget)
+bool emotenoderef::canDraw(krkrsdl3::iTVPRenderBackend* renderer) const
 {
     if (!isNeedDraw || !isIcon || renderMethod.size() < 1 || currentNode->removed)
         return false; // 跳过无需绘制的 和 非icon的 和 无method 的节点
-    if (!renderer || !target || !ic || !ic->selftexture)
+    if (!renderer || !ic || !ic->selftexture)
         return false;
 
     // CPU and GPU deformation paths carry different geometry payloads.
     if (_useGPUDeform)
-    {
-        if (_gpuDeformSurfaces.empty()) return false;
-    }
-    else if (_meshVertices.empty() || _meshIndices.empty())
-        return false;
+        return !_gpuDeformSurfaces.empty();
+    return !_meshVertices.empty() && !_meshIndices.empty();
+}
 
+bool emotenoderef::renderMask(krkrsdl3::iTVPRenderBackend* renderer, void* maskTarget, emotelimit lim)
+{
     // 提前绘制好蒙版目标（不考虑复合蒙版的情况）
-    bool hasStencil = renderMethod.at(0).hasStencil;
-    if (hasStencil && maskTarget != 0)
+    if (!needsMask() || maskTarget == nullptr)
+        return false;
+    // Count source-node groups separately from clears. This is an identity
+    // hash for profiling, not a content-validity key for a future cache.
+    uint64_t group = 1469598103934665603ull;
+    for (auto* maskLayer : renderMethod.at(0).layerNode)
+        group = (group ^ reinterpret_cast<uintptr_t>(maskLayer)) * 1099511628211ull;
+    krkrsdl3::TVPRecordEmoteMaskGroup(group);
+    renderer->SetTarget(maskTarget);
+    renderer->ClearTarget(true);
+    krkrsdl3::TVPRecordEmoteMaskClear();
+    bool hasDraw = false;
+    for (auto maskLayer : renderMethod.at(0).layerNode)
     {
-        // Count source-node groups separately from clears. This is an identity
-        // hash for profiling, not a content-validity key for a future cache.
-        uint64_t group = 1469598103934665603ull;
-        for (auto* maskLayer : renderMethod.at(0).layerNode)
-            group = (group ^ reinterpret_cast<uintptr_t>(maskLayer)) * 1099511628211ull;
-        krkrsdl3::TVPRecordEmoteMaskGroup(group);
-        renderer->SetTarget(maskTarget);
-        renderer->ClearTarget(true);
-        krkrsdl3::TVPRecordEmoteMaskClear();
-        bool hasDraw = false;
-        for (auto maskLayer : renderMethod.at(0).layerNode)
+        if (maskLayer != nullptr && maskLayer->currOpa > 0)
         {
-            if (maskLayer != nullptr && maskLayer->currOpa > 0)
-            {
-                hasDraw = true;
-                if (maskLayer->draw(renderer, maskTarget, lim, nullptr))
-                    krkrsdl3::TVPRecordEmoteMaskDraw();
-            }
+            hasDraw = true;
+            if (maskLayer->draw(renderer, maskTarget, lim, nullptr))
+                krkrsdl3::TVPRecordEmoteMaskDraw();
         }
-        // 排除异常蒙版
-        if (!hasDraw)
-            hasStencil = false;
     }
+    // 排除异常蒙版
+    return hasDraw;
+}
 
+bool emotenoderef::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget)
+{
+    if (!target || !canDraw(renderer))
+        return false;
+    const bool masked = renderMask(renderer, maskTarget, lim);
+    return drawWithMask(renderer, target, masked ? maskTarget : nullptr);
+}
+
+bool emotenoderef::drawWithMask(krkrsdl3::iTVPRenderBackend* renderer, void* target, void* mask)
+{
     // 主体绘制（SetTarget 内部完成视口/深度/混合基础状态设置）
     renderer->SetTarget(target);
-    renderer->SetMask(hasStencil ? maskTarget : nullptr);
+    renderer->SetMask(mask);
 
     // 透明度与混色
     float totalOpa = currOpa;
@@ -783,6 +791,7 @@ const emoterect& emoterect::geometry() const
 void emotemotionref::progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim)
 {
     _shapeCount = 0;
+    _masksPrepared = false; // prepared masks belong to the previous geometry
     renderMethod = renderList;
 
     if (currentMotion == nullptr) return;
@@ -898,16 +907,70 @@ void emotemotionref::collectDrawNodes()
                      { return a->getCurrentRenderZ() < b->getCurrentRenderZ(); });
 }
 
+bool emotemotionref::prepareMasks(krkrsdl3::iTVPRenderBackend* renderer, emotelimit lim, void* maskTarget)
+{
+    // A masked node drawn in place switches to the mask target and back, which
+    // ends the canvas render pass and resumes it with a full load and store of
+    // the canvas. Instead every mask of the frame is drawn first, each into its
+    // own target (the player's mask target, then the engine's extra ones), so
+    // the canvas is drawn in one pass. Players call this before clearing their
+    // canvas. Mask contents and draw order are unchanged; a frame with more
+    // masked nodes than targets draws in place as before.
+    _masksPrepared = false;
+    size_t masked = 0;
+    for (auto r : _drawNodes)
+        if (r != nullptr && r->needsMask() && r->canDraw(renderer))
+            ++masked;
+    if (maskTarget == nullptr || masked == 0 || masked > emoteengine::kMaxPreparedMasks + 1)
+        return false;
+    std::vector<void*> targets;
+    targets.reserve(masked);
+    targets.push_back(maskTarget);
+    for (size_t extra = 0; targets.size() < masked; ++extra)
+    {
+        void* target = refTop->maskTargetFor(renderer, extra, int(lim.width), int(lim.height));
+        if (target == nullptr)
+            return false;
+        targets.push_back(target);
+    }
+    _drawMasks.assign(_drawNodes.size(), nullptr);
+    size_t used = 0;
+    for (size_t i = 0; i < _drawNodes.size(); ++i)
+    {
+        auto* r = _drawNodes[i];
+        if (r == nullptr || !r->needsMask() || !r->canDraw(renderer))
+            continue;
+        void* mask = targets[used++];
+        if (r->renderMask(renderer, mask, lim))
+            _drawMasks[i] = mask;
+    }
+    _masksPrepared = true;
+    return true;
+}
+
 void emotemotionref::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget)
 {
-
-    // 绘制
-    for (auto r : _drawNodes)
+    if (!_masksPrepared)
+        prepareMasks(renderer, lim, maskTarget);
+    if (!_masksPrepared)
     {
-        if (r != nullptr)
+        // 绘制
+        for (auto r : _drawNodes)
         {
-            r->wasDrawn = r->draw(renderer, target, lim, maskTarget);
+            if (r != nullptr)
+            {
+                r->wasDrawn = r->draw(renderer, target, lim, maskTarget);
+            }
         }
+        return;
+    }
+    // The masks belong to this frame's geometry: one draw consumes them.
+    _masksPrepared = false;
+    for (size_t i = 0; i < _drawNodes.size(); ++i)
+    {
+        auto* r = _drawNodes[i];
+        if (r != nullptr)
+            r->wasDrawn = target && r->canDraw(renderer) && r->drawWithMask(renderer, target, _drawMasks[i]);
     }
 }
 bool emotemotionref::contains(float x, float y, const char* label) const
@@ -969,7 +1032,41 @@ bool EmoteHitFrame::contains(const char* label, float x, float y, bool local) co
            motion->contains(x, y, label);
 }
 
-emoteengine::~emoteengine() = default;
+emoteengine::~emoteengine()
+{
+    releaseMaskTargets();
+}
+
+void* emoteengine::maskTargetFor(krkrsdl3::iTVPRenderBackend* renderer, size_t index, int width, int height)
+{
+    if (!renderer || index >= kMaxPreparedMasks || width <= 0 || height <= 0)
+        return nullptr;
+    if (renderer != _maskPoolRenderer || width != _maskPoolWidth || height != _maskPoolHeight)
+    {
+        releaseMaskTargets();
+        _maskPoolRenderer = renderer;
+        _maskPoolWidth = width;
+        _maskPoolHeight = height;
+    }
+    while (_maskPool.size() <= index)
+    {
+        void* target = renderer->CreateTarget(width, height);
+        if (!target)
+            return nullptr;
+        _maskPool.push_back(target);
+    }
+    return _maskPool[index];
+}
+
+void emoteengine::releaseMaskTargets()
+{
+    if (_maskPoolRenderer && _maskPoolRenderer == krkrsdl3::TVPGetRenderBackend())
+        for (void* target : _maskPool)
+            _maskPoolRenderer->DestroyTarget(target);
+    _maskPool.clear();
+    _maskPoolRenderer = nullptr;
+    _maskPoolWidth = _maskPoolHeight = 0;
+}
 
 void emoteengine::recordAnimationProgress(double milliseconds, double tick, bool mainPlaying)
 {
@@ -1018,6 +1115,11 @@ void emoteengine::progress(float tick, std::vector<emoteRender>& renderList, emo
 
     _mainMotionRef->progress(tick, renderList, lim);
     _mainMotionRef->collectDrawNodes();
+}
+void emoteengine::prepareMasks(krkrsdl3::iTVPRenderBackend* renderer, emotelimit lim, void* maskTarget)
+{
+    if (_mainMotionRef)
+        _mainMotionRef->prepareMasks(renderer, lim, maskTarget);
 }
 void emoteengine::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget)
 {
