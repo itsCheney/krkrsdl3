@@ -428,34 +428,15 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
 
     if (!refTop->samplingPhysics && isShape && frame && !currentNode->removed && refMtn && !renderMethod.empty())
     {
-        auto& area = _shapeArea;
-        area.label = currentNode->label;
-        area.shapeType = 2;
-        if (frame->src.find("shape/circle") != std::string::npos) area.shapeType = 1;
-        else if (frame->src.find("shape/point") != std::string::npos) area.shapeType = 0;
-        else if (frame->src.find("shape/quad") != std::string::npos) area.shapeType = 3;
+        int shapeType = 2;
+        if (frame->src.find("shape/circle") != std::string::npos) shapeType = 1;
+        else if (frame->src.find("shape/point") != std::string::npos) shapeType = 0;
+        else if (frame->src.find("shape/quad") != std::string::npos) shapeType = 3;
         const Uint64 shapeBuildStarted = SDL_GetTicksNS();
-        buildShapeMesh(renderMethod, area.shapeType, area.vertices, area.indices);
-        krkrsdl3::TVPRecordEmoteShapeBuild(
-            SDL_GetTicksNS() - shapeBuildStarted, area.vertices.size());
-        const float vw = lim.viewW > 0 ? lim.viewW : renderMethod.front().width;
-        const float vh = lim.viewH > 0 ? lim.viewH : renderMethod.front().height;
-        float minX = 1, minY = 1, maxX = -1, maxY = -1;
-        if (!area.vertices.empty())
-        {
-            minX = maxX = area.vertices.front().x;
-            minY = maxY = area.vertices.front().y;
-        }
-        for (const auto& v : area.vertices)
-        {
-            minX = std::min(minX, v.x); maxX = std::max(maxX, v.x);
-            minY = std::min(minY, v.y); maxY = std::max(maxY, v.y);
-        }
-        area.left = (minX + 1) * 0.5f * vw;
-        area.top = (minY + 1) * 0.5f * vh;
-        area.width = (maxX - minX) * 0.5f * vw;
-        area.height = (maxY - minY) * 0.5f * vh;
-        refMtn->recordShape(area);
+        refMtn->recordShape(currentNode->label, shapeType, renderMethod,
+                            lim.viewW > 0 ? lim.viewW : renderMethod.front().width,
+                            lim.viewH > 0 ? lim.viewH : renderMethod.front().height);
+        krkrsdl3::TVPRecordEmoteShapeBuild(SDL_GetTicksNS() - shapeBuildStarted, 0);
     }
 
     // Deformed icon meshes can be evaluated directly in the Metal vertex
@@ -762,12 +743,42 @@ emotenoderef* emotemotionref::getNodeRef(emotenode* node)
     const auto found = _nodeIndex.find(node);
     return found == _nodeIndex.end() ? nullptr : &_nodeCache[found->second];
 }
-void emotemotionref::recordShape(const emoterect& area)
+void emotemotionref::recordShape(const std::string& label, int shapeType,
+                                  const std::vector<emoteRender>& methods,
+                                  float viewW, float viewH)
 {
-    // Reuse each destination vector's capacity, including when geometry is
-    // unchanged. clear()+push_back used to free shape meshes every frame.
+    // Reuse each slot's capacity across frames; the geometry is rebuilt from
+    // this frame's chain only if a script asks for it.
     if (_shapeCount == shapeNodeAreas.size()) shapeNodeAreas.emplace_back();
-    shapeNodeAreas[_shapeCount++] = area;
+    emoterect& area = shapeNodeAreas[_shapeCount++];
+    area.label = label;
+    area.shapeType = shapeType;
+    area.methods.assign(methods.begin(), methods.end());
+    area.viewW = viewW;
+    area.viewH = viewH;
+    area.built = false;
+}
+const emoterect& emoterect::geometry() const
+{
+    if (built) return *this;
+    built = true;
+    buildShapeMesh(methods, shapeType, vertices, indices);
+    float minX = 1, minY = 1, maxX = -1, maxY = -1;
+    if (!vertices.empty())
+    {
+        minX = maxX = vertices.front().x;
+        minY = maxY = vertices.front().y;
+    }
+    for (const auto& v : vertices)
+    {
+        minX = std::min(minX, v.x); maxX = std::max(maxX, v.x);
+        minY = std::min(minY, v.y); maxY = std::max(maxY, v.y);
+    }
+    left = (minX + 1) * 0.5f * viewW;
+    top = (minY + 1) * 0.5f * viewH;
+    width = (maxX - minX) * 0.5f * viewW;
+    height = (maxY - minY) * 0.5f * viewH;
+    return *this;
 }
 void emotemotionref::progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim)
 {

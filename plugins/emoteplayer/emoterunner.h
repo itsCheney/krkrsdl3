@@ -30,14 +30,27 @@ namespace emoteplayer
         float viewH = 0.0f;
     };
     // Shape bounds are exposed to scripts; containment always uses the NDC mesh.
+    // Shapes are hit areas: every shape node records one per frame, but scripts
+    // query them only on touch or layer lookups. The frame's surface chain is
+    // kept and the mesh (a 65-point evaluation for circles) is built on first
+    // use, from the same inputs the eager build used.
     struct emoterect
     {
         std::string label;
-        float left = 0, top = 0, width = 0, height = 0;
         int shapeType = 2;
-        std::vector<EmoteVertex> vertices;
-        std::vector<uint16_t> indices;
-        bool contains(float x, float y) const { return containsMesh(vertices, indices, x, y); }
+        std::vector<emoteRender> methods;
+        float viewW = 0, viewH = 0;
+        // Set by geometry().
+        mutable bool built = false;
+        mutable float left = 0, top = 0, width = 0, height = 0;
+        mutable std::vector<EmoteVertex> vertices;
+        mutable std::vector<uint16_t> indices;
+        const emoterect& geometry() const;
+        bool contains(float x, float y) const
+        {
+            geometry();
+            return containsMesh(vertices, indices, x, y);
+        }
     };
     // 引用自绘制 - 每次绘制创建独立ref，持有node引用+独立状态，避免多次绘制状态重复
     class emotenoderef
@@ -122,7 +135,6 @@ namespace emoteplayer
         std::vector<krkrsdl3::TVPMeshDeformSurface> _gpuDeformSurfaces;
         // Per-node scratch storage survives frames. Index topology is retained
         // until division or mesh mode actually changes.
-        emoterect _shapeArea;
     };
     // motion辅助类 - 管理按priority排序的nodeList并处理子motion展开
     class emotemotionref
@@ -148,7 +160,8 @@ namespace emoteplayer
         // its membership/order/Z changes, and is shared by draw and bounds scans.
         const std::vector<emotenoderef*>& drawNodes() const { return _drawNodes; }
         void collectDrawNodes();
-        void recordShape(const emoterect& area);
+        void recordShape(const std::string& label, int shapeType,
+                         const std::vector<emoteRender>& methods, float viewW, float viewH);
 
         emotemotion* currentMotion = nullptr;
         emoteengine* refTop = nullptr;

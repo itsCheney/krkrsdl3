@@ -802,8 +802,9 @@ static tTJSVariant makeLayerGetter(EmotePlayer* player, emotemotionref* motion, 
     }
     else
     {
-        if (const auto* area = findShapeAreaRecursive(motion, name))
+        if (const auto* found = findShapeAreaRecursive(motion, name))
         {
+            const emoterect* area = &found->geometry();
             auto* getter = new TmpMotionObj(player, motion, name);
             tTJSVariant l(area->left), t(area->top), w(area->width), h(area->height), st(area->shapeType);
             getter->PropSet(TJS_MEMBERENSURE, TJS_N("l"), nullptr, &l, getter);
@@ -1578,7 +1579,10 @@ void EmotePlayer::skipToSync()
 }
 void EmotePlayer::pass()
 {
-    TVPConsoleLog("EmotePlayer::pass TODO");
+    // pass() releases a player held at a sync point (the motion player's
+    // releaseSyncWait). This runtime has no such hold: motions run to their
+    // last keyframe (selfSyncTime) and stop there, so there is nothing to
+    // release. Scripts call it on every advance; it used to log each call.
 }
 void EmotePlayer::stop()
 {
