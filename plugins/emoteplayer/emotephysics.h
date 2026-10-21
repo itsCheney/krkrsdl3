@@ -197,9 +197,12 @@ public:
         const double cosine = std::cos(rotation), sine = std::sin(rotation);
         return {cosine * force.x + sine * force.y, -sine * force.x + cosine * force.y};
     }
+    // Bumped whenever the set of anchor layers may change.
+    std::uint64_t anchorGeneration = 0;
     void reset(const std::vector<bustControl*>& bust, const std::vector<uniControl*>& hair,
                const std::vector<uniControl*>& parts)
     {
+        ++anchorGeneration;
         busts.clear(); chains.clear(); remainder = 0;
         stopWind(); windRandom = 0x9e3779b9;
         for (auto* rule : bust)

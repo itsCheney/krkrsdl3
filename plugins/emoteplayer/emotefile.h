@@ -23,10 +23,25 @@ struct emoteVar // 变量
     int32_t rangeEnd = 1;
     int32_t division = 0;
     std::string id;
+    // id without the trailing NUL the PSB strings carry: the key of the
+    // engine's control variables. Built on first use, then reused per frame.
+    const std::string& controlKey() const
+    {
+        if (!_controlKeyReady)
+        {
+            _controlKey = id.substr(0, id.find('\0'));
+            _controlKeyReady = true;
+        }
+        return _controlKey;
+    }
     float transToTick(float currVal)
     {
         return emoteParameterTick(currVal, rangeBegin, rangeEnd, division);
     }
+
+private:
+    mutable std::string _controlKey;
+    mutable bool _controlKeyReady = false;
 };
 
 class emotefile;

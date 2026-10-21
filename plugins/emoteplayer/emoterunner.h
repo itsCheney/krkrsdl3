@@ -143,6 +143,17 @@ namespace emoteplayer
         std::vector<krkrsdl3::TVPMeshDeformSurface> _gpuDeformSurfaces;
         // Per-node scratch storage survives frames. Index topology is retained
         // until division or mesh mode actually changes.
+
+        // Depth of the root entry after this node's progress (draw sorting).
+        float _renderZ = 0;
+        // Physics sampling evaluates only nodes that lead to an anchor layer.
+        // Whether this node does, for the anchor set and attachments it was
+        // worked out for.
+        bool _leadsToAnchor = false;
+        std::uint64_t _anchorKey = ~std::uint64_t(0);
+        // A type 12 node's stencil layers, looked up by name on first use.
+        std::vector<emotenoderef*> _stencilRefs;
+        bool _stencilResolved = false;
     };
     // motion辅助类 - 管理按priority排序的nodeList并处理子motion展开
     class emotemotionref
@@ -176,7 +187,6 @@ namespace emoteplayer
 
         emotemotion* currentMotion = nullptr;
         emoteengine* refTop = nullptr;
-        std::vector<emoteRender> renderMethod;
         emotenoderef* parent = nullptr;
         std::string label; // retain the instance label in the drawn snapshot
 
@@ -197,6 +207,8 @@ namespace emoteplayer
         std::vector<emoterect> shapeNodeAreas;
         size_t _shapeCount = 0;
         std::vector<emotenoderef*> _drawNodes, _drawScratch, _drawStack;
+        // Holds the root entry's mask while a type 2 layer is evaluated.
+        std::vector<emotenoderef*> _keptLayers;
         // Per draw node: the mask prepared for it before the canvas pass.
         std::vector<void*> _drawMasks;
         bool _masksPrepared = false;
@@ -260,10 +272,17 @@ namespace emoteplayer
         void setVariable(const std::string& name, tjs_real value, double time = 0, double easing = 0);
         tjs_real getVariable(const std::string& name);
         bool getControlVariable(const std::string& name, float& value) const;
+        // The same lookup for a name already stripped of its NUL (emoteVar::controlKey).
+        bool getControlVariableByKey(const std::string& key, float& value) const;
         EmotePhysics physics;
         bool samplingPhysics = false;
         void samplePhysics(float tick, const emoteRender& root, emotelimit lim);
         void recordPhysicsAnchor(const std::string& name, const std::vector<emoteRender>& chain);
+        // Whether physics sampling must evaluate this node: it is an anchor
+        // layer, or one is below it (children or a motion its frames show).
+        bool leadsToPhysicsAnchor(emotenode* node, int depth = 0);
+        std::uint64_t physicsAnchorKey() const { return physics.anchorGeneration * 1024 + _attach.size(); }
+        emotemotionref* physicsSample() const { return _physicsRef.get(); }
         void updatePhysics(float frames);
         bool controlsAnimating() const;
         void skipControls();
@@ -289,6 +308,9 @@ namespace emoteplayer
         // 三重签名缓存变量数据
         std::map<std::string, tjs_real> _varCache;
     private:
+        // Physics samples reuse one runtime tree instead of building it per tick.
+        std::unique_ptr<emotemotionref> _physicsRef;
+        std::vector<emoteRender> _physicsChain;
         std::vector<void*> _maskPool;
         krkrsdl3::iTVPRenderBackend* _maskPoolRenderer = nullptr;
         int _maskPoolWidth = 0, _maskPoolHeight = 0;

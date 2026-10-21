@@ -1093,22 +1093,26 @@ emotetimeline::emotetimeline(emotefile* filePtr, uint32_t startOffset)
     // dic
     std::map<std::string, uint32_t> _rootData;
     filePtr->parseObject(_rootData, startOffset);
-    // frameinfo
+    // Every key is optional: a timeline can be just a label. Absent keys keep
+    // their defaults (-1 times, not diff, no variables) instead of reading
+    // offset 0, which logged "Invalidate Number"/"Invalidate List" per load.
     int64_t tmp = 0;
-    filePtr->parseNumber(tmp, _rootData["lastTime"]);
-    lastTime = static_cast<int32_t>(tmp);
-    filePtr->parseNumber(tmp, _rootData["loopBegin"]);
-    loopBegin = static_cast<int32_t>(tmp);
-    filePtr->parseNumber(tmp, _rootData["loopEnd"]);
-    loopEnd = static_cast<int32_t>(tmp);
-    if (filePtr->parseNumber(tmp, _rootData["diff"]))
-        diff = static_cast<int8_t>(tmp);
+    auto number = [&](const char* key) {
+        const auto it = _rootData.find(key);
+        return it != _rootData.end() && filePtr->parseNumber(tmp, it->second);
+    };
+    if (number("lastTime")) lastTime = static_cast<int32_t>(tmp);
+    if (number("loopBegin")) loopBegin = static_cast<int32_t>(tmp);
+    if (number("loopEnd")) loopEnd = static_cast<int32_t>(tmp);
+    if (number("diff")) diff = static_cast<int8_t>(tmp);
 
     // label
-    filePtr->parseString(label, _rootData["label"]);
+    if (const auto it = _rootData.find("label"); it != _rootData.end())
+        filePtr->parseString(label, it->second);
     // variableList
     std::vector<uint32_t> _tmpList;
-    filePtr->parseList(_tmpList, _rootData["variableList"]);
+    if (const auto it = _rootData.find("variableList"); it != _rootData.end())
+        filePtr->parseList(_tmpList, it->second);
     for (size_t i = 0; i < _tmpList.size(); i++)
     {
         emoteTimeVar* tmp = new emoteTimeVar(filePtr, _tmpList.at(i));
@@ -1118,6 +1122,10 @@ emotetimeline::emotetimeline(emotefile* filePtr, uint32_t startOffset)
         for (const auto* variable : variableList)
             for (const auto* frame : variable->frameList)
                 lastTime = std::max(lastTime, (int32_t)std::ceil(frame->time) - 1);
+    // A label-only timeline has nothing to play. It used to read lastTime 0
+    // from the missing key and finish at once; keep that.
+    if (lastTime < 0 && variableList.empty() && !(loopBegin >= 0 && loopEnd > loopBegin))
+        lastTime = 0;
 }
 emotetimeline::~emotetimeline()
 {

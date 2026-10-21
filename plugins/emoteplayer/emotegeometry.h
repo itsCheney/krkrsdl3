@@ -42,8 +42,6 @@ struct emoteRender // 渲染方式
     float currOx = 0, currOy = 0;
     uint32_t currInheritMask = 0x20007FC;
     int32_t transformOrder[4] = {0, 1, 2, 3};
-    // 辅助信息
-    std::string label;
 };
 
 // Cubic Bezier basis functions

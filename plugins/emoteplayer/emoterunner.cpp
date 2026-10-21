@@ -183,6 +183,18 @@ void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderL
 }
 void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim)
 {
+    if (refTop->samplingPhysics)
+    {
+        // Physics reads only the anchor layers' positions; the rest of the
+        // model needs no evaluation for it.
+        const auto key = refTop->physicsAnchorKey();
+        if (_anchorKey != key)
+        {
+            _anchorKey = key;
+            _leadsToAnchor = refTop->leadsToPhysicsAnchor(currentNode);
+        }
+        if (!_leadsToAnchor) return;
+    }
     const Uint64 nodeProfileStarted = SDL_GetTicksNS();
     // 参数化时可能改变
     currTick = tick;
@@ -247,8 +259,22 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
     // 修复（修复部分游戏emote立绘消失以及DRACU-RIOT!菜单问题。）
 
     // 构建渲染方法
-    renderMethod.clear();
-    renderMethod = renderList;
+    // renderList is the ancestors' chain, shared by the whole walk: this node
+    // pushes its own entry, may adjust the root entry, and undoes both before
+    // returning. Copying the chain into every node cost more than evaluating
+    // the node. Only drawable icons keep a copy (renderMethod), for draw and
+    // hit tests.
+    std::vector<emoteRender>& chain = renderList;
+    bool pushed = false;
+    glm::mat4 savedRootMat(1.0f);
+    bool savedRootStencil = false;
+    size_t savedRootLayers = 0;
+    if (!chain.empty())
+    {
+        savedRootMat = chain.front().attachMat;
+        savedRootStencil = chain.front().hasStencil;
+        savedRootLayers = chain.front().layerNode.size();
+    }
     if (!frame || (!isNeedDraw && (width == 0 || height == 0)) || currentNode->type == 7)
     {
         originX = lim.originX;
@@ -358,25 +384,31 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         }
 
         // 有深度信息时，穿透到最顶层
-        if (renderMethod.size() > 0 && currCoordz != 0.0)
+        if (chain.size() > 0 && currCoordz != 0.0)
         {
-            renderMethod.at(0).attachMat =
-                glm::translate(renderMethod.at(0).attachMat, glm::vec3(0.0, 0.0, currCoordz));
+            chain.at(0).attachMat =
+                glm::translate(chain.at(0).attachMat, glm::vec3(0.0, 0.0, currCoordz));
         }
 
         // 有模板信息时，穿透到最顶层
-        if (renderMethod.size() > 0 && currentNode->stencilCompositeMaskLayerList.size() > 0 && currentNode->type == 12)
+        if (chain.size() > 0 && currentNode->stencilCompositeMaskLayerList.size() > 0 && currentNode->type == 12)
         {
-            renderMethod.at(0).hasStencil = true;
-            for (auto nodeName : currentNode->stencilCompositeMaskLayerList)
+            chain.at(0).hasStencil = true;
+            // The mask layers are found by name once; the refs live as long as
+            // this one (both are rebuilt when the motion's nodes change).
+            if (!_stencilResolved)
             {
-                // 让父类去找节点
-                emotenoderef* tmpNode = refMtn->getNodeRef(currentNode->_rootmotion->getNodeByName(nodeName));
-                if (tmpNode != nullptr)
+                _stencilResolved = true;
+                _stencilRefs.clear();
+                for (const auto& nodeName : currentNode->stencilCompositeMaskLayerList)
                 {
-                    renderMethod.at(0).layerNode.push_back(tmpNode);
+                    // 让父类去找节点
+                    emotenoderef* tmpNode = refMtn->getNodeRef(currentNode->_rootmotion->getNodeByName(nodeName));
+                    if (tmpNode != nullptr)
+                        _stencilRefs.push_back(tmpNode);
                 }
             }
+            chain.at(0).layerNode.insert(chain.at(0).layerNode.end(), _stencilRefs.begin(), _stencilRefs.end());
         }
 
         // Shape zoom stays in the shared transform, including frame interpolation.
@@ -389,7 +421,9 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         }
 
         // 渲染信息记录
-        emoteRender emt;
+        chain.emplace_back();
+        pushed = true;
+        emoteRender& emt = chain.back();
         if (isLayout)
             emt.type = 3;
         else
@@ -419,23 +453,26 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         emt.originY = originY;
         emt.width = width;
         emt.height = height;
-        emt.label = currentNode->label;
-        renderMethod.push_back(emt);
     }
+    _renderZ = chain.empty() ? 0.0f : chain.front().attachMat[3][2];
+    if (isIcon && !refTop->samplingPhysics)
+        renderMethod.assign(chain.begin(), chain.end()); // reuses this node's storage
+    else
+        renderMethod.clear();
 
     if (refTop->samplingPhysics && frame && !currentNode->removed)
-        refTop->recordPhysicsAnchor(currentNode->label, renderMethod);
+        refTop->recordPhysicsAnchor(currentNode->label, chain);
 
-    if (!refTop->samplingPhysics && isShape && frame && !currentNode->removed && refMtn && !renderMethod.empty())
+    if (!refTop->samplingPhysics && isShape && frame && !currentNode->removed && refMtn && !chain.empty())
     {
         int shapeType = 2;
         if (frame->src.find("shape/circle") != std::string::npos) shapeType = 1;
         else if (frame->src.find("shape/point") != std::string::npos) shapeType = 0;
         else if (frame->src.find("shape/quad") != std::string::npos) shapeType = 3;
         const Uint64 shapeBuildStarted = SDL_GetTicksNS();
-        refMtn->recordShape(currentNode->label, shapeType, renderMethod,
-                            lim.viewW > 0 ? lim.viewW : renderMethod.front().width,
-                            lim.viewH > 0 ? lim.viewH : renderMethod.front().height);
+        refMtn->recordShape(currentNode->label, shapeType, chain,
+                            lim.viewW > 0 ? lim.viewW : chain.front().width,
+                            lim.viewH > 0 ? lim.viewH : chain.front().height);
         krkrsdl3::TVPRecordEmoteShapeBuild(SDL_GetTicksNS() - shapeBuildStarted, 0);
     }
 
@@ -445,7 +482,7 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
     const bool gpuCapable = backend && backend->SupportsMeshDeformation();
     _useGPUDeform = false;
     _gpuDeformSurfaces.clear();
-    if (!refTop->samplingPhysics && isIcon && isNeedDraw && renderMethod.size() > 0)
+    if (!refTop->samplingPhysics && isIcon && isNeedDraw && chain.size() > 0)
     {
         // 确定细分等级
         int div = currentNode ? (int)currentNode->meshDivision : 0;
@@ -453,7 +490,7 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         div = std::min(div, 254); // (div + 1)^2 must fit uint16_t indices
         // 检查是否包含mesh变形
         bool containsMesh = false;
-        for (auto itm : renderMethod)
+        for (const auto& itm : chain)
         {
             if (itm.type == 1)
             {
@@ -466,7 +503,7 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         _meshDivX = div;
         _meshDivY = div;
         if (containsMesh && gpuCapable &&
-            buildGPUDeformSurfaces(renderMethod, _gpuDeformSurfaces))
+            buildGPUDeformSurfaces(chain, _gpuDeformSurfaces))
         {
             _useGPUDeform = true;
             _meshVertices.clear();
@@ -475,13 +512,13 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         {
             const size_t expectedIndices = size_t(div) * size_t(div) * 6;
             const bool rebuildIndices = _meshIndices.size() != expectedIndices;
-            buildSubdivMesh(renderMethod, _meshDivX, _meshDivY, _meshVertices, _meshIndices,
+            buildSubdivMesh(chain, _meshDivX, _meshDivY, _meshVertices, _meshIndices,
                             rebuildIndices);
         }
         else
         {
             const bool rebuildIndices = _meshIndices.size() != 6;
-            buildRectMesh(renderMethod, _meshVertices, _meshIndices, rebuildIndices);
+            buildRectMesh(chain, _meshVertices, _meshIndices, rebuildIndices);
         }
         const uint64_t meshVertexCount = containsMesh
             ? uint64_t(div + 1) * uint64_t(div + 1)
@@ -513,7 +550,7 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
             if (childRef)
             {
                 // Preserve the target viewport through nested motions.
-                childRef->progress(tick, renderMethod,
+                childRef->progress(tick, chain,
                                    {originX, originY, width, height, lim.zMax, lim.viewW,
                                     lim.viewH});
             }
@@ -543,9 +580,19 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
             refMtn->_subMotionRefs.push_back(currentMtnRef);
             krkrsdl3::TVPRecordEmoteSubmotionRebuild(
                 SDL_GetTicksNS() - submotionRebuildStarted, submotionCreated);
-            currentMtnRef->progress(tick + currTimeOffset, renderMethod,
+            currentMtnRef->progress(tick + currTimeOffset, chain,
                             {originX, originY, width, height, lim.zMax, lim.viewW, lim.viewH});
         }
+    }
+
+    // Hand the chain back as it came in.
+    if (pushed)
+        chain.pop_back();
+    if (!chain.empty())
+    {
+        chain.front().attachMat = savedRootMat;
+        chain.front().hasStencil = savedRootStencil;
+        chain.front().layerNode.resize(savedRootLayers);
     }
 }
 bool emotenoderef::containsCurrentMesh(float x, float y) const
@@ -680,11 +727,7 @@ bool emotenoderef::drawWithMask(krkrsdl3::iTVPRenderBackend* renderer, void* tar
 }
 float emotenoderef::getCurrentRenderZ()
 {
-    if (renderMethod.size() > 0)
-    {
-        return renderMethod.at(0).attachMat[3][2];
-    }
-    return 0;
+    return _renderZ;
 }
 
 emotemotionref::~emotemotionref()
@@ -700,7 +743,7 @@ float emotemotionref::getTickByIdx(int32_t idx)
         return -1.0f;
     float currVal = 0;
     // file系控制
-    if (!refTop->getControlVariable(currentMotion->parameter.at(idx)->id, currVal) &&
+    if (!refTop->getControlVariableByKey(currentMotion->parameter.at(idx)->controlKey(), currVal) &&
         !currentMotion->_filePtr->getTickByName(currentMotion->parameter.at(idx)->id, currVal))
     {
         if (currentMotion->_filePtr->isMotion)
@@ -792,7 +835,6 @@ void emotemotionref::progress(float tick, std::vector<emoteRender>& renderList, 
 {
     _shapeCount = 0;
     _masksPrepared = false; // prepared masks belong to the previous geometry
-    renderMethod = renderList;
 
     if (currentMotion == nullptr) return;
 
@@ -854,17 +896,27 @@ void emotemotionref::progress(float tick, std::vector<emoteRender>& renderList, 
                 actualTick = std::fmod(tick, currentMotion->loopTime);
         }
 
-        std::vector<emoteRender> localRender = renderList;
-        if (localRender.size() > 0 && ch->type == 2)
+        // Layers share the caller's chain; a type 2 layer starts without the
+        // inherited mask, which is put back afterwards.
+        const bool dropMask = renderList.size() > 0 && ch->type == 2;
+        bool keptStencil = false;
+        if (dropMask)
         {
-            localRender.at(0).hasStencil = false;
-            localRender.at(0).layerNode.clear();
+            keptStencil = renderList.front().hasStencil;
+            renderList.front().hasStencil = false;
+            _keptLayers.swap(renderList.front().layerNode);
         }
 
         emotenoderef* ref = getNodeRef(ch);
         if (ref)
         {
-            ref->progress(actualTick, localRender, lim);
+            ref->progress(actualTick, renderList, lim);
+        }
+        if (dropMask)
+        {
+            renderList.front().hasStencil = keptStencil;
+            _keptLayers.swap(renderList.front().layerNode);
+            _keptLayers.clear();
         }
     }
     shapeNodeAreas.resize(_shapeCount);
@@ -1269,6 +1321,13 @@ bool emoteengine::getControlVariable(const std::string& name, float& value) cons
     value = entry->second;
     return true;
 }
+bool emoteengine::getControlVariableByKey(const std::string& key, float& value) const
+{
+    const auto entry = controlVariables.find(key);
+    if (entry == controlVariables.end()) return false;
+    value = entry->second;
+    return true;
+}
 
 void emoteengine::updateEyeControl(float tick, bool isMain)
 {
@@ -1404,9 +1463,27 @@ void emoteengine::samplePhysics(float tick, const emoteRender& root, emotelimit 
     physics.beginAnchors();
     samplingPhysics = true;
     struct Restore { bool& flag; ~Restore() { flag = false; } } restore{samplingPhysics};
-    std::vector<emoteRender> chain{root};
-    emotemotionref sample(_mainmotion, this);
-    sample.progress(tick, chain, lim);
+    if (!_physicsRef || _physicsRef->currentMotion != _mainmotion)
+        _physicsRef = std::make_unique<emotemotionref>(_mainmotion, this);
+    _physicsChain.assign(1, root);
+    _physicsRef->progress(tick, _physicsChain, lim);
+}
+
+bool emoteengine::leadsToPhysicsAnchor(emotenode* node, int depth)
+{
+    if (node == nullptr || depth > 64) return false; // depth guards motion cycles
+    if (physics.needsAnchor(node->label)) return true;
+    for (auto* child : node->children)
+        if (leadsToPhysicsAnchor(child, depth + 1)) return true;
+    for (const auto* frame : node->frameList)
+    {
+        if (frame == nullptr || !frame->hasContent || node->_filePtr->findsourceByName(frame->src))
+            continue;
+        if (auto* motion = findmotionByName(frame->src))
+            for (auto* inner : motion->nodeList)
+                if (leadsToPhysicsAnchor(inner, depth + 1)) return true;
+    }
+    return false;
 }
 
 void emoteengine::recordPhysicsAnchor(const std::string& name, const std::vector<emoteRender>& chain)
