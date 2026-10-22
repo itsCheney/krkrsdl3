@@ -644,8 +644,11 @@ void TVPInitScriptEngine()
 void TVPUninitScriptEngine()
 {
     TVPRemoveCompactEventHook(&TVPTJSGCCallback);
-    
+
+    // Finalizers run by this collection may throw; the engine is deleted anyway.
+    TJS::TJSBeginEngineTeardown();
     TVPScriptEngine->DoGarbageCollection();
+    TJS::TJSEndEngineTeardown();
     delete TVPScriptEngine;
     // 回收不了的object以后想办法
     /*

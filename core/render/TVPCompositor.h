@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -26,18 +27,26 @@ struct TVPLayerGlyphUploadInfo {
     const char* reason="unsupported";
     bool targetWritten=false; // also observable if a post-encoding Submit throws
 };
-// GPU mesh-deformation input. Matrices are column-major and already include
-// inheritance/attach transforms. Keeping this representation renderer-neutral
-// lets plugins use an accelerated path without exposing their own types here.
+// GPU mesh-deformation input: one entry per surface of an Emote node chain,
+// innermost last. The vertex shader evaluates the same chain as the CPU path
+// (emoteSurfaceEvaluator). Matrices are column-major. Keeping this
+// representation renderer-neutral lets plugins use an accelerated path without
+// exposing their own types here.
 struct TVPMeshDeformSurface
 {
-    float matrix[16] = {0};
+    float attach[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     float originX = 0, originY = 0, width = 0, height = 0;
+    // attach * (coord, 0, 1); the w component is always 0 in the chain.
+    float positionX = 0, positionY = 0, positionZ = 0, reserved0 = 0;
+    float angle = 0, zoomX = 1, zoomY = 1, slantX = 0;
+    float slantY = 0, offsetX = 0, offsetY = 0, reserved1 = 0;
     int32_t type = 0;
-    int32_t reserved[3] = {0, 0, 0};
+    uint32_t inheritMask = 0;
+    uint32_t transformOrder = 0x03020100; // four operation bytes, first in the low byte
+    uint32_t reserved2 = 0;
     float controlPts[32] = {0};
 };
-static_assert(sizeof(TVPMeshDeformSurface) == 224, "GPU deformation surface layout");
+static_assert(sizeof(TVPMeshDeformSurface) == 272, "GPU deformation surface layout");
 
 //---------------------------------------------------------------------------
 // 渲染后端抽象层（合并接口）
@@ -297,9 +306,14 @@ struct TVPRenderBackendDesc
                                     // 由入口直接构造，此时可为 nullptr
 };
 void TVPRegisterRenderBackend(const TVPRenderBackendDesc& desc);
-// 画面比例：false=保持比例 letterbox（默认），true=拉伸铺满窗口
+// 画面比例：false=保持比例 letterbox（默认），true=把比 16:9 窄的横屏画面拉伸到 16:9 后再 letterbox
 void TVPSetStretchMode(bool enable);
 bool TVPGetStretchMode();
+// GPU 后端每发出一次 draw call 计数一次；累计值供宿主算每帧 draw call 数
+// 定义在头文件里，独立的 Metal 后端测试不链接 TVPCompositor.cpp 也能用
+inline std::atomic<uint64_t> TVPDrawCallCount{0};
+inline void TVPCountDrawCall() { TVPDrawCallCount.fetch_add(1, std::memory_order_relaxed); }
+inline uint64_t TVPGetDrawCallCount() { return TVPDrawCallCount.load(std::memory_order_relaxed); }
 // 探测通过的可用后端名列表
 std::vector<std::string> TVPListRenderBackends();
 bool TVPRenderBackendAvailable(const std::string& name);

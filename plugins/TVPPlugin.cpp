@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <set>
 #include "TVPScript.h"
 #include "TVPPlugin.h"
 #include "TVPStorage.h"
@@ -36,9 +37,19 @@
 bool TVPLoadInternalPlugin(const ttstr& _name);
 extern std::set<ttstr> TVPRegisteredPlugins;
 static bool TVPPluginLoading = false;
+static std::set<ttstr> TVPMissingPluginsLogged;
 void TVPLoadPlugin(const ttstr& name)
 {
     bool success = TVPLoadInternalPlugin(name);
+    if (!success)
+    {
+        // Only built-in modules can be linked, so a miss means the game will
+        // later fail on whatever this plugin should have provided.
+        ttstr key = TVPExtractStorageName(name).AsLowerCase();
+        if (TVPRegisteredPlugins.find(key) == TVPRegisteredPlugins.end() &&
+            TVPMissingPluginsLogged.insert(key).second)
+            TVPAddImportantLog(TJS_N("(warning) Plugin is not built in: ") + name);
+    }
     return; // seal all plugins
 }
 //---------------------------------------------------------------------------
@@ -212,6 +223,7 @@ void TVPLoadInternalPlugins()
 void TVPUnloadInternalPlugins()
 {
     ncbAutoRegister::ClearRegisteredModule();
+    TVPMissingPluginsLogged.clear();
 }
 
 bool TVPLoadInternalPlugin(const ttstr& _name)

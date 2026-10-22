@@ -107,7 +107,8 @@ tGenericFreeTypeFace::tGenericFreeTypeFace(const ttstr& fontname, tjs_uint32 opt
         }
 
         // ファイルを開く
-        File = TVPCreateFontStream(fontname);
+        int registeredIndex = 0;
+        File = TVPCreateFontStream(fontname, &registeredIndex);
         if (File == NULL)
         {
             TVPThrowExceptionMessage(TVPCannotOpenFontFile, fontname);
@@ -147,7 +148,11 @@ tGenericFreeTypeFace::tGenericFreeTypeFace(const ttstr& fontname, tjs_uint32 opt
             FT_Done_Face(face), face = NULL;
 
         // FreeType エンジンでファイルを開こうとしてみる
+        // A name registered from a collection (.ttc) opens its own face; an
+        // index given in options overrides it.
         tjs_uint index = TVP_GET_FACE_INDEX_FROM_OPTIONS(options);
+        if (index == 0)
+            index = registeredIndex;
         if (!OpenFaceByIndex(index, Face))
         {
             // フォントを開けなかった
@@ -525,24 +530,7 @@ tTVPCharacterData* tFreeTypeFace::GetGlyphFromCharcode(tjs_wchar code)
                                           ft_bmp->rows, metrics);
         glyph_bmp->Gray = 256;
 
-        if (Options & TVP_TF_UNDERLINE)
-        {
-            tjs_int pos = -1, thickness = -1;
-            GetUnderline(pos, thickness);
-            if (pos >= 0 && thickness > 0)
-            {
-                glyph_bmp->AddHorizontalLine(pos, thickness, 255);
-            }
-        }
-        if (Options & TVP_TF_STRIKEOUT)
-        {
-            tjs_int pos = -1, thickness = -1;
-            GetStrikeOut(pos, thickness);
-            if (pos >= 0 && thickness > 0)
-            {
-                glyph_bmp->AddHorizontalLine(pos, thickness, 255);
-            }
-        }
+        AddLinesToGlyph(glyph_bmp);
     }
     catch (...)
     {
@@ -588,20 +576,24 @@ tjs_int h = FTFace->glyph->bitmap.rows;
     advancex = FT_PosToInt(FTFace->glyph->advance.x);
     advancey = FT_PosToInt(FTFace->glyph->advance.y);
     rt = tTVPRect(l, t, l + w, t + h);
+    AddLinesToRect(rt, advancex);
+    return true;
+}
+
+//---------------------------------------------------------------------------
+/**
+ * 下線・取り消し線を描く (オプションで指定されている場合)
+ * @param glyph	グリフ (このフェイスのベースラインに置かれていること)
+ */
+void tFreeTypeFace::AddLinesToGlyph(tTVPCharacterData* glyph) const
+{
     if (Options & TVP_TF_UNDERLINE)
     {
         tjs_int pos = -1, thickness = -1;
         GetUnderline(pos, thickness);
         if (pos >= 0 && thickness > 0)
         {
-            if (rt.left > 0)
-                rt.left = 0;
-            if (rt.right < advancex)
-                rt.right = advancex;
-            if (pos < rt.top)
-                rt.top = pos;
-            if ((pos + thickness) >= rt.bottom)
-                rt.bottom = pos + thickness + 1;
+            glyph->AddHorizontalLine(pos, thickness, 255);
         }
     }
     if (Options & TVP_TF_STRIKEOUT)
@@ -610,6 +602,30 @@ tjs_int h = FTFace->glyph->bitmap.rows;
         GetStrikeOut(pos, thickness);
         if (pos >= 0 && thickness > 0)
         {
+            glyph->AddHorizontalLine(pos, thickness, 255);
+        }
+    }
+}
+//---------------------------------------------------------------------------
+
+//---------------------------------------------------------------------------
+/**
+ * 下線・取り消し線の領域を描画領域に含める (オプションで指定されている場合)
+ */
+void tFreeTypeFace::AddLinesToRect(tTVPRect& rt, tjs_int advancex) const
+{
+    const tjs_uint32 lines[] = {TVP_TF_UNDERLINE, TVP_TF_STRIKEOUT};
+    for (tjs_uint32 line : lines)
+    {
+        if (!(Options & line))
+            continue;
+        tjs_int pos = -1, thickness = -1;
+        if (line == TVP_TF_UNDERLINE)
+            GetUnderline(pos, thickness);
+        else
+            GetStrikeOut(pos, thickness);
+        if (pos >= 0 && thickness > 0)
+        {
             if (rt.left > 0)
                 rt.left = 0;
             if (rt.right < advancex)
@@ -620,7 +636,17 @@ tjs_int h = FTFace->glyph->bitmap.rows;
                 rt.bottom = pos + thickness + 1;
         }
     }
-    return true;
+}
+//---------------------------------------------------------------------------
+
+//---------------------------------------------------------------------------
+/**
+ * 指定した文字コードに対するグリフがあるかどうか (グリフは読み込まない)
+ */
+bool tFreeTypeFace::HasGlyph(tjs_wchar code) const
+{
+    FT_ULong localcode = UnicodeToLocalChar ? UnicodeToLocalChar(code) : code;
+    return FT_Get_Char_Index(FTFace, localcode) != 0;
 }
 
 //---------------------------------------------------------------------------

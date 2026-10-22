@@ -113,6 +113,10 @@ public:
             thickness = 1;
         pos = FTFace->ascender * 7 * ppem / (10 * upe);
     }
+    // Underline / strikeout per the options, in this face's coordinates.
+    void AddLinesToGlyph(tTVPCharacterData* glyph) const;
+    void AddLinesToRect(struct tTVPRect& rt, tjs_int advancex) const;
+    bool HasGlyph(tjs_wchar code) const;
     tTVPCharacterData* GetGlyphFromCharcode(tjs_wchar code);
     bool GetGlyphRectFromCharcode(struct tTVPRect& rt,
                                   tjs_wchar code,

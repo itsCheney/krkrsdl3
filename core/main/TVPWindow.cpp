@@ -747,6 +747,8 @@ void TVPWindow::BringToFront()
     }
 }
 //---------------------------------------------------------------------------
+void (*TVPHostModalYield)() = nullptr;
+
 void TVPWindow::ShowWindowAsModal()
 {
     pSprite->type = 1;
@@ -766,6 +768,12 @@ void TVPWindow::ShowWindowAsModal()
         else if (modal_result_ != 0)
         {
             break;
+        }
+        else if (TVPHostModalYield)
+        {
+            // The host's next frame resumes here. Sleeping instead would hold
+            // the host's frame, and on iOS no touch reaches the dialog then.
+            TVPHostModalYield();
         }
         else if (remain > 0)
         {

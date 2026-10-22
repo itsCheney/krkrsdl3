@@ -27,7 +27,8 @@ struct TVPSprite
     void* texture = nullptr;
     int type = 0; // 0:窗口 1:modal 2:overlay
     int xPos = 0, yPos = 0;
-    float scale = 1.0;
+    float scale = 1.0;  // 横向缩放（拉伸模式下与纵向不同）
+    float scaleY = 1.0; // 纵向缩放
     int width = 0, height = 0;
     bool isVisible = false;
     // 纹理是否借用于外部（如 GPU 纹理别名）：借用的句柄不由 sprite 销毁

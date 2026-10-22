@@ -108,7 +108,6 @@ tTJSVariant D3DEmotePlayer::clone(iTJSDispatch2* newlayer)
         {
             emoteplayer::EmotePlayer* src = Impl->Player;
             emoteplayer::EmotePlayer* dst = np->Impl->Player;
-            dst->inheritAnimationModeFrom(*src);
             // clone 先给新播放器加载同一文件并增加引用计数，再恢复 motion/状态
             dst->set_motionKey(src->get_motionKey());
             tTJSString motion = src->get_motion();
@@ -117,10 +116,8 @@ tTJSVariant D3DEmotePlayer::clone(iTJSDispatch2* newlayer)
             dst->set_tickCount(src->get_tickCount());
             dst->set_speed(src->get_speed());
             dst->unserialize(src->serialize());
-            dst->copyAnimationStateFrom(*src);
             // 变量复制（按当前 motion 的变量表枚举）
-            tTJSVariant keys;
-            if (!src->usesIntegratedAnimation()) keys = src->get_variableKeys();
+            tTJSVariant keys = src->get_variableKeys();
             if (keys.Type() == tvtObject)
             {
                 iTJSDispatch2* arr = keys.AsObjectNoAddRef();
@@ -180,6 +177,9 @@ void D3DEmotePlayer::progress(tjs_real frames)
     // 脚本按 60fps 帧数传入 → 换算毫秒
     if (Impl && Impl->Player)
     {
+        Impl->Player->set_bustScale(BustScale);
+        Impl->Player->set_hairScale(HairScale);
+        Impl->Player->set_partsScale(PartsScale);
         Impl->Player->progress(frames * 1000.0 / 60.0);
         if (Layer && Device && Device->GetBackend())
         {
@@ -195,19 +195,19 @@ void D3DEmotePlayer::progress(tjs_real frames)
 void D3DEmotePlayer::setCoord(tjs_real x, tjs_real y, tjs_real z, tjs_real t)
 {
     if (Impl && Impl->Player)
-        Impl->Player->setCoord(x, y);
+        Impl->Player->setCoord(x, y, t);
 }
 
 void D3DEmotePlayer::setRot(tjs_real angle, tjs_real time, tjs_real easing)
 {
     if (Impl && Impl->Player)
-        Impl->Player->setRotate(angle * 360.0 / (3.14159265358979 * 2.0));
+        Impl->Player->setRotate(angle, time, easing);
 }
 
 void D3DEmotePlayer::setScale(tjs_real scale, tjs_real time, tjs_real easing)
 {
     if (Impl && Impl->Player)
-        Impl->Player->setScale(scale);
+        Impl->Player->setScale(scale, time, easing);
 }
 
 void D3DEmotePlayer::setColor(tjs_uint32 color, tjs_real time, tjs_real easing)

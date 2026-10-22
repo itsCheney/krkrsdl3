@@ -1,15 +1,117 @@
+// textrender.dll: the TextRenderBase layout engine used by some KiriKiri Z
+// titles instead of KAG text.
+//
+// Layout, timing and option handling follow the AetherKrkr port
+// (https://github.com/AetherKiri/AetherKrkr, plugins/textrender.cpp,
+// GPL-3.0-or-later), which in turn is based on the drop-in replacement by
+// Hikaru Terazono (3c1u, https://github.com/3c1u/TextRender, MIT / Apache-2.0).
+// Adapted here to UTF-8 tjs_char, the krkrsdl3 FreeTypeFontRasterizer, and
+// with graphical characters, %p and overflow reporting kept from the previous
+// krkrsdl3 implementation.
+
 #include "ncbind/ncbind.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <initializer_list>
+#include <limits>
 #include <optional>
+#include <string>
+#include <vector>
 
 #include "FreeTypeFontRasterizer.h"
 #include "Platform.h"
 
 #define NCB_MODULE_NAME TJS_N("textrender.dll")
 
-// use Kirikiri-Z rasterizer for layouting
+extern bool Layer_FetchImageSize(ttstr imageName, int& w, int& h);
+extern iTJSDispatch2* TVPCreateRectObject(tjs_int left, tjs_int top, tjs_int right, tjs_int bottom);
 
 using RgbColor = uint32_t;
+using tr_string = std::u32string;
+
+// -------------------------------------------------------------------
+// UTF-8 <-> code points
+
+static tr_string utf8ToCodePoints(const ttstr& s)
+{
+    tr_string out;
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(s.c_str());
+    if (!p)
+        return out;
+    while (*p)
+    {
+        char32_t c = *p;
+        int extra = 0;
+        if (c >= 0xF0)
+            c &= 0x07, extra = 3;
+        else if (c >= 0xE0)
+            c &= 0x0F, extra = 2;
+        else if (c >= 0xC0)
+            c &= 0x1F, extra = 1;
+        else if (c >= 0x80)
+        {
+            // stray continuation byte
+            out.push_back(0xFFFD);
+            ++p;
+            continue;
+        }
+        ++p;
+        for (int i = 0; i < extra; ++i)
+        {
+            if ((*p & 0xC0) != 0x80)
+            {
+                c = 0xFFFD;
+                extra = 0;
+                break;
+            }
+            c = (c << 6) | (*p & 0x3F);
+            ++p;
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+static void appendUtf8(std::string& out, char32_t c)
+{
+    if (c < 0x80)
+        out.push_back(static_cast<char>(c));
+    else if (c < 0x800)
+    {
+        out.push_back(static_cast<char>(0xC0 | (c >> 6)));
+        out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+    }
+    else if (c < 0x10000)
+    {
+        out.push_back(static_cast<char>(0xE0 | (c >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+    }
+    else
+    {
+        out.push_back(static_cast<char>(0xF0 | (c >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((c >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+    }
+}
+
+static ttstr codePointsToTtstr(const tr_string& s)
+{
+    std::string out;
+    for (char32_t c : s)
+        appendUtf8(out, c);
+    return ttstr(out.c_str());
+}
+
+static bool containsCodePoint(const tr_string& s, char32_t ch)
+{
+    return s.find(ch) != tr_string::npos;
+}
+
+// -------------------------------------------------------------------
+// dictionary helpers
 
 #define setprop_t(d, p, ty) \
     { \
@@ -18,9 +120,9 @@ using RgbColor = uint32_t;
     }
 
 #define setprop_opt_t(d, p, ty) \
-    if (0 != p) \
+    if (p != std::nullopt) \
     { \
-        tTJSVariant v(ty(p)); \
+        tTJSVariant v(ty(*p)); \
         d->PropSet(TJS_MEMBERENSURE, TJS_N(#p), nullptr, &v, d); \
     } \
     else \
@@ -31,69 +133,97 @@ using RgbColor = uint32_t;
 
 #define setprop(d, p) setprop_t(d, p, )
 
-#define setprop_opt(d, p) setprop_opt_t(d, p, )
-
-#define getprop_opt(d, p) getprop_opt_t(d, p, )
-
 #define getprop_t(d, p, ty) \
     { \
         tTJSVariant v; \
         if (TJS_SUCCEEDED(d->PropGet(0, TJS_N(#p), nullptr, &v, d)) && v.Type() != tvtVoid) \
         { \
-            p = ty(v); \
-        } \
-    }
-
-#define getprop_opt_t(d, p, ty) \
-    { \
-        tTJSVariant v; \
-        if (TJS_SUCCEEDED(d->PropGet(0, TJS_N(#p), nullptr, &v, d)) && v.Type() != tvtVoid) \
-        { \
-            p = ty(v); \
-        } \
-        else \
-        { \
-            p = 0; \
-        } \
-    }
-
-#define getprop_ensure_opt_deref(d, p, e) \
-    { \
-        tTJSVariant v; \
-        if (TJS_SUCCEEDED(d->PropGet(0, TJS_N(#p), nullptr, &v, d)) && v.Type() != tvtVoid) \
-        { \
-            auto ens = v.e; \
-            if (ens) \
-                p = *ens; \
-            else \
-                p = std::nullopt; \
-        } \
-        else \
-        { \
-            p = std::nullopt; \
+            p = ty((tjs_int)(v)); \
         } \
     }
 
 #define getprop(d, p) getprop_t(d, p, )
 
-#define getprop_ensure_deref(d, p, e) \
-    { \
-        tTJSVariant v; \
-        if (TJS_SUCCEEDED(d->PropGet(0, TJS_N(#p), nullptr, &v, d)) && v.Type() != tvtVoid) \
-        { \
-            auto ens = v.e; \
-            if (ens) \
-                p = *ens; \
-        } \
+static bool variantIsString(const tTJSVariant& value)
+{
+    return value.Type() == tvtString;
+}
+
+static bool variantIsNumeric(const tTJSVariant& value)
+{
+    const tTJSVariantType type = value.Type();
+    return type == tvtInteger || type == tvtReal;
+}
+
+static bool readObjectProp(iTJSDispatch2* object, const tjs_char* name, tTJSVariant& value)
+{
+    return object && TJS_SUCCEEDED(object->PropGet(0, name, nullptr, &value, object)) &&
+           value.Type() != tvtVoid;
+}
+
+static bool readIntPropAliases(iTJSDispatch2* object,
+                               std::initializer_list<const tjs_char*> names,
+                               int& value)
+{
+    for (const auto* name : names)
+    {
+        tTJSVariant prop;
+        if (!readObjectProp(object, name, prop) || !variantIsNumeric(prop))
+            continue;
+        value = static_cast<int>((tjs_int)prop);
+        return true;
     }
+    return false;
+}
+
+static bool readRealPropAliases(iTJSDispatch2* object,
+                                std::initializer_list<const tjs_char*> names,
+                                double& value)
+{
+    for (const auto* name : names)
+    {
+        tTJSVariant prop;
+        if (!readObjectProp(object, name, prop) || !variantIsNumeric(prop))
+            continue;
+        value = prop.AsReal();
+        return true;
+    }
+    return false;
+}
+
+static bool readStringPropAliases(iTJSDispatch2* object,
+                                  std::initializer_list<const tjs_char*> names,
+                                  ttstr& value)
+{
+    for (const auto* name : names)
+    {
+        tTJSVariant prop;
+        if (!readObjectProp(object, name, prop) || !variantIsString(prop))
+            continue;
+        value = ttstr(prop);
+        return true;
+    }
+    return false;
+}
+
+static bool readCodePointsProp(iTJSDispatch2* object, const tjs_char* name, tr_string& value)
+{
+    tTJSVariant prop;
+    if (!readObjectProp(object, name, prop) || !variantIsString(prop))
+        return false;
+    value = utf8ToCodePoints(ttstr(prop));
+    return true;
+}
+
+// -------------------------------------------------------------------
 
 struct TextRenderState
 {
     bool bold = false;
     bool italic = false;
     ttstr face = TJS_N("user");
-    int fontsize = 24;
-    double fontscale = 1.0;
+    int fontSize = 24;
+    double fontScale = 1.0;
     RgbColor chColor = 0xffffff;
     int rubySize = 10;
     int rubyOffset = -2;
@@ -101,26 +231,21 @@ struct TextRenderState
     RgbColor shadowColor = 0x000000;
     bool edge = false;
     RgbColor edgeColor = 0x0080ff;
+    int edgeExtent = 2;
+    int edgeEmphasis = 2048;
     int lineSpacing = 6;
     int pitch = 0;
     int lineSize = 0;
     int align = -1;
     int valign = -1;
 
-    bool renderOver = false;
-    int renderDelay = 1000;
-    ttstr renderText = TJS_N("");
-
-    // -------------------------------------------------------------- //
-
     tTJSVariant serialize() const
     {
         auto dict = TJSCreateDictionaryObject();
-
         setprop(dict, bold);
         setprop(dict, italic);
-        setprop(dict, fontsize);
-        setprop(dict, fontscale);
+        setprop(dict, fontSize);
+        setprop(dict, fontScale);
         setprop(dict, face);
         setprop_t(dict, chColor, static_cast<tjs_int>);
         setprop(dict, rubySize);
@@ -129,15 +254,15 @@ struct TextRenderState
         setprop_t(dict, shadowColor, static_cast<tjs_int>);
         setprop(dict, edge);
         setprop_t(dict, edgeColor, static_cast<tjs_int>);
+        setprop(dict, edgeExtent);
+        setprop(dict, edgeEmphasis);
         setprop(dict, lineSpacing);
         setprop(dict, pitch);
         setprop(dict, lineSize);
         setprop(dict, align);
         setprop(dict, valign);
-
         auto res = tTJSVariant(dict, dict);
         dict->Release();
-
         return res;
     }
 
@@ -145,77 +270,71 @@ struct TextRenderState
     {
         auto dict = t.AsObjectNoAddRef();
         if (!dict)
-        {
             return;
+        getprop(dict, bold);
+        getprop(dict, italic);
+        readIntPropAliases(dict, {TJS_N("fontSize"), TJS_N("fontsize"), TJS_N("fontheight"), TJS_N("fontHeight")},
+                           fontSize);
+        readRealPropAliases(dict, {TJS_N("fontScale"), TJS_N("fontscale")}, fontScale);
+        readStringPropAliases(dict, {TJS_N("face"), TJS_N("fontface"), TJS_N("fontFace")}, face);
+        {
+            int color = static_cast<int>(chColor);
+            if (readIntPropAliases(dict, {TJS_N("chColor"), TJS_N("color")}, color))
+                chColor = static_cast<RgbColor>(color);
         }
-
-        getprop_t(dict, bold, static_cast<tjs_int>);
-        getprop_t(dict, italic, static_cast<tjs_int>);
-        getprop(dict, fontsize);
-        getprop(dict, fontscale);
-        getprop_ensure_deref(dict, face, AsStringNoAddRef());
-        getprop_t(dict, chColor, static_cast<tjs_int>);
         getprop(dict, rubySize);
         getprop(dict, rubyOffset);
-        getprop_t(dict, shadow, static_cast<tjs_int>);
-        getprop_t(dict, shadowColor, static_cast<tjs_int>);
-        getprop_t(dict, edge, static_cast<tjs_int>);
-        getprop_t(dict, edgeColor, static_cast<tjs_int>);
-        getprop(dict, lineSpacing);
+        getprop(dict, shadow);
+        getprop_t(dict, shadowColor, static_cast<RgbColor>);
+        getprop(dict, edge);
+        getprop_t(dict, edgeColor, static_cast<RgbColor>);
+        getprop(dict, edgeExtent);
+        getprop(dict, edgeEmphasis);
+        readIntPropAliases(dict, {TJS_N("lineSpacing"), TJS_N("linespacing")}, lineSpacing);
         getprop(dict, pitch);
-        getprop(dict, lineSize);
-        getprop(dict, align);
-        getprop(dict, valign);
-    }
-
-    static TextRenderState from(tTJSVariant t)
-    {
-        TextRenderState state{};
-        state.deserialize(t);
-        return state;
+        readIntPropAliases(dict, {TJS_N("lineSize"), TJS_N("linesize"), TJS_N("linestep"), TJS_N("lineStep")},
+                           lineSize);
+        readIntPropAliases(dict, {TJS_N("align"), TJS_N("halign")}, align);
+        readIntPropAliases(dict, {TJS_N("valign")}, valign);
     }
 };
 
 struct TextRenderOptions
 {
-    const tjs_wchar* following =
-        TJS_W("%),:;]}????。，、．：；゛゜ヽヾゝゞ々’”）〕］｝〉》」』】°′″℃￠％‰　!.?=????????????"
-              "?？！ーぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶ");
-    const tjs_wchar* leading = TJS_W("\\$([{?‘“（〔［｛〈《「『【￥＄￡");
-    const tjs_wchar* begin = TJS_W("「『（‘“〔［｛〈《");
-    const tjs_wchar* end = TJS_W("」』）’”〕］｝〉》");
-
-    // -------------------------------------------------------------- //
-
-    tTJSVariant serialize() const
-    {
-        auto dict = TJSCreateDictionaryObject();
-
-        setprop(dict, following);
-        setprop(dict, leading);
-        setprop(dict, begin);
-        setprop(dict, end);
-
-        auto res = tTJSVariant(dict, dict);
-        dict->Release();
-
-        return res;
-    }
+    // kinsoku: characters that must not start a line
+    tr_string following{
+        U"%),:;]}\uff61\uff63\uff9e\uff9f\u3002\uff0c\u3001\uff0e\uff1a\uff1b\u309b\u309c\u30fd\u30fe\u309d\u309e"
+        U"\u3005\u2019\u201d\uff09\u3015\uff3d\uff5d\u3009\u300b\u300d\u300f\u3011\u00b0\u2032\u2033\u2103\uffe0"
+        U"\uff05\u2030\u3000!.?\uff64\uff65\uff67\uff68\uff69\uff6a\uff6b\uff6c\uff6d\uff6e\uff6f\uff70\u30fb"
+        U"\uff1f\uff01\u30fc\u3041\u3043\u3045\u3047\u3049\u3063\u3083\u3085\u3087\u308e\u30a1\u30a3\u30a5"
+        U"\u30a7\u30a9\u30c3\u30e3\u30e5\u30e7\u30ee\u30f5\u30f6"};
+    // kinsoku: characters that must not end a line
+    tr_string leading{U"\\$([{\uff62\u2018\u201c\uff08\u3014\uff3b\uff5b\u3008\u300a\u300c\u300e\u3010\uffe5\uff04\uffe1"};
+    // auto-indent open / close brackets
+    tr_string begin{U"\u300c\u300e\uff08\u2018\u201c\u3014\uff3b\uff5b\u3008\u300a"};
+    tr_string end{U"\u300d\u300f\uff09\u2019\u201d\u3015\uff3d\uff5d\u3009\u300b"};
+    bool ignoreDelay = false;
+    bool widthTimeScale = false;
 
     void deserialize(tTJSVariant t)
     {
         auto dict = t.AsObjectNoAddRef();
         if (!dict)
-        {
             return;
+        readCodePointsProp(dict, TJS_N("following"), following);
+        readCodePointsProp(dict, TJS_N("leading"), leading);
+        readCodePointsProp(dict, TJS_N("begin"), begin);
+        readCodePointsProp(dict, TJS_N("end"), end);
+        {
+            int value = ignoreDelay ? 1 : 0;
+            if (readIntPropAliases(dict, {TJS_N("ignore_delay"), TJS_N("ignoreDelay")}, value))
+                ignoreDelay = value != 0;
         }
-    }
-
-    static TextRenderState from(tTJSVariant t)
-    {
-        TextRenderState state{};
-        state.deserialize(t);
-        return state;
+        {
+            int value = widthTimeScale ? 1 : 0;
+            if (readIntPropAliases(dict, {TJS_N("width_time_scale"), TJS_N("widthTimeScale")}, value))
+                widthTimeScale = value != 0;
+        }
     }
 };
 
@@ -226,24 +345,25 @@ struct CharacterInfo
     bool graph = false;
     bool vertical = false;
     ttstr face = TJS_N("user");
-
+    // position after alignment, as reported to scripts
     int x = 0;
     int y = 0;
+    // position from line layout, before alignment
+    int layoutX = 0;
+    int layoutY = 0;
     int cw = 0;
     int size = 0;
-
     RgbColor color = 0xffffff;
-    RgbColor edge = 0x00;   //
-    RgbColor shadow = 0x00; //
-
-    ttstr text = TJS_N("");
-
-    // -------------------------------------------------------------- //
+    std::optional<RgbColor> edge = std::nullopt;
+    int edgeExtent = 0;
+    int edgeEmphasis = 0;
+    std::optional<RgbColor> shadow = std::nullopt;
+    ttstr text;
+    double delay = 0.0;
 
     tTJSVariant serialize() const
     {
         auto dict = TJSCreateDictionaryObject();
-
         setprop(dict, bold);
         setprop(dict, italic);
         setprop(dict, graph);
@@ -253,201 +373,52 @@ struct CharacterInfo
         setprop(dict, cw);
         setprop(dict, size);
         setprop(dict, face);
-
         setprop_t(dict, color, static_cast<tjs_int>);
         setprop_opt_t(dict, edge, static_cast<tjs_int>);
+        setprop(dict, edgeExtent);
+        setprop(dict, edgeEmphasis);
         setprop_opt_t(dict, shadow, static_cast<tjs_int>);
-
         setprop(dict, text);
-
+        setprop(dict, delay);
         auto res = tTJSVariant(dict, dict);
         dict->Release();
-
         return res;
-    }
-
-    void deserialize(tTJSVariant t)
-    {
-        auto dict = t.AsObjectNoAddRef();
-        if (!dict)
-        {
-            return;
-        }
-
-        getprop(dict, bold);
-        getprop(dict, italic);
-        getprop(dict, graph);
-        getprop(dict, vertical);
-        getprop(dict, x);
-        getprop(dict, y);
-        getprop(dict, cw);
-        getprop(dict, size);
-        getprop_ensure_deref(dict, face, AsStringNoAddRef());
-
-        getprop_t(dict, color, static_cast<tjs_int>);
-        getprop_opt_t(dict, edge, static_cast<tjs_int>);
-        getprop_opt_t(dict, shadow, static_cast<tjs_int>);
-
-        getprop_ensure_deref(dict, text, AsStringNoAddRef());
-    }
-
-    static TextRenderState from(tTJSVariant t)
-    {
-        TextRenderState state{};
-        state.deserialize(t);
-        return state;
     }
 };
 
+struct TextRenderKeyWait
+{
+    int pos = 0;
+    double time = 0.0;
+};
+
 #define property_accessor(name, type, storage) \
-    type get_##name() const \
-    { \
-        return storage; \
-    } \
+    type get_##name() const { return storage; } \
+    void set_##name(type v) { storage = v; }
+
+#define property_accessor_cast(name, type, cast, storage) \
+    cast get_##name() const { return cast(storage); } \
+    void set_##name(cast v) { storage = type(v); }
+
+#define property_accessor_font(name, type, storage) \
+    type get_##name() const { return storage; } \
     void set_##name(type v) \
     { \
         storage = v; \
+        m_fontDirty = true; \
     }
 
-#define property_accessor_cast(name, type, cast, storage) \
-    cast get_##name() const \
-    { \
-        return cast(storage); \
-    } \
-    void set_##name(cast v) \
-    { \
-        storage = type(v); \
-    }
-
-#define property_accessor_string(name, storage) \
-    tTJSVariant get_##name() const \
-    { \
-        return tTJSVariant(storage); \
-    } \
+#define property_accessor_string(name, storage, dirty) \
+    tTJSVariant get_##name() const { return tTJSVariant(storage); } \
     void set_##name(tTJSVariant v) \
     { \
-        auto s = v.AsStringNoAddRef(); \
-        storage = s->LongString ? s->LongString : s->ShortString; \
+        storage = v.Type() == tvtVoid ? ttstr() : ttstr(v); \
+        if (dirty) \
+            m_fontDirty = true; \
     }
 
 #define property_delegate(name) NCB_PROPERTY(name, get_##name, set_##name);
 
-class TextRenderBase
-{
-public:
-    TextRenderBase();
-    virtual ~TextRenderBase();
-    bool render(tTJSString text, int autoIndent, int diff, int all, bool _reserved);
-    void setRenderSize(int width, int height);
-    void setDefault(tTJSVariant defaultSettings);
-    void setOption(tTJSVariant options);
-    tTJSVariant getCharacters(int start, int end);
-    void clear();
-    void done();
-
-    void resetFont();
-    void resetStyle();
-    tTJSVariant getKeyWait();
-    void setKeyWait(tTJSVariant) { throw "no support setKeyWait"; };
-    int calcShowCount();
-
-    // property accessor
-    property_accessor(vertical, bool, m_vertical);
-
-    property_accessor(bold, bool, m_state.bold);
-    property_accessor(italic, bool, m_state.italic);
-    property_accessor_string(face, m_state.face);
-    property_accessor(fontSize, int, m_state.fontsize);
-    property_accessor(fontScale, double, m_state.fontscale);
-    property_accessor_cast(chColor, RgbColor, tjs_int, m_state.chColor);
-    property_accessor(rubySize, int, m_state.rubySize);
-    property_accessor(rubyOffset, int, m_state.rubyOffset);
-    property_accessor(shadow, bool, m_state.shadow);
-    property_accessor_cast(shadowColor, RgbColor, tjs_int, m_state.shadowColor);
-    property_accessor(edge, bool, m_state.edge);
-    property_accessor(lineSpacing, int, m_state.lineSpacing);
-    property_accessor(pitch, int, m_state.pitch);
-    property_accessor(lineSize, int, m_state.lineSize);
-
-    property_accessor(renderOver, bool, m_state.renderOver);
-    property_accessor(renderDelay, int, m_state.renderDelay);
-    int get_renderLeft() const { return m_renderLeft; }
-    void set_renderLeft(int v) { throw "avoid to set set_renderLeft"; };
-    int get_renderRight() const { return m_renderRight; }
-    void set_renderRight(int v) { throw "avoid to set set_renderRight"; };
-    int get_renderTop() const { return m_renderTop; }
-    void set_renderTop(int v) { throw "avoid to set set_renderTop"; };
-    int get_renderBottom() const { return m_renderBottom; }
-    void set_renderBottom(int v) { throw "avoid to set renderBottom"; };
-    property_accessor(renderText, ttstr, m_state.renderText);
-    int get_renderCount() const { return m_state.renderText.length(); }
-    void set_renderCount(int v) { throw "avoid to set renderCount"; };
-
-    property_accessor(defaultBold, bool, m_default.bold);
-    property_accessor(defaultItalic, bool, m_default.italic);
-    property_accessor_string(defaultFace, m_default.face);
-    property_accessor(defaultFontSize, int, m_default.fontsize);
-    property_accessor(defaultFontScale, float, m_default.fontscale);
-    property_accessor_cast(defaultChColor, RgbColor, tjs_int, m_default.chColor);
-    property_accessor(defaultRubySize, int, m_default.rubySize);
-    property_accessor(defaultRubyOffset, int, m_default.rubyOffset);
-    property_accessor(defaultShadow, bool, m_default.shadow);
-    property_accessor_cast(defaultShadowColor, RgbColor, tjs_int, m_default.shadowColor);
-    property_accessor(defaultEdge, bool, m_default.edge);
-    property_accessor(defaultLineSpacing, int, m_default.lineSpacing);
-    property_accessor(defaultPitch, int, m_default.pitch);
-    property_accessor(defaultLineSize, int, m_default.lineSize);
-    property_accessor(defaultValign, int, m_default.valign);
-
-private:
-    // 可渲染区域
-    int m_boxLeft = 0;
-    int m_boxTop = 0;
-    int m_boxWidth = 0;
-    int m_boxHeight = 0;
-    // 已渲染区域
-    int m_renderLeft = 0;
-    int m_renderTop = 0;
-    int m_renderRight = 0;
-    int m_renderBottom = 0;
-
-    int curr_x = 0;
-    int curr_y = 0;
-
-    int m_indent = 0;
-    int m_autoIndent = 0;
-    bool m_overflow = false;
-    bool m_isBeginningOfLine = true;
-
-    bool m_vertical = false;
-
-    // 需要与主渲染隔离
-    FontRasterizer* m_rasterizer = NULL;
-    FontRasterizer* GetCurrentRasterizer();
-
-    TextRenderOptions m_options{};
-    TextRenderState m_default{};
-    TextRenderState m_state{};
-
-    std::vector<CharacterInfo> m_characters{};
-    std::vector<CharacterInfo> m_buffer{};
-    uint32_t m_mode = 0;
-
-    void pushCharacter(const tjs_char* ch);
-    void pushGraphicalCharacter(ttstr const& graph);
-    void performLinebreak();
-    void flush(bool force = false);
-    void updateFont();
-};
-
-enum TextRenderAlignment
-{
-    kTextRenderAlignmentLeft = -1,
-    kTextRenderAlignmentCenter = 0,
-    kTextRenderAlignmentRight = 1,
-};
-
-// 这个没理解，后续再研究
 enum TextRenderMode
 {
     kTextRenderModeLeading = 0,
@@ -455,756 +426,941 @@ enum TextRenderMode
     kTextRenderModeFollowing,
 };
 
+class TextRenderBase
+{
+public:
+    TextRenderBase() : m_rasterizer(new FreeTypeFontRasterizer()) {}
+    virtual ~TextRenderBase()
+    {
+        if (m_rasterizer)
+        {
+            m_rasterizer->Release();
+            m_rasterizer = nullptr;
+        }
+    }
+
+    bool render(const ttstr& text, int autoIndent, int diff, int all, bool same, bool plain,
+                iTJSDispatch2* callbackThis);
+    static tjs_error renderCallback(tTJSVariant* result,
+                                    tjs_int numparams,
+                                    tTJSVariant** param,
+                                    iTJSDispatch2* objthis);
+    void setRenderSize(int width, int height);
+    void setDefault(tTJSVariant defaultSettings);
+    void setOption(tTJSVariant options);
+    tTJSVariant getCharacters(int start, int end);
+    void clear();
+    void done();
+    void newline();
+
+    tTJSVariant getKeyWait();
+    double get_renderDelay() const;
+    int calcShowCount(int elapsed);
+    int get_renderCount() const;
+    void set_renderCount(int value);
+    void redraw();
+    tTJSVariant renderText(tTJSVariant text);
+    void resetStyle();
+    void resetFont();
+    bool get_renderOver() const { return m_overflow; }
+    void setFontScale(double v) { set_fontScale(v); }
+    tTJSVariant getRect();
+
+    property_accessor(vertical, bool, m_vertical);
+    property_accessor_font(bold, bool, m_state.bold);
+    property_accessor_font(italic, bool, m_state.italic);
+    property_accessor_string(face, m_state.face, true);
+    property_accessor_font(fontSize, int, m_state.fontSize);
+    property_accessor_font(fontScale, double, m_state.fontScale);
+    property_accessor_cast(chColor, RgbColor, tjs_int, m_state.chColor);
+    property_accessor(rubySize, int, m_state.rubySize);
+    property_accessor(rubyOffset, int, m_state.rubyOffset);
+    property_accessor(shadow, bool, m_state.shadow);
+    property_accessor_cast(shadowColor, RgbColor, tjs_int, m_state.shadowColor);
+    property_accessor(edge, bool, m_state.edge);
+    property_accessor_cast(edgeColor, RgbColor, tjs_int, m_state.edgeColor);
+    property_accessor(edgeExtent, int, m_state.edgeExtent);
+    property_accessor(edgeEmphasis, int, m_state.edgeEmphasis);
+    property_accessor(lineSpacing, int, m_state.lineSpacing);
+    property_accessor(pitch, int, m_state.pitch);
+    property_accessor(lineSize, int, m_state.lineSize);
+    property_accessor(align, int, m_state.align);
+    property_accessor(valign, int, m_state.valign);
+    property_accessor(timeScale, double, m_timeScale);
+
+    property_accessor(defaultBold, bool, m_default.bold);
+    property_accessor(defaultItalic, bool, m_default.italic);
+    property_accessor_string(defaultFace, m_default.face, false);
+    property_accessor(defaultFontSize, int, m_default.fontSize);
+    property_accessor(defaultFontScale, double, m_default.fontScale);
+    property_accessor_cast(defaultChColor, RgbColor, tjs_int, m_default.chColor);
+    property_accessor(defaultRubySize, int, m_default.rubySize);
+    property_accessor(defaultRubyOffset, int, m_default.rubyOffset);
+    property_accessor(defaultShadow, bool, m_default.shadow);
+    property_accessor_cast(defaultShadowColor, RgbColor, tjs_int, m_default.shadowColor);
+    property_accessor(defaultEdge, bool, m_default.edge);
+    property_accessor_cast(defaultEdgeColor, RgbColor, tjs_int, m_default.edgeColor);
+    property_accessor(defaultEdgeExtent, int, m_default.edgeExtent);
+    property_accessor(defaultEdgeEmphasis, int, m_default.edgeEmphasis);
+    property_accessor(defaultLineSpacing, int, m_default.lineSpacing);
+    property_accessor(defaultPitch, int, m_default.pitch);
+    property_accessor(defaultLineSize, int, m_default.lineSize);
+    property_accessor(defaultAlign, int, m_default.align);
+    property_accessor(defaultValign, int, m_default.valign);
+
+    int get_renderLeft() { return getRenderedBounds().left; }
+    int get_renderTop() { return getRenderedBounds().top; }
+    int get_renderWidth()
+    {
+        const auto bounds = getRenderedBounds();
+        return bounds.right - bounds.left;
+    }
+    int get_renderHeight()
+    {
+        const auto bounds = getRenderedBounds();
+        return bounds.bottom - bounds.top;
+    }
+    int get_renderRight() { return getRenderedBounds().right; }
+    int get_renderBottom() { return getRenderedBounds().bottom; }
+
+private:
+    struct RenderBounds
+    {
+        int left;
+        int top;
+        int right;
+        int bottom;
+    };
+
+    FontRasterizer* m_rasterizer;
+    int m_cachedAscentHeight = 0;
+    bool m_fontDirty = true;
+    bool m_layoutDirty = false;
+
+    int m_boxWidth = 0;
+    int m_boxHeight = 0;
+    int m_x = 0;
+    int m_y = 0;
+    int m_indent = 0;
+    int m_autoIndent = 0;
+    int m_renderCountOverride = -1;
+    bool m_overflow = false;
+    bool m_isBeginningOfLine = true;
+    bool m_vertical = false;
+    double m_timeScale = 1.0;
+    double m_baseCharacterDelay = 0.0;
+    double m_characterDelay = 0.0;
+    double m_currentDelay = 0.0;
+    double m_renderDelay = 0.0;
+    size_t m_timingSegmentStart = 0;
+    double m_timingSegmentStartDelay = 0.0;
+    size_t m_sameKeyWaitIndex = 0;
+    bool m_sameTiming = false;
+
+    TextRenderOptions m_options{};
+    TextRenderState m_default{};
+    TextRenderState m_state{};
+
+    std::vector<CharacterInfo> m_characters{};
+    std::vector<CharacterInfo> m_buffer{};
+    std::vector<TextRenderKeyWait> m_keyWaits{};
+    uint32_t m_mode = kTextRenderModeLeading;
+
+    void pushCharacter(char32_t ch);
+    void pushGraphicalCharacter(const ttstr& graph);
+    void performLinebreak();
+    void flush(bool force = false);
+    void applyFont();
+    void applyAlignment();
+    int getEffectiveLineSpacing() const;
+    int getEffectiveFontHeight() const;
+    int getAscentHeight();
+    RenderBounds getRenderedBounds();
+    size_t getCharacterCount() const;
+    void addDelay(double delay);
+    void synchronizeTiming(double targetTime);
+    void updateOverflow();
+    std::optional<double> resolveDelayLabel(iTJSDispatch2* callbackThis, const tr_string& label) const;
+};
+
 // -------------------------------------------------------------------
+// parser helpers; `i` indexes the current character and is advanced first
 
-TextRenderBase::TextRenderBase()
+static bool readchar(const tr_string& str, size_t& i, char32_t& c)
 {
+    if (++i >= str.size())
+        return false;
+    c = str[i];
+    return true;
 }
 
-TextRenderBase::~TextRenderBase()
+static void read_integer(const tr_string& str, size_t& i, int& value)
 {
-    if (m_rasterizer)
-        m_rasterizer->Release();
-}
-
-static int read_integer(tTJSString const& str, const tjs_char* p, int& value)
-{
+    char32_t ch;
     bool is_negative = false;
-    int retLen = 0;
     while (true)
     {
-        int chLen = utf8_char_len(p + retLen);
-        if (chLen != 1)
-        {
-            TVPThrowExceptionMessage(TJS_N("TextRenderBase::render() failed to "
-                                           "parse: expected either integer or ';', found EOF"));
-        }
-        tjs_char ch = *(p + retLen);
-        retLen++;
+        if (!readchar(str, i, ch))
+            TVPThrowExceptionMessage(
+                TJS_N("TextRenderBase::render() parse error: expected integer or ';', found EOF"));
         if ('0' <= ch && ch <= '9')
         {
-            value = value * 10 + (ch - '0');
+            value = value * 10 + static_cast<int>(ch - '0');
             continue;
         }
-        else if (ch == '-')
+        if (ch == '-')
         {
             is_negative = !is_negative;
             continue;
         }
-        else if (ch == ';')
+        if (ch == ';')
         {
             if (is_negative)
-            {
                 value = -value;
-            }
-            break;
+            return;
         }
-
-        TVPThrowExceptionMessage(TJS_N("TextRenderBase::render() failed to "
-                                       "parse: expected either integer or ';', found '%1'"),
-                                 ch);
+        TVPThrowExceptionMessage(TJS_N("TextRenderBase::render() parse error: unexpected char"));
     }
-    return retLen;
 }
 
-static const char* constChar = "\t ";
-bool TextRenderBase::render(tTJSString text, int autoIndent, int diff, int all, bool same)
+// Reads digits up to ';'. An empty token (e.g. "%d;") returns fallback.
+static int read_optional_integer(const tr_string& str, size_t& i, int fallback)
 {
-    const tjs_char* p = text.c_str();
-    for (; *p; p++)
+    char32_t ch;
+    bool negative = false;
+    bool hasValue = false;
+    int value = 0;
+    while (true)
     {
-        int chLen = utf8_char_len(p);
-        if (chLen <= 0)
-            continue;
-
-        if (chLen == 1)
+        if (!readchar(str, i, ch))
+            TVPThrowExceptionMessage(
+                TJS_N("TextRenderBase::render() parse error: expected integer or ';', found EOF"));
+        if (ch == ';')
+            break;
+        if ('0' <= ch && ch <= '9')
         {
-            bool hasget = true;
-            switch (*p)
+            hasValue = true;
+            value = value * 10 + static_cast<int>(ch - '0');
+        }
+        else if (ch == '-')
+            negative = !negative;
+        else
+            TVPThrowExceptionMessage(TJS_N("TextRenderBase::render() parse error: unexpected char"));
+    }
+    if (!hasValue)
+        return fallback;
+    return negative ? -value : value;
+}
+
+static tr_string read_until_semicolon(const tr_string& str, size_t& i, const tjs_char* command)
+{
+    tr_string token;
+    char32_t ch;
+    while (true)
+    {
+        if (!readchar(str, i, ch))
+            TVPThrowExceptionMessage(TJS_N("TextRenderBase::render() parse error: unterminated %1"), command);
+        if (ch == ';')
+            return token;
+        token += ch;
+    }
+}
+
+static tr_string read_delay_label(const tr_string& str, size_t& i, const tjs_char* command)
+{
+    char32_t ch;
+    if (!readchar(str, i, ch) || ch != '$')
+        TVPThrowExceptionMessage(TJS_N("TextRenderBase::render() parse error: expected '$' after %1"), command);
+    return read_until_semicolon(str, i, command);
+}
+
+static bool read_flag(const tr_string& str, size_t& i, bool default_value, const tjs_char* command)
+{
+    char32_t ch;
+    if (!readchar(str, i, ch))
+        TVPThrowExceptionMessage(TJS_N("TextRenderBase::render() parse error: expected flag after %1"), command);
+    if (ch == '0')
+        return false;
+    if (ch == '1')
+        return true;
+    return default_value;
+}
+
+// -------------------------------------------------------------------
+
+tjs_error TextRenderBase::renderCallback(tTJSVariant* result,
+                                         tjs_int numparams,
+                                         tTJSVariant** param,
+                                         iTJSDispatch2* objthis)
+{
+    if (!objthis)
+        return TJS_E_NATIVECLASSCRASH;
+    if (numparams < 1 || !param || !param[0])
+        return TJS_E_BADPARAMCOUNT;
+
+    auto* self = ncbInstanceAdaptor<TextRenderBase>::GetNativeInstance(objthis);
+    if (!self)
+        return TJS_E_NATIVECLASSCRASH;
+
+    const auto intParam = [&](tjs_int index, int fallback)
+    {
+        return index < numparams && param[index] && param[index]->Type() != tvtVoid
+                   ? static_cast<int>(static_cast<tjs_int>(*param[index]))
+                   : fallback;
+    };
+    const int autoIndent = intParam(1, 0);
+    const int diff = intParam(2, 0);
+    const int all = intParam(3, 0);
+    const bool same = intParam(4, 0) != 0;
+    const bool plain = intParam(5, 0) != 0;
+
+    const bool rendered = self->render(ttstr(*param[0]), autoIndent, diff, all, same, plain, objthis);
+    if (result)
+        *result = rendered;
+    return TJS_S_OK;
+}
+
+void TextRenderBase::applyFont()
+{
+    if (!m_fontDirty)
+        return;
+    m_fontDirty = false;
+
+    tTVPFont font;
+    font.Height = static_cast<tjs_int>(getEffectiveFontHeight());
+    font.Flags =
+        static_cast<tjs_uint32>((m_state.bold ? TVP_TF_BOLD : 0) | (m_state.italic ? TVP_TF_ITALIC : 0));
+    font.Angle = 0;
+    font.Face = m_state.face;
+    m_rasterizer->ApplyFont(font);
+    m_cachedAscentHeight = m_rasterizer->GetAscentHeight();
+}
+
+int TextRenderBase::getEffectiveLineSpacing() const
+{
+    return m_state.lineSpacing;
+}
+
+int TextRenderBase::getEffectiveFontHeight() const
+{
+    const double scale = std::max(m_state.fontScale, 0.001);
+    return std::max(1, static_cast<int>(std::lround(m_state.fontSize * scale)));
+}
+
+int TextRenderBase::getAscentHeight()
+{
+    applyFont();
+    return m_cachedAscentHeight;
+}
+
+size_t TextRenderBase::getCharacterCount() const
+{
+    return m_characters.size() + m_buffer.size();
+}
+
+void TextRenderBase::addDelay(double delay)
+{
+    if (m_options.ignoreDelay)
+        return;
+    m_currentDelay += std::max(delay, 0.0);
+}
+
+void TextRenderBase::synchronizeTiming(double targetTime)
+{
+    targetTime = std::max(targetTime, m_timingSegmentStartDelay);
+    const double sourceDuration = std::max(m_currentDelay - m_timingSegmentStartDelay, 0.0);
+    const double targetDuration = targetTime - m_timingSegmentStartDelay;
+    const double scale = sourceDuration > 0.0 ? targetDuration / sourceDuration : 1.0;
+
+    size_t index = 0;
+    const auto scaleCharacter = [&](CharacterInfo& character)
+    {
+        if (index++ < m_timingSegmentStart)
+            return;
+        character.delay = m_timingSegmentStartDelay + (character.delay - m_timingSegmentStartDelay) * scale;
+    };
+    for (auto& character : m_characters)
+        scaleCharacter(character);
+    for (auto& character : m_buffer)
+        scaleCharacter(character);
+    for (auto& wait : m_keyWaits)
+    {
+        if (wait.pos < static_cast<int>(m_timingSegmentStart))
+            continue;
+        wait.time = m_timingSegmentStartDelay + (wait.time - m_timingSegmentStartDelay) * scale;
+    }
+
+    m_currentDelay = targetTime;
+    m_renderDelay = std::max(m_renderDelay, targetTime);
+    m_timingSegmentStart = getCharacterCount();
+    m_timingSegmentStartDelay = targetTime;
+}
+
+std::optional<double> TextRenderBase::resolveDelayLabel(iTJSDispatch2* callbackThis,
+                                                        const tr_string& label) const
+{
+    if (!callbackThis)
+        return std::nullopt;
+
+    tTJSVariant labelValue(codePointsToTtstr(label));
+    tTJSVariant* params[] = {&labelValue};
+    tTJSVariant resolved;
+    const tjs_error status =
+        callbackThis->FuncCall(0, TJS_N("onLabel"), nullptr, &resolved, 1, params, callbackThis);
+    if (TJS_FAILED(status) || (resolved.Type() != tvtInteger && resolved.Type() != tvtReal))
+        return std::nullopt;
+    return static_cast<double>(resolved.AsReal());
+}
+
+void TextRenderBase::updateOverflow()
+{
+    if (m_boxHeight <= 0 || getCharacterCount() == 0)
+    {
+        m_overflow = false;
+        return;
+    }
+    m_overflow = m_y + getAscentHeight() > m_boxHeight;
+}
+
+bool TextRenderBase::render(const ttstr& source, int autoIndent, int diff, int all, bool same, bool plain,
+                            iTJSDispatch2* callbackThis)
+{
+    const tr_string text = utf8ToCodePoints(source);
+
+    // A new message keeps the already laid-out glyphs, but their reveal time
+    // is reset to zero, so only the newly supplied text animates. `same` is
+    // used for concurrently rendered language tracks: they share the first
+    // track's key-wait anchors but each track starts at time zero.
+    flush();
+    if (!same)
+    {
+        for (auto& character : m_characters)
+            character.delay = 0.0;
+        m_keyWaits.clear();
+        m_renderDelay = 0.0;
+    }
+    m_currentDelay = 0.0;
+
+    m_autoIndent = autoIndent;
+    m_sameTiming = same;
+    m_sameKeyWaitIndex = 0;
+    m_baseCharacterDelay = m_options.ignoreDelay ? 0.0 : std::max(static_cast<double>(diff), 0.0);
+    if (all > 0 && m_baseCharacterDelay == 0.0 && !m_options.ignoreDelay)
+    {
+        // Keep distinct timestamps so the requested total time can be
+        // distributed even when the caller did not provide a speed.
+        m_baseCharacterDelay = 0.001;
+    }
+    m_characterDelay = m_baseCharacterDelay;
+    m_timingSegmentStart = getCharacterCount();
+    m_timingSegmentStartDelay = m_currentDelay;
+
+    const size_t len = text.size();
+    const auto finish = [&]()
+    {
+        if (all > 0 && !m_options.ignoreDelay)
+            synchronizeTiming(static_cast<double>(all));
+        else
+            m_renderDelay = std::max(m_renderDelay, m_currentDelay);
+        updateOverflow();
+        return !m_overflow;
+    };
+
+    if (plain)
+    {
+        // The plain path recognizes LF only; every markup character is text.
+        for (char32_t ch : text)
+        {
+            if (ch == '\n')
             {
-                case '%':
-                    p += chLen;
-                    chLen = utf8_char_len(p);
-                    if (chLen != 1)
-                    {
-                        TVPThrowExceptionMessage(TJS_N("TextRenderBase::render() failed to "
-                                                       "parse: expected character, found EOF"));
-                    }
-                    switch (*p)
-                    {
-                        case 't':
-                        case 'f':
-                        {
-                            ttstr faceName{};
-                            while (true)
-                            {
-                                p += chLen;
-                                chLen = utf8_char_len(p);
-                                if (chLen == 0)
-                                {
-                                    TVPThrowExceptionMessage(
-                                        TJS_N("TextRenderBase::render() failed to "
-                                              "parse: expected character, found EOF"));
-                                }
+                flush();
+                performLinebreak();
+            }
+            else
+                pushCharacter(ch);
+        }
+        return finish();
+    }
 
-                                if (chLen == 1 && *p == ';')
-                                    break;
+    for (size_t i = 0; i < len; ++i)
+    {
+        char32_t ch = text[i];
+        switch (ch)
+        {
+            case '%':
+            {
+                if (!readchar(text, i, ch))
+                    TVPThrowExceptionMessage(TJS_N("TextRenderBase: parse error after %%"));
 
-                                faceName += ttstr(p, chLen);
-                            }
-
-                            m_state.face = faceName;
-
-                            break;
-                        }
-                        case 'b':
-                        {
-                            p += chLen;
-                            chLen = utf8_char_len(p);
-                            if (chLen != 1 || (*p != '0' && *p != '1'))
-                            {
-                                TVPThrowExceptionMessage(
-                                    TJS_N("TextRenderBase::render() failed to "
-                                          "parse %%b: expected either '0' or '1', found EOF"));
-                            }
-                            bool flag = *p == '1';
-                            m_state.bold = flag;
-
-                            break;
-                        }
-                        case 'i':
-                        {
-                            p += chLen;
-                            chLen = utf8_char_len(p);
-                            if (chLen != 1 || (*p != '0' && *p != '1'))
-                            {
-                                TVPThrowExceptionMessage(
-                                    TJS_N("TextRenderBase::render() failed to "
-                                          "parse %%i: expected either '0' or '1', found EOF"));
-                            }
-                            bool flag = *p == '1';
-                            m_state.italic = flag;
-                            break;
-                        }
-                        case 's':
-                        {
-                            p += chLen;
-                            chLen = utf8_char_len(p);
-                            if (chLen != 1 || (*p != '0' && *p != '1'))
-                            {
-                                TVPThrowExceptionMessage(
-                                    TJS_N("TextRenderBase::render() failed to "
-                                          "parse %%s: expected either '0' or '1', found EOF"));
-                            }
-                            bool flag = *p == '1';
-                            m_state.shadow = flag;
-                            break;
-                        }
-                        case 'e':
-                        {
-                            p += chLen;
-                            chLen = utf8_char_len(p);
-                            if (chLen != 1 || (*p != '0' && *p != '1'))
-                            {
-                                TVPThrowExceptionMessage(
-                                    TJS_N("TextRenderBase::render() failed to "
-                                          "parse %%e: expected either '0' or '1', found '%1'"),
-                                    *p);
-                            }
-                            bool flag = *p == '1';
-                            m_state.edge = flag;
-                            break;
-                        }
-                        case 'B': // TODO: Big
-                            TVPConsoleLog(TJS_N("TODO big font"));
-                            break;
-                        case 'S': // TODO: Small
-                            TVPConsoleLog(TJS_N("TODO small font"));
-                            break;
-                        case 'r': // Reset
-                            resetFont();
-                            break;
-                        case 'C': // TODO: Centre
-                            TVPConsoleLog(TJS_N("TODO centre"));
-                            break;
-                        case 'R': // TODO: Right
-                            TVPConsoleLog(TJS_N("TODO right"));
-                            break;
-                        case 'L': // TODO: Left
-                            TVPConsoleLog(TJS_N("TODO left"));
-                            break;
-                        case 'l':
-                        {
-                            while (true)
-                            {
-                                p += chLen;
-                                chLen = utf8_char_len(p);
-                                if (chLen == 0)
-                                {
-                                    TVPThrowExceptionMessage(
-                                        TJS_N("TextRenderBase::render() failed to "
-                                              "parse: expected character, found EOF"));
-                                }
-                                if (chLen == 1 && *p == ';')
-                                    break;
-                            }
-                            break;
-                        }
-                        case 'n':
-                        {
-                            int n = 0;
-                            p++;
-                            chLen = read_integer(text, p, n);
-                            if (chLen > 0)
-                                p += chLen - 1;
-                            if (n == 0)
-                                n = 1;
-                            flush();
-                            performLinebreak();
-                            for (int i = 0; i < n; i++)
-                                performLinebreak();
-                            break;
-                        }
-                        case 'p':
-                        {
-                            int value = 0;
-                            p++;
-                            chLen = read_integer(text, p, value);
-                            if (chLen > 0)
-                                p += chLen - 1;
-                            m_state.pitch = value;
-                            break;
-                        }
-                        case 'd':
-                        {
-                            int value = 0;
-                            p++;
-                            chLen = read_integer(text, p, value);
-                            if (chLen > 0)
-                                p += chLen - 1;
-                            // TODO: text speed
-                            break;
-                        }
-                        case 'w':
-                        {
-                            int value = 0;
-                            p++;
-                            chLen = read_integer(text, p, value);
-                            if (chLen > 0)
-                                p += chLen - 1;
-                            // TODO: wait
-                            break;
-                        }
-                        case 'D': // %D[0-9]+; || %D$.+;
-                        {
-                            p += chLen;
-                            chLen = utf8_char_len(p);
-                            if (chLen == 1 && *p == '$')
-                            {
-                                ttstr labelName{};
-                                while (true)
-                                {
-                                    p += chLen;
-                                    chLen = utf8_char_len(p);
-                                    if (chLen == 0)
-                                    {
-                                        TVPThrowExceptionMessage(
-                                            TJS_N("TextRenderBase::render() failed to "
-                                                  "parse: expected character, found EOF"));
-                                    }
-                                    if (chLen == 1 && *p == ';')
-                                        break;
-                                    labelName += ttstr(p, chLen);
-                                }
-                                // TODO: labelName
-                            }
-                            else
-                            {
-                                int value = 0;
-                                p += chLen;
-                                chLen = read_integer(text, p, value);
-                                if (chLen > 0)
-                                    p += chLen - 1;
-                                // TODO: label?
-                            }
-                            //
-                            break;
-                        }
-                        case '0':
-                        case '1':
-                        case '2':
-                        case '3':
-                        case '4':
-                        case '5':
-                        case '6':
-                        case '7':
-                        case '8':
-                        case '9':
-                        {
-                            int value = static_cast<int>(*p - '0');
-                            p += chLen;
-                            chLen = read_integer(text, p, value);
-                            if (chLen > 0)
-                                p += chLen - 1;
-
-                            // font size
-                            m_state.fontsize = m_default.fontsize * value / 100;
-
-                            updateFont();
-
-                            break;
-                        }
-                        default:
-                            TVPThrowExceptionMessage(
-                                TJS_N("TextRenderBase::render() failed to "
-                                      "parse: expected any of 'fbiseBSrCRLpdwD0123456789', found "
-                                      "'%1'"),
-                                *p);
-                            break;
-                    }
-                    break;
-                case '\\':
-                    p += chLen;
-                    chLen = utf8_char_len(p);
-                    if (chLen != 1)
-                    {
-                        TVPThrowExceptionMessage(TJS_N("TextRenderBase::render() failed to "
-                                                       "parse: expected character, found EOF"));
-                    }
-                    switch (*p)
-                    {
-                        case 'n':
-                            flush();
-                            performLinebreak();
-                            break;
-                        case 't':
-                            pushCharacter(constChar);
-                            break;
-                        case 'i':
-                            m_indent = curr_x;
-                            break;
-                        case 'r':
-                            m_indent = 0;
-                            break;
-                        case 'w':
-                            pushCharacter(constChar + 1);
-                            break;
-                        case 'k':
-                            break;
-                        case 'x':
-                            break;
-                        default:
-                            hasget = false;
-                            break;
-                    }
-                    break;
-                case '[':
+                switch (ch)
                 {
-                    // [ .* ]
-                    // [ .*, [0-9]+ ]
-                    ttstr ruby{};
-                    while (true)
+                    case 'f':
                     {
-                        p += chLen;
-                        chLen = utf8_char_len(p);
-                        if (chLen == 0)
-                        {
-                            TVPThrowExceptionMessage(TJS_N("TextRenderBase::render() failed to "
-                                                           "parse: expected character, found EOF"));
-                        }
-                        if (chLen == 1 && *p == ']')
-                            break;
+                        tr_string fontname = read_until_semicolon(text, i, TJS_N("%f"));
+                        if (!fontname.empty())
+                            m_state.face = codePointsToTtstr(fontname);
+                        m_fontDirty = true;
                         break;
-                        ruby += ttstr(p, chLen);
                     }
-                    // TODO: implement ruby
-                    break;
-                }
-                case '#':
-                {
-                    // [ .* ]
-                    // [ .*, [0-9]+ ]
-                    RgbColor colour = 0x00000000;
-                    bool isNull = true;
-                    while (true)
+                    case 'b':
+                        m_state.bold = read_flag(text, i, m_default.bold, TJS_N("%b"));
+                        m_fontDirty = true;
+                        break;
+                    case 'i':
+                        m_state.italic = read_flag(text, i, m_default.italic, TJS_N("%i"));
+                        m_fontDirty = true;
+                        break;
+                    case 's':
+                        m_state.shadow = read_flag(text, i, m_default.shadow, TJS_N("%s"));
+                        break;
+                    case 'e':
+                        m_state.edge = read_flag(text, i, m_default.edge, TJS_N("%e"));
+                        break;
+                    case 'p':
                     {
-                        p += chLen;
-                        chLen = utf8_char_len(p);
-                        if (chLen != 1)
+                        int value = 0;
+                        read_integer(text, i, value);
+                        m_state.pitch = value;
+                        break;
+                    }
+                    case 'l':
+                        // label definition; nothing to lay out
+                        read_until_semicolon(text, i, TJS_N("%l"));
+                        break;
+                    case 'd':
+                    {
+                        // An empty %d; resets the speed to the caller supplied
+                        // base delay. %d0; disables delay.
+                        const int value = read_optional_integer(text, i, 100);
+                        if (!m_options.ignoreDelay)
+                            m_characterDelay = m_baseCharacterDelay * static_cast<double>(value) / 100.0;
+                        break;
+                    }
+                    case 'a':
+                    {
+                        const int value =
+                            read_optional_integer(text, i, static_cast<int>(m_baseCharacterDelay));
+                        if (!m_options.ignoreDelay)
+                            m_characterDelay = std::max(static_cast<double>(value), 0.0);
+                        break;
+                    }
+                    case 'w':
+                    {
+                        if (i + 1 < len && text[i + 1] == '$')
                         {
-                            TVPThrowExceptionMessage(TJS_N("TextRenderBase::render() failed to "
-                                                           "parse: expected character, found EOF"));
-                        }
-                        if (*p == ';')
-                            break;
-                        isNull = false;
-                        RgbColor c = 0;
-                        if ('0' <= *p && *p <= '9')
-                        {
-                            c = static_cast<RgbColor>(*p - '0');
-                        }
-                        else if ('A' <= *p && *p <= 'F')
-                        {
-                            c = 0x0a + static_cast<RgbColor>(*p - 'A');
-                        }
-                        else if ('a' <= *p && *p <= 'f')
-                        {
-                            c = 0x0a + static_cast<RgbColor>(*p - 'a');
+                            const auto label = read_delay_label(text, i, TJS_N("%w"));
+                            if (const auto value = resolveDelayLabel(callbackThis, label))
+                                addDelay(*value);
                         }
                         else
                         {
-                            TVPThrowExceptionMessage(
-                                TJS_N("TextRenderBase::render() failed to "
-                                      "parse: expected hexadecimal number, found '%1'"),
-                                *p);
+                            int value = 0;
+                            read_integer(text, i, value);
+                            addDelay(m_baseCharacterDelay * static_cast<double>(value) / 100.0);
                         }
-
-                        colour = (colour << 4) | c;
+                        break;
                     }
-                    if (isNull)
-                        colour = 0xffffff;
-                    m_state.chColor = colour;
-
-                    break;
-                }
-                case '&':
-                {
-                    // '&' .+ ';'
-                    ttstr graph{};
-                    while (true)
+                    case 't':
                     {
-                        p += chLen;
-                        chLen = utf8_char_len(p);
-                        if (chLen == 0)
+                        if (i + 1 < len && text[i + 1] == '$')
                         {
-                            TVPThrowExceptionMessage(TJS_N("TextRenderBase::render() failed to "
-                                                           "parse: expected character, found EOF"));
+                            const auto label = read_delay_label(text, i, TJS_N("%t"));
+                            if (const auto value = resolveDelayLabel(callbackThis, label))
+                                addDelay(*value);
                         }
-                        if (chLen == 1 && *p == ';')
-                            break;
-                        graph += ttstr(p, chLen);
+                        else
+                        {
+                            int value = 0;
+                            read_integer(text, i, value);
+                            addDelay(static_cast<double>(value));
+                        }
+                        break;
                     }
-                    pushGraphicalCharacter(graph);
-                    break;
-                }
-                case '$':
-                {
-                    // '&' .+ ';'
-                    ttstr varName{};
-                    while (true)
+                    case 'D':
                     {
-                        p += chLen;
-                        chLen = utf8_char_len(p);
-                        if (chLen == 0)
+                        if (i + 1 < len && text[i + 1] == '$')
                         {
-                            TVPThrowExceptionMessage(TJS_N("TextRenderBase::render() failed to "
-                                                           "parse: expected character, found EOF"));
-                        }
-                        if (chLen == 1 && *p == ';')
+                            const auto label = read_delay_label(text, i, TJS_N("%D"));
+                            if (!m_options.ignoreDelay)
+                            {
+                                if (const auto value = resolveDelayLabel(callbackThis, label))
+                                    synchronizeTiming(*value);
+                            }
                             break;
-                        varName += ttstr(p, chLen);
+                        }
+                        int value = 0;
+                        read_integer(text, i, value);
+                        if (!m_options.ignoreDelay)
+                            synchronizeTiming(value);
+                        break;
                     }
-                    // TODO: implement eval
-                    break;
+                    case 'n':
+                    {
+                        // KAGEX-compatible logical line break: %n[lines];
+                        int lines = 0;
+                        read_integer(text, i, lines);
+                        if (lines == 0)
+                            lines = 1;
+                        flush();
+                        performLinebreak();
+                        for (int line = 0; line < lines; ++line)
+                            performLinebreak();
+                        break;
+                    }
+                    case 'r':
+                        m_state = m_default;
+                        m_fontDirty = true;
+                        break;
+                    case '0':
+                    case '1':
+                    case '2':
+                    case '3':
+                    case '4':
+                    case '5':
+                    case '6':
+                    case '7':
+                    case '8':
+                    case '9':
+                    {
+                        int value = static_cast<int>(ch - '0');
+                        read_integer(text, i, value);
+                        m_state.fontSize = m_default.fontSize * value / 100;
+                        m_fontDirty = true;
+                        break;
+                    }
+                    default:
+                        // %B %S %C %R %L and unknown commands are ignored
+                        break;
                 }
-                case '\n':
-                {
-                    flush();
-                    performLinebreak();
-                    break;
-                }
-                default:
-                    hasget = false;
+                break;
             }
-            if (hasget)
-                continue;
+            case '\\':
+            {
+                if (!readchar(text, i, ch))
+                    TVPThrowExceptionMessage(TJS_N("TextRenderBase: parse error after backslash"));
+
+                switch (ch)
+                {
+                    case 'n':
+                        flush();
+                        performLinebreak();
+                        break;
+                    case 't':
+                        pushCharacter('\t');
+                        break;
+                    case 'i':
+                        m_indent = m_x;
+                        break;
+                    case 'r':
+                        m_indent = 0;
+                        break;
+                    case 'w':
+                        pushCharacter(' ');
+                        break;
+                    case 'k':
+                    {
+                        const int position = static_cast<int>(getCharacterCount());
+                        if (m_sameTiming && m_sameKeyWaitIndex < m_keyWaits.size())
+                            synchronizeTiming(m_keyWaits[m_sameKeyWaitIndex++].time);
+                        else if (!m_sameTiming)
+                            m_keyWaits.push_back({position, m_currentDelay});
+                        break;
+                    }
+                    case 'x':
+                        break;
+                    default:
+                        pushCharacter(ch);
+                        break;
+                }
+                break;
+            }
+            case '[':
+            {
+                // ruby text: consumed, not drawn yet
+                while (true)
+                {
+                    if (!readchar(text, i, ch))
+                        TVPThrowExceptionMessage(TJS_N("TextRenderBase: parse error in ruby []"));
+                    if (ch == ']')
+                        break;
+                }
+                break;
+            }
+            case '#':
+            {
+                RgbColor colour = 0x00;
+                bool isNull = true;
+                while (true)
+                {
+                    if (!readchar(text, i, ch))
+                        TVPThrowExceptionMessage(TJS_N("TextRenderBase: parse error in color #"));
+                    if (ch == ';')
+                        break;
+                    RgbColor c = 0;
+                    if ('0' <= ch && ch <= '9')
+                        c = static_cast<RgbColor>(ch - '0');
+                    else if ('A' <= ch && ch <= 'F')
+                        c = 0x0a + static_cast<RgbColor>(ch - 'A');
+                    else if ('a' <= ch && ch <= 'f')
+                        c = 0x0a + static_cast<RgbColor>(ch - 'a');
+                    colour = (colour << 4) | c;
+                    isNull = false;
+                }
+                m_state.chColor = isNull ? m_default.chColor : colour;
+                break;
+            }
+            case '&':
+            {
+                tr_string graph = read_until_semicolon(text, i, TJS_N("&"));
+                pushGraphicalCharacter(codePointsToTtstr(graph));
+                break;
+            }
+            case '$':
+            {
+                // eval: not supported, skip the expression
+                read_until_semicolon(text, i, TJS_N("$"));
+                break;
+            }
+            case '\r':
+                // CRLF counts as one line break; CR alone is also a break.
+                if (i + 1 < len && text[i + 1] == '\n')
+                    ++i;
+                flush();
+                performLinebreak();
+                break;
+            case '\n':
+                flush();
+                performLinebreak();
+                break;
+            default:
+                pushCharacter(ch);
+                break;
         }
-        // TODO: character should include format options;
-        //       as the font is lazy-evaluated/drawn
-        //       (restrictions for line-breaking algorithm)
-        pushCharacter(p);
-        p += chLen - 1;
     }
 
-    if (curr_y > m_boxHeight)
-    {
-        m_overflow = true;
-        set_renderOver(true);
-    }
-    else
-    {
-        m_overflow = false;
-        set_renderOver(false);
-    }
-
-    return !m_overflow;
+    return finish();
 }
 
 void TextRenderBase::performLinebreak()
 {
-    auto rasterizer = GetCurrentRasterizer();
-    if (m_state.align == kTextRenderAlignmentLeft)
-        curr_x = m_boxLeft + m_indent;
-    else if (m_state.align == kTextRenderAlignmentRight)
-        curr_x = m_boxWidth - m_indent;
-    else
-        curr_x = m_boxLeft + m_indent;
+    m_x = m_indent;
     m_isBeginningOfLine = true;
-    if (m_state.valign == kTextRenderAlignmentLeft)
-    {
-        curr_y += rasterizer->GetAscentHeight() + m_state.lineSpacing;
-        m_renderBottom += m_state.lineSpacing;
-    }
-    else if (m_state.valign == kTextRenderAlignmentRight)
-    {
-        curr_y -= rasterizer->GetAscentHeight() + m_state.lineSpacing;
-        m_renderTop -= m_state.lineSpacing;
-    }
-    else
-        curr_y += rasterizer->GetAscentHeight() + m_state.lineSpacing;
+    m_y += getAscentHeight() + getEffectiveLineSpacing();
 }
 
-extern bool Layer_FetchImageSize(ttstr imageName, int& w, int& h);
-void TextRenderBase::pushGraphicalCharacter(ttstr const& graph)
+void TextRenderBase::pushGraphicalCharacter(const ttstr& graph)
 {
-    // 获取图像信息
-    int _w = 0, _h = 0;
-    Layer_FetchImageSize(graph, _w, _h);
+    flush();
 
-    // 推入图像数据
-    CharacterInfo info{
-        m_state.bold,
-        m_state.italic,
-        true,
-        false,
-        m_state.face,
-        0,
-        0,
-        _w,
-        _h,
-        m_state.chColor,
-        (m_state.edge ? m_state.edgeColor : 0),
-        (m_state.shadow ? m_state.shadowColor : 0),
-        (ttstr(graph)),
-    };
+    int w = 0, h = 0;
+    Layer_FetchImageSize(graph, w, h);
 
+    CharacterInfo info;
+    info.bold = m_state.bold;
+    info.italic = m_state.italic;
+    info.graph = true;
+    info.face = m_state.face;
+    info.cw = w;
+    info.size = h;
+    info.color = m_state.chColor;
+    info.edge = m_state.edge ? std::make_optional(m_state.edgeColor) : std::nullopt;
+    info.shadow = m_state.shadow ? std::make_optional(m_state.shadowColor) : std::nullopt;
+    info.text = graph;
+    info.delay = m_currentDelay;
     m_buffer.push_back(std::move(info));
+
+    addDelay(m_characterDelay);
+    m_mode = kTextRenderModeNormal;
+    m_isBeginningOfLine = false;
 }
 
-static bool findchInChars(const tjs_wchar* chz, const tjs_wchar ch)
+void TextRenderBase::pushCharacter(char32_t ch)
 {
-    for (int i = 0; chz[i] != '\0'; i++)
-    {
-        if (chz[i] == ch)
-        {
-            return true;
-        }
-    }
-    return false;
-}
+    const bool isLeadingChar = containsCodePoint(m_options.leading, ch);
+    const bool isFollowingChar = containsCodePoint(m_options.following, ch);
+    const bool isIndent = containsCodePoint(m_options.begin, ch);
+    const bool isIndentDecr = containsCodePoint(m_options.end, ch);
 
-FontRasterizer* TextRenderBase::GetCurrentRasterizer()
-{
-    if (!m_rasterizer)
-        m_rasterizer = new FreeTypeFontRasterizer();
-    return m_rasterizer;
-}
+    uint32_t current;
+    if (isLeadingChar)
+        current = kTextRenderModeLeading;
+    else if (isFollowingChar)
+        current = kTextRenderModeFollowing;
+    else
+        current = kTextRenderModeNormal;
 
-void TextRenderBase::pushCharacter(const tjs_char* ch)
-{
-    tjs_wchar chwd = 0;
-    if (!TVP_utf8_to_utf16(ch, &chwd))
-        return;
-    auto isIndent = findchInChars(m_options.begin, chwd);
-    auto isIndentDecr = findchInChars(m_options.end, chwd);
+    // Kinsoku: characters stay buffered together, and move to the next line
+    // as one unit, when the previous one must not end a line (an opening
+    // bracket) or this one must not start a line (closing punctuation).
+    if (m_mode != kTextRenderModeLeading && current != kTextRenderModeFollowing)
+        flush();
 
-    auto rasterizer = GetCurrentRasterizer();
-    auto text_height = rasterizer->GetAscentHeight();
+    applyFont();
 
     int advance_width = 0, advance_height = 0;
+    if (ch <= 0xFFFF)
+        m_rasterizer->GetTextExtent(static_cast<tjs_wchar>(ch), advance_width, advance_height);
+    else
+        advance_width = getEffectiveFontHeight(); // the rasterizer only takes BMP characters
 
-    rasterizer->GetTextExtent(chwd, advance_width, advance_height);
-
-    CharacterInfo info{
-        m_state.bold,
-        m_state.italic,
-        false,
-        false,
-        m_state.face,
-        0,
-        0,
-        advance_width,
-        m_state.fontsize,
-        m_state.chColor,
-        (m_state.edge ? m_state.edgeColor : 0),
-        (m_state.shadow ? m_state.shadowColor : 0),
-        (ttstr(ch, utf8_char_len(ch))),
-    };
-
+    CharacterInfo info;
+    info.bold = m_state.bold;
+    info.italic = m_state.italic;
+    info.face = m_state.face;
+    info.cw = advance_width;
+    info.size = getEffectiveFontHeight();
+    info.color = m_state.chColor;
+    info.edge = m_state.edge ? std::make_optional(m_state.edgeColor) : std::nullopt;
+    info.edgeExtent = m_state.edge ? m_state.edgeExtent : 0;
+    info.edgeEmphasis = m_state.edge ? m_state.edgeEmphasis : 0;
+    info.shadow = m_state.shadow ? std::make_optional(m_state.shadowColor) : std::nullopt;
+    info.text = codePointsToTtstr(tr_string(1, ch));
+    info.delay = m_currentDelay;
     m_buffer.push_back(std::move(info));
+
+    double characterDelay = m_characterDelay;
+    if (m_options.widthTimeScale)
+    {
+        characterDelay *= static_cast<double>(std::max(advance_width, 0)) /
+                          static_cast<double>(std::max(getEffectiveFontHeight(), 1));
+    }
+    addDelay(characterDelay);
 
     if (m_autoIndent)
     {
-        // pre-indent
+        // hanging indent for a line that starts with an opening bracket
         if (m_isBeginningOfLine && m_autoIndent < 0)
-        {
-            curr_x -= advance_width;
-        }
-
+            m_x -= advance_width;
         if (isIndent)
-        {
-            m_indent = curr_x + advance_width;
-            // TODO: register pair
-        }
-
+            m_indent = m_x + advance_width;
         if (isIndentDecr && m_indent > 0)
         {
-            flush(); // FIXME: not safe?
+            flush();
             m_indent = 0;
         }
     }
 
+    m_mode = current;
     m_isBeginningOfLine = false;
 }
 
 void TextRenderBase::flush(bool force)
 {
     if (m_buffer.empty())
-    {
         return;
-    }
 
-    // 有数据了，为y增加一行区域
-    if (m_state.align == kTextRenderAlignmentLeft)
+    // place every buffered character on the current line, or move the whole
+    // group to the next line when it does not fit
+    auto x = m_x;
+    for (auto& ch : m_buffer)
     {
-        m_renderBottom += GetCurrentRasterizer()->GetAscentHeight() + m_state.lineSpacing;
-    }
-    else if (m_state.align == kTextRenderAlignmentRight)
-    {
-        m_renderTop -= GetCurrentRasterizer()->GetAscentHeight() + m_state.lineSpacing;
-    }
-    else
-    {
-        m_renderTop = m_boxTop;
-        m_renderBottom = m_boxTop + m_boxHeight;
-    }
+        const auto advance_width = ch.cw;
+        auto new_x = advance_width + x + m_state.pitch;
 
-    // try place all characters in the same line
-    // 左对齐
-    if (m_state.align == kTextRenderAlignmentLeft)
-    {
-        auto x = m_boxLeft;
-
-        for (auto& ch : m_buffer)
+        if (m_boxWidth < new_x)
         {
-            auto advance_width = ch.cw;
-            auto new_x = advance_width + x + m_state.pitch;
-
-            if (m_boxWidth < new_x)
+            if (force)
             {
-                if (force)
-                {
-                    performLinebreak();
-                    x = curr_x;
-                    new_x = advance_width + x + m_state.pitch;
-                }
-                else
-                {
-                    flush(true);
-                    return;
-                }
+                performLinebreak();
+                x = m_x;
+                new_x = advance_width + x + m_state.pitch;
             }
-
-            ch.x = x;
-            ch.y = curr_y;
-
-            x = new_x;
-            m_renderRight = std::max(m_renderRight, x);
-        }
-
-        curr_x = x;
-    }
-    // 右对齐
-    else if (m_state.align == kTextRenderAlignmentRight)
-    {
-        auto x = m_boxLeft + m_boxWidth;
-
-        for (auto& ch : m_buffer)
-        {
-            auto advance_width = ch.cw;
-            auto new_x = x - advance_width;
-
-            if (new_x < m_boxLeft)
+            else
             {
-                if (force)
-                {
-                    performLinebreak();
-                    new_x = curr_x - advance_width;
-                }
-                else
-                {
-                    flush(true);
-                    return;
-                }
-            }
-
-            ch.x = new_x;
-            ch.y = curr_y;
-
-            x = new_x - m_state.pitch;
-            m_renderLeft = std::min(m_renderLeft, x);
-        }
-
-        curr_x = x;
-    }
-    // 居中对齐
-    else
-    {
-        int totalWidth = 0;
-        for (size_t i = 0; i < m_buffer.size(); i++)
-        {
-            totalWidth += m_buffer[i].cw;
-            if (i < m_buffer.size() - 1)
-            {
-                totalWidth += m_state.pitch;
+                performLinebreak();
+                flush(true);
+                return;
             }
         }
-        if (totalWidth > m_boxWidth && !force)
-        {
-            performLinebreak();
-            flush(true);
-            return;
-        }
-
-        int startX = m_boxLeft + (m_boxWidth - totalWidth) / 2;
-        int x = startX;
-        for (size_t i = 0; i < m_buffer.size(); i++)
-        {
-            auto& ch = m_buffer[i];
-            float advance_width = ch.cw;
-
-            ch.x = x;
-            ch.y = curr_y;
-
-            x += advance_width;
-            if (i < m_buffer.size() - 1)
-            {
-                x += m_state.pitch;
-            }
-        }
-
-        curr_x = x;
-
-        m_renderLeft = m_boxLeft;
-        m_renderRight = m_boxLeft + m_boxWidth;
+        ch.layoutX = ch.x = x;
+        ch.layoutY = ch.y = m_y;
+        x = new_x;
     }
-    
+
+    m_x = x;
     m_characters.insert(m_characters.end(), m_buffer.begin(), m_buffer.end());
-    for (size_t i = 0; i < m_buffer.size(); i++)
-    {
-        m_state.renderText += m_buffer.at(i).text;
-    }
     m_buffer.clear();
+    m_layoutDirty = true;
+}
+
+void TextRenderBase::applyAlignment()
+{
+    if (!m_layoutDirty || m_characters.empty())
+        return;
+    m_layoutDirty = false;
+
+    struct LineBounds
+    {
+        size_t first = 0;
+        size_t last = 0;
+        int y = 0;
+        int left = 0;
+        int right = 0;
+        int top = 0;
+        int bottom = 0;
+    };
+
+    // Alignment is always computed from the unaligned layout positions, so
+    // characters appended after a previous alignment pass line up correctly.
+    std::vector<LineBounds> lines;
+    for (size_t i = 0; i < m_characters.size(); ++i)
+    {
+        auto& ch = m_characters[i];
+        ch.x = ch.layoutX;
+        ch.y = ch.layoutY;
+        const int left = ch.x;
+        const int right = ch.x + std::max(ch.cw, 0);
+        const int top = ch.y;
+        const int bottom = ch.y + std::max(ch.size, getAscentHeight());
+        if (lines.empty() || lines.back().y != ch.y)
+        {
+            lines.push_back({i, i, ch.y, left, right, top, bottom});
+            continue;
+        }
+        auto& line = lines.back();
+        line.last = i;
+        line.left = std::min(line.left, left);
+        line.right = std::max(line.right, right);
+        line.top = std::min(line.top, top);
+        line.bottom = std::max(line.bottom, bottom);
+    }
+
+    int blockTop = std::numeric_limits<int>::max();
+    int blockBottom = std::numeric_limits<int>::min();
+    for (auto& line : lines)
+    {
+        if (m_boxWidth > 0)
+        {
+            const int lineWidth = line.right - line.left;
+            int offsetX = 0;
+            if (m_state.align == 0)
+                offsetX = (m_boxWidth - lineWidth) / 2 - line.left;
+            else if (m_state.align > 0)
+                offsetX = (m_boxWidth - lineWidth) - line.left;
+            if (offsetX != 0)
+            {
+                for (size_t i = line.first; i <= line.last; ++i)
+                    m_characters[i].x += offsetX;
+            }
+        }
+        blockTop = std::min(blockTop, line.top);
+        blockBottom = std::max(blockBottom, line.bottom);
+    }
+
+    if (m_boxHeight > 0 && blockTop <= blockBottom)
+    {
+        const int blockHeight = blockBottom - blockTop;
+        int offsetY = 0;
+        if (m_state.valign == 0)
+            offsetY = (m_boxHeight - blockHeight) / 2 - blockTop;
+        else if (m_state.valign > 0)
+            offsetY = (m_boxHeight - blockHeight) - blockTop;
+        if (offsetY != 0)
+        {
+            for (auto& ch : m_characters)
+                ch.y += offsetY;
+        }
+    }
 }
 
 void TextRenderBase::setRenderSize(int width, int height)
@@ -1226,148 +1382,214 @@ void TextRenderBase::setOption(tTJSVariant options)
 
 tTJSVariant TextRenderBase::getCharacters(int start, int end)
 {
-    // TODO: only (0, 0) is observed
+    applyAlignment();
     auto array = TJSCreateArrayObject();
 
+    // only (0, 0) has been observed: return everything
     if ((end < start) || (start == 0 && end == 0))
     {
         for (size_t i = 0, cnt = m_characters.size(); i < cnt; ++i)
         {
             auto ch = m_characters[i].serialize();
-            array->PropSetByNum(TJS_MEMBERENSURE, i, &ch, array);
+            array->PropSetByNum(TJS_MEMBERENSURE, (tjs_int)i, &ch, array);
         }
     }
-    else
-    {
-        // TODO: unknown behaviour
-    }
 
-    return tTJSVariant(array, array);
+    auto res = tTJSVariant(array, array);
+    array->Release();
+    return res;
 }
 
 void TextRenderBase::clear()
 {
     m_characters.clear();
-
+    m_buffer.clear();
     m_state = m_default;
     m_overflow = false;
-
-    curr_x = 0;
-    // 提前检查y的对齐方式
-    if (m_state.valign == kTextRenderAlignmentLeft)
-    {
-        // 正常搞
-        curr_y = m_boxTop;
-        m_renderTop = m_boxTop;
-        m_renderBottom = m_boxTop;
-    }
-    else if (m_state.valign == kTextRenderAlignmentRight)
-    {
-        // 从底部开始
-        curr_y = m_boxTop + m_boxHeight - m_state.fontsize;
-        m_renderTop = m_boxTop + m_boxHeight;
-        m_renderBottom = m_boxTop + m_boxHeight;
-    }
-    else
-    {
-        // 感觉为了高效实现对齐和实时渲染，以后可能得改整个textrender的流程
-        // 不考虑多行了，现在的流程不好搞
-        curr_y = m_boxTop + (m_boxHeight - GetCurrentRasterizer()->GetAscentHeight()) / 2;
-        m_renderTop = m_boxTop;
-        m_renderBottom = m_boxTop;
-    }
-    // x的渲染区域重置
-    if (m_state.align == kTextRenderAlignmentLeft)
-    {
-        m_renderLeft = m_boxLeft;
-        m_renderRight = m_boxLeft;
-    }
-    else if (m_state.align == kTextRenderAlignmentRight)
-    {
-        m_renderLeft = m_boxLeft + m_boxWidth;
-        m_renderRight = m_boxLeft + m_boxWidth;
-    }
-    else
-    {
-        m_renderLeft = m_boxLeft;
-        m_renderRight = m_boxLeft;
-    }
-
+    m_x = 0;
+    m_y = 0;
     m_indent = 0;
-
     m_isBeginningOfLine = true;
-
-    updateFont();
-}
-
-void TextRenderBase::updateFont()
-{
-    auto rasterizer = GetCurrentRasterizer();
-    auto font = tTVPFont{
-        m_state.fontsize, // height of text
-        static_cast<tjs_uint32>((m_state.bold ? TVP_TF_BOLD : 0) |
-                                (m_state.italic ? TVP_TF_ITALIC : 0)),
-        0,
-        m_state.face, // TODO: this may fuck up the font settings by
-                      // forcing the fallback font (in most cases)
-    };
-    rasterizer->ApplyFont(font);
+    m_fontDirty = true;
+    m_layoutDirty = false;
+    m_mode = kTextRenderModeLeading;
+    m_keyWaits.clear();
+    m_baseCharacterDelay = 0.0;
+    m_characterDelay = 0.0;
+    m_currentDelay = 0.0;
+    m_renderDelay = 0.0;
+    m_timingSegmentStart = 0;
+    m_timingSegmentStartDelay = 0.0;
+    m_sameKeyWaitIndex = 0;
+    m_sameTiming = false;
+    m_renderCountOverride = -1;
 }
 
 void TextRenderBase::done()
 {
     flush();
+    applyAlignment();
+    updateOverflow();
 }
 
-void TextRenderBase::resetFont()
+void TextRenderBase::newline()
 {
-    m_state = m_default;
+    flush();
+    performLinebreak();
 }
 
 void TextRenderBase::resetStyle()
 {
     m_state = m_default;
+    m_fontDirty = true;
+    m_layoutDirty = true;
+}
+
+void TextRenderBase::resetFont()
+{
+    m_state.bold = m_default.bold;
+    m_state.italic = m_default.italic;
+    m_state.face = m_default.face;
+    m_state.fontSize = m_default.fontSize;
+    m_state.fontScale = m_default.fontScale;
+    m_fontDirty = true;
+    m_layoutDirty = true;
 }
 
 tTJSVariant TextRenderBase::getKeyWait()
 {
-    iTJSDispatch2* dsp = TJSCreateArrayObject();
-    tTJSVariant ret(dsp, dsp);
-    dsp->Release();
-    return ret;
+    const double scale = std::max(m_timeScale, 0.0);
+    auto array = TJSCreateArrayObject();
+    for (size_t i = 0; i < m_keyWaits.size(); ++i)
+    {
+        auto dict = TJSCreateDictionaryObject();
+        {
+            tTJSVariant value(m_keyWaits[i].pos);
+            dict->PropSet(TJS_MEMBERENSURE, TJS_N("pos"), nullptr, &value, dict);
+        }
+        {
+            tTJSVariant value(m_keyWaits[i].time * scale);
+            dict->PropSet(TJS_MEMBERENSURE, TJS_N("time"), nullptr, &value, dict);
+        }
+        tTJSVariant value(dict, dict);
+        dict->Release();
+        array->PropSetByNum(TJS_MEMBERENSURE, static_cast<tjs_int>(i), &value, array);
+    }
+    auto res = tTJSVariant(array, array);
+    array->Release();
+    return res;
 }
 
-int TextRenderBase::calcShowCount()
+double TextRenderBase::get_renderDelay() const
 {
-    return m_characters.size();
+    return m_renderDelay * std::max(m_timeScale, 0.0);
 }
 
-// register the class
+int TextRenderBase::calcShowCount(int elapsed)
+{
+    // number of characters whose reveal time has passed
+    const double scale = std::max(m_timeScale, 0.0);
+    for (size_t i = m_characters.size(); i > 0; --i)
+    {
+        if (elapsed >= m_characters[i - 1].delay * scale)
+            return static_cast<int>(i);
+    }
+    return 0;
+}
+
+int TextRenderBase::get_renderCount() const
+{
+    if (m_renderCountOverride >= 0)
+        return m_renderCountOverride;
+    return static_cast<int>(getCharacterCount());
+}
+
+void TextRenderBase::set_renderCount(int value)
+{
+    m_renderCountOverride = std::max(value, 0);
+}
+
+void TextRenderBase::redraw()
+{
+    done();
+    m_renderCountOverride = -1;
+}
+
+tTJSVariant TextRenderBase::renderText(tTJSVariant text)
+{
+    clear();
+    render(text.Type() == tvtVoid ? ttstr() : ttstr(text), 0, 0, 0, false, false, nullptr);
+    done();
+    return getCharacters(0, 0);
+}
+
+TextRenderBase::RenderBounds TextRenderBase::getRenderedBounds()
+{
+    applyAlignment();
+    RenderBounds bounds{0, 0, 0, 0};
+    bool hasCharacter = false;
+
+    auto accumulate = [&](const CharacterInfo& character)
+    {
+        const int left = character.x;
+        const int top = character.y;
+        const int right = character.x + std::max(character.cw, 0);
+        const int bottom = character.y + std::max(character.size, 0);
+        if (!hasCharacter)
+        {
+            bounds = {left, top, right, bottom};
+            hasCharacter = true;
+            return;
+        }
+        bounds.left = std::min(bounds.left, left);
+        bounds.top = std::min(bounds.top, top);
+        bounds.right = std::max(bounds.right, right);
+        bounds.bottom = std::max(bounds.bottom, bottom);
+    };
+
+    for (const auto& character : m_characters)
+        accumulate(character);
+    for (const auto& character : m_buffer)
+        accumulate(character);
+
+    if (!hasCharacter)
+    {
+        bounds.right = std::max(m_boxWidth, 0);
+        bounds.bottom = std::max(m_boxHeight, 0);
+    }
+    return bounds;
+}
+
+tTJSVariant TextRenderBase::getRect()
+{
+    const auto bounds = getRenderedBounds();
+    iTJSDispatch2* rect = TVPCreateRectObject(bounds.left, bounds.top, bounds.right, bounds.bottom);
+    tTJSVariant result(rect, rect);
+    rect->Release();
+    return result;
+}
+
 NCB_REGISTER_CLASS(TextRenderBase)
 {
     Constructor();
 
-    NCB_METHOD(render);
+    NCB_METHOD_RAW_CALLBACK(render, &TextRenderBase::renderCallback, 0);
     NCB_METHOD(setRenderSize);
     NCB_METHOD(setDefault);
     NCB_METHOD(setOption);
     NCB_METHOD(getCharacters);
     NCB_METHOD(clear);
     NCB_METHOD(done);
+    NCB_METHOD(newline);
 
-    NCB_METHOD(resetFont);
-    NCB_METHOD(resetStyle);
     NCB_METHOD(getKeyWait);
     NCB_METHOD(calcShowCount);
-    Property(TJS_N("keyWait"), &Class::getKeyWait, &Class::setKeyWait);
-    property_delegate(renderCount);
-    property_delegate(renderOver);
-    property_delegate(renderDelay);
-    property_delegate(renderText);
-    property_delegate(renderLeft);
-    property_delegate(renderRight);
-    property_delegate(renderTop);
-    property_delegate(renderBottom);
+    NCB_METHOD(redraw);
+    NCB_METHOD(renderText);
+    NCB_METHOD(resetStyle);
+    NCB_METHOD(resetFont);
+    NCB_METHOD(setFontScale);
+    NCB_METHOD(getRect);
 
     property_delegate(vertical);
     property_delegate(bold);
@@ -1379,10 +1601,17 @@ NCB_REGISTER_CLASS(TextRenderBase)
     property_delegate(rubySize);
     property_delegate(rubyOffset);
     property_delegate(shadow);
+    property_delegate(shadowColor);
     property_delegate(edge);
+    property_delegate(edgeColor);
+    property_delegate(edgeExtent);
+    property_delegate(edgeEmphasis);
     property_delegate(lineSpacing);
     property_delegate(pitch);
     property_delegate(lineSize);
+    property_delegate(align);
+    property_delegate(valign);
+    property_delegate(timeScale);
 
     property_delegate(defaultBold);
     property_delegate(defaultItalic);
@@ -1393,9 +1622,27 @@ NCB_REGISTER_CLASS(TextRenderBase)
     property_delegate(defaultRubySize);
     property_delegate(defaultRubyOffset);
     property_delegate(defaultShadow);
+    property_delegate(defaultShadowColor);
     property_delegate(defaultEdge);
+    property_delegate(defaultEdgeColor);
+    property_delegate(defaultEdgeExtent);
+    property_delegate(defaultEdgeEmphasis);
     property_delegate(defaultLineSpacing);
     property_delegate(defaultPitch);
     property_delegate(defaultLineSize);
+    property_delegate(defaultAlign);
     property_delegate(defaultValign);
+
+    NCB_PROPERTY(renderCount, get_renderCount, set_renderCount);
+    // renderOver is a read-only property in the original textrender.dll; a
+    // method would read as a truthy function object.
+    NCB_PROPERTY_RO(renderOver, get_renderOver);
+    NCB_PROPERTY_RO(renderDelay, get_renderDelay);
+    NCB_PROPERTY_RO(keyWait, getKeyWait);
+    NCB_PROPERTY_RO(renderLeft, get_renderLeft);
+    NCB_PROPERTY_RO(renderTop, get_renderTop);
+    NCB_PROPERTY_RO(renderWidth, get_renderWidth);
+    NCB_PROPERTY_RO(renderHeight, get_renderHeight);
+    NCB_PROPERTY_RO(renderRight, get_renderRight);
+    NCB_PROPERTY_RO(renderBottom, get_renderBottom);
 };

@@ -76,6 +76,10 @@ enum tTVPMouseCursorState
 // script side types; only forward-declared here, never included
 class tTJSNI_BaseLayer;
 
+// Set by a host that drives frames itself (Mikage's display link): modal
+// loops call it once per pass to hand the frame back instead of sleeping.
+extern void (*TVPHostModalYield)();
+
 //---------------------------------------------------------------------------
 //! @brief 窗口核心类（非 script 部分）
 //---------------------------------------------------------------------------

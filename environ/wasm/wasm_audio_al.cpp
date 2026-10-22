@@ -17,6 +17,7 @@
 #include <AL/al.h>
 #include <AL/alc.h>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <algorithm>
 #include <vector>
@@ -45,6 +46,7 @@ static bool InitOpenAL()
 class tTVPSoundBufferWASM : public iTVPSoundBuffer
 {
     float    _volume = 1.0f, _pan = 0.0f;
+    float    _pos[3] = {0, 0, 0};          // 3D position from SetPosition
     tTVPWaveFormat _format;
     int      _frameSize = 0, _bytesPerSample = 0;
 
@@ -101,6 +103,9 @@ public:
         alGenSources(1, &_alSource);
         alGenBuffers((ALsizei)_bufIds.size(), _bufIds.data());
         alSourcef(_alSource, AL_GAIN, 1.0f);
+        // Positions are relative to the listener, so pan stays a direction.
+        alSourcei(_alSource, AL_SOURCE_RELATIVE, AL_TRUE);
+        UpdatePosition();
         TVPAddLog(ttstr(TJS_N("[openal] buf=")) + ttstr((int)_bufIds.size())
                    + ttstr(TJS_N(" freq=")) + ttstr((int)_format.SamplesPerSec)
                    + ttstr(TJS_N(" ch=")) + ttstr((int)_format.Channels));
@@ -133,7 +138,7 @@ public:
 
     void SetVolume(float v) override       { _volume = v; if (_alSource) alSourcef(_alSource, AL_GAIN, v); }
     float GetVolume() override            { return _volume; }
-    void SetPan(float v) override         { _pan = v; if (_alSource) { float p[] = {v,0,0}; alSourcefv(_alSource, AL_POSITION, p); } }
+    void SetPan(float v) override         { _pan = std::clamp(v, -1.0f, 1.0f); UpdatePosition(); }
     float GetPan() override               { return _pan; }
 
     // ── Core: Append decoded PCM data to the playback queue ──────────────
@@ -234,8 +239,24 @@ public:
 
     void SetPosition(float x, float y, float z) override
     {
+        _pos[0] = x; _pos[1] = y; _pos[2] = z;
+        UpdatePosition();
+    }
+
+private:
+    // OpenAL pans by direction, so pan is a point on the unit circle in
+    // front of the listener; {pan,0,0} would put any nonzero pan hard to one
+    // side. Pan and a 3D position share AL_POSITION: an explicit position
+    // wins, and the engine's reset to the origin leaves pan in place.
+    void UpdatePosition()
+    {
         if (!_alSource) return;
-        float p[] = {x, y, z};
+        if (_pos[0] != 0 || _pos[1] != 0 || _pos[2] != 0)
+        {
+            alSourcefv(_alSource, AL_POSITION, _pos);
+            return;
+        }
+        float p[] = {_pan, 0, -std::sqrt(1.0f - _pan * _pan)};
         alSourcefv(_alSource, AL_POSITION, p);
     }
 };

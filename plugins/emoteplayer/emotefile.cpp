@@ -403,6 +403,59 @@ static EmoteDecodedCache& SharedEmoteCache()
     }());
     return *cache;
 }
+namespace
+{
+// Most recently released first.
+std::vector<std::unique_ptr<emotefile>>& EmoteFilePool()
+{
+    static std::vector<std::unique_ptr<emotefile>> pool;
+    return pool;
+}
+// A scene shows a few characters; each pooled file holds its icon pixels and
+// textures, so the pool stays small.
+constexpr std::size_t kEmoteFilePoolSize = 6;
+constexpr std::size_t kEmoteFilePoolKeptOnTrim = 2;
+std::uint64_t emoteFilePoolHits = 0;
+void ClearEmoteFilePool(std::size_t keep)
+{
+    auto& pool = EmoteFilePool();
+    if (pool.size() > keep) pool.resize(keep);
+}
+} // namespace
+
+void ReleaseEmoteFile(emotefile* released)
+{
+    std::unique_ptr<emotefile> file(released);
+    if (!file || !file->IsPoolable() || file->PoolGeneration() != SharedEmoteCache().Generation() ||
+        TVPHasXP3ArchiveFilters())
+        return;
+    auto& pool = EmoteFilePool();
+    pool.insert(pool.begin(), std::move(file));
+    if (pool.size() > kEmoteFilePoolSize) pool.resize(kEmoteFilePoolSize);
+}
+emotefile* TakePooledEmoteFile(const std::string& canonicalPath, std::int32_t seed)
+{
+    if (TVPHasXP3ArchiveFilters()) return nullptr;
+    auto& pool = EmoteFilePool();
+    for (auto it = pool.begin(); it != pool.end(); ++it)
+    {
+        if ((*it)->PoolPath() != canonicalPath || (*it)->PoolSeed() != seed) continue;
+        emotefile* file = it->release();
+        pool.erase(it);
+        file->ResetPlayState();
+        ++emoteFilePoolHits;
+        return file;
+    }
+    return nullptr;
+}
+std::size_t PooledEmoteFileCount()
+{
+    return EmoteFilePool().size();
+}
+std::uint64_t PooledEmoteFileHits()
+{
+    return emoteFilePoolHits;
+}
 void ClearSharedEmoteResourceCache(const char* reason)
 {
     // One line per clear: clears are rare and the reason decides whether the
@@ -410,11 +463,13 @@ void ClearSharedEmoteResourceCache(const char* reason)
     TVPConsoleLog("emote.resourceCache action=clear reason=%s",
                   reason ? reason : "unspecified");
     SharedEmoteCache().Clear();
+    ClearEmoteFilePool(0);
 }
 void TrimSharedEmoteResourceCache(const char* reason)
 {
     const auto keep = SharedEmoteCache().BudgetBytes() / 4;
     const auto removed = SharedEmoteCache().TrimTo(keep);
+    ClearEmoteFilePool(kEmoteFilePoolKeptOnTrim);
     if (removed)
         TVPConsoleLog("emote.resourceCache action=trim reason=%s removed=%llu retainedBytes=%llu",
                       reason ? reason : "unspecified",
@@ -423,6 +478,8 @@ void TrimSharedEmoteResourceCache(const char* reason)
 }
 void InvalidateSharedEmoteResource(const std::string& canonicalPath)
 {
+    // The generation bump below also keeps files loaded before it out of the pool.
+    ClearEmoteFilePool(0);
     SharedEmoteCache().EraseIf([&](const auto& key) {
         return key.first == canonicalPath ||
             (key.first.size() > canonicalPath.size() &&
@@ -739,6 +796,15 @@ emotenode::emotenode(emotemotion* rootmotion,
     {
         filePtr->parseNumber(tmp, it->second);
         meshCombine = static_cast<uint8_t>(tmp);
+    }
+    it = _rootData.find("transformOrder");
+    if (it != _rootData.end())
+    {
+        std::vector<uint32_t> order;
+        if (filePtr->parseList(order, it->second) && order.size() == 4)
+            for (size_t i = 0; i < 4; ++i)
+                if (filePtr->parseNumber(tmp, order[i]) && tmp >= 0 && tmp <= 3)
+                    transformOrder[i] = static_cast<int32_t>(tmp);
     }
     it = _rootData.find("meshDivision");
     if (it != _rootData.end())
@@ -1084,27 +1150,39 @@ emotetimeline::emotetimeline(emotefile* filePtr, uint32_t startOffset)
     // dic
     std::map<std::string, uint32_t> _rootData;
     filePtr->parseObject(_rootData, startOffset);
-    // frameinfo
+    // Every key is optional: a timeline can be just a label. Absent keys keep
+    // their defaults (-1 times, not diff, no variables) instead of reading
+    // offset 0, which logged "Invalidate Number"/"Invalidate List" per load.
     int64_t tmp = 0;
-    filePtr->parseNumber(tmp, _rootData["lastTime"]);
-    lastTime = static_cast<int32_t>(tmp);
-    filePtr->parseNumber(tmp, _rootData["loopBegin"]);
-    loopBegin = static_cast<int32_t>(tmp);
-    filePtr->parseNumber(tmp, _rootData["loopEnd"]);
-    loopEnd = static_cast<int32_t>(tmp);
-    if (filePtr->parseNumber(tmp, _rootData["diff"]))
-        diff = static_cast<int8_t>(tmp);
+    auto number = [&](const char* key) {
+        const auto it = _rootData.find(key);
+        return it != _rootData.end() && filePtr->parseNumber(tmp, it->second);
+    };
+    if (number("lastTime")) lastTime = static_cast<int32_t>(tmp);
+    if (number("loopBegin")) loopBegin = static_cast<int32_t>(tmp);
+    if (number("loopEnd")) loopEnd = static_cast<int32_t>(tmp);
+    if (number("diff")) diff = static_cast<int8_t>(tmp);
 
     // label
-    filePtr->parseString(label, _rootData["label"]);
+    if (const auto it = _rootData.find("label"); it != _rootData.end())
+        filePtr->parseString(label, it->second);
     // variableList
     std::vector<uint32_t> _tmpList;
-    filePtr->parseList(_tmpList, _rootData["variableList"]);
+    if (const auto it = _rootData.find("variableList"); it != _rootData.end())
+        filePtr->parseList(_tmpList, it->second);
     for (size_t i = 0; i < _tmpList.size(); i++)
     {
         emoteTimeVar* tmp = new emoteTimeVar(filePtr, _tmpList.at(i));
         variableList.push_back(tmp);
     }
+    if (lastTime < 0 && !(loopBegin >= 0 && loopEnd > loopBegin))
+        for (const auto* variable : variableList)
+            for (const auto* frame : variable->frameList)
+                lastTime = std::max(lastTime, (int32_t)std::ceil(frame->time) - 1);
+    // A label-only timeline has nothing to play. It used to read lastTime 0
+    // from the missing key and finish at once; keep that.
+    if (lastTime < 0 && variableList.empty() && !(loopBegin >= 0 && loopEnd > loopBegin))
+        lastTime = 0;
 }
 emotetimeline::~emotetimeline()
 {
@@ -1124,6 +1202,14 @@ bustControl::bustControl(emotefile* filePtr, uint32_t startOffset)
     // dic
     std::map<std::string, uint32_t> _rootData;
     filePtr->parseObject(_rootData, startOffset);
+    filePtr->parseString(baseLayer, _rootData["baseLayer"]);
+    filePtr->parseString(label, _rootData["label"]);
+    if (_rootData.count("enabled"))
+    {
+        int64_t value = 1;
+        filePtr->parseNumber(value, _rootData["enabled"]);
+        enabled = value != 0;
+    }
     // friction/gravity/spring
     filePtr->parseReal(friction, _rootData["friction"]);
     filePtr->parseReal(gravity, _rootData["gravity"]);
@@ -1171,6 +1257,14 @@ uniControl::uniControl(emotefile* filePtr, uint32_t startOffset)
     // dic
     std::map<std::string, uint32_t> _rootData;
     filePtr->parseObject(_rootData, startOffset);
+    filePtr->parseString(baseLayer, _rootData["baseLayer"]);
+    filePtr->parseString(label, _rootData["label"]);
+    if (_rootData.count("enabled"))
+    {
+        int64_t value = 1;
+        filePtr->parseNumber(value, _rootData["enabled"]);
+        enabled = value != 0;
+    }
     // b_rate/bend_spd/bend_vol/friction_x/friction_y/gravity
     filePtr->parseReal(b_rate, _rootData["b_rate"]);
     filePtr->parseReal(bend_spd, _rootData["bend_spd"]);
@@ -1209,10 +1303,11 @@ uniControl::uniControl(emotefile* filePtr, uint32_t startOffset)
         filePtr->parseList(_p, _rootData["p"]);
         filePtr->parseList(_pv, _rootData["pv"]);
         // bp/p/pv
-        int cts = std::min(_bp.size(), std::min(_p.size(), _pv.size()));
+        const size_t cts = std::min({_bp.size(), _p.size(), _pv.size(),
+                                     _sx.size(), _sy.size(), _len.size()});
         for (int i = 0; i < cts; i++)
         {
-            uniSegment _psD;
+            uniSegment _psD{};
             filePtr->parseObject(_tmpData, _bp.at(i));
             filePtr->parseReal(_psD.bp.x, _tmpData["x"]);
             filePtr->parseReal(_psD.bp.y, _tmpData["y"]);
@@ -1328,6 +1423,7 @@ emotemetadata::emotemetadata(emotefile* filePtr, uint32_t startOffset) : _filePt
     filePtr->parseObject(_base, _rootData["base"]);
     filePtr->parseString(chara, _base["chara"]);
     filePtr->parseString(motion, _base["motion"]);
+    if (_rootData.count("scale")) filePtr->parseReal(scale, _rootData["scale"]);
 
     // attrcomp
     std::vector<uint32_t> _tmpList;
@@ -1833,6 +1929,9 @@ bool emotefile::load(const ttstr& filePath)
         canonicalPath.find(TVPArchiveDelimiter) != std::string::npos;
     const auto key = std::make_pair(canonicalPath, _seed);
     const auto generation = SharedEmoteCache().Generation();
+    _poolable = cacheable;
+    _poolPath = canonicalPath;
+    _poolGeneration = generation;
     if (cacheable) {
         if (auto resource = SharedEmoteCache().Find(key)) {
             LoadDecodedResource(std::move(resource));
@@ -2005,7 +2104,7 @@ bool emotefile::load(const ttstr& filePath)
             filePtr);
         // Load Names
         namesCache.reserve(nameIndexes.size());
-        for (int i = 0; i < namesCache.size(); i++)
+        for (size_t i = 0; i < nameIndexes.size(); i++)
         {
             filePtr->SetPosition(_header.offsetNames + nameIndexes[i]);
             std::string str;
@@ -2043,10 +2142,16 @@ bool emotefile::load(const ttstr& filePath)
         {
             std::string list;
             const auto index = nameIndexes[i];
-            auto chr = namesData[index];
-            while (chr != 0)
+            // A corrupt table can index past the arrays or loop; such a name
+            // ends where it goes wrong.
+            auto chr = index < namesData.size() ? namesData[index] : 0;
+            for (size_t steps = 0; chr != 0 && steps < namesData.size(); ++steps)
             {
+                if (chr >= namesData.size())
+                    break;
                 const auto code = namesData[chr];
+                if (code >= charset.size())
+                    break;
                 const auto d = charset[code];
                 const auto realChr = chr - d;
                 chr = code;
@@ -2112,10 +2217,10 @@ tTJSVariant emotefile::root()
 }
 void emotefile::EnsureTJSNameTable()
 {
-    // A copy of the decoded table, not a reference: the per-occurrence ttstr
-    // built from it must match the per-byte path byte for byte.
+    // Converted to TJS strings once per file, from the same bytes the
+    // per-occurrence conversion used; TJS strings are immutable and shared.
     if (_tjsNameTableReady) return;
-    namesCacheTJS = namesCache;
+    namesCacheTJS.assign(namesCache.begin(), namesCache.end());
     _tjsNameTableReady = true;
 }
 void emotefile::EnsureTJSStringTable()
@@ -2130,6 +2235,7 @@ void emotefile::EnsureTJSStringTable()
         // The decoder treats a stream that ends before the terminator as an
         // empty string; preserve that instead of exposing the partial bytes.
         stringsCacheTJS.emplace_back(terminated ? str : std::string());
+        // Each value converts once; every occurrence shares the TJS string.
     }
     _tjsStringTableReady = true;
 }
@@ -2197,7 +2303,7 @@ tTJSVariant emotefile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
         {
             tjs_int32 val32 = 0;
             filePtr->ReadBuffer(&val32, 3);
-            val32 |= ((val32 & 0x800000) == 0 ? 0 : 0xFFFF0000);
+            val32 |= ((val32 & 0x800000) == 0 ? 0 : (tjs_int32)0xFF000000);
             return tTJSVariant(val32);
         }
         case PSB::PSBObjType::NumberN4:
@@ -2210,21 +2316,21 @@ tTJSVariant emotefile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
         {
             tjs_int64 val64 = 0;
             filePtr->ReadBuffer(&val64, 5);
-            val64 |= ((val64 & 0x8000000000) == 0 ? 0 : 0xFFFFFFFF00000000);
+            val64 |= ((val64 & 0x8000000000) == 0 ? 0 : (tjs_int64)0xFFFFFF0000000000);
             return tTJSVariant(val64);
         }
         case PSB::PSBObjType::NumberN6:
         {
             tjs_int64 val64 = 0;
             filePtr->ReadBuffer(&val64, 6);
-            val64 |= ((val64 & 0x800000000000) == 0 ? 0 : 0xFFFFFF0000000000);
+            val64 |= ((val64 & 0x800000000000) == 0 ? 0 : (tjs_int64)0xFFFF000000000000);
             return tTJSVariant(val64);
         }
         case PSB::PSBObjType::NumberN7:
         {
             tjs_int64 val64 = 0;
             filePtr->ReadBuffer(&val64, 7);
-            val64 |= ((val64 & 0x80000000000000) == 0 ? 0 : 0xFFFF000000000000);
+            val64 |= ((val64 & 0x80000000000000) == 0 ? 0 : (tjs_int64)0xFF00000000000000);
             return tTJSVariant(val64);
         }
         case PSB::PSBObjType::NumberN8:
@@ -2298,6 +2404,8 @@ tTJSVariant emotefile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
                     return tTJSVariant(stringsCacheTJS[idx]);
                 return tTJSVariant();
             }
+            if (idx < 0 || static_cast<size_t>(idx) >= stringsOffset.size())
+                return tTJSVariant();
             filePtr->SetPosition(_header.offsetStringsData + stringsOffset[idx]);
             std::string str;
             tjs_uint8 val8 = 0;
@@ -2378,7 +2486,7 @@ tTJSVariant emotefile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
             EnsureTJSNameTable();
             for (tjs_int i = 0; i < _objsNamesIdx.size(); i++)
             {
-                const ttstr keyName = namesCacheTJS.at(_objsNamesIdx.at(i));
+                const ttstr& keyName = namesCacheTJS.at(_objsNamesIdx.at(i));
                 tTJSVariant obj = readAllObjs(keyName, _tmpOffset + _objsOffset.at(i));
                 dsp->PropSet(TJS_MEMBERENSURE, keyName.c_str(), nullptr, &obj, dsp);
             }
@@ -2397,12 +2505,12 @@ uint32_t emotefile::readListInfo(std::vector<uint32_t>* target)
 }
 void emotefile::refreshListInfo(std::vector<uint32_t>* target1, std::vector<uint32_t>* target2)
 {
-    target2->reserve(target1->size());
+    target2->resize(target1->size());
     uint32_t basePose = filePtr->GetPosition();
     for (uint32_t i = 0; i < target1->size(); i++)
     {
         filePtr->SetPosition(basePose + target1->at(i));
-        target2->at(i) = filePtr->ReadI8LE();
+        target2->at(i) = filePtr->ReadI32LE();
         target1->at(i) += 4;
     }
 }
@@ -2470,7 +2578,7 @@ bool emotefile::parseNumber(int64_t& output, uint32_t _objOffset)
         {
             int32_t val32 = 0;
             filePtr->ReadBuffer(&val32, 3);
-            val32 |= ((val32 & 0x800000) == 0 ? 0 : 0xFFFF0000);
+            val32 |= ((val32 & 0x800000) == 0 ? 0 : (tjs_int32)0xFF000000);
             output = static_cast<int64_t>(val32);
             return true;
         }
@@ -2485,7 +2593,7 @@ bool emotefile::parseNumber(int64_t& output, uint32_t _objOffset)
         {
             int64_t val64 = 0;
             filePtr->ReadBuffer(&val64, 5);
-            val64 |= ((val64 & 0x8000000000) == 0 ? 0 : 0xFFFFFFFF00000000);
+            val64 |= ((val64 & 0x8000000000) == 0 ? 0 : (tjs_int64)0xFFFFFF0000000000);
             output = static_cast<int64_t>(val64);
             return true;
         }
@@ -2493,7 +2601,7 @@ bool emotefile::parseNumber(int64_t& output, uint32_t _objOffset)
         {
             int64_t val64 = 0;
             filePtr->ReadBuffer(&val64, 6);
-            val64 |= ((val64 & 0x800000000000) == 0 ? 0 : 0xFFFFFF0000000000);
+            val64 |= ((val64 & 0x800000000000) == 0 ? 0 : (tjs_int64)0xFFFF000000000000);
             output = static_cast<int64_t>(val64);
             return true;
         }
@@ -2501,7 +2609,7 @@ bool emotefile::parseNumber(int64_t& output, uint32_t _objOffset)
         {
             int64_t val64 = 0;
             filePtr->ReadBuffer(&val64, 7);
-            val64 |= ((val64 & 0x80000000000000) == 0 ? 0 : 0xFFFF000000000000);
+            val64 |= ((val64 & 0x80000000000000) == 0 ? 0 : (tjs_int64)0xFF00000000000000);
             output = static_cast<int64_t>(val64);
             return true;
         }
@@ -2550,7 +2658,7 @@ bool emotefile::parseReal(double& output, uint32_t _objOffset)
         {
             int32_t val32 = 0;
             filePtr->ReadBuffer(&val32, 3);
-            val32 |= ((val32 & 0x800000) == 0 ? 0 : 0xFFFF0000);
+            val32 |= ((val32 & 0x800000) == 0 ? 0 : (tjs_int32)0xFF000000);
             output = static_cast<int64_t>(val32);
             return true;
         }
@@ -2565,7 +2673,7 @@ bool emotefile::parseReal(double& output, uint32_t _objOffset)
         {
             int64_t val64 = 0;
             filePtr->ReadBuffer(&val64, 5);
-            val64 |= ((val64 & 0x8000000000) == 0 ? 0 : 0xFFFFFFFF00000000);
+            val64 |= ((val64 & 0x8000000000) == 0 ? 0 : (tjs_int64)0xFFFFFF0000000000);
             output = static_cast<int64_t>(val64);
             return true;
         }
@@ -2573,7 +2681,7 @@ bool emotefile::parseReal(double& output, uint32_t _objOffset)
         {
             int64_t val64 = 0;
             filePtr->ReadBuffer(&val64, 6);
-            val64 |= ((val64 & 0x800000000000) == 0 ? 0 : 0xFFFFFF0000000000);
+            val64 |= ((val64 & 0x800000000000) == 0 ? 0 : (tjs_int64)0xFFFF000000000000);
             output = static_cast<int64_t>(val64);
             return true;
         }
@@ -2581,7 +2689,7 @@ bool emotefile::parseReal(double& output, uint32_t _objOffset)
         {
             int64_t val64 = 0;
             filePtr->ReadBuffer(&val64, 7);
-            val64 |= ((val64 & 0x80000000000000) == 0 ? 0 : 0xFFFF000000000000);
+            val64 |= ((val64 & 0x80000000000000) == 0 ? 0 : (tjs_int64)0xFF00000000000000);
             output = static_cast<int64_t>(val64);
             return true;
         }
@@ -2654,6 +2762,8 @@ bool emotefile::parseString(std::string& output, uint32_t _objOffset)
             tjs_int32 idx = 0;
             filePtr->ReadBuffer(&idx,
                                 typeByte - static_cast<tjs_int8>(PSB::PSBObjType::StringN1) + 1);
+            if (idx < 0 || static_cast<size_t>(idx) >= stringsOffset.size())
+                return false;
             filePtr->SetPosition(_header.offsetStringsData + stringsOffset[idx]);
             // A truncated tail keeps the partial bytes here, unlike the script
             // decoder which reports it as empty.
@@ -3137,6 +3247,19 @@ bool emotefile::getTickByName(const std::string& name, float& ret)
         return false;
     ret = it->second;
     return true;
+}
+void emotefile::ResetPlayState()
+{
+    if (_metadata == nullptr) return;
+    // GenerateAniTree inserts every variable at 0, then selects option 0 of
+    // each selector; motion parameter writes start empty.
+    for (auto& variable : _metadata->_varList) variable.second = 0.0f;
+    for (auto& object : _objects)
+        if (object.second)
+            for (auto& motion : object.second->motion)
+                if (motion.second) motion.second->parameterCache.clear();
+    for (auto* selector : _metadata->_selectorControl)
+        selector->selectValue(0);
 }
 void emotefile::setVariable(const std::string& name, tjs_real value)
 {

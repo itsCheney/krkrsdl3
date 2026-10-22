@@ -6,6 +6,12 @@
 #include "PSBMedia.h"
 #include "PSBData.h"
 
+class tTVPMemoryStream;
+
+// Reads a whole PSB into memory, decompressing an MDF wrapper. Takes
+// ownership of src (deleted, also on failure). Returns null on failure.
+tTVPMemoryStream* PSBReadDecompressed(tTJSBinaryStream* src);
+
 //---------------------------------------------------------------------------
 // tTJSNI_PsbFile
 //---------------------------------------------------------------------------
@@ -26,9 +32,27 @@ public:
     void refreshListInfo(std::vector<tjs_uint32>* target1, std::vector<tjs_uint32>* target2);
     tTJSVariant readAllObjs(const ttstr& key, tjs_uint32 _objOffset);
 
+    // Reads the resource names and offsets of a decompressed PSB into out,
+    // leaving each Data void. Builds no TJS objects and registers nothing
+    // with psb://, so it can run on loader threads. data is not modified.
+    static bool scanResources(const tjs_uint8* data, tjs_uint64 size, PSB::PSBMediaInfo& out);
+
 private:
     iTJSDispatch2* Owner;
+    // Only collect _resources; readAllObjs builds no TJS values.
+    bool _scanOnly = false;
+    // The decompressed PSB, only while load parses it.
     tTJSBinaryStream* filePtr = nullptr;
+    const tjs_uint8* fileData = nullptr;
+    tjs_uint64 fileSize = 0;
+    // psb:// key this instance registered, if any.
+    ttstr _mediaKey;
+
+    void releaseLoad();
+    void detachMedia();
+    void dropMedia();
+    // Reads the header and tables of filePtr; false if they are unusable.
+    bool parseTables();
 
     PSB::PSBHeader _header;
     std::vector<tjs_uint32> stringsOffset;

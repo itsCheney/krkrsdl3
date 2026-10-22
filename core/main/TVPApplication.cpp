@@ -204,26 +204,64 @@ void tTVPApplication::FilterUserMessage(
     func(m_lstUserMsg);
 }
 
+namespace
+{
+// Each exit stage runs even when an earlier one threw (a script error or a
+// System.exit from a save callback or finalizer). Skipping the rest would
+// leave the script engine and SDL state alive into the next game session.
+template <typename Stage>
+void RunExitStage(const char* name, Stage&& stage)
+{
+    try
+    {
+        stage();
+    }
+    catch (const eTJSSilent&)
+    {
+        // System.exit during exit: already exiting.
+    }
+    catch (const eTJS& error)
+    {
+        TVPAddLog(ttstr(TJS_N("exit.")) + name + TJS_N(": ") + error.GetMessage());
+    }
+    catch (const std::exception& error)
+    {
+        TVPAddLog(ttstr(TJS_N("exit.")) + name + TJS_N(": ") + error.what());
+    }
+    catch (...)
+    {
+        TVPAddLog(ttstr(TJS_N("exit.")) + name + TJS_N(": unknown exception"));
+    }
+}
+} // namespace
+
 void tTVPApplication::OnExit()
 {
     // Invalidate decoder callbacks and synchronously release all movie players
     // while their event hooks, renderer and SDL devices are still alive.
-    TVPInvalidateMovieSession();
-    TVPFinalizeVideoOverlaySession();
+    RunExitStage("movies", [] {
+        TVPInvalidateMovieSession();
+        TVPFinalizeVideoOverlaySession();
+    });
     delete image_load_thread_;
     image_load_thread_ = NULL;
     // KAG save callbacks can execute Scripts.execStorage (including ZIP/7z
     // plugin formats). Run them before at-exit clears archive caches/factories.
-    if (TVPGetScriptEngine())
-        TVPDeliverCompactEvent(TVP_COMPACT_LEVEL_MAX);
+    RunExitStage("compact", [] {
+        if (TVPGetScriptEngine())
+            TVPDeliverCompactEvent(TVP_COMPACT_LEVEL_MAX);
+    });
     // Finish session-owned native layers/callbacks before at-exit/plugin/VM
     // teardown. They must never root or refer to a previous game's objects.
-    emoteplayer::ResetEmotePlayerSession();
-    TVPSystemUninit();
+    RunExitStage("emote", [] { emoteplayer::ResetEmotePlayerSession(); });
+    RunExitStage("systemUninit", [] { TVPSystemUninit(); });
+    // A throwing at-exit handler must not leave the next session believing
+    // the system is still being uninitialized.
+    TVPSystemUninitCalled = false;
     // Wave decoder workers stop inside SystemUninit; image loading stopped
     // above. No worker can retain/use an XP3 helper VM during this reset.
-    TVPResetXP3FilterSession();
-    TVPUnloadPlugins();
+    RunExitStage("xp3Filter", [] { TVPResetXP3FilterSession(); });
+    RunExitStage("plugins", [] { TVPUnloadPlugins(); });
     TVPResetEventState();
     TVPResetGraphicSessionState();
 
@@ -231,9 +269,9 @@ void tTVPApplication::OnExit()
         delete TVPSystemControl;
     TVPSystemControl = NULL;
     TVPSystemControlAlive = false;
-    TVPUninitScriptEngine();
+    RunExitStage("scriptEngine", [] { TVPUninitScriptEngine(); });
     TVPClearAllAutoPath();
-    TVPClearAllWindows();
+    RunExitStage("windows", [] { TVPClearAllWindows(); });
     // Script finalizers can repopulate image caches after the first reset.
     TVPResetGraphicSessionState();
     krkrsdl3::TVPClearAllTexture();

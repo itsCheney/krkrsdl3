@@ -1,4 +1,5 @@
 #include "emoterunner.h"
+#include "emoteframeselect.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -36,51 +37,14 @@ void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderL
         isNeedDraw = false;
         return;
     }
-    frame = nullptr;
-    size_t currFrameIdx = -1;
-    for (size_t i = 0; i < currentNode->frameList.size(); i++)
-    {
-        if (currentNode->frameList.at(i)->time <= tick)
-        {
-            frame = currentNode->frameList.at(i);
-            currFrameIdx = i;
-        }
-        else
-            break;
-    }
-
+    const auto selected = selectEmoteNodeFrames(currentNode->frameList, tick, currentNode->type == 1);
+    frame = selected.first;
+    nextframe = selected.second;
     if (frame == nullptr || !frame->hasContent)
     {
-        // motion 末尾的"结束帧"（type0 无 content）被命中时
-        //（tick 超过 motion 末帧且无循环回绕），回退到最后一个有 content 的帧：
-        // 静态层（如触摸判定 shape）在任何 tick 下都应保持其几何；
-        // 中间的空帧仍保持"隐藏"语义。此前直接隐藏，导致主 motion 播完后
-        // 触摸判定层整体消失
-        emoteframe* saved = frame;
-        if (currFrameIdx != (size_t)-1 && currFrameIdx == currentNode->frameList.size() - 1)
-        {
-            for (int i = (int)currFrameIdx - 1; i >= 0; --i)
-            {
-                if (currentNode->frameList.at(i)->hasContent)
-                {
-                    frame = currentNode->frameList.at(i);
-                    break;
-                }
-            }
-        }
-        if (frame == nullptr || !frame->hasContent)
-        {
-            frame = saved;
-            isNeedDraw = false;
-            return;
-        }
-        nextframe = nullptr; // 静态保持，不再向后续帧插值
+        isNeedDraw = false;
+        return;
     }
-    nextframe = nullptr;
-    if (currFrameIdx >= 0 && currFrameIdx < currentNode->frameList.size() - 1)
-        nextframe = currentNode->frameList.at(currFrameIdx + 1);
-    if (nextframe != nullptr && !nextframe->hasContent)
-        nextframe = nullptr;
 
     // 节点基础信息获取
     isNeedDraw = true;
@@ -152,7 +116,7 @@ void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderL
         if (_source.icon != ic) // 直接比对ic
         {
             ic = _source.icon;
-            ic->ensureLoad();
+            if (!refTop->samplingPhysics) ic->ensureLoad();
             width = ic->width;
             height = ic->height;
             originX = ic->originX;
@@ -219,6 +183,18 @@ void emotenoderef::checkDrawStatus(float tick, std::vector<emoteRender>& renderL
 }
 void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim)
 {
+    if (refTop->samplingPhysics)
+    {
+        // Physics reads only the anchor layers' positions; the rest of the
+        // model needs no evaluation for it.
+        const auto key = refTop->physicsAnchorKey();
+        if (_anchorKey != key)
+        {
+            _anchorKey = key;
+            _leadsToAnchor = refTop->leadsToPhysicsAnchor(currentNode);
+        }
+        if (!_leadsToAnchor) return;
+    }
     const Uint64 nodeProfileStarted = SDL_GetTicksNS();
     // 参数化时可能改变
     currTick = tick;
@@ -283,8 +259,22 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
     // 修复（修复部分游戏emote立绘消失以及DRACU-RIOT!菜单问题。）
 
     // 构建渲染方法
-    renderMethod.clear();
-    renderMethod = renderList;
+    // renderList is the ancestors' chain, shared by the whole walk: this node
+    // pushes its own entry, may adjust the root entry, and undoes both before
+    // returning. Copying the chain into every node cost more than evaluating
+    // the node. Only drawable icons keep a copy (renderMethod), for draw and
+    // hit tests.
+    std::vector<emoteRender>& chain = renderList;
+    bool pushed = false;
+    glm::mat4 savedRootMat(1.0f);
+    bool savedRootStencil = false;
+    size_t savedRootLayers = 0;
+    if (!chain.empty())
+    {
+        savedRootMat = chain.front().attachMat;
+        savedRootStencil = chain.front().hasStencil;
+        savedRootLayers = chain.front().layerNode.size();
+    }
     if (!frame || (!isNeedDraw && (width == 0 || height == 0)) || currentNode->type == 7)
     {
         originX = lim.originX;
@@ -394,25 +384,31 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         }
 
         // 有深度信息时，穿透到最顶层
-        if (renderMethod.size() > 0 && currCoordz != 0.0)
+        if (chain.size() > 0 && currCoordz != 0.0)
         {
-            renderMethod.at(0).attachMat =
-                glm::translate(renderMethod.at(0).attachMat, glm::vec3(0.0, 0.0, currCoordz));
+            chain.at(0).attachMat =
+                glm::translate(chain.at(0).attachMat, glm::vec3(0.0, 0.0, currCoordz));
         }
 
         // 有模板信息时，穿透到最顶层
-        if (renderMethod.size() > 0 && currentNode->stencilCompositeMaskLayerList.size() > 0 && currentNode->type == 12)
+        if (chain.size() > 0 && currentNode->stencilCompositeMaskLayerList.size() > 0 && currentNode->type == 12)
         {
-            renderMethod.at(0).hasStencil = true;
-            for (auto nodeName : currentNode->stencilCompositeMaskLayerList)
+            chain.at(0).hasStencil = true;
+            // The mask layers are found by name once; the refs live as long as
+            // this one (both are rebuilt when the motion's nodes change).
+            if (!_stencilResolved)
             {
-                // 让父类去找节点
-                emotenoderef* tmpNode = refMtn->getNodeRef(currentNode->_rootmotion->getNodeByName(nodeName));
-                if (tmpNode != nullptr)
+                _stencilResolved = true;
+                _stencilRefs.clear();
+                for (const auto& nodeName : currentNode->stencilCompositeMaskLayerList)
                 {
-                    renderMethod.at(0).layerNode.push_back(tmpNode);
+                    // 让父类去找节点
+                    emotenoderef* tmpNode = refMtn->getNodeRef(currentNode->_rootmotion->getNodeByName(nodeName));
+                    if (tmpNode != nullptr)
+                        _stencilRefs.push_back(tmpNode);
                 }
             }
+            chain.at(0).layerNode.insert(chain.at(0).layerNode.end(), _stencilRefs.begin(), _stencilRefs.end());
         }
 
         // Shape zoom stays in the shared transform, including frame interpolation.
@@ -425,7 +421,9 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         }
 
         // 渲染信息记录
-        emoteRender emt;
+        chain.emplace_back();
+        pushed = true;
+        emoteRender& emt = chain.back();
         if (isLayout)
             emt.type = 3;
         else
@@ -448,45 +446,34 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         emt.currOx = currOx;
         emt.currOy = currOy;
         emt.currInheritMask = currentNode->inheritMask;
+        std::copy(std::begin(currentNode->transformOrder), std::end(currentNode->transformOrder),
+                  std::begin(emt.transformOrder));
         // fbo信息
         emt.originX = originX;
         emt.originY = originY;
         emt.width = width;
         emt.height = height;
-        emt.label = currentNode->label;
-        renderMethod.push_back(emt);
     }
+    _renderZ = chain.empty() ? 0.0f : chain.front().attachMat[3][2];
+    if (isIcon && !refTop->samplingPhysics)
+        renderMethod.assign(chain.begin(), chain.end()); // reuses this node's storage
+    else
+        renderMethod.clear();
 
-    if (isShape && frame && !currentNode->removed && refMtn && !renderMethod.empty())
+    if (refTop->samplingPhysics && frame && !currentNode->removed)
+        refTop->recordPhysicsAnchor(currentNode->label, chain);
+
+    if (!refTop->samplingPhysics && isShape && frame && !currentNode->removed && refMtn && !chain.empty())
     {
-        auto& area = _shapeArea;
-        area.label = currentNode->label;
-        area.shapeType = 2;
-        if (frame->src.find("shape/circle") != std::string::npos) area.shapeType = 1;
-        else if (frame->src.find("shape/point") != std::string::npos) area.shapeType = 0;
-        else if (frame->src.find("shape/quad") != std::string::npos) area.shapeType = 3;
+        int shapeType = 2;
+        if (frame->src.find("shape/circle") != std::string::npos) shapeType = 1;
+        else if (frame->src.find("shape/point") != std::string::npos) shapeType = 0;
+        else if (frame->src.find("shape/quad") != std::string::npos) shapeType = 3;
         const Uint64 shapeBuildStarted = SDL_GetTicksNS();
-        buildShapeMesh(renderMethod, area.shapeType, area.vertices, area.indices, &_surfaceMatrices);
-        krkrsdl3::TVPRecordEmoteShapeBuild(
-            SDL_GetTicksNS() - shapeBuildStarted, area.vertices.size());
-        const float vw = lim.viewW > 0 ? lim.viewW : renderMethod.front().width;
-        const float vh = lim.viewH > 0 ? lim.viewH : renderMethod.front().height;
-        float minX = 1, minY = 1, maxX = -1, maxY = -1;
-        if (!area.vertices.empty())
-        {
-            minX = maxX = area.vertices.front().x;
-            minY = maxY = area.vertices.front().y;
-        }
-        for (const auto& v : area.vertices)
-        {
-            minX = std::min(minX, v.x); maxX = std::max(maxX, v.x);
-            minY = std::min(minY, v.y); maxY = std::max(maxY, v.y);
-        }
-        area.left = (minX + 1) * 0.5f * vw;
-        area.top = (minY + 1) * 0.5f * vh;
-        area.width = (maxX - minX) * 0.5f * vw;
-        area.height = (maxY - minY) * 0.5f * vh;
-        refMtn->recordShape(area);
+        refMtn->recordShape(currentNode->label, shapeType, chain,
+                            lim.viewW > 0 ? lim.viewW : chain.front().width,
+                            lim.viewH > 0 ? lim.viewH : chain.front().height);
+        krkrsdl3::TVPRecordEmoteShapeBuild(SDL_GetTicksNS() - shapeBuildStarted, 0);
     }
 
     // Deformed icon meshes can be evaluated directly in the Metal vertex
@@ -495,7 +482,7 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
     const bool gpuCapable = backend && backend->SupportsMeshDeformation();
     _useGPUDeform = false;
     _gpuDeformSurfaces.clear();
-    if (isIcon && isNeedDraw && renderMethod.size() > 0)
+    if (!refTop->samplingPhysics && isIcon && isNeedDraw && chain.size() > 0)
     {
         // 确定细分等级
         int div = currentNode ? (int)currentNode->meshDivision : 0;
@@ -503,7 +490,7 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         div = std::min(div, 254); // (div + 1)^2 must fit uint16_t indices
         // 检查是否包含mesh变形
         bool containsMesh = false;
-        for (auto itm : renderMethod)
+        for (const auto& itm : chain)
         {
             if (itm.type == 1)
             {
@@ -515,9 +502,9 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         const Uint64 meshBuildStarted = SDL_GetTicksNS();
         _meshDivX = div;
         _meshDivY = div;
-        if (containsMesh && gpuCapable)
+        if (containsMesh && gpuCapable &&
+            buildGPUDeformSurfaces(chain, _gpuDeformSurfaces))
         {
-            buildGPUDeformSurfaces(renderMethod, _surfaceMatrices, _gpuDeformSurfaces);
             _useGPUDeform = true;
             _meshVertices.clear();
         }
@@ -525,14 +512,13 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
         {
             const size_t expectedIndices = size_t(div) * size_t(div) * 6;
             const bool rebuildIndices = _meshIndices.size() != expectedIndices;
-            buildSubdivMesh(renderMethod, _meshDivX, _meshDivY, _meshVertices, _meshIndices,
-                            &_surfaceMatrices, rebuildIndices);
+            buildSubdivMesh(chain, _meshDivX, _meshDivY, _meshVertices, _meshIndices,
+                            rebuildIndices);
         }
         else
         {
             const bool rebuildIndices = _meshIndices.size() != 6;
-            buildRectMesh(renderMethod, _meshVertices, _meshIndices, &_surfaceMatrices,
-                          rebuildIndices);
+            buildRectMesh(chain, _meshVertices, _meshIndices, rebuildIndices);
         }
         const uint64_t meshVertexCount = containsMesh
             ? uint64_t(div + 1) * uint64_t(div + 1)
@@ -564,7 +550,7 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
             if (childRef)
             {
                 // Preserve the target viewport through nested motions.
-                childRef->progress(tick, renderMethod,
+                childRef->progress(tick, chain,
                                    {originX, originY, width, height, lim.zMax, lim.viewW,
                                     lim.viewH});
             }
@@ -594,9 +580,19 @@ void emotenoderef::progress(float tick, std::vector<emoteRender>& renderList, em
             refMtn->_subMotionRefs.push_back(currentMtnRef);
             krkrsdl3::TVPRecordEmoteSubmotionRebuild(
                 SDL_GetTicksNS() - submotionRebuildStarted, submotionCreated);
-            currentMtnRef->progress(tick + currTimeOffset, renderMethod,
+            currentMtnRef->progress(tick + currTimeOffset, chain,
                             {originX, originY, width, height, lim.zMax, lim.viewW, lim.viewH});
         }
+    }
+
+    // Hand the chain back as it came in.
+    if (pushed)
+        chain.pop_back();
+    if (!chain.empty())
+    {
+        chain.front().attachMat = savedRootMat;
+        chain.front().hasStencil = savedRootStencil;
+        chain.front().layerNode.resize(savedRootLayers);
     }
 }
 bool emotenoderef::containsCurrentMesh(float x, float y) const
@@ -622,52 +618,60 @@ bool emotenoderef::nearCurrentMesh(float x, float y, float margin) const
     return nearMesh(vertices, indices, x, y, margin);
 }
 
-bool emotenoderef::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget)
+bool emotenoderef::canDraw(krkrsdl3::iTVPRenderBackend* renderer) const
 {
     if (!isNeedDraw || !isIcon || renderMethod.size() < 1 || currentNode->removed)
         return false; // 跳过无需绘制的 和 非icon的 和 无method 的节点
-    if (!renderer || !target || !ic || !ic->selftexture)
+    if (!renderer || !ic || !ic->selftexture)
         return false;
 
     // CPU and GPU deformation paths carry different geometry payloads.
     if (_useGPUDeform)
-    {
-        if (_gpuDeformSurfaces.empty()) return false;
-    }
-    else if (_meshVertices.empty() || _meshIndices.empty())
-        return false;
+        return !_gpuDeformSurfaces.empty();
+    return !_meshVertices.empty() && !_meshIndices.empty();
+}
 
+bool emotenoderef::renderMask(krkrsdl3::iTVPRenderBackend* renderer, void* maskTarget, emotelimit lim)
+{
     // 提前绘制好蒙版目标（不考虑复合蒙版的情况）
-    bool hasStencil = renderMethod.at(0).hasStencil;
-    if (hasStencil && maskTarget != 0)
+    if (!needsMask() || maskTarget == nullptr)
+        return false;
+    // Count source-node groups separately from clears. This is an identity
+    // hash for profiling, not a content-validity key for a future cache.
+    uint64_t group = 1469598103934665603ull;
+    for (auto* maskLayer : renderMethod.at(0).layerNode)
+        group = (group ^ reinterpret_cast<uintptr_t>(maskLayer)) * 1099511628211ull;
+    krkrsdl3::TVPRecordEmoteMaskGroup(group);
+    renderer->SetTarget(maskTarget);
+    renderer->ClearTarget(true);
+    krkrsdl3::TVPRecordEmoteMaskClear();
+    bool hasDraw = false;
+    for (auto maskLayer : renderMethod.at(0).layerNode)
     {
-        // Count source-node groups separately from clears. This is an identity
-        // hash for profiling, not a content-validity key for a future cache.
-        uint64_t group = 1469598103934665603ull;
-        for (auto* maskLayer : renderMethod.at(0).layerNode)
-            group = (group ^ reinterpret_cast<uintptr_t>(maskLayer)) * 1099511628211ull;
-        krkrsdl3::TVPRecordEmoteMaskGroup(group);
-        renderer->SetTarget(maskTarget);
-        renderer->ClearTarget(true);
-        krkrsdl3::TVPRecordEmoteMaskClear();
-        bool hasDraw = false;
-        for (auto maskLayer : renderMethod.at(0).layerNode)
+        if (maskLayer != nullptr && maskLayer->currOpa > 0)
         {
-            if (maskLayer != nullptr && maskLayer->currOpa > 0)
-            {
-                hasDraw = true;
-                if (maskLayer->draw(renderer, maskTarget, lim, nullptr))
-                    krkrsdl3::TVPRecordEmoteMaskDraw();
-            }
+            hasDraw = true;
+            if (maskLayer->draw(renderer, maskTarget, lim, nullptr))
+                krkrsdl3::TVPRecordEmoteMaskDraw();
         }
-        // 排除异常蒙版
-        if (!hasDraw)
-            hasStencil = false;
     }
+    // 排除异常蒙版
+    return hasDraw;
+}
 
+bool emotenoderef::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget)
+{
+    if (!target || !canDraw(renderer))
+        return false;
+    const bool masked = renderMask(renderer, maskTarget, lim);
+    return drawWithMask(renderer, target, masked ? maskTarget : nullptr);
+}
+
+bool emotenoderef::drawWithMask(krkrsdl3::iTVPRenderBackend* renderer, void* target, void* mask)
+{
     // 主体绘制（SetTarget 内部完成视口/深度/混合基础状态设置）
     renderer->SetTarget(target);
-    renderer->SetMask(hasStencil ? maskTarget : nullptr);
+    renderer->SetMask(mask);
 
     // 透明度与混色
     float totalOpa = currOpa;
@@ -723,11 +727,7 @@ bool emotenoderef::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emo
 }
 float emotenoderef::getCurrentRenderZ()
 {
-    if (renderMethod.size() > 0)
-    {
-        return renderMethod.at(0).attachMat[3][2];
-    }
-    return 0;
+    return _renderZ;
 }
 
 emotemotionref::~emotemotionref()
@@ -742,26 +742,9 @@ float emotemotionref::getTickByIdx(int32_t idx)
     if (idx >= currentMotion->parameter.size() || idx < 0)
         return -1.0f;
     float currVal = 0;
-    if (refTop->integratedAnimation())
-    {
-        double value = 0;
-        const auto& id = currentMotion->parameter.at(idx)->id;
-        if (refTop->getMotionParameter(currentMotion, id, value))
-        {
-            const bool metadataVariable = currentMotion->_filePtr->_metadata &&
-                currentMotion->_filePtr->_metadata->_varList.find(id) != currentMotion->_filePtr->_metadata->_varList.end();
-            if (currentMotion->_filePtr->isMotion && !metadataVariable)
-            {
-                if (currentMotion->lastTime < 0) return value;
-                const auto* parameter = currentMotion->parameter.at(idx);
-                const double span = parameter->rangeEnd + 1 - parameter->rangeBegin;
-                return span != 0 ? value * currentMotion->lastTime / span : 0;
-            }
-            return currentMotion->parameter.at(idx)->transToTick(value);
-        }
-    }
     // file系控制
-    if (!currentMotion->_filePtr->getTickByName(currentMotion->parameter.at(idx)->id, currVal))
+    if (!refTop->getControlVariableByKey(currentMotion->parameter.at(idx)->controlKey(), currVal) &&
+        !currentMotion->_filePtr->getTickByName(currentMotion->parameter.at(idx)->id, currVal))
     {
         if (currentMotion->_filePtr->isMotion)
         {
@@ -811,17 +794,47 @@ emotenoderef* emotemotionref::getNodeRef(emotenode* node)
     const auto found = _nodeIndex.find(node);
     return found == _nodeIndex.end() ? nullptr : &_nodeCache[found->second];
 }
-void emotemotionref::recordShape(const emoterect& area)
+void emotemotionref::recordShape(const std::string& label, int shapeType,
+                                  const std::vector<emoteRender>& methods,
+                                  float viewW, float viewH)
 {
-    // Reuse each destination vector's capacity, including when geometry is
-    // unchanged. clear()+push_back used to free shape meshes every frame.
+    // Reuse each slot's capacity across frames; the geometry is rebuilt from
+    // this frame's chain only if a script asks for it.
     if (_shapeCount == shapeNodeAreas.size()) shapeNodeAreas.emplace_back();
-    shapeNodeAreas[_shapeCount++] = area;
+    emoterect& area = shapeNodeAreas[_shapeCount++];
+    area.label = label;
+    area.shapeType = shapeType;
+    area.methods.assign(methods.begin(), methods.end());
+    area.viewW = viewW;
+    area.viewH = viewH;
+    area.built = false;
+}
+const emoterect& emoterect::geometry() const
+{
+    if (built) return *this;
+    built = true;
+    buildShapeMesh(methods, shapeType, vertices, indices);
+    float minX = 1, minY = 1, maxX = -1, maxY = -1;
+    if (!vertices.empty())
+    {
+        minX = maxX = vertices.front().x;
+        minY = maxY = vertices.front().y;
+    }
+    for (const auto& v : vertices)
+    {
+        minX = std::min(minX, v.x); maxX = std::max(maxX, v.x);
+        minY = std::min(minY, v.y); maxY = std::max(maxY, v.y);
+    }
+    left = (minX + 1) * 0.5f * viewW;
+    top = (minY + 1) * 0.5f * viewH;
+    width = (maxX - minX) * 0.5f * viewW;
+    height = (maxY - minY) * 0.5f * viewH;
+    return *this;
 }
 void emotemotionref::progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim)
 {
     _shapeCount = 0;
-    renderMethod = renderList;
+    _masksPrepared = false; // prepared masks belong to the previous geometry
 
     if (currentMotion == nullptr) return;
 
@@ -883,17 +896,27 @@ void emotemotionref::progress(float tick, std::vector<emoteRender>& renderList, 
                 actualTick = std::fmod(tick, currentMotion->loopTime);
         }
 
-        std::vector<emoteRender> localRender = renderList;
-        if (localRender.size() > 0 && ch->type == 2)
+        // Layers share the caller's chain; a type 2 layer starts without the
+        // inherited mask, which is put back afterwards.
+        const bool dropMask = renderList.size() > 0 && ch->type == 2;
+        bool keptStencil = false;
+        if (dropMask)
         {
-            localRender.at(0).hasStencil = false;
-            localRender.at(0).layerNode.clear();
+            keptStencil = renderList.front().hasStencil;
+            renderList.front().hasStencil = false;
+            _keptLayers.swap(renderList.front().layerNode);
         }
 
         emotenoderef* ref = getNodeRef(ch);
         if (ref)
         {
-            ref->progress(actualTick, localRender, lim);
+            ref->progress(actualTick, renderList, lim);
+        }
+        if (dropMask)
+        {
+            renderList.front().hasStencil = keptStencil;
+            _keptLayers.swap(renderList.front().layerNode);
+            _keptLayers.clear();
         }
     }
     shapeNodeAreas.resize(_shapeCount);
@@ -936,16 +959,70 @@ void emotemotionref::collectDrawNodes()
                      { return a->getCurrentRenderZ() < b->getCurrentRenderZ(); });
 }
 
+bool emotemotionref::prepareMasks(krkrsdl3::iTVPRenderBackend* renderer, emotelimit lim, void* maskTarget)
+{
+    // A masked node drawn in place switches to the mask target and back, which
+    // ends the canvas render pass and resumes it with a full load and store of
+    // the canvas. Instead every mask of the frame is drawn first, each into its
+    // own target (the player's mask target, then the engine's extra ones), so
+    // the canvas is drawn in one pass. Players call this before clearing their
+    // canvas. Mask contents and draw order are unchanged; a frame with more
+    // masked nodes than targets draws in place as before.
+    _masksPrepared = false;
+    size_t masked = 0;
+    for (auto r : _drawNodes)
+        if (r != nullptr && r->needsMask() && r->canDraw(renderer))
+            ++masked;
+    if (maskTarget == nullptr || masked == 0 || masked > emoteengine::kMaxPreparedMasks + 1)
+        return false;
+    std::vector<void*> targets;
+    targets.reserve(masked);
+    targets.push_back(maskTarget);
+    for (size_t extra = 0; targets.size() < masked; ++extra)
+    {
+        void* target = refTop->maskTargetFor(renderer, extra, int(lim.width), int(lim.height));
+        if (target == nullptr)
+            return false;
+        targets.push_back(target);
+    }
+    _drawMasks.assign(_drawNodes.size(), nullptr);
+    size_t used = 0;
+    for (size_t i = 0; i < _drawNodes.size(); ++i)
+    {
+        auto* r = _drawNodes[i];
+        if (r == nullptr || !r->needsMask() || !r->canDraw(renderer))
+            continue;
+        void* mask = targets[used++];
+        if (r->renderMask(renderer, mask, lim))
+            _drawMasks[i] = mask;
+    }
+    _masksPrepared = true;
+    return true;
+}
+
 void emotemotionref::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget)
 {
-
-    // 绘制
-    for (auto r : _drawNodes)
+    if (!_masksPrepared)
+        prepareMasks(renderer, lim, maskTarget);
+    if (!_masksPrepared)
     {
-        if (r != nullptr)
+        // 绘制
+        for (auto r : _drawNodes)
         {
-            r->wasDrawn = r->draw(renderer, target, lim, maskTarget);
+            if (r != nullptr)
+            {
+                r->wasDrawn = r->draw(renderer, target, lim, maskTarget);
+            }
         }
+        return;
+    }
+    // The masks belong to this frame's geometry: one draw consumes them.
+    _masksPrepared = false;
+    for (size_t i = 0; i < _drawNodes.size(); ++i)
+    {
+        auto* r = _drawNodes[i];
+        if (r != nullptr)
+            r->wasDrawn = target && r->canDraw(renderer) && r->drawWithMask(renderer, target, _drawMasks[i]);
     }
 }
 bool emotemotionref::contains(float x, float y, const char* label) const
@@ -1007,184 +1084,64 @@ bool EmoteHitFrame::contains(const char* label, float x, float y, bool local) co
            motion->contains(x, y, label);
 }
 
-emoteengine::emoteengine()
+emoteengine::~emoteengine()
 {
-    const char* mode = SDL_GetHint("MIKAGE_EMOTE_ANIMATION_MODE");
-    if (!mode) mode = std::getenv("MIKAGE_EMOTE_ANIMATION_MODE");
-    _integratedAnimation = mode && std::strcmp(mode, "integrated") == 0;
+    releaseMaskTargets();
 }
-emoteengine::~emoteengine() = default;
 
-void emoteengine::resetAnimationState()
+void* emoteengine::maskTargetFor(krkrsdl3::iTVPRenderBackend* renderer, size_t index, int width, int height)
 {
-    _animationFile = nullptr; _animation.reset({}, {}); _animationClock = 0;
-    _animationEyes.clear(); _animationEyeRefs.clear(); _varCache.clear();
-    _animationParameterLabels.clear();
-}
-void emoteengine::ensureAnimationState()
-{
-    if (!integratedAnimation() || _animationFile == _mainfile) return;
-    resetAnimationState();
-    if (!_mainfile || !_mainfile->_metadata) return;
-    auto* metadata = _mainfile->_metadata;
-    std::vector<animation::Timeline> timelines;
-    std::map<std::string, double> defaults;
-    for (auto* file : _attach) if (file && file->_metadata)
-        for (const auto& value : file->_metadata->_varList) defaults[value.first] = value.second;
-    for (const auto& value : metadata->_varList) defaults[value.first] = value.second;
-    for (auto* source : metadata->_timelineControl)
+    if (!renderer || index >= kMaxPreparedMasks || width <= 0 || height <= 0)
+        return nullptr;
+    if (renderer != _maskPoolRenderer || width != _maskPoolWidth || height != _maskPoolHeight)
     {
-        animation::Timeline timeline;
-        timeline.label = source->label; timeline.loopBegin = source->loopBegin;
-        timeline.loopEnd = source->loopEnd; timeline.lastTime = source->lastTime;
-        timeline.difference = source->diff != 0;
-        for (auto* variable : source->variableList)
-        {
-            bool selectorTarget = false;
-            for (auto* selector : metadata->_selectorControl)
-                for (const auto& option : selector->selectItem)
-                    if (option.label == variable->label) selectorTarget = true;
-            if (selectorTarget) continue; // Preserve the existing selector ownership rule.
-            animation::Track track; track.label = variable->label;
-            track.instant = std::find(metadata->_instantVariableList.begin(), metadata->_instantVariableList.end(), track.label) != metadata->_instantVariableList.end();
-            for (auto* frame : variable->frameList)
-                track.frames.push_back({frame->time, frame->value, frame->easing, frame->hasContent && frame->type != 0});
-            timeline.tracks.push_back(std::move(track));
-        }
-        timelines.push_back(std::move(timeline));
+        releaseMaskTargets();
+        _maskPoolRenderer = renderer;
+        _maskPoolWidth = width;
+        _maskPoolHeight = height;
     }
-    _animation.reset(std::move(timelines), defaults);
-    for (auto* eye : metadata->_eyeControl)
+    while (_maskPool.size() <= index)
     {
-        auto copy = *eye; copy.hasStart = copy.isBlinking = false;
-        copy.currWaitInterval = -1; copy.lastTick = copy.baseVal = 0;
-        _animationEyes.push_back(copy);
+        void* target = renderer->CreateTarget(width, height);
+        if (!target)
+            return nullptr;
+        _maskPool.push_back(target);
     }
-    for (auto& eye : _animationEyes) _animationEyeRefs.push_back(&eye);
-    _animationFile = _mainfile;
+    return _maskPool[index];
 }
-void emoteengine::updateAnimationSelectors()
+
+void emoteengine::releaseMaskTargets()
 {
-    if (!_mainfile || !_mainfile->_metadata) return;
-    for (auto* selector : _mainfile->_metadata->_selectorControl)
-    {
-        if (!_animation.hasVariable(selector->lable)) continue;
-        const double raw = _animation.variable(selector->lable);
-        const int selected = raw >= 0 && raw < selector->selectItem.size() ? static_cast<int>(raw) : -1;
-        for (std::size_t i = 0; i < selector->selectItem.size(); ++i)
-        {
-            const auto& option = selector->selectItem[i];
-            _animation.setVariable(option.label, static_cast<int>(i) == selected ? option.onValue : option.offValue);
-        }
-    }
+    if (_maskPoolRenderer && _maskPoolRenderer == krkrsdl3::TVPGetRenderBackend())
+        for (void* target : _maskPool)
+            _maskPoolRenderer->DestroyTarget(target);
+    _maskPool.clear();
+    _maskPoolRenderer = nullptr;
+    _maskPoolWidth = _maskPoolHeight = 0;
 }
-void emoteengine::advanceAnimation(double milliseconds, double speedDivisor)
-{
-    ensureAnimationState();
-    if (_animationPaused) return;
-    const double dt = animation::millisecondsToFrames(milliseconds, speedDivisor);
-    _animationClock += dt; _animation.advance(dt); updateAnimationSelectors();
-    if (_mainfile && _mainfile->_metadata) updateEyeControl(_animationClock, true);
-}
-void emoteengine::setAnimationVariable(const std::string& name, double value, double time, double easing)
-{
-    ensureAnimationState(); _animation.setVariable(name, value, time, easing); updateAnimationSelectors();
-}
-bool emoteengine::getMotionParameter(emotemotion* motion, const std::string& id, double& value)
-{
-    ensureAnimationState();
-    if (motion && motion->_filePtr && _animationParameterLabels.find(motion) == _animationParameterLabels.end())
-    {
-        auto& labels = _animationParameterLabels[motion];
-        for (const auto& object : motion->_filePtr->_objects)
-            for (const auto& clip : object.second->motion) if (clip.second == motion)
-            {
-                for (auto* parameter : motion->parameter)
-                {
-                    std::string scoped(object.first.c_str()); scoped += '/'; scoped += parameter->id.c_str(); scoped.append(1, '\0');
-                    labels[parameter->id] = std::move(scoped);
-                }
-            }
-    }
-    const auto motionLabels = _animationParameterLabels.find(motion);
-    if (motionLabels != _animationParameterLabels.end())
-    {
-        const auto scoped = motionLabels->second.find(id);
-        if (scoped != motionLabels->second.end() && _animation.hasVariable(scoped->second))
-        { value = _animation.variable(scoped->second); return true; }
-    }
-    if (_animation.hasVariable(id)) { value = _animation.variable(id); return true; }
-    return false; // Existing per-resource defaults remain the read-only fallback.
-}
-void emoteengine::copyAnimationStateFrom(const emoteengine& source)
-{
-    if (!integratedAnimation() || !source.integratedAnimation()) return;
-    ensureAnimationState(); _animation = source._animation; _animationClock = source._animationClock;
-    _animationPaused = source._animationPaused; _animationEyes = source._animationEyes;
-    _animationEyeRefs.clear(); for (auto& eye : _animationEyes) _animationEyeRefs.push_back(&eye);
-}
-std::string emoteengine::serializeAnimationState() const
-{
-    const auto core = _animation.serialize();
-    std::ostringstream out; out.imbue(std::locale::classic()); out << std::setprecision(17);
-    out << "EMOTEENGINE1 " << _animationClock << ' ' << _animationPaused << ' ' << _animationEyes.size() << ' ' << core.size() << '\n';
-    out << core;
-    for (const auto& eye : _animationEyes)
-        out << eye.hasStart << ' ' << eye.isBlinking << ' ' << eye.currWaitInterval << ' ' << eye.lastTick << ' ' << eye.baseVal << '\n';
-    return out.str();
-}
-bool emoteengine::restoreAnimationState(const std::string& text)
-{
-    ensureAnimationState();
-    if (text.size() > 16 * 1024 * 1024) return false;
-    std::istringstream in(text); in.imbue(std::locale::classic());
-    std::string magic; double clock; bool paused; std::size_t eyes, size;
-    if (!(in >> magic >> clock >> paused >> eyes >> size) || magic != "EMOTEENGINE1" || !std::isfinite(clock) || clock < 0 || eyes != _animationEyes.size() || size > text.size()) return false;
-    if (in.get() != '\n') return false;
-    std::string core(size, '\0'); if (!in.read(core.data(), size)) return false;
-    auto candidate = _animation; if (!candidate.restore(core)) return false;
-    auto eyeStates = _animationEyes;
-    for (auto& eye : eyeStates)
-        if (!(in >> eye.hasStart >> eye.isBlinking >> eye.currWaitInterval >> eye.lastTick >> eye.baseVal) ||
-            !std::isfinite(eye.lastTick) || !std::isfinite(eye.baseVal) || eye.currWaitInterval < -1 || eye.lastTick < 0) return false;
-    in >> std::ws; if (!in.eof()) return false;
-    _animation = std::move(candidate); _animationClock = clock; _animationPaused = paused;
-    _animationEyes = std::move(eyeStates); _animationEyeRefs.clear();
-    for (auto& eye : _animationEyes) _animationEyeRefs.push_back(&eye);
-    updateAnimationSelectors(); return true;
-}
+
 void emoteengine::recordAnimationProgress(double milliseconds, double tick, bool mainPlaying)
 {
     const bool diagnostics = SDL_GetHintBoolean("MIKAGE_METAL_DIAGNOSTICS", false);
     if (!diagnostics) return;
     ++_animationProgressVersion;
     _animationTrace[(_animationProgressVersion - 1) % _animationTrace.size()] =
-        {milliseconds, integratedAnimation() ? _animationClock : tick, _animationProgressVersion, _animationDrawVersion, mainPlaying};
+        {milliseconds, tick, _animationProgressVersion, _animationDrawVersion, mainPlaying};
     auto& trace = _animationTrace[(_animationProgressVersion - 1) % _animationTrace.size()];
-    if (integratedAnimation())
+    if (_mainfile && _mainfile->_metadata)
     {
-        for (const auto& value : _animation.values())
+        for (const auto& value : controlVariables)
             if (trace.variableCount < trace.variableValues.size()) trace.variableValues[trace.variableCount++] = value.second;
-        for (const auto& state : _animation.states()) if (state.playing && trace.timelineCount < trace.timelineTimes.size())
-            trace.timelineTimes[trace.timelineCount++] = state.time;
-    }
-    else if (_mainfile && _mainfile->_metadata)
-    {
-        for (const auto& value : _mainfile->_metadata->_varList)
-            if (trace.variableCount < trace.variableValues.size()) trace.variableValues[trace.variableCount++] = value.second;
-        for (auto* timeline : currTimeline) if (trace.timelineCount < trace.timelineTimes.size())
-            trace.timelineTimes[trace.timelineCount++] = tick - currStartTick + timeline->loopBegin;
+        for (const auto& playing : currTimeline) if (trace.timelineCount < trace.timelineTimes.size())
+            trace.timelineTimes[trace.timelineCount++] = controlTick - playing.startTick;
     }
     const auto now = SDL_GetTicks();
     if (now - _animationLogAt < 1000) return;
     _animationLogAt = now;
-    const auto& counts = _animation.counters();
-    TVPConsoleLog("emote.animation mode=%s player=%p inputMS=%.3f tick=%.3f mainPlaying=%d progressVersion=%llu drawVersion=%llu drawCalls=%llu repeatedDraws=%llu wraps=%llu crossings=%llu",
-        integratedAnimation() ? "integrated" : "legacy", static_cast<void*>(this), milliseconds,
-        integratedAnimation() ? _animationClock : tick, mainPlaying ? 1 : 0,
+    TVPConsoleLog("emote.animation player=%p inputMS=%.3f tick=%.3f mainPlaying=%d progressVersion=%llu drawVersion=%llu drawCalls=%llu repeatedDraws=%llu",
+        static_cast<void*>(this), milliseconds, tick, mainPlaying ? 1 : 0,
         static_cast<unsigned long long>(_animationProgressVersion), static_cast<unsigned long long>(_animationDrawVersion),
-        static_cast<unsigned long long>(_animationDrawCalls), static_cast<unsigned long long>(_animationRepeatedDraws),
-        static_cast<unsigned long long>(counts.wraps), static_cast<unsigned long long>(counts.crossings));
+        static_cast<unsigned long long>(_animationDrawCalls), static_cast<unsigned long long>(_animationRepeatedDraws));
 }
 void emoteengine::recordAnimationDraw()
 {
@@ -1211,6 +1168,11 @@ void emoteengine::progress(float tick, std::vector<emoteRender>& renderList, emo
     _mainMotionRef->progress(tick, renderList, lim);
     _mainMotionRef->collectDrawNodes();
 }
+void emoteengine::prepareMasks(krkrsdl3::iTVPRenderBackend* renderer, emotelimit lim, void* maskTarget)
+{
+    if (_mainMotionRef)
+        _mainMotionRef->prepareMasks(renderer, lim, maskTarget);
+}
 void emoteengine::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget)
 {
     if (_mainMotionRef)
@@ -1218,11 +1180,6 @@ void emoteengine::draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emot
 }
 bool emoteengine::getTickByName(const std::string& name, tjs_real& retVal)
 {
-    if (integratedAnimation())
-    {
-        ensureAnimationState();
-        if (_animation.hasVariable(name)) { retVal = _animation.variable(name); return true; }
-    }
     auto it = _varCache.find(name);
     if (it != _varCache.end())
     {
@@ -1294,244 +1251,274 @@ emotemotion* emoteengine::findmotionByName(const std::string& name)
     }
     return nullptr;
 }
-void emoteengine::updateEyeControl(float tick, bool isMain)
+namespace
 {
-    if (integratedAnimation()) ensureAnimationState();
-    std::default_random_engine dre;
-    // 眼动控制
-    for (auto itm : integratedAnimation() ? _animationEyeRefs : _mainfile->_metadata->_eyeControl)
-    {
-        // 初始化tick
-        if (!itm->hasStart)
-        {
-            itm->hasStart = true;
-            itm->lastTick = tick;
-        }
-        // 初始化间隔
-        if (itm->currWaitInterval < 0)
-        {
-            itm->currWaitInterval = itm->uid(dre);
-        }
+std::string controlKey(const std::string& name)
+{
+    return name.substr(0, name.find('\0'));
+}
 
-        // 播放时 进行参数控制
-        if (itm->isBlinking)
-        {
-            if (tick - itm->lastTick > itm->blinkFrameCount) // 是否结束
-            {
-                itm->isBlinking = false;
-                itm->currWaitInterval = -1;
-                itm->lastTick = tick;
-                // 重置初始值
-                auto varPos = _mainfile->_metadata->_varList.find(itm->label);
-                if (varPos != _mainfile->_metadata->_varList.end())
-                {
-                    if (integratedAnimation()) _animation.setVariable(itm->label, itm->baseVal);
-                    else varPos->second = itm->baseVal;
-                }
-            }
-            else
-            {
-                // 计算数值
-                float realVal = itm->beginFrame;
-                if ((tick - itm->lastTick) * 2 < itm->blinkFrameCount) // 闭眼
-                {
-                    realVal += (tick - itm->lastTick) * 2 * (itm->endFrame - itm->beginFrame) /
-                               itm->blinkFrameCount;
-                }
-                else // 睁开
-                {
-                    realVal += (itm->blinkFrameCount - (tick - itm->lastTick)) * 2 *
-                               (itm->endFrame - itm->beginFrame) / itm->blinkFrameCount;
-                }
-                realVal = std::max(realVal, itm->beginFrame);
-                realVal = std::min(realVal, itm->endFrame);
-                // 写入参数
-                auto varPos = _mainfile->_metadata->_varList.find(itm->label);
-                if (varPos != _mainfile->_metadata->_varList.end())
-                {
-                    if (integratedAnimation()) _animation.setVariable(itm->label, realVal);
-                    else varPos->second = realVal;
-                }
-            }
-        }
-        else // 未播放时进行等待
-        {
-            if (tick - itm->lastTick > itm->currWaitInterval)
-            {
-                itm->isBlinking = true;
-                itm->lastTick = tick;
-                // 获取初始值
-                auto varPos = _mainfile->_metadata->_varList.find(itm->label);
-                if (varPos != _mainfile->_metadata->_varList.end())
-                {
-                    itm->baseVal = integratedAnimation() ? _animation.variable(itm->label) : varPos->second;
-                }
-            }
-        }
-    }
-    for (auto itm : _mainfile->_metadata->_eyeControl)
-    {
-        // nothing to do
-    }
-}
-void emoteengine::startTimeline(float tick, const std::string& name, bool isMain, int flags)
+bool instantVariable(const emotemetadata& metadata, const std::string& key)
 {
-    if (integratedAnimation())
-    {
-        ensureAnimationState();
-        std::string label(name.c_str()); label.append(1, '\0');
-        _animation.play(label, flags);
-        return;
-    }
-    for (auto itm : _mainfile->_metadata->_timelineControl)
-    {
-        if (strcmp(itm->label.c_str(), name.c_str()) == 0)
-        {
-            currTimeline.push_back(itm);
-            currStartTick = tick;
-            return;
-        }
-    }
+    for (const auto& label : metadata._instantVariableList)
+        if (controlKey(label) == key) return true;
+    return false;
 }
-void emoteengine::stopTimeline(const std::string& name, bool isMain)
+
+bool timelineValue(const emoteTimeVar& variable, double tick, double initial, bool instant, double& value)
 {
-    if (integratedAnimation())
+    const emoteTimeVarFrame* current = nullptr;
+    const emoteTimeVarFrame* next = nullptr;
+    double previous = initial;
+    for (size_t i = 0; i < variable.frameList.size(); ++i)
     {
-        ensureAnimationState();
-        std::string label(name.c_str()); if (!label.empty()) label.append(1, '\0');
-        _animation.stop(label); return;
+        const auto* frame = variable.frameList[i];
+        if (frame->time > tick) { next = frame; break; }
+        if (current && current->hasContent) previous = current->value;
+        current = frame;
     }
-    for (auto itm : _mainfile->_metadata->_timelineControl)
+    if (!current) return false;
+    // Terminal empty keys delimit duration; interior empty keys hide the channel.
+    if (!current->hasContent && current == variable.frameList.back())
     {
-        if (strcmp(itm->label.c_str(), name.c_str()) == 0)
-        {
-            currTimeline.erase(std::remove(currTimeline.begin(), currTimeline.end(), itm),
-                               currTimeline.end());
-            currStartTick = -1.0f;
-            return;
-        }
+        for (auto it = variable.frameList.rbegin(); it != variable.frameList.rend(); ++it)
+            if ((*it)->hasContent) { value = (*it)->value; return true; }
     }
-}
-bool emoteengine::checkTimline(const std::string& name, bool& result, bool isMain)
-{
-    if (integratedAnimation())
-    {
-        ensureAnimationState();
-        std::string label(name.c_str()); if (!label.empty()) label.append(1, '\0');
-        result = _animation.playing(label);
-        return label.empty() || _animation.definition(label) != nullptr;
-    }
-    emotetimeline* matchT = nullptr;
-    for (auto itm : _mainfile->_metadata->_timelineControl)
-    {
-        if (strcmp(itm->label.c_str(), name.c_str()) == 0)
-        {
-            matchT = itm;
-            break;
-        }
-    }
-    if (matchT == nullptr)
-        return false;
-    for (auto itm : currTimeline)
-    {
-        if (itm == matchT)
-        {
-            result = true;
-            return true;
-        }
-    }
-    result = false;
+    if (!current->hasContent) return false;
+    value = current->value;
+    // A timeline key requests a target to reach before the next key. It is
+    // different from a geometry key, which describes the pose at its own time.
+    if (!instant && next && next->time > current->time + 1)
+        value = previous + (value - previous) * emoteEase((tick - current->time) /
+                                      (next->time - current->time - 1), current->easing);
     return true;
 }
+}
+
+void emoteengine::resetControls()
+{
+    controlTick = 0;
+    currTimeline.clear(); baseVariables.clear(); controlVariables.clear(); variableTweens.clear(); _varCache.clear();
+    eyes.clear();
+    if (!_mainfile || !_mainfile->_metadata) return;
+    const auto& metadata = *_mainfile->_metadata;
+    for (const auto& entry : metadata._varList) baseVariables[controlKey(entry.first)] = entry.second;
+    controlVariables = baseVariables;
+    for (const auto* eye : metadata._eyeControl)
+    {
+        eyes.push_back(*eye);
+        auto& copy = eyes.back();
+        copy.hasStart = copy.isBlinking = false;
+        copy.currWaitInterval = -1;
+    }
+    physics.reset(metadata._bustControl, metadata._hairControl, metadata._partsControl);
+}
+
+bool emoteengine::getControlVariable(const std::string& name, float& value) const
+{
+    const auto entry = controlVariables.find(controlKey(name));
+    if (entry == controlVariables.end()) return false;
+    value = entry->second;
+    return true;
+}
+bool emoteengine::getControlVariableByKey(const std::string& key, float& value) const
+{
+    const auto entry = controlVariables.find(key);
+    if (entry == controlVariables.end()) return false;
+    value = entry->second;
+    return true;
+}
+
+void emoteengine::updateEyeControl(float tick, bool isMain)
+{
+    for (auto& eye : eyes)
+    {
+        const auto key = controlKey(eye.label);
+        if (!eye.hasStart)
+        {
+            eye.hasStart = true;
+            eye.lastTick = tick;
+        }
+        if (eye.currWaitInterval < 0) eye.currWaitInterval = eye.uid(random);
+        if (!eye.isBlinking)
+        {
+            if (tick - eye.lastTick < eye.currWaitInterval) continue;
+            eye.isBlinking = true;
+            eye.lastTick = tick;
+        }
+        const double elapsed = tick - eye.lastTick;
+        if (eye.blinkFrameCount <= 0 || elapsed >= eye.blinkFrameCount)
+        {
+            eye.isBlinking = false; eye.currWaitInterval = -1; eye.lastTick = tick;
+            continue;
+        }
+        const double ratio = 1 - std::abs(2 * elapsed / eye.blinkFrameCount - 1);
+        // Compose with this frame's expression, so a closed-eye pose stays closed.
+        auto& value = controlVariables[key];
+        value += (eye.endFrame - value) * ratio;
+    }
+}
+
+void emoteengine::startTimeline(float tick, const std::string& name, int flags)
+{
+    if (!_mainfile || !_mainfile->_metadata) return;
+    for (auto* timeline : _mainfile->_metadata->_timelineControl)
+    {
+        if (controlKey(timeline->label) != controlKey(name)) continue;
+        stopTimeline(name);
+        PlayingTimeline playing;
+        playing.timeline = timeline; playing.startTick = tick;
+        playing.flags = flags | 1 | (timeline->diff ? 2 : 0);
+        if (!(playing.flags & 2)) playing.initialVariables = baseVariables;
+        currTimeline.push_back(playing);
+        return;
+    }
+}
+
+void emoteengine::stopTimeline(const std::string& name, bool isMain)
+{
+    const auto key = controlKey(name);
+    currTimeline.erase(std::remove_if(currTimeline.begin(), currTimeline.end(),
+        [&](const PlayingTimeline& playing) { return key.empty() || controlKey(playing.timeline->label) == key; }),
+        currTimeline.end());
+}
+
+bool emoteengine::checkTimline(const std::string& name, bool& result, bool isMain)
+{
+    result = false;
+    const auto key = controlKey(name);
+    for (const auto& playing : currTimeline)
+        if (key.empty() || controlKey(playing.timeline->label) == key) { result = true; break; }
+    return true;
+}
+
+void emoteengine::blendTimeline(const std::string& name, double ratio, double time, double easing, bool stopWhenDone)
+{
+    for (auto& playing : currTimeline)
+        if (controlKey(playing.timeline->label) == controlKey(name))
+        {
+            playing.blend.set(playing.blend.value(controlTick), ratio, controlTick, time, easing);
+            playing.stopWhenBlended = stopWhenDone;
+        }
+}
+
 void emoteengine::updateTimelineControl(float tick, bool isMain)
 {
-    if (integratedAnimation()) return; // advanced once by advanceAnimation(dt)
-    if (currTimeline.size() < 1)
-        return;
-
-    for (auto timelineItm : currTimeline)
+    for (auto it = variableTweens.begin(); it != variableTweens.end();)
     {
-        // 考察时间
-        if (timelineItm->loopEnd > 0.0f &&
-            tick - currStartTick + timelineItm->loopBegin > timelineItm->loopEnd)
+        baseVariables[it->first] = it->second.value(tick);
+        if (it->second.done(tick)) it = variableTweens.erase(it);
+        else ++it;
+    }
+    controlVariables = baseVariables;
+    // Main channels establish the pose; difference channels add to it. Rebuild
+    // from the inputs every frame so a breathing loop never accumulates drift.
+    for (int difference = 0; difference < 2; ++difference)
+    {
+        for (auto& playing : currTimeline)
         {
-            // 重置时间戳
-            currStartTick = tick;
-        }
-        float currRelTime = tick - currStartTick + timelineItm->loopBegin;
-
-        // 遍历每一个变量
-        for (auto varItm : timelineItm->variableList)
-        {
-            // 跳过
-            if (varItm->frameList.size() == 0)
-                continue;
-
-            // 对于select变量进行跳过
-            bool isfindInSelect = false;
-            for (auto sleItm : _mainfile->_metadata->_selectorControl)
+            if (bool(playing.flags & 2) != bool(difference)) continue;
+            auto* timeline = playing.timeline;
+            double local = std::max(0.0, tick - playing.startTick);
+            if (timeline->loopBegin >= 0 && timeline->loopEnd > timeline->loopBegin && local >= timeline->loopEnd)
+                local = timeline->loopBegin + std::fmod(local - timeline->loopBegin,
+                                                      timeline->loopEnd - timeline->loopBegin);
+            else if (timeline->lastTime >= 0) local = std::min(local, double(timeline->lastTime));
+            const double ratio = playing.blend.value(tick);
+            for (const auto* variable : timeline->variableList)
             {
-                for (auto _sleItm : sleItm->selectItem)
-                {
-                    if (strcmp(_sleItm.label.c_str(), varItm->label.c_str()) == 0)
-                    {
-                        isfindInSelect = true;
-                        break;
-                    }
-                }
-                if (isfindInSelect)
-                    break;
-            }
-            if (isfindInSelect)
-                continue;
-
-            // 确定帧位置
-            emoteTimeVarFrame* currFrame = nullptr;
-            size_t currFrameIdx = -1;
-            for (size_t i = 0; i < varItm->frameList.size(); i++)
-            {
-                if (varItm->frameList.at(i)->time <= currRelTime)
-                {
-                    currFrame = varItm->frameList.at(i);
-                    currFrameIdx = i;
-                }
-                else
-                    break;
-            }
-            if (currFrame == nullptr || !currFrame->hasContent)
-                continue;
-            emoteTimeVarFrame* nextframe = nullptr;
-            if (currFrameIdx >= 0 && currFrameIdx < varItm->frameList.size() - 1)
-                nextframe = varItm->frameList.at(currFrameIdx + 1);
-            if (nextframe != nullptr && !nextframe->hasContent)
-                nextframe = nullptr;
-
-            // 插值
-            double realVal = 0.0;
-            if (nextframe != nullptr &&
-                ((currFrame->type != 2) ||
-                 (currFrame->type == 2 && nextframe->type == 2))) // 存在下一帧则对关键帧进行插值
-            {
-                // val
-                realVal = (currFrame->value + (nextframe->value - currFrame->value) /
-                                                  (nextframe->time - currFrame->time) *
-                                                  (currRelTime - currFrame->time));
-            }
-            else
-            {
-                // 计算坐标
-                realVal = currFrame->value;
-            }
-
-            // 赋予
-            auto varPos = _mainfile->_metadata->_varList.find(varItm->label);
-            if (varPos != _mainfile->_metadata->_varList.end())
-            {
-                varPos->second = realVal;
+                double value;
+                const auto initial = playing.initialVariables.find(controlKey(variable->label));
+                const bool immediate = instantVariable(*_mainfile->_metadata, controlKey(variable->label));
+                if (!timelineValue(*variable, local, initial == playing.initialVariables.end() ? 0 : initial->second, immediate, value)) continue;
+                auto& output = controlVariables[controlKey(variable->label)];
+                if (difference) output += value * ratio;
+                else output += (value - output) * ratio;
             }
         }
     }
+    currTimeline.erase(std::remove_if(currTimeline.begin(), currTimeline.end(), [&](const PlayingTimeline& playing)
+    {
+        const auto* timeline = playing.timeline;
+        const bool looping = timeline->loopBegin >= 0 && timeline->loopEnd > timeline->loopBegin;
+        const bool finished = !looping && timeline->lastTime >= 0 && tick - playing.startTick >= timeline->lastTime;
+        if (finished && !(playing.flags & 2))
+            for (const auto* variable : timeline->variableList)
+            {
+                const auto key = controlKey(variable->label);
+                const auto initial = playing.initialVariables.find(key);
+                const bool immediate = instantVariable(*_mainfile->_metadata, key);
+                double value;
+                if (timelineValue(*variable, timeline->lastTime,
+                                  initial == playing.initialVariables.end() ? 0 : initial->second, immediate, value))
+                    baseVariables[key] += (value - baseVariables[key]) * playing.blend.value(tick);
+            }
+        return finished || (playing.stopWhenBlended && playing.blend.done(tick));
+    }), currTimeline.end());
 }
+
+void emoteengine::samplePhysics(float tick, const emoteRender& root, emotelimit lim)
+{
+    if (physics.empty() || !_mainmotion) return;
+    physics.beginAnchors();
+    samplingPhysics = true;
+    struct Restore { bool& flag; ~Restore() { flag = false; } } restore{samplingPhysics};
+    if (!_physicsRef || _physicsRef->currentMotion != _mainmotion)
+        _physicsRef = std::make_unique<emotemotionref>(_mainmotion, this);
+    _physicsChain.assign(1, root);
+    _physicsRef->progress(tick, _physicsChain, lim);
+}
+
+bool emoteengine::leadsToPhysicsAnchor(emotenode* node, int depth)
+{
+    if (node == nullptr || depth > 64) return false; // depth guards motion cycles
+    if (physics.needsAnchor(node->label)) return true;
+    for (auto* child : node->children)
+        if (leadsToPhysicsAnchor(child, depth + 1)) return true;
+    for (const auto* frame : node->frameList)
+    {
+        if (frame == nullptr || !frame->hasContent || node->_filePtr->findsourceByName(frame->src))
+            continue;
+        if (auto* motion = findmotionByName(frame->src))
+            for (auto* inner : motion->nodeList)
+                if (leadsToPhysicsAnchor(inner, depth + 1)) return true;
+    }
+    return false;
+}
+
+void emoteengine::recordPhysicsAnchor(const std::string& name, const std::vector<emoteRender>& chain)
+{
+    if (chain.empty() || !physics.needsAnchor(name)) return;
+    float x, y;
+    // Shape/point is centered at UV (.5, .5); use the same inherited placement
+    // and Bezier evaluation as visible geometry, before camera/projection/affine.
+    evaluateSurfaceChain(chain, 0.5f, 0.5f, x, y);
+    physics.setAnchor(name, Vector3(x, -y));
+}
+
+void emoteengine::updatePhysics(float frames)
+{
+    physics.update(frames, [&](const std::string& name, double value)
+    {
+        if (!name.empty() && std::isfinite(value)) controlVariables[controlKey(name)] = value;
+    });
+}
+
+bool emoteengine::controlsAnimating() const
+{
+    if (!variableTweens.empty()) return true;
+    for (const auto& playing : currTimeline)
+        if (!playing.blend.done(controlTick)) return true;
+    return false;
+}
+
+void emoteengine::skipControls()
+{
+    for (auto& tween : variableTweens) tween.second.duration = 0;
+    for (auto& playing : currTimeline) playing.blend.duration = 0;
+    updateTimelineControl(controlTick);
+}
+
 emoteVar* emoteengine::findVarByName(const std::string& name)
 {
     for (auto obj : _mainfile->_objects)
@@ -1543,9 +1530,30 @@ emoteVar* emoteengine::findVarByName(const std::string& name)
     }
     return nullptr;
 }
-void emoteengine::setVariable(const std::string& name, tjs_real value)
+void emoteengine::setVariable(const std::string& name, tjs_real value, double time, double easing)
 {
-    if (integratedAnimation()) { setAnimationVariable(name, value, 0, 0); return; }
+    if (!std::isfinite(value)) return;
+    const auto key = controlKey(name);
+    if (_mainfile && !_mainfile->isMotion)
+    {
+        for (const auto* selector : _mainfile->_metadata->_selectorControl)
+        {
+            if (controlKey(selector->lable) != key) continue;
+            const int index = (int)value;
+            if (index >= 0 && index < (int)selector->selectItem.size())
+                for (size_t i = 0; i < selector->selectItem.size(); ++i)
+                {
+                    const auto& item = selector->selectItem[i];
+                    setVariable(item.label, i == index ? item.onValue : item.offValue, time, easing);
+                }
+            return;
+        }
+        const float current = baseVariables.count(key) ? baseVariables[key] : 0;
+        if (time > 0) variableTweens[key].set(current, value, controlTick, time, easing);
+        else { variableTweens.erase(key); baseVariables[key] = value; controlVariables[key] = value; }
+        _varCache[name] = value;
+        return;
+    }
     // 所有file
     std::vector<emotefile*> allFiles = _attach;
     allFiles.push_back(_mainfile);
@@ -1611,7 +1619,10 @@ void emoteengine::setVariable(const std::string& name, tjs_real value)
 }
 tjs_real emoteengine::getVariable(const std::string& name)
 {
-    if (integratedAnimation()) { ensureAnimationState(); return _animation.variable(name); }
+    const auto base = baseVariables.find(controlKey(name));
+    if (base != baseVariables.end()) return base->second;
+    float controlled;
+    if (getControlVariable(name, controlled)) return controlled;
     size_t pos = name.find('/');
     if (_mainfile->isMotion) // motion类
     {
@@ -1676,9 +1687,6 @@ tjs_real emoteengine::getVariable(const std::string& name)
         return ret;
     }
     return 0.0;
-}
-void emoteengine::updatePhysics(float tick)
-{
 }
 
 } // namespace emoteplayer

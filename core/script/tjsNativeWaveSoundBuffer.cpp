@@ -1117,6 +1117,9 @@ void tTJSNI_WaveSoundBuffer::TryCreateSoundBuffer(bool use3d)
     Level2Buffer = new tjs_uint8[Level2BufferSize];
 
     SoundBuffer = TVPCreateSoundBuffer(InputFormat, L1BufferUnits);
+    // Every platform buffer implements SetPan; without this, pan went to
+    // SetPosition, which the SDL backends don't implement.
+    BufferCanControlPan = SoundBuffer != NULL;
 }
 //---------------------------------------------------------------------------
 void tTJSNI_WaveSoundBuffer::CreateSoundBuffer()
