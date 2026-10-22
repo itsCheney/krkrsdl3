@@ -19,11 +19,111 @@
 struct FontFaceEntry
 {
     plutovg_font_face_t* face;
-    ttstr name;
-    void* data;     // owned font data buffer
-    unsigned int dataSize;
+    ttstr name;                    // file or registered name it was loaded under
+    std::vector<std::string> families; // lowercase family names from the name table
+    bool fallback;                 // the shared built-in face, never matched by name
 };
 static std::vector<FontFaceEntry> g_fontFaces;
+
+static std::string lowerFontName(const tjs_char* name)
+{
+    std::string ret(name ? name : "");
+    for (auto& c : ret)
+        if (c >= 'A' && c <= 'Z')
+            c = (char)(c - 'A' + 'a');
+    return ret;
+}
+
+static std::string lowerFontName(const ttstr& name)
+{
+    return lowerFontName(name.c_str());
+}
+
+static void appendUtf8(std::string& out, unsigned cp)
+{
+    if (cp < 0x80) out += (char)cp;
+    else if (cp < 0x800) { out += (char)(0xC0 | (cp >> 6)); out += (char)(0x80 | (cp & 0x3F)); }
+    else { out += (char)(0xE0 | (cp >> 12)); out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F)); }
+}
+
+static tjs_uint fontU32(const tjs_uint8* data, tjs_uint size, tjs_uint at)
+{
+    return at < size && size - at >= 4 ? ((tjs_uint)data[at] << 24 | (tjs_uint)data[at + 1] << 16 | (tjs_uint)data[at + 2] << 8 | data[at + 3]) : 0;
+}
+
+static bool isFontCollection(const tjs_uint8* data, tjs_uint size)
+{
+    return size >= 12 && !std::memcmp(data, "ttcf", 4);
+}
+
+// Number of faces: one for a plain font, the face count of a TTC.
+static tjs_uint fontFaceCount(const tjs_uint8* data, tjs_uint size)
+{
+    if (!isFontCollection(data, size))
+        return 1;
+    return std::min<tjs_uint>(fontU32(data, size, 8), (size - 12) / 4);
+}
+
+// Reads the family names (IDs 1 and 16) of one face so scripts can name
+// a private font by family, as GDI+ PrivateFontCollection allows.
+static std::vector<std::string> readFontFamilies(const tjs_uint8* data, tjs_uint size, tjs_uint index)
+{
+    std::vector<std::string> names;
+    auto u16 = [&](tjs_uint at) -> tjs_uint { return at < size && size - at >= 2 ? (tjs_uint)(data[at] << 8 | data[at + 1]) : 0; };
+    auto u32 = [&](tjs_uint at) -> tjs_uint { return fontU32(data, size, at); };
+    tjs_uint font = 0;
+    if (isFontCollection(data, size))
+    {
+        if (index >= fontFaceCount(data, size))
+            return names;
+        font = u32(12 + index * 4);
+    }
+    else if (index)
+        return names;
+    if (font >= size)
+        return names;
+    tjs_uint tables = u16(font + 4), name = 0, nameSize = 0;
+    for (tjs_uint i = 0; i < tables; ++i)
+    {
+        tjs_uint rec = font + 12 + i * 16;
+        if (rec >= size || size - rec < 16)
+            break;
+        if (!std::memcmp(data + rec, "name", 4))
+        {
+            name = u32(rec + 8);
+            nameSize = u32(rec + 12);
+        }
+    }
+    if (!name || name >= size || nameSize > size - name)
+        return names;
+    tjs_uint count = u16(name + 2), strings = name + u16(name + 4);
+    for (tjs_uint i = 0; i < count; ++i)
+    {
+        tjs_uint rec = name + 6 + i * 12;
+        if (rec + 12 > name + nameSize)
+            break;
+        tjs_uint platform = u16(rec), encoding = u16(rec + 2), id = u16(rec + 6);
+        tjs_uint length = u16(rec + 8), at = strings + u16(rec + 10);
+        if ((id != 1 && id != 16) || at > size || length > size - at)
+            continue;
+        std::string value;
+        if (platform == 3 || platform == 0)
+        {
+            for (tjs_uint j = 0; j + 1 < length; j += 2)
+                appendUtf8(value, u16(at + j));
+        }
+        else if (platform == 1 && encoding == 0)
+        {
+            for (tjs_uint j = 0; j < length; ++j)
+                if (data[at + j] < 0x80)
+                    value += (char)data[at + j];
+        }
+        value = lowerFontName(value.c_str());
+        if (!value.empty() && std::find(names.begin(), names.end(), value) == names.end())
+            names.push_back(value);
+    }
+    return names;
+}
 
 void initGdiPlus()
 {
@@ -71,57 +171,117 @@ static void fontDataDestroy(void* closure)
     delete[] (tjs_uint8*)closure;
 }
 
+static void fontFaceRelease(void* closure)
+{
+    plutovg_font_face_destroy((plutovg_font_face_t*)closure);
+}
+
+// Takes ownership of the stream. Registers every face of a collection; the
+// one named name (else the first) gets the name and is returned.
+static plutovg_font_face_t* loadFontFace(tTJSBinaryStream* in, const ttstr& name, bool fallback)
+{
+    tjs_uint size = (tjs_uint)in->GetSize();
+    tjs_uint8* fileData = new tjs_uint8[size];
+    try { in->ReadBuffer(fileData, size); }
+    catch (...) { delete[] fileData; delete in; throw; }
+    delete in;
+
+    const tjs_uint count = fontFaceCount(fileData, size);
+    std::vector<FontFaceEntry> entries;
+    for (tjs_uint i = 0; i < count; ++i)
+    {
+        FontFaceEntry entry;
+        entry.families = readFontFamilies(fileData, size, i);
+        entry.fallback = fallback;
+        // plutovg owns fileData from here and frees it through fontDataDestroy,
+        // also when loading fails. Later faces share it by holding the first.
+        if (!i)
+            entry.face = plutovg_font_face_load_from_data(fileData, size, 0, fontDataDestroy, fileData);
+        else
+            entry.face = plutovg_font_face_load_from_data(fileData, size, (int)i, fontFaceRelease,
+                                                          plutovg_font_face_reference(entries[0].face));
+        if (!entry.face)
+        {
+            if (!i)
+                TVPThrowExceptionMessage(TJS_N("plutovg cannot load:%1"), name);
+            continue;
+        }
+        entries.push_back(entry);
+    }
+    size_t primary = 0;
+    const std::string key = lowerFontName(name);
+    for (size_t i = 0; i < entries.size(); ++i)
+        if (std::find(entries[i].families.begin(), entries[i].families.end(), key) != entries[i].families.end())
+        {
+            primary = i;
+            break;
+        }
+    entries[primary].name = name;
+    g_fontFaces.insert(g_fontFaces.end(), entries.begin(), entries.end());
+    return entries[primary].face;
+}
+
+static plutovg_font_face_t* findFontFace(const ttstr& familyName)
+{
+    std::string key = lowerFontName(familyName);
+    if (key.empty())
+        return nullptr;
+    for (auto& entry : g_fontFaces)
+    {
+        if (entry.fallback)
+            continue;
+        if (lowerFontName(entry.name) == key ||
+            std::find(entry.families.begin(), entry.families.end(), key) != entry.families.end())
+            return entry.face;
+    }
+    return nullptr;
+}
+
+// Loads a family the core font system knows (system or registered fonts).
+static plutovg_font_face_t* loadRegisteredFont(const ttstr& familyName)
+{
+    if (familyName.IsEmpty())
+        return nullptr;
+    std::vector<ttstr> fonts;
+    TVPGetAllFontList(fonts);
+    for (auto& font : fonts)
+    {
+        if (lowerFontName(font) != lowerFontName(familyName))
+            continue;
+        if (tTJSBinaryStream* in = TVPCreateFontStream(font))
+            return loadFontFace(in, familyName, false);
+    }
+    return nullptr;
+}
+
+// One shared copy of the built-in face backs every unknown family.
+static plutovg_font_face_t* fallbackFontFace()
+{
+    for (auto& entry : g_fontFaces)
+        if (entry.fallback)
+            return entry.face;
+    tTJSBinaryStream* in = GetResourceStream(TJS_N("DroidSansFallback.ttf"));
+    return in ? loadFontFace(in, TJS_N(""), true) : nullptr;
+}
+
 void GdiPlus::addPrivateFont(const tjs_char* fontFileName)
 {
-    ttstr filename = TVPGetPlacedPath(fontFileName);
-    tTJSBinaryStream* in = NULL;
+    ttstr name(fontFileName ? fontFileName : TJS_N(""));
+    for (auto& entry : g_fontFaces)
+        if (!entry.fallback && !name.IsEmpty() && entry.name == name)
+            return;
+    ttstr filename = name.IsEmpty() ? ttstr() : TVPGetPlacedPath(name);
     if (filename.length())
     {
-        in = TVPCreateBinaryStreamForRead(filename, TJS_N(""));
-    }
-    else
-    {
-        std::vector<ttstr> ret;
-        TVPGetAllFontList(ret);
-        for (auto& ftN : ret)
+        if (tTJSBinaryStream* in = TVPCreateBinaryStreamForRead(filename, TJS_N("")))
         {
-            if (ftN == ttstr(fontFileName))
-            {
-                in = TVPCreateFontStream(fontFileName);
-                if (in)
-                    break;
-            }
-        }
-        if (!in)
-        {
-            in = GetResourceStream(TJS_N("DroidSansFallback.ttf"));
+            loadFontFace(in, name, false);
+            return;
         }
     }
-    if (in)
-    {
-        tjs_uint size = (tjs_uint)in->GetSize();
-        tjs_uint8* fileData = new tjs_uint8[size];
-        in->ReadBuffer(fileData, size);
-        delete in;
-
-        // Load font face (plutovg takes ownership of data via destroy callback)
-        plutovg_font_face_t* face =
-            plutovg_font_face_load_from_data(fileData, size, 0, fontDataDestroy, fileData);
-        if (!face)
-        {
-            delete[] fileData;
-            TVPThrowExceptionMessage(TJS_N("plutovg cannot load:%1"), fontFileName);
-        }
-
-        FontFaceEntry entry;
-        entry.face = face;
-        entry.name = ttstr(fontFileName);
-        entry.data = fileData;
-        entry.dataSize = size;
-        g_fontFaces.push_back(entry);
+    if (loadRegisteredFont(name) || fallbackFontFace())
         return;
-    }
-    TVPThrowExceptionMessage(TJS_N("cannot open:%1"), fontFileName);
+    TVPThrowExceptionMessage(TJS_N("cannot open:%1"), name);
 }
 
 tTJSVariant GdiPlus::getFontList(bool privateOnly)
@@ -144,7 +304,7 @@ tTJSVariant GdiPlus::getFontList(bool privateOnly)
 
     for (auto& entry : g_fontFaces)
     {
-        if (entry.name.length())
+        if (!entry.fallback && entry.name.length())
         {
             tTJSVariant vname(entry.name), *param = &vname;
             array->FuncCall(0, TJS_N("add"), NULL, 0, 1, &param, array);
@@ -219,10 +379,8 @@ void FontInfo::setFamilyName(const tjs_char* name)
     {
         this->familyName = name;
     }
-    if (!getFontFace())
-    {
-        GdiPlus::addPrivateFont(name);
-    }
+    if (!findFontFace(familyName) && !loadRegisteredFont(familyName) && !getFontFace())
+        fallbackFontFace();
 }
 
 void FontInfo::setForceSelfPathDraw(bool state)
@@ -254,7 +412,7 @@ void FontInfo::updateSizeParams(void) const
         plutovg_font_face_get_metrics(face, (float)emSize, &a, &d, &lg, nullptr);
         ascent = a;
         descent = -d; // plutovg returns negative descent
-        lineSpacing = lg;
+        lineSpacing = a - d + lg;
         ascentLeading = 0;
         descentLeading = 0;
     }
@@ -300,15 +458,15 @@ tjs_real FontInfo::getLineSpacing() const
 
 plutovg_font_face_t* FontInfo::getFontFace() const
 {
-    // Search by family name
+    if (plutovg_font_face_t* face = findFontFace(familyName))
+        return face;
+    // GDI+ substitutes an unknown family. Prefer a font the game supplied over
+    // the built-in face, which only covers missing families.
     for (auto& entry : g_fontFaces)
-    {
-        if (entry.name == familyName)
+        if (!entry.fallback)
             return entry.face;
-    }
-    // Fallback to first available
-    if (!g_fontFaces.empty())
-        return g_fontFaces[0].face;
+    for (auto& entry : g_fontFaces)
+        return entry.face;
     return nullptr;
 }
 
@@ -1180,9 +1338,13 @@ GdipImage* GdipImage::Clone()
 #endif
                 plutovg_path_destroy);
             if(info.path && !path) throw std::bad_alloc();
-            cloned->vectorGraph.push_back({app.get(),path.get()});app.release();path.release();
+            cloned->vectorGraph.push_back({app.get(),path.get(),info.matrix});app.release();path.release();
         }
         cloned->transMtx = transMtx;
+        cloned->bgColor = bgColor;
+        // The base image is never drawn into, so the clone shares it.
+        if (_surface)
+            cloned->_surface = plutovg_surface_reference(_surface);
     }
     return cloned.release();
 }
@@ -1198,12 +1360,16 @@ RectF GdipImage::GetBounds()
     else if (type == 1)
     {
         RectF last(0, 0, 0, 0);
+        if (_surface)
+            last = RectF(0, 0, (tjs_real)plutovg_surface_get_width(_surface),
+                         (tjs_real)plutovg_surface_get_height(_surface));
         for (auto& itm : vectorGraph)
         {
             if (itm.path && !pathIsEmpty(itm.path))
             {
-                plutovg_rect_t ext;
-                plutovg_path_extents(itm.path, &ext, false);
+                plutovg_rect_t raw, ext;
+                plutovg_path_extents(itm.path, &raw, false);
+                plutovg_matrix_map_rect(&itm.matrix, &raw, &ext);
                 RectF org = last;
                 RectF::Union(last, org, RectF(ext.x, ext.y, ext.w, ext.h));
             }
@@ -1267,8 +1433,9 @@ void LayerExDraw::updateRect(RectF& rect)
 #endif
     if (updateWhenDraw)
     {
-        tTVPRect rc((tjs_int)rect.x, (tjs_int)rect.y, (tjs_int)(rect.x + rect.w),
-                    (tjs_int)(rect.y + rect.h));
+        // Round outwards so antialiased edges are repainted too.
+        tTVPRect rc((tjs_int)std::floor(rect.x), (tjs_int)std::floor(rect.y),
+                    (tjs_int)std::ceil(rect.x + rect.w), (tjs_int)std::ceil(rect.y + rect.h));
         _this->Update(rc);
     }
 }
@@ -1406,7 +1573,6 @@ class LayerExDraw::InvocationSpanCapture
     std::unique_ptr<GdipImage> replacementRecord;
     bool fullUpdate=false;
     uint64_t recordBytes=0;
-    plutovg_matrix_t recordTransform;
     struct State {
         GeometryT width,height,clipLeft,clipTop,clipWidth,clipHeight;
         BufferT buffer; PitchT pitch;
@@ -1510,8 +1676,8 @@ public:
         std::unique_ptr<Appearance> copy(app->Clone());
         std::unique_ptr<plutovg_path_t,void(*)(plutovg_path_t*)> copiedPath(plutovg_path_clone_checked(path),plutovg_path_destroy);
         if(!copy || !copiedPath) throw std::bad_alloc();
-        stagedRecord.push_back({copy.get(),copiedPath.get()});
-        copy.release();copiedPath.release();recordBytes+=bytes;recordTransform=owner.transform;
+        stagedRecord.push_back({copy.get(),copiedPath.get(),owner.transform});
+        copy.release();copiedPath.release();recordBytes+=bytes;
     }
     void PublishRecord() noexcept {
         if(replacementRecord) {delete owner.metaGraphics;owner.metaGraphics=replacementRecord.release();}
@@ -1519,7 +1685,7 @@ public:
         for(auto& info:stagedRecord) {
             owner.metaGraphics->vectorGraph.push_back(info);info={nullptr,nullptr};
         }
-        owner.metaGraphics->transMtx=recordTransform;stagedRecord.clear();
+        stagedRecord.clear();
     }
     void StageClear(tjs_uint32 argb) {
         fullUpdate=true;
@@ -1588,9 +1754,13 @@ public:
             auto& graph=owner.metaGraphics->vectorGraph;
             if(stagedRecord.size()>graph.max_size()-graph.size()) return TVPLayerSpanCompositeResult::ParameterBudget;
             const auto size=graph.size()+stagedRecord.size();
-            if(size>graph.capacity() && size>(available-recordBytes)/sizeof(GdipImage::Info))
+            const auto fits=(available-recordBytes)/sizeof(GdipImage::Info);
+            if(size>graph.capacity() && size>fits)
                 return TVPLayerSpanCompositeResult::ParameterBudget;
-            graph.reserve(size);
+            // Grow geometrically within the budget; an exact reserve copied
+            // the whole record on every recorded GPU call.
+            if(size>graph.capacity())
+                graph.reserve(std::max<uint64_t>(size,std::min<uint64_t>(uint64_t(graph.capacity())*2,fits)));
         }
         return status;
     }
@@ -1734,21 +1904,30 @@ void LayerExDraw::resetViewTransform()
     updateViewTransform();
 }
 
+// The rotate/scale/translate methods append to the current matrix and take
+// degrees, like GDI+ MatrixOrderAppend (the blend2d port replaced the
+// matrix and took radians).
 void LayerExDraw::rotateViewTransform(tjs_real angle)
 {
-    plutovg_matrix_init_rotate(&viewTransform, (float)angle);
+    plutovg_matrix_t op, current = viewTransform;
+    plutovg_matrix_init_rotate(&op, (float)(angle * 3.14159265358979323846 / 180.0));
+    plutovg_matrix_multiply(&viewTransform, &current, &op);
     updateViewTransform();
 }
 
 void LayerExDraw::scaleViewTransform(tjs_real sx, tjs_real sy)
 {
-    plutovg_matrix_init_scale(&viewTransform, (float)sx, (float)sy);
+    plutovg_matrix_t op, current = viewTransform;
+    plutovg_matrix_init_scale(&op, (float)sx, (float)sy);
+    plutovg_matrix_multiply(&viewTransform, &current, &op);
     updateViewTransform();
 }
 
 void LayerExDraw::translateViewTransform(tjs_real dx, tjs_real dy)
 {
-    plutovg_matrix_init_translate(&viewTransform, (float)dx, (float)dy);
+    plutovg_matrix_t op, current = viewTransform;
+    plutovg_matrix_init_translate(&op, (float)dx, (float)dy);
+    plutovg_matrix_multiply(&viewTransform, &current, &op);
     updateViewTransform();
 }
 
@@ -1774,19 +1953,25 @@ void LayerExDraw::resetTransform()
 
 void LayerExDraw::rotateTransform(tjs_real angle)
 {
-    plutovg_matrix_init_rotate(&transform, (float)angle);
+    plutovg_matrix_t op, current = transform;
+    plutovg_matrix_init_rotate(&op, (float)(angle * 3.14159265358979323846 / 180.0));
+    plutovg_matrix_multiply(&transform, &current, &op);
     updateTransform();
 }
 
 void LayerExDraw::scaleTransform(tjs_real sx, tjs_real sy)
 {
-    plutovg_matrix_init_scale(&transform, (float)sx, (float)sy);
+    plutovg_matrix_t op, current = transform;
+    plutovg_matrix_init_scale(&op, (float)sx, (float)sy);
+    plutovg_matrix_multiply(&transform, &current, &op);
     updateTransform();
 }
 
 void LayerExDraw::translateTransform(tjs_real dx, tjs_real dy)
 {
-    plutovg_matrix_init_translate(&transform, (float)dx, (float)dy);
+    plutovg_matrix_t op, current = transform;
+    plutovg_matrix_init_translate(&op, (float)dx, (float)dy);
+    plutovg_matrix_multiply(&transform, &current, &op);
     updateTransform();
 }
 
@@ -1822,9 +2007,67 @@ RectF LayerExDraw::drawPath(const Appearance* app, const Path* path)
     return _drawPath(app, path->path);
 }
 
+void LayerExDraw::unionBounds(RectF& bounds, const plutovg_rect_t& rect,
+                              const plutovg_matrix_t& matrix)
+{
+    if (rect.w < 0 || rect.h < 0)
+        return;
+    plutovg_rect_t mapped;
+    plutovg_matrix_map_rect(&matrix, &rect, &mapped);
+    if (bounds.w <= 0 || bounds.h <= 0)
+    {
+        bounds = RectF(mapped.x, mapped.y, mapped.w, mapped.h);
+        return;
+    }
+    const tjs_real left = std::min<tjs_real>(bounds.x, mapped.x);
+    const tjs_real top = std::min<tjs_real>(bounds.y, mapped.y);
+    const tjs_real right = std::max<tjs_real>(bounds.x + bounds.w, mapped.x + mapped.w);
+    const tjs_real bottom = std::max<tjs_real>(bounds.y + bounds.h, mapped.y + mapped.h);
+    bounds = RectF(left, top, right - left, bottom - top);
+}
+
+// Device-space area every draw entry of app can touch, used both as the
+// result scripts see and as the repaint rectangle.
 RectF LayerExDraw::getPathExtents(const Appearance* app, const plutovg_path_t* path)
 {
-    return RectF();
+    RectF bounds;
+    if (!app || !path || pathIsEmpty(path))
+        return bounds;
+
+    plutovg_rect_t extents;
+    plutovg_path_extents(path, &extents, false);
+    for (const auto& drawInfo : app->drawInfos)
+    {
+        if (!drawInfo.info)
+            continue;
+        float grow = 0;
+        if (drawInfo.type == 0)
+        {
+            const SoftPen* pen = static_cast<const SoftPen*>(drawInfo.info);
+            grow = (float)pen->strokeWidth * 0.5f;
+            // Miter tips reach up to miterLimit half-widths; square caps a
+            // half-width diagonal; custom caps their own outline.
+            if (pen->lineJoin == PLUTOVG_LINE_JOIN_MITER)
+                grow *= std::max(1.0f, pen->miterLimit);
+            else if (pen->lineCap == PLUTOVG_LINE_CAP_SQUARE)
+                grow *= 1.415f;
+            for (const plutovg_path_t* cap : {pen->startCapPath, pen->endCapPath})
+            {
+                if (!cap || pathIsEmpty(cap))
+                    continue;
+                plutovg_rect_t c;
+                plutovg_path_extents(cap, &c, false);
+                grow = std::max(grow, std::max(std::max(std::fabs(c.x), std::fabs(c.x + c.w)),
+                                               std::max(std::fabs(c.y), std::fabs(c.y + c.h))) +
+                                          (float)pen->strokeWidth * 0.5f);
+            }
+        }
+        plutovg_rect_t rect = {extents.x - grow + (float)drawInfo.ox,
+                               extents.y - grow + (float)drawInfo.oy,
+                               extents.w + grow * 2, extents.h + grow * 2};
+        unionBounds(bounds, rect, calcTransform);
+    }
+    return bounds;
 }
 
 void LayerExDraw::draw(const SoftPen* pen, const plutovg_matrix_t* matrix,
@@ -1890,38 +2133,40 @@ void LayerExDraw::fill(const SoftBrush* brush, const plutovg_matrix_t* matrix,
     plutovg_canvas_restore(canvas);
 }
 
+void LayerExDraw::recordPath(const Appearance* app, const plutovg_path_t* path)
+{
+#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
+    if(invocationCapture) { stageCapturedRecord(app,path); return; }
+#endif
+    std::unique_ptr<Appearance> copiedApp(app->Clone());
+    std::unique_ptr<plutovg_path_t,void(*)(plutovg_path_t*)> copiedPath(
+#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
+        plutovg_path_clone_checked(path),
+#else
+        plutovg_path_clone(path),
+#endif
+        plutovg_path_destroy);
+    if(!copiedPath) throw std::bad_alloc();
+    metaGraphics->vectorGraph.push_back({copiedApp.get(),copiedPath.get(),transform});
+    copiedApp.release();copiedPath.release();
+}
+
 RectF LayerExDraw::_drawPath(const Appearance* app, const plutovg_path_t* path)
 {
     RectF bounds;
     if (!canvas || !app || !path || pathIsEmpty(path))
         return bounds;
+    bounds = getPathExtents(app, path);
+
+    // One entry per call: replay draws every paint of the entry, so an
+    // entry per paint drew each paint once per paint.
+    if (metaGraphics && !app->drawInfos.empty())
+        recordPath(app, path);
 
     for (const auto& drawInfo : app->drawInfos)
     {
         if (!drawInfo.info)
             continue;
-
-        if (metaGraphics)
-        {
-#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
-            if(invocationCapture) stageCapturedRecord(app,path);
-            else
-#endif
-            {
-            std::unique_ptr<Appearance> copiedApp(app->Clone());
-            std::unique_ptr<plutovg_path_t,void(*)(plutovg_path_t*)> copiedPath(
-#if defined(PLUTOVG_SPAN_CAPTURE_VERSION)
-                plutovg_path_clone_checked(path),
-#else
-                plutovg_path_clone(path),
-#endif
-                plutovg_path_destroy);
-            if(!copiedPath) throw std::bad_alloc();
-            metaGraphics->vectorGraph.push_back({copiedApp.get(),copiedPath.get()});
-            copiedApp.release();copiedPath.release();
-            metaGraphics->transMtx = transform;
-            }
-        }
 
         plutovg_matrix_t drawMatrix;
         plutovg_matrix_init_translate(&drawMatrix, (float)drawInfo.ox, (float)drawInfo.oy);
@@ -2159,118 +2404,297 @@ RectF LayerExDraw::drawRectangles(const Appearance* app, tTJSVariant rects)
 // ============================================================
 // Text drawing
 // ============================================================
+// GDI+ lays text out with a 1/6 em padding on each side
+// (StringFormat::GenericDefault) and samples at pixel centres.
+static tjs_real textPadding(const FontInfo* font)
+{
+    return font->getEmSize() / 6.0;
+}
+
+static PointF textOrigin(const FontInfo* font, tjs_real x, tjs_real y)
+{
+    return PointF(x + textPadding(font) - 0.5, y - 0.5);
+}
+
 RectF LayerExDraw::drawPathString(const FontInfo* font, const Appearance* app, tjs_real x,
                                   tjs_real y, const tjs_char* text)
 {
-    plutovg_font_face_t* face = font->getFontFace();
-    if (!face)
-        return RectF();
-
-    plutovg_path_t* textPath = plutovg_path_create();
-    float emSize = (float)font->getEmSize();
-    float xpos  = (float)x;
-    float yBase = (float)y + (float)font->getAscent() - (float)font->getDescent();
-    size_t len = TJS_strlen(text);
-
-    plutovg_text_iterator_t it;
-    plutovg_text_iterator_init(&it, text, (int)len, PLUTOVG_TEXT_ENCODING_UTF8);
-    float aw = 0, lsb = 0;
-    plutovg_rect_t ext = {0, 0, 0, 0};
-    while (plutovg_text_iterator_has_next(&it))
-    {
-        plutovg_codepoint_t cp = plutovg_text_iterator_next(&it);
-        plutovg_font_face_get_glyph_metrics(face, emSize, cp, &aw, &lsb, &ext);
-        float adv = plutovg_font_face_get_glyph_path(face, emSize, xpos, yBase + ext.y, cp, textPath);
-        xpos += adv;
-    }
-
-    RectF ret = _drawPath(app, textPath);
-    plutovg_path_destroy(textPath);
-    return ret;
+    return drawPathString2(font, app, x, y, text);
 }
 
+// Brush entries only, as GDI+ DrawString ignores pens; drawPathString strokes.
+// Returns the measureString layout box at each brush offset, as GDI+ does;
+// the repaint also covers ink outside it.
 RectF LayerExDraw::drawString(const FontInfo* font, const Appearance* app, tjs_real x, tjs_real y,
                               const tjs_char* text)
 {
     RectF bounds;
-    plutovg_font_face_t* face = font->getFontFace();
-    if (!face || !canvas)
-        return RectF();
+    if (!canvas || !app || !font->getFontFace())
+        return bounds;
 
-    plutovg_canvas_save(canvas);
-    plutovg_canvas_set_operator(canvas, PLUTOVG_OPERATOR_SRC_OVER);
-    plutovg_canvas_set_matrix(canvas, &calcTransform);
-    plutovg_canvas_set_font(canvas, face, (float)font->getEmSize());
+    std::unique_ptr<plutovg_path_t, void (*)(plutovg_path_t*)> textPath(plutovg_path_create(),
+                                                                        plutovg_path_destroy);
+    PointF offset = textOrigin(font, x, y);
+    getTextOutline(font, offset, textPath.get(), text);
+    if (pathIsEmpty(textPath.get()))
+        return bounds;
 
-    size_t len = TJS_strlen(text);
-
-    for (const auto& drawInfo : app->drawInfos)
+    if (metaGraphics)
     {
-        if (!drawInfo.info)
-            continue;
-
-        if (drawInfo.type == 1) // brush only
-        {
-            SoftBrush* brush = static_cast<SoftBrush*>(drawInfo.info);
-            if (!brush)
-                continue;
-            brush->applyToCanvas(canvas);
-            plutovg_canvas_fill_text(canvas, text, (int)len, PLUTOVG_TEXT_ENCODING_UTF8,
-                                     (float)(x + drawInfo.ox),
-                                     (float)(y + drawInfo.oy));
-        }
+        // Record only what was drawn, so a replay doesn't stroke the text.
+        Appearance brushes;
+        for (const auto& drawInfo : app->drawInfos)
+            if (drawInfo.info && drawInfo.type == 1)
+                brushes.drawInfos.emplace_back(drawInfo);
+        if (!brushes.drawInfos.empty())
+            recordPath(&brushes, textPath.get());
     }
 
-    plutovg_canvas_restore(canvas);
+    plutovg_rect_t extents;
+    plutovg_path_extents(textPath.get(), &extents, false);
+    const RectF layout = measureString(font, text);
+    RectF update;
+    for (const auto& drawInfo : app->drawInfos)
+    {
+        if (!drawInfo.info || drawInfo.type != 1)
+            continue;
+        plutovg_matrix_t drawMatrix;
+        plutovg_matrix_init_translate(&drawMatrix, (float)drawInfo.ox, (float)drawInfo.oy);
+        fill(static_cast<SoftBrush*>(drawInfo.info), &drawMatrix, textPath.get());
+        plutovg_rect_t ink = {extents.x + (float)drawInfo.ox, extents.y + (float)drawInfo.oy,
+                              extents.w, extents.h};
+        plutovg_rect_t box = {(float)(x + drawInfo.ox + layout.x), (float)(y + drawInfo.oy + layout.y),
+                              (float)layout.w, (float)layout.h};
+        unionBounds(bounds, box, calcTransform);
+        unionBounds(update, box, calcTransform);
+        unionBounds(update, ink, calcTransform);
+    }
 
-    updateRect(bounds);
+    updateRect(update);
     return bounds;
 }
 
+// GDI+ MeasureString: the layout box drawString fills, from (0,0). The
+// widest line's advance plus the 1/6 em padding on each side, one line
+// height per line.
 RectF LayerExDraw::measureString(const FontInfo* font, const tjs_char* text)
 {
     plutovg_font_face_t* face = font->getFontFace();
-    if (!face)
+    if (!face || !text)
         return RectF();
 
-    plutovg_rect_t extents;
-    size_t len = TJS_strlen(text);
-    plutovg_font_face_text_extents(face, (float)font->getEmSize(), text, (int)len,
-                                    PLUTOVG_TEXT_ENCODING_UTF8, &extents);
-    return RectF(extents.x, extents.y, extents.w, extents.h);
+    const float size = (float)font->getEmSize();
+    float width = 0;
+    int lines = 1;
+    for (const tjs_char *line = text, *p = text;; ++p)
+    {
+        if (*p && *p != '\n' && *p != '\r')
+            continue;
+        plutovg_rect_t extents;
+        width = std::max(width, plutovg_font_face_text_extents(face, size, line, (int)(p - line),
+                                                               PLUTOVG_TEXT_ENCODING_UTF8,
+                                                               &extents));
+        if (!*p)
+            break;
+        if (*p == '\r' && p[1] == '\n')
+            ++p;
+        ++lines;
+        line = p + 1;
+    }
+    return RectF(0, 0, width + (float)textPadding(font) * 2, (float)font->getLineSpacing() * lines);
 }
 
+// The ink box of the text, in the same coordinates as measureString.
 RectF LayerExDraw::measureStringInternal(const FontInfo* font, const tjs_char* text)
 {
-    return measureString(font, text);
+    plutovg_font_face_t* face = font->getFontFace();
+    if (!face || !text)
+        return RectF();
+
+    const float size = (float)font->getEmSize();
+    const float left = (float)textPadding(font);
+    float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    bool any = false;
+    int index = 0;
+    for (const tjs_char *line = text, *p = text;; ++p)
+    {
+        if (*p && *p != '\n' && *p != '\r')
+            continue;
+        plutovg_rect_t e = {0, 0, 0, 0};
+        plutovg_font_face_text_extents(face, size, line, (int)(p - line),
+                                       PLUTOVG_TEXT_ENCODING_UTF8, &e);
+        if (e.w > 0 && e.h > 0)
+        {
+            // Extents are relative to the baseline, y down.
+            const float top = (float)(font->getAscent() + font->getLineSpacing() * index) + e.y;
+            if (!any)
+                x0 = left + e.x, y0 = top, x1 = x0 + e.w, y1 = top + e.h;
+            else
+            {
+                x0 = std::min(x0, left + e.x);
+                y0 = std::min(y0, top);
+                x1 = std::max(x1, left + e.x + e.w);
+                y1 = std::max(y1, top + e.h);
+            }
+            any = true;
+        }
+        if (!*p)
+            break;
+        if (*p == '\r' && p[1] == '\n')
+            ++p;
+        ++index;
+        line = p + 1;
+    }
+    return any ? RectF(x0, y0, x1 - x0, y1 - y0) : RectF();
 }
+
+namespace
+{
+int countTextLines(const tjs_char* text)
+{
+    int lines = 1;
+    for (size_t i = 0; text && text[i]; ++i)
+    {
+        if (text[i] == '\n')
+            lines++;
+        else if (text[i] == '\r' && text[i + 1] != '\n')
+            lines++;
+    }
+    return lines;
+}
+
+// Line height from the outline's ink plus descent padding, shared by
+// measureString2 and drawPathString2 (AetherKrkr calcPathTextHeight).
+float pathTextHeight(const FontInfo* font, const plutovg_path_t* path, bool measurePadding,
+                     int lineCount)
+{
+    const float lineH = (float)font->getLineSpacing();
+    const float minH = (measurePadding ? lineH * 1.124f : lineH) * (float)std::max(1, lineCount);
+    plutovg_rect_t box;
+    if (pathIsEmpty(path))
+        return minH;
+    plutovg_path_extents(path, &box, true);
+    if (box.h <= 0)
+        return minH;
+    constexpr float inkMargin = 2.0f;
+    if (!measurePadding)
+        return std::max(minH, box.h + inkMargin);
+    return std::max(minH, box.h + std::fabs((float)font->getDescent()) + inkMargin + 1.0f);
+}
+
+float pathTextWidth(const plutovg_path_t* path)
+{
+    if (pathIsEmpty(path))
+        return 0;
+    plutovg_rect_t box;
+    plutovg_path_extents(path, &box, true);
+    return box.w;
+}
+} // namespace
 
 RectF LayerExDraw::drawPathString2(const FontInfo* font, const Appearance* app, tjs_real x,
                                    tjs_real y, const tjs_char* text)
 {
-    return RectF(); // TODO
+    std::unique_ptr<plutovg_path_t, void (*)(plutovg_path_t*)> path(plutovg_path_create(),
+                                                                    plutovg_path_destroy);
+    PointF offset = textOrigin(font, x, y);
+    getTextOutline(font, offset, path.get(), text);
+    return _drawPath(app, path.get());
 }
 
 RectF LayerExDraw::measureString2(const FontInfo* font, const tjs_char* text)
 {
-    return RectF(); // TODO
+    std::unique_ptr<plutovg_path_t, void (*)(plutovg_path_t*)> path(plutovg_path_create(),
+                                                                    plutovg_path_destroy);
+    PointF offset;
+    getTextOutline(font, offset, path.get(), text);
+    // GDI+ adds the layout padding on both sides of the ink width.
+    return RectF(0, 0, pathTextWidth(path.get()) + (float)textPadding(font) * 2,
+                 pathTextHeight(font, path.get(), true, countTextLines(text)));
 }
 
 RectF LayerExDraw::measureStringInternal2(const FontInfo* font, const tjs_char* text)
 {
-    return RectF(); // TODO
+    std::unique_ptr<plutovg_path_t, void (*)(plutovg_path_t*)> path(plutovg_path_create(),
+                                                                    plutovg_path_destroy);
+    PointF offset;
+    getTextOutline(font, offset, path.get(), text);
+    return RectF(textPadding(font), 0, pathTextWidth(path.get()),
+                 pathTextHeight(font, path.get(), false, countTextLines(text)));
 }
 
+// Appends one glyph with its top at offset.y and advances offset.x. Each
+// contour is closed, as GDI+ glyph outlines are, so pens join at its start.
 void LayerExDraw::getGlyphOutline(const FontInfo* fontInfo, PointF& offset, plutovg_path_t* path,
                                   tjs_uint glyph)
 {
-    // TODO
+    plutovg_font_face_t* face = fontInfo->getFontFace();
+    if (!face || glyph == '\n' || glyph == '\r' || glyph == '\t')
+        return;
+    struct Outline
+    {
+        plutovg_path_t* path;
+        bool open;
+    } outline = {path, false};
+    offset.x += plutovg_font_face_traverse_glyph_path(
+        face, (float)fontInfo->getEmSize(), (float)offset.x,
+        (float)(offset.y + fontInfo->getAscent()), (plutovg_codepoint_t)glyph,
+        [](void* closure, plutovg_path_command_t command, const plutovg_point_t* points, int) {
+            Outline* o = static_cast<Outline*>(closure);
+            switch (command)
+            {
+                case PLUTOVG_PATH_COMMAND_MOVE_TO:
+                    if (o->open)
+                        plutovg_path_close(o->path);
+                    plutovg_path_move_to(o->path, points[0].x, points[0].y);
+                    o->open = true;
+                    break;
+                case PLUTOVG_PATH_COMMAND_LINE_TO:
+                    plutovg_path_line_to(o->path, points[0].x, points[0].y);
+                    break;
+                case PLUTOVG_PATH_COMMAND_CUBIC_TO:
+                    plutovg_path_cubic_to(o->path, points[0].x, points[0].y, points[1].x, points[1].y,
+                                          points[2].x, points[2].y);
+                    break;
+                case PLUTOVG_PATH_COMMAND_CLOSE:
+                    plutovg_path_close(o->path);
+                    o->open = false;
+                    break;
+            }
+        },
+        &outline);
+    if (outline.open)
+        plutovg_path_close(path);
 }
 
 void LayerExDraw::getTextOutline(const FontInfo* fontInfo, PointF& offset, plutovg_path_t* path,
                                  ttstr text)
 {
-    // TODO
+    const tjs_char* chars = text.c_str();
+    if (!chars || !*chars)
+        return;
+    const tjs_real lineStartX = offset.x;
+    const tjs_real lineStep = fontInfo->getLineSpacing();
+    plutovg_text_iterator_t it;
+    plutovg_text_iterator_init(&it, chars, (int)TJS_strlen(chars), PLUTOVG_TEXT_ENCODING_UTF8);
+    bool afterCR = false;
+    while (plutovg_text_iterator_has_next(&it))
+    {
+        plutovg_codepoint_t cp = plutovg_text_iterator_next(&it);
+        if (cp == '\n' && afterCR)
+        {
+            afterCR = false;
+            continue;
+        }
+        afterCR = cp == '\r';
+        if (cp == '\n' || cp == '\r')
+        {
+            offset.x = lineStartX;
+            offset.y += lineStep;
+            continue;
+        }
+        getGlyphOutline(fontInfo, offset, path, cp);
+    }
 }
 
 // ============================================================
@@ -2297,6 +2721,41 @@ RectF LayerExDraw::drawImageStretch(tjs_real dleft, tjs_real dtop, tjs_real dwid
                            dheight / sheight, dleft, dtop);
 }
 
+// Draws the record's base image under base, then each record entry with the
+// transform it was recorded under, followed by base.
+void LayerExDraw::replayRecord(const GdipImage* image, const plutovg_matrix_t& base)
+{
+    if (canvas && image->_surface)
+    {
+        plutovg_canvas_save(canvas);
+        plutovg_canvas_set_operator(canvas, PLUTOVG_OPERATOR_SRC_OVER);
+        plutovg_canvas_set_matrix(canvas, &base);
+        plutovg_canvas_set_texture(canvas, image->_surface, PLUTOVG_TEXTURE_TYPE_PLAIN, 1.0f, nullptr);
+        plutovg_canvas_fill_rect(canvas, 0, 0, (float)plutovg_surface_get_width(image->_surface),
+                                 (float)plutovg_surface_get_height(image->_surface));
+        plutovg_canvas_restore(canvas);
+    }
+    const plutovg_matrix_t saved = calcTransform;
+    for (const auto& info : image->vectorGraph)
+    {
+        if (!canvas || !info.app || !info.path || pathIsEmpty(info.path))
+            continue;
+        plutovg_matrix_multiply(&calcTransform, &info.matrix, &base);
+        for (const auto& drawInfo : info.app->drawInfos)
+        {
+            if (!drawInfo.info)
+                continue;
+            plutovg_matrix_t drawMatrix;
+            plutovg_matrix_init_translate(&drawMatrix, (float)drawInfo.ox, (float)drawInfo.oy);
+            if (drawInfo.type == 0)
+                draw(static_cast<SoftPen*>(drawInfo.info), &drawMatrix, info.path);
+            else
+                fill(static_cast<SoftBrush*>(drawInfo.info), &drawMatrix, info.path);
+        }
+    }
+    calcTransform = saved;
+}
+
 RectF LayerExDraw::drawImageAffine(GdipImage* src, tjs_real sleft, tjs_real stop, tjs_real swidth,
                                    tjs_real sheight, bool affine, tjs_real A, tjs_real B,
                                    tjs_real C, tjs_real D, tjs_real E, tjs_real F)
@@ -2305,6 +2764,8 @@ RectF LayerExDraw::drawImageAffine(GdipImage* src, tjs_real sleft, tjs_real stop
     if (!canvas || !src)
         return bounds;
 
+    // matrix maps source pixels, relative to (sleft, stop), to the layer.
+    // The point form gives where the source rect's corners land.
     plutovg_matrix_t matrix;
     if (affine)
     {
@@ -2312,7 +2773,10 @@ RectF LayerExDraw::drawImageAffine(GdipImage* src, tjs_real sleft, tjs_real stop
     }
     else
     {
-        tjs_real a = C - A, b = D - B, c = E - A, d = F - B, e = A, f = B;
+        if (swidth == 0 || sheight == 0)
+            return bounds;
+        tjs_real a = (C - A) / swidth, b = (D - B) / swidth, c = (E - A) / sheight,
+                 d = (F - B) / sheight, e = A, f = B;
         plutovg_matrix_init(&matrix, (float)a, (float)b, (float)c, (float)d, (float)e, (float)f);
     }
 
@@ -2327,6 +2791,7 @@ RectF LayerExDraw::drawImageAffine(GdipImage* src, tjs_real sleft, tjs_real stop
         const int srcHeight = (int)sheight;
         if (srcWidth <= 0 || srcHeight <= 0)
             return bounds;
+        unionBounds(bounds, plutovg_rect_t{0.0f, 0.0f, (float)srcWidth, (float)srcHeight}, matrix);
 
         plutovg_canvas_save(canvas);
         plutovg_canvas_set_operator(canvas, PLUTOVG_OPERATOR_SRC_OVER);
@@ -2340,37 +2805,20 @@ RectF LayerExDraw::drawImageAffine(GdipImage* src, tjs_real sleft, tjs_real stop
     }
     else if (src->type == 1)
     {
-        // Vector: replay
-        plutovg_matrix_t savedMtx = calcTransform;
-        calcTransform = matrix;
-        plutovg_matrix_t srcRectTransform;
-        plutovg_matrix_init_scale(&srcRectTransform, (float)(swidth / src->GetWidth()),
-                                  (float)(sheight / src->GetHeight()));
-        plutovg_matrix_translate(&srcRectTransform, (float)(-sleft), (float)(-stop));
-
-        plutovg_matrix_t temp = calcTransform;
-        plutovg_matrix_multiply(&calcTransform, &temp, &srcRectTransform);
-        temp = calcTransform;
-        plutovg_matrix_multiply(&calcTransform, &temp, &src->transMtx);
-
-        for (auto& infoItm : src->vectorGraph)
-        {
-            if (!canvas || !infoItm.app || !infoItm.path || pathIsEmpty(infoItm.path))
-                continue;
-            for (const auto& drawInfo : infoItm.app->drawInfos)
-            {
-                if (!drawInfo.info)
-                    continue;
-                plutovg_matrix_t drawMatrix;
-                plutovg_matrix_init_translate(&drawMatrix, (float)drawInfo.ox,
-                                              (float)drawInfo.oy);
-                if (drawInfo.type == 0)
-                    draw(static_cast<SoftPen*>(drawInfo.info), &drawMatrix, infoItm.path);
-                else
-                    fill(static_cast<SoftBrush*>(drawInfo.info), &drawMatrix, infoItm.path);
-            }
-        }
-        calcTransform = savedMtx;
+        // Vector: replay the record's own transform, then the source rect
+        // offset, then matrix, clipped to the source rect like a bitmap.
+        if (swidth <= 0 || sheight <= 0)
+            return bounds;
+        unionBounds(bounds, plutovg_rect_t{0.0f, 0.0f, (float)swidth, (float)sheight}, matrix);
+        plutovg_matrix_t srcRect, local, base;
+        plutovg_matrix_init_translate(&srcRect, (float)(-sleft), (float)(-stop));
+        plutovg_matrix_multiply(&local, &src->transMtx, &srcRect);
+        plutovg_matrix_multiply(&base, &local, &matrix);
+        plutovg_canvas_save(canvas);
+        plutovg_canvas_set_matrix(canvas, &matrix);
+        plutovg_canvas_clip_rect(canvas, 0.0f, 0.0f, (float)swidth, (float)sheight);
+        replayRecord(src, base);
+        plutovg_canvas_restore(canvas);
     }
 
     updateRect(bounds);
@@ -2422,14 +2870,15 @@ bool LayerExDraw::redraw(GdipImage* image)
     // Clear and redraw
     plutovg_canvas_save(canvas);
     plutovg_canvas_reset_matrix(canvas);
+    // A record starts from the colour its last clear() used.
     plutovg_color_t clearColor;
-    plutovg_color_init_argb32(&clearColor, 0);
+    plutovg_color_init_argb32(&clearColor, image->type == 0 ? 0 : image->bgColor);
     plutovg_canvas_set_color(canvas, &clearColor);
     plutovg_canvas_set_operator(canvas, PLUTOVG_OPERATOR_SRC);
     plutovg_canvas_fill_rect(canvas, 0, 0, (float)width, (float)height);
     plutovg_canvas_restore(canvas);
 
-    if (image->_surface)
+    if (image->type == 0 && image->_surface)
     {
         plutovg_canvas_save(canvas);
         plutovg_canvas_set_operator(canvas, PLUTOVG_OPERATOR_SRC_OVER);
@@ -2438,6 +2887,14 @@ bool LayerExDraw::redraw(GdipImage* image)
         plutovg_canvas_fill_rect(canvas, 0, 0, (float)image->width, (float)image->height);
         plutovg_canvas_set_matrix(canvas, &calcTransform);
         plutovg_canvas_restore(canvas);
+    }
+    else if (image->type == 1)
+    {
+        // Replay the record (and its loaded base image) under the view
+        // transform, as GDI+ plays a metafile back.
+        plutovg_matrix_t base;
+        plutovg_matrix_multiply(&base, &image->transMtx, &viewTransform);
+        replayRecord(image, base);
     }
     _this->Update();
     return true;
@@ -2471,23 +2928,52 @@ bool LayerExDraw::redrawRecord()
     return false;
 }
 
+// There is no metafile format here, so this saves the layer image as PNG,
+// written through storage like the other savers, then redraws the record.
 bool LayerExDraw::saveRecord(const tjs_char* filename)
 {
-    if (!surface)
+    if (!surface || !filename)
         return false;
-    // Save to PNG via plutovg
-    // Note: TJS uses UTF-8 char paths
-    ttstr fn(filename);
-    bool ret = plutovg_surface_write_to_png(surface, fn.c_str());
+    struct Sink
+    {
+        tTJSBinaryStream* out;
+        bool ok;
+    } sink = {TVPCreateBinaryStreamForWrite(ttstr(filename), TJS_N("")), true};
+    bool ret = false;
+    if (sink.out)
+    {
+        // The encoder is C code; keep stream exceptions on this side of it.
+        ret = plutovg_surface_write_to_png_stream(
+            surface,
+            [](void* closure, void* data, int size) {
+                Sink* s = static_cast<Sink*>(closure);
+                if (!s->ok)
+                    return;
+                try { s->out->WriteBuffer(data, size); }
+                catch (...) { s->ok = false; }
+            },
+            &sink);
+        ret = ret && sink.ok;
+        delete sink.out;
+    }
     GdipImage* image = getRecordImage();
     if (image)
         delete image;
     return ret;
 }
 
+// Starts a new record holding the image file as its base, as the GDI+
+// version records the image's DrawImage, and shows it on the layer.
 bool LayerExDraw::loadRecord(const tjs_char* filename)
 {
-    return false; // TODO
+    if (!filename)
+        return false;
+    plutovg_surface_t* loaded = loadImage(filename);
+    if (!loaded)
+        return false;
+    createRecord();
+    metaGraphics->_surface = loaded; // the record takes the reference
+    return redraw(metaGraphics);
 }
 
 // ============================================================
@@ -3332,24 +3818,30 @@ struct ncbInvocationPolicy<LayerExDraw>
                 if(!plutovg_surface_is_owned(src->_surface)) return "borrowedSource";
             } else if(src->type==1) {
                 if(src->width<=0 || src->height<=0) return "source";
+                if(src->_surface && !plutovg_surface_is_owned(src->_surface)) return "borrowedSource";
                 if(params[7]->AsReal()==0 || params[8]->AsReal()==0) return "geometry";
                 // No script callback occurs from this probe through capture.
                 // The argument owns the vector for that synchronous interval;
                 // the packet copies all sampled paint before GPU submission.
+                // Same order as drawImageAffine: transMtx, source offset, destination.
                 plutovg_matrix_t matrix,rect,temp;
-                plutovg_matrix_init(&matrix,float(params[2]->AsReal()/params[7]->AsReal()),0,0,
+                plutovg_matrix_init(&temp,float(params[2]->AsReal()/params[7]->AsReal()),0,0,
                     float(params[3]->AsReal()/params[8]->AsReal()),float(params[0]->AsReal()),float(params[1]->AsReal()));
-                plutovg_matrix_init_scale(&rect,float(params[7]->AsReal()/src->GetWidth()),float(params[8]->AsReal()/src->GetHeight()));
-                plutovg_matrix_translate(&rect,float(-params[5]->AsReal()),float(-params[6]->AsReal()));
-                temp=matrix;plutovg_matrix_multiply(&matrix,&temp,&rect);
-                temp=matrix;plutovg_matrix_multiply(&matrix,&temp,&src->transMtx);
-                const float values[]={matrix.a,matrix.b,matrix.c,matrix.d,matrix.e,matrix.f};
-                for(float v:values) if(!std::isfinite(v) || std::abs(v)>1000000.f) return "state";
-                if((std::abs(matrix.a)+std::abs(matrix.c))*200000.f+std::abs(matrix.e)>1000000.f ||
-                   (std::abs(matrix.b)+std::abs(matrix.d))*200000.f+std::abs(matrix.f)>1000000.f) return "state";
+                plutovg_matrix_init_translate(&rect,float(-params[5]->AsReal()),float(-params[6]->AsReal()));
+                plutovg_matrix_multiply(&matrix,&src->transMtx,&rect);
+                rect=matrix;plutovg_matrix_multiply(&matrix,&rect,&temp);
+                const auto bounded=[](const plutovg_matrix_t& m) {
+                    const float values[]={m.a,m.b,m.c,m.d,m.e,m.f};
+                    for(float v:values) if(!std::isfinite(v) || std::abs(v)>1000000.f) return false;
+                    return !((std::abs(m.a)+std::abs(m.c))*200000.f+std::abs(m.e)>1000000.f ||
+                             (std::abs(m.b)+std::abs(m.d))*200000.f+std::abs(m.f)>1000000.f);
+                };
+                if(!bounded(matrix)) return "state";
                 if(src->vectorGraph.size()>TVPLayerSpanCompositeGeometry::MaxSpans) return "budget";
                 for(const auto& info:src->vectorGraph) {
                     if(!info.app || !info.path || pathIsEmpty(info.path)) continue;
+                    plutovg_matrix_t entry;plutovg_matrix_multiply(&entry,&info.matrix,&matrix);
+                    if(!bounded(entry)) return "state";
                     if(!PathData(info.path)) return "path";
                     if(!Paints(info.app)) return "paint";
                 }

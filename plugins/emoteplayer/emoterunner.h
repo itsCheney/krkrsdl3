@@ -10,7 +10,6 @@
 
 #include "emotefile.h"
 #include "emotegeometry.h"
-#include "emoteanimation.h"
 #include "emoteperformance.h"
 
 namespace emoteplayer
@@ -31,14 +30,27 @@ namespace emoteplayer
         float viewH = 0.0f;
     };
     // Shape bounds are exposed to scripts; containment always uses the NDC mesh.
+    // Shapes are hit areas: every shape node records one per frame, but scripts
+    // query them only on touch or layer lookups. The frame's surface chain is
+    // kept and the mesh (a 65-point evaluation for circles) is built on first
+    // use, from the same inputs the eager build used.
     struct emoterect
     {
         std::string label;
-        float left = 0, top = 0, width = 0, height = 0;
         int shapeType = 2;
-        std::vector<EmoteVertex> vertices;
-        std::vector<uint16_t> indices;
-        bool contains(float x, float y) const { return containsMesh(vertices, indices, x, y); }
+        std::vector<emoteRender> methods;
+        float viewW = 0, viewH = 0;
+        // Set by geometry().
+        mutable bool built = false;
+        mutable float left = 0, top = 0, width = 0, height = 0;
+        mutable std::vector<EmoteVertex> vertices;
+        mutable std::vector<uint16_t> indices;
+        const emoterect& geometry() const;
+        bool contains(float x, float y) const
+        {
+            geometry();
+            return containsMesh(vertices, indices, x, y);
+        }
     };
     // 引用自绘制 - 每次绘制创建独立ref，持有node引用+独立状态，避免多次绘制状态重复
     class emotenoderef
@@ -54,6 +66,14 @@ namespace emoteplayer
         bool nearCurrentMesh(float x, float y, float margin) const;
         // 通过 core/render 的 2D 渲染抽象绘制（插件无渲染后端区分）
         bool draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget);
+        // draw() split in two: whether the node draws at all and needs a mask,
+        // its stencil sources drawn into maskTarget (false when nothing was
+        // drawn, so the node is unmasked), and the node itself over an
+        // already prepared mask (nullptr for none).
+        bool canDraw(krkrsdl3::iTVPRenderBackend* renderer) const;
+        bool needsMask() const { return !renderMethod.empty() && renderMethod.front().hasStencil; }
+        bool renderMask(krkrsdl3::iTVPRenderBackend* renderer, void* maskTarget, emotelimit lim);
+        bool drawWithMask(krkrsdl3::iTVPRenderBackend* renderer, void* target, void* mask);
         float getCurrentRenderZ();
 
         // ref
@@ -121,11 +141,19 @@ namespace emoteplayer
         std::vector<uint16_t> _meshIndices;
         bool _useGPUDeform = false;
         std::vector<krkrsdl3::TVPMeshDeformSurface> _gpuDeformSurfaces;
-        // Per-node scratch storage survives frames. Surface matrices are rebuilt
-        // once per mesh update, while index topology is retained until division
-        // or mesh mode actually changes.
-        std::vector<glm::mat4> _surfaceMatrices;
-        emoterect _shapeArea;
+        // Per-node scratch storage survives frames. Index topology is retained
+        // until division or mesh mode actually changes.
+
+        // Depth of the root entry after this node's progress (draw sorting).
+        float _renderZ = 0;
+        // Physics sampling evaluates only nodes that lead to an anchor layer.
+        // Whether this node does, for the anchor set and attachments it was
+        // worked out for.
+        bool _leadsToAnchor = false;
+        std::uint64_t _anchorKey = ~std::uint64_t(0);
+        // A type 12 node's stencil layers, looked up by name on first use.
+        std::vector<emotenoderef*> _stencilRefs;
+        bool _stencilResolved = false;
     };
     // motion辅助类 - 管理按priority排序的nodeList并处理子motion展开
     class emotemotionref
@@ -140,6 +168,9 @@ namespace emoteplayer
 
         float getTickByIdx(int32_t parameterIdx);
         void progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim);
+        // Draws this frame's masks ahead of the canvas pass; draw() then uses
+        // them. Optional: draw() prepares them itself when not called.
+        bool prepareMasks(krkrsdl3::iTVPRenderBackend* renderer, emotelimit lim, void* maskTarget);
         void draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget);
         bool contains(float x, float y, const char* label = nullptr) const;
         // Whether any node drawn in the last frame may have written (x, y).
@@ -151,11 +182,11 @@ namespace emoteplayer
         // its membership/order/Z changes, and is shared by draw and bounds scans.
         const std::vector<emotenoderef*>& drawNodes() const { return _drawNodes; }
         void collectDrawNodes();
-        void recordShape(const emoterect& area);
+        void recordShape(const std::string& label, int shapeType,
+                         const std::vector<emoteRender>& methods, float viewW, float viewH);
 
         emotemotion* currentMotion = nullptr;
         emoteengine* refTop = nullptr;
-        std::vector<emoteRender> renderMethod;
         emotenoderef* parent = nullptr;
         std::string label; // retain the instance label in the drawn snapshot
 
@@ -176,12 +207,16 @@ namespace emoteplayer
         std::vector<emoterect> shapeNodeAreas;
         size_t _shapeCount = 0;
         std::vector<emotenoderef*> _drawNodes, _drawScratch, _drawStack;
+        // Holds the root entry's mask while a type 2 layer is evaluated.
+        std::vector<emotenoderef*> _keptLayers;
+        // Per draw node: the mask prepared for it before the canvas pass.
+        std::vector<void*> _drawMasks;
+        bool _masksPrepared = false;
     };
     // 核心模拟引擎
     class emoteengine
     {
     public:
-        emoteengine();
 	    // 主file/motion
         emotefile* _mainfile = nullptr;
         emotemotion* _mainmotion = nullptr;
@@ -191,8 +226,18 @@ namespace emoteplayer
 
         ~emoteengine();
 
+        // Extra mask targets, so every masked node of a frame can have its
+        // mask drawn before the canvas pass (see emotemotionref::draw). Same
+        // size as the player's own mask target; owned here.
+        void* maskTargetFor(krkrsdl3::iTVPRenderBackend* renderer, size_t index, int width, int height);
+        void releaseMaskTargets();
+        static constexpr size_t kMaxPreparedMasks = 4;
+
         // progress/draw接口(替代_mainMotionRef)
         void progress(float tick, std::vector<emoteRender>& renderList, emotelimit lim);
+        // Call after progress and before clearing the canvas (see
+        // emotemotionref::prepareMasks), with the mask target draw() gets.
+        void prepareMasks(krkrsdl3::iTVPRenderBackend* renderer, emotelimit lim, void* maskTarget);
         void draw(krkrsdl3::iTVPRenderBackend* renderer, void* target, emotelimit lim, void* maskTarget);
         // A monotonic prepared-content generation, independent of diagnostics
         // and clock-call counters. Never resets during the engine lifetime.
@@ -205,38 +250,47 @@ namespace emoteplayer
         // 控制系列
         emotemotion* findmotionByName(const std::string& name);
         void updateEyeControl(float tick, bool isMain = false);
-        std::vector<emotetimeline*> currTimeline;
-        float currStartTick = -1.0f;
-        void startTimeline(float tick, const std::string& name, bool isMain = false, int flags = 0);
+        struct PlayingTimeline
+        {
+            emotetimeline* timeline = nullptr;
+            double startTick = 0;
+            int flags = 0;
+            std::map<std::string, float> initialVariables;
+            EmoteTween blend{1, 1};
+            bool stopWhenBlended = false;
+        };
+        std::vector<PlayingTimeline> currTimeline;
+        double controlTick = 0;
+        void resetControls();
+        void startTimeline(float tick, const std::string& name, int flags = 0);
         void stopTimeline(const std::string& name, bool isMain = false);
         bool checkTimline(const std::string& name, bool& result, bool isMain = false);
         void updateTimelineControl(float tick, bool isMain = false);
+        void blendTimeline(const std::string& name, double ratio, double time, double easing,
+                           bool stopWhenDone = false);
         emoteVar* findVarByName(const std::string& name);
-        void setVariable(const std::string& name, tjs_real value);
+        void setVariable(const std::string& name, tjs_real value, double time = 0, double easing = 0);
         tjs_real getVariable(const std::string& name);
-        void updatePhysics(float tick);
+        bool getControlVariable(const std::string& name, float& value) const;
+        // The same lookup for a name already stripped of its NUL (emoteVar::controlKey).
+        bool getControlVariableByKey(const std::string& key, float& value) const;
+        EmotePhysics physics;
+        bool samplingPhysics = false;
+        void samplePhysics(float tick, const emoteRender& root, emotelimit lim);
+        void recordPhysicsAnchor(const std::string& name, const std::vector<emoteRender>& chain);
+        // Whether physics sampling must evaluate this node: it is an anchor
+        // layer, or one is below it (children or a motion its frames show).
+        bool leadsToPhysicsAnchor(emotenode* node, int depth = 0);
+        std::uint64_t physicsAnchorKey() const { return physics.anchorGeneration * 1024 + _attach.size(); }
+        emotemotionref* physicsSample() const { return _physicsRef.get(); }
+        void updatePhysics(float frames);
+        bool controlsAnimating() const;
+        void skipControls();
+        tTJSVariant serializeControls() const;
+        void unserializeControls(const tTJSVariant& state);
 
-        bool integratedAnimation() const { return _integratedAnimation; }
-        void inheritAnimationMode(bool value) { _integratedAnimation = value; resetAnimationState(); }
-        void ensureAnimationState();
-        void resetAnimationState();
-        void advanceAnimation(double milliseconds, double speedDivisor);
-        void setAnimationVariable(const std::string& name, double value, double time, double easing);
-        void updateAnimationSelectors();
         void recordAnimationProgress(double milliseconds, double tick, bool mainPlaying);
         void recordAnimationDraw();
-        void copyAnimationStateFrom(const emoteengine& source);
-        std::string serializeAnimationState() const;
-        bool restoreAnimationState(const std::string& text);
-        bool getMotionParameter(emotemotion* motion, const std::string& id, double& value);
-        animation::Runtime _animation;
-        double _animationClock = 0;
-        bool _animationPaused = false;
-        // This pointer identifies a binding; the ResourceManager owns its lifetime.
-        emotefile* _animationFile = nullptr;
-        std::vector<eyeControl> _animationEyes;
-        std::vector<eyeControl*> _animationEyeRefs;
-        std::map<emotemotion*, std::map<std::string, std::string>> _animationParameterLabels;
         struct AnimationTrace {
             double inputMS = 0, tick = 0;
             std::uint64_t progressVersion = 0, drawVersion = 0;
@@ -248,14 +302,22 @@ namespace emoteplayer
         std::uint64_t _animationProgressVersion = 0, _animationDrawVersion = 0;
         std::uint64_t _animationDrawCalls = 0, _animationRepeatedDraws = 0;
         std::uint64_t _animationLogAt = 0;
-    private:
-        bool _integratedAnimation = false;
-    public:
 
         // Each draw owns its geometry, so shared players can render to multiple layers.
         std::shared_ptr<emotemotionref> _mainMotionRef;
         // 三重签名缓存变量数据
         std::map<std::string, tjs_real> _varCache;
+    private:
+        // Physics samples reuse one runtime tree instead of building it per tick.
+        std::unique_ptr<emotemotionref> _physicsRef;
+        std::vector<emoteRender> _physicsChain;
+        std::vector<void*> _maskPool;
+        krkrsdl3::iTVPRenderBackend* _maskPoolRenderer = nullptr;
+        int _maskPoolWidth = 0, _maskPoolHeight = 0;
+        std::map<std::string, float> baseVariables, controlVariables;
+        std::map<std::string, EmoteTween> variableTweens;
+        std::vector<eyeControl> eyes;
+        std::default_random_engine random;
     };
     // A snapshot of one draw: queries never rebuild geometry or advance animation.
     struct EmoteHitFrame

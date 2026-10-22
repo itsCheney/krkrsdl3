@@ -636,13 +636,22 @@ void TVPDepartTexture(TVPSprite* sp)
         renderTexture.end());
 }
 
-// 统一 letterbox 计算：保持宽高比地缩放并居中（所有后端共用同一套行为）
-static void TVPCalcLetterbox(TVPSprite* sp, int winWidth, int winHeight)
+// 统一 letterbox 计算：保持宽高比地缩放并居中（所有后端共用同一套行为）。
+// 拉伸模式把比 16:9 窄的横屏画面（如 4:3）横向拉伸到 16:9，再同样居中留黑边；
+// 16:9 及更宽的画面、竖屏画面不变。
+static void TVPCalcLetterbox(TVPSprite* sp, int winWidth, int winHeight, bool stretch)
 {
-    float currScale = std::min(((float)winWidth) / sp->width, ((float)winHeight) / sp->height);
-    sp->scale = currScale;
-    sp->xPos = (winWidth - currScale * sp->width) / 2.0f;
-    sp->yPos = (winHeight - currScale * sp->height) / 2.0f;
+    if (sp->width <= 0 || sp->height <= 0)
+        return;
+    float width = (float)sp->width;
+    const float height = (float)sp->height;
+    if (stretch && width >= height && width * 9.0f < height * 16.0f)
+        width = height * 16.0f / 9.0f;
+    const float fit = std::min(((float)winWidth) / width, ((float)winHeight) / height);
+    sp->scale = fit * width / sp->width;
+    sp->scaleY = fit;
+    sp->xPos = (winWidth - fit * width) / 2.0f;
+    sp->yPos = (winHeight - fit * height) / 2.0f;
 }
 
 void TVPRenderOnce(int winWidth, int winHeight)
@@ -659,17 +668,9 @@ void TVPRenderOnce(int winWidth, int winHeight)
     TVPSprite* retSpr = KRKR_Get_Current_Sprite();
     if (retSpr && retSpr->texture)
     {
-        if (stretch)
-        {
-            backend->DrawWindowTexture(retSpr->texture, 0.0f, 0.0f,
-                                       (float)winWidth, (float)winHeight);
-        }
-        else
-        {
-            TVPCalcLetterbox(retSpr, winWidth, winHeight);
-            backend->DrawWindowTexture(retSpr->texture, retSpr->xPos, retSpr->yPos,
-                                       retSpr->scale * retSpr->width, retSpr->scale * retSpr->height);
-        }
+        TVPCalcLetterbox(retSpr, winWidth, winHeight, stretch);
+        backend->DrawWindowTexture(retSpr->texture, retSpr->xPos, retSpr->yPos,
+                                   retSpr->scale * retSpr->width, retSpr->scaleY * retSpr->height);
     }
 
     // 绘制 overlay
@@ -682,17 +683,9 @@ void TVPRenderOnce(int winWidth, int winHeight)
         if (texture->isVisible && texture->type == 2 && texture->texture)
         {
             overlayDrawn++;
-            if (stretch)
-            {
-                backend->DrawWindowTexture(texture->texture, 0.0f, 0.0f,
-                                           (float)winWidth, (float)winHeight);
-            }
-            else
-            {
-                TVPCalcLetterbox(texture, winWidth, winHeight);
-                backend->DrawWindowTexture(texture->texture, texture->xPos, texture->yPos,
-                                           texture->scale * texture->width, texture->scale * texture->height);
-            }
+            TVPCalcLetterbox(texture, winWidth, winHeight, stretch);
+            backend->DrawWindowTexture(texture->texture, texture->xPos, texture->yPos,
+                                       texture->scale * texture->width, texture->scaleY * texture->height);
         }
     }
     TVPReportCompositorFrame((int)renderTexture.size(), overlayCandidates, overlayDrawn,

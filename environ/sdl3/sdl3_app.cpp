@@ -348,12 +348,15 @@ struct Finger
 
     Finger() : id(0), x(0), y(0), startX(0), startY(0), downTime(0), active(false), moved(false) {}
 };
+// How far a finger travels, in points, before it stops being a tap and
+// becomes a drag. Kirikiroid2 uses about a tenth of an inch.
+static const float DRAG_THRESHOLD_POINTS = 12.0f;
 static TouchState _state;
 static std::map<SDL_FingerID, Finger> fingers;
 static float rightClickX, rightClickY;
 static Uint64 rightClickStartTime;
 static const Uint32 RIGHT_CLICK_CONFIRM_DELAY = 150;
-void sendMouseEvent(int button, int eventType, float pX, float pY);
+void sendMouseEvent(int button, int eventType, float pX, float pY, bool click = true);
 void sendMouseMotion(float pX, float pY);
 void normalizedTouchToDrawable(float pX, float pY, int& pixelX, int& pixelY)
 {
@@ -366,6 +369,12 @@ void normalizedTouchToDrawable(float pX, float pY, int& pixelX, int& pixelY)
 }
 void handleFingerDown(const SDL_TouchFingerEvent& e)
 {
+    if (_state == STATE_SINGLE_FINGER && fingers.size() == 1 && fingers.begin()->second.moved)
+    {
+        // A drag holds the left button; extra fingers do not turn it into
+        // a right click or a menu halfway through.
+        return;
+    }
     Finger f;
     f.id = e.fingerID;
     f.x = f.startX = e.x;
@@ -416,8 +425,16 @@ void handleFingerUp(const SDL_TouchFingerEvent& e)
         if (_state == STATE_SINGLE_FINGER)
         {
             if (!f.moved)
+            {
                 sendMouseEvent(SDL_BUTTON_LEFT, SDL_EVENT_MOUSE_BUTTON_DOWN, f.x, f.y);
-            sendMouseEvent(SDL_BUTTON_LEFT, SDL_EVENT_MOUSE_BUTTON_UP, f.x, f.y);
+                sendMouseEvent(SDL_BUTTON_LEFT, SDL_EVENT_MOUSE_BUTTON_UP, f.x, f.y);
+            }
+            else
+            {
+                // The end of a drag is not a click, so swiping through a
+                // backlog or across the screen does not advance text.
+                sendMouseEvent(SDL_BUTTON_LEFT, SDL_EVENT_MOUSE_BUTTON_UP, f.x, f.y, false);
+            }
         }
         else if (_state == STATE_MULTI_FINGER)
         {
@@ -438,26 +455,37 @@ void handleFingerMotion(const SDL_TouchFingerEvent& e)
 
     Finger& f = it->second;
 
-    // 检查是否移动
-    float dx = e.x - f.startX;
-    float dy = e.y - f.startY;
-    float moveDist = dx * dx + dy * dy;
+    // 检查是否移动（以点为单位，与屏幕尺寸无关）
+    int windowWidth = 1, windowHeight = 1;
+    SDL_GetWindowSize(tvp_window, &windowWidth, &windowHeight);
+    float dx = (e.x - f.startX) * windowWidth;
+    float dy = (e.y - f.startY) * windowHeight;
 
-    if (moveDist > 0.0001f)
+    if (!f.moved && dx * dx + dy * dy > DRAG_THRESHOLD_POINTS * DRAG_THRESHOLD_POINTS)
     { // 移动阈值
         f.moved = true;
-        f.x = e.x;
-        f.y = e.y;
-
         if (_state == STATE_SINGLE_FINGER)
         {
-            // 单指移动，发送鼠标移动
+            // Like Kirikiroid2, a moving finger is a mouse drag: press where
+            // it landed, then follow it. Backlogs, scroll bars and sliders
+            // handle the drag themselves.
+            sendMouseMotion(f.startX, f.startY);
+            sendMouseEvent(SDL_BUTTON_LEFT, SDL_EVENT_MOUSE_BUTTON_DOWN, f.startX, f.startY);
+        }
+    }
+    if (f.moved)
+    {
+        f.x = e.x;
+        f.y = e.y;
+        if (_state == STATE_SINGLE_FINGER)
+        {
+            // 单指拖动，按住左键移动
             sendMouseMotion(f.x, f.y);
         }
     }
 }
 
-void sendMouseEvent(int button, int eventType, float pX, float pY)
+void sendMouseEvent(int button, int eventType, float pX, float pY, bool click)
 {
     int pixelX = 0, pixelY = 0;
     normalizedTouchToDrawable(pX, pY, pixelX, pixelY);
@@ -486,7 +514,7 @@ void sendMouseEvent(int button, int eventType, float pX, float pY)
         }
         else if (eventType == SDL_EVENT_MOUSE_BUTTON_UP)
         {
-            krkrsdl3::KRKR_Trig_MouseUp(tmp, pixelX,pixelY);
+            krkrsdl3::KRKR_Trig_MouseUp(tmp, pixelX, pixelY, click);
         }
     }
 }

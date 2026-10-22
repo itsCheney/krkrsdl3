@@ -585,7 +585,8 @@ public:
     plutovg_matrix_t transMtx;
     tjs_int width = 0, height = 0;
 
-    // Bitmap data
+    // Bitmap data; in a record, the base image loadRecord loaded, drawn
+    // before vectorGraph
     plutovg_surface_t* _surface; // owned (refcounted)
 
     // Vector graph data
@@ -593,6 +594,9 @@ public:
     {
         Appearance* app;
         plutovg_path_t* path;
+        // The layer transform the entry was drawn with; replay applies it
+        // before the image's own transMtx.
+        plutovg_matrix_t matrix{1, 0, 0, 1, 0, 0};
     };
     tjs_uint32 bgColor;
     std::vector<Info> vectorGraph;
@@ -898,9 +902,12 @@ public:
     void translateTransform(tjs_real dx, tjs_real dy);
 
 protected:
+    static void unionBounds(RectF& bounds, const plutovg_rect_t& rect, const plutovg_matrix_t& matrix);
     RectF getPathExtents(const Appearance* app, const plutovg_path_t* path);
     void draw(const SoftPen* pen, const plutovg_matrix_t* matrix, const plutovg_path_t* path);
     void fill(const SoftBrush* brush, const plutovg_matrix_t* matrix, const plutovg_path_t* path);
+    void recordPath(const Appearance* app, const plutovg_path_t* path);
+    void replayRecord(const GdipImage* image, const plutovg_matrix_t& base);
     RectF _drawPath(const Appearance* app, const plutovg_path_t* path);
     void getGlyphOutline(const FontInfo* font, PointF& offset, plutovg_path_t* path,
                          tjs_uint glyph);

@@ -22,18 +22,54 @@ namespace TJS
 //---------------------------------------------------------------------------
 // simple object heap manager
 //---------------------------------------------------------------------------
-static bool _tjsForceShutdown = false;
 static tTJSObjectPool<tTJSCustomObject> _allTJSObjects;
+static int _tjsEngineTeardownDepth = 0;
+void TJSBeginEngineTeardown()
+{
+    ++_tjsEngineTeardownDepth;
+}
+void TJSEndEngineTeardown()
+{
+    --_tjsEngineTeardownDepth;
+}
+template <typename Step>
+static void RunFinalizeStep(Step&& step)
+{
+    if (!_tjsEngineTeardownDepth)
+        return step();
+    try
+    {
+        step();
+    }
+    catch (...)
+    {
+    }
+}
 void TJSCompactObjectHeap()
 {
     // TODO
 }
 void TJSClearObjectHeap()
 {
-    _tjsForceShutdown = true;
-    _allTJSObjects.forEach([](tTJSCustomObject* obj) { delete obj; });
+    // Objects left in the pool here are kept alive by reference cycles or by
+    // references the engine never dropped. Deleting each of them outright freed
+    // objects and native instances that others still pointed at. Pin
+    // everything, drop members and native instances while nothing can be
+    // freed, then let ordinary reference counting free what that released.
+    std::vector<tTJSCustomObject*> objs;
+    _allTJSObjects.forEach([&objs](tTJSCustomObject* obj) {
+        obj->AddRef();
+        objs.push_back(obj);
+    });
+    for (tTJSCustomObject* obj : objs)
+        obj->ClearForShutdown();
+    for (tTJSCustomObject* obj : objs)
+        obj->Release();
+
+    // Whatever is still alive is referenced from outside TJS; it is leaked
+    // rather than freed under its holder.
+    _allTJSObjects.forEach([](tTJSCustomObject* obj) { obj->DetachFromObjectHeap(); });
     _allTJSObjects.clear();
-    _tjsForceShutdown = false;
 }
 
 //---------------------------------------------------------------------------
@@ -394,56 +430,42 @@ tTJSCustomObject::tTJSCustomObject(tjs_int hashbits)
 //---------------------------------------------------------------------------
 tTJSCustomObject::~tTJSCustomObject()
 {
-    if (!_tjsForceShutdown) // TODO instance管理以后再说
+    for (tjs_int i = TJS_MAX_NATIVE_CLASS - 1; i >= 0; i--)
     {
-        for (tjs_int i = TJS_MAX_NATIVE_CLASS - 1; i >= 0; i--)
+        if (ClassIDs[i] != -1)
         {
-            if (ClassIDs[i] != -1)
-            {
-                if (ClassInstances[i])
-                    ClassInstances[i]->Destruct();
-            }
+            if (ClassInstances[i])
+                ClassInstances[i]->Destruct();
         }
+    }
 
-        delete[] Symbols;
-    }
-    else
-    {
-        for (tjs_int i = 0; i < TJS_MAX_NATIVE_CLASS; i++)
-        {
-            if (ClassIDs[i] != -1 && ClassInstances[i])
-            {
-                delete ClassInstances[i];
-                ClassInstances[i] = nullptr;
-                ClassIDs[i] = -1;
-            }
-        }
-        if (Symbols)
-        {
-            tTJSSymbolData* lv1 = Symbols;
-            tTJSSymbolData* lv1lim = lv1 + HashSize;
-            for (; lv1 < lv1lim; lv1++)
-            {
-                tTJSSymbolData* d = lv1->Next;
-                while (d)
-                {
-                    tTJSSymbolData* nextd = d->Next;
-                    delete d;
-                    d = nextd;
-                }
-            }
-            delete[] Symbols;
-            Symbols = nullptr;
-        }
-    }
+    delete[] Symbols;
 
     if (TJSObjectHashMapEnabled())
         TJSRemoveObjectHashRecord(this);
 
-    if (!_tjsForceShutdown)
+    _allTJSObjects.unregisterObject(this->GCIndex);
+}
+//---------------------------------------------------------------------------
+void tTJSCustomObject::ClearForShutdown()
+{
+    // Skip "finalize" when the last reference goes; the script engine is
+    // already shutting down.
+    IsInvalidated = true;
+    // Native instances are dropped without being destroyed. Their destructors
+    // expect Invalidate() and live host subsystems, both gone by now.
+    for (tjs_int i = 0; i < TJS_MAX_NATIVE_CLASS; i++)
     {
-        _allTJSObjects.unregisterObject(this->GCIndex);
+        ClassInstances[i] = nullptr;
+        ClassIDs[i] = -1;
     }
+    if (Symbols)
+        DeleteAllMembers();
+}
+//---------------------------------------------------------------------------
+void tTJSCustomObject::DetachFromObjectHeap()
+{
+    GCIndex = (tjs_size)-1;
 }
 //---------------------------------------------------------------------------
 void tTJSCustomObject::_Finalize(void)
@@ -473,7 +495,9 @@ void tTJSCustomObject::Finalize(void)
     // call this object's "finalize"
     if (CallFinalize)
     {
-        FuncCall(0, finalize_name.c_str(), finalize_name.GetHint(), NULL, 0, NULL, this);
+        RunFinalizeStep([&] {
+            FuncCall(0, finalize_name.c_str(), finalize_name.GetHint(), NULL, 0, NULL, this);
+        });
     }
 
     for (tjs_int i = TJS_MAX_NATIVE_CLASS - 1; i >= 0; i--)
@@ -481,7 +505,7 @@ void tTJSCustomObject::Finalize(void)
         if (ClassIDs[i] != -1)
         {
             if (ClassInstances[i])
-                ClassInstances[i]->Invalidate();
+                RunFinalizeStep([&] { ClassInstances[i]->Invalidate(); });
         }
     }
     DeleteAllMembers();

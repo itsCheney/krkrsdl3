@@ -1,8 +1,10 @@
 #include "SWRenderBackend.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 #include "PlatformView.h"
 
@@ -28,6 +30,16 @@ struct ColorRGBA
     uint8_t r, g, b, a;
 };
 
+// Preserve the division's float result for all byte values; a reciprocal
+// multiplication can round differently. The table is portable and read-only.
+static constexpr auto NormalizedChannels = []() constexpr
+{
+    std::array<float, 256> values{};
+    for (size_t i = 0; i < values.size(); ++i)
+        values[i] = (float)i / 255.0f;
+    return values;
+}();
+
 static inline uint8_t Clampf(float v)
 {
     if (v < 0)
@@ -37,49 +49,127 @@ static inline uint8_t Clampf(float v)
     return (uint8_t)v;
 }
 
-// 与迁移前 emoteplayer 的 blendPixels 语义一致
-static ColorRGBA BlendPixels(ColorRGBA src,
-                             ColorRGBA dst,
-                             int mode,
-                             float opa,
-                             ColorRGBA uniformColor = {0, 0, 0, 0})
+// Opacity is invalidated by writable locks and every render operation.
+static bool IsOpaqueBuffer(const std::vector<uint8_t>& pixels)
 {
-    float sa = src.a / 255.0f * opa;
-    float da = dst.a / 255.0f;
+    for (size_t i = 3; i < pixels.size(); i += 4)
+        if (pixels[i] != 255)
+            return false;
+    return true;
+}
+
+// Like InternalAffineBlt, clip once per scanline before transferring a span.
+// Integer pixel vertices within this range keep the old float edge stepping
+// exact, including its inclusive shared edges. Other geometry retains that
+// stepping rather than changing its coverage/texture rounding.
+static bool IsIntegralVertex(float value)
+{
+    return value >= 0.0f && value <= 2048.0f && value == std::floor(value);
+}
+
+static void ClipIntegralEdge(
+    int64_t slope, int64_t value, int origin, int64_t& first, int64_t& last)
+{
+    if (slope > 0)
+    {
+        const int64_t numerator = -value;
+        const int64_t offset = numerator / slope + (numerator % slope > 0);
+        first = std::max(first, origin + offset);
+    }
+    else if (slope < 0)
+    {
+        const int64_t denominator = -slope;
+        const int64_t offset = value / denominator - (value % denominator < 0);
+        last = std::min(last, origin + offset);
+    }
+    else if (value < 0)
+        first = last + 1;
+}
+
+static void ClipFloatEdge(
+    float slope, float value, int origin, int length, int64_t& first, int64_t& last)
+{
+    if (slope == 0.0f || (slope > 0.0f && value >= 0.0f))
+    {
+        if (value < 0.0f)
+            first = last + 1;
+        return;
+    }
+    if (slope < 0.0f && value < 0.0f)
+    {
+        first = last + 1;
+        return;
+    }
+    // Adding a constant is monotonic. A conservative rounding-error bound lets
+    // us accept/reject an entire edge without walking it. Near its crossing we
+    // use the original repeated float additions, so fractional coverage stays
+    // byte-identical too; there is no fixed-point conversion of the geometry.
+    const double n = length - 1;
+    const double nu = n * std::numeric_limits<float>::epsilon();
+    if (nu < 0.5)
+    {
+        const double end = (double)value + n * slope;
+        const double error =
+            nu / (1.0 - nu) * (std::abs((double)value) + n * std::abs((double)slope)) +
+            n * std::numeric_limits<float>::min();
+        if (slope < 0.0f && end > error)
+            return;
+        if (slope > 0.0f && end < -error)
+        {
+            first = last + 1;
+            return;
+        }
+    }
+    int offset = 0;
+    if (slope > 0.0f)
+    {
+        while (offset < length && value < 0.0f)
+        {
+            value += slope;
+            ++offset;
+        }
+        first = std::max(first, (int64_t)origin + offset);
+    }
+    else
+    {
+        while (offset < length && value >= 0.0f)
+        {
+            value += slope;
+            ++offset;
+        }
+        last = std::min(last, (int64_t)origin + offset - 1);
+    }
+}
+
+// 与迁移前 emoteplayer 的 blendPixels 语义一致
+static ColorRGBA BlendPixels(
+    ColorRGBA src, ColorRGBA dst, int mode, float opa, ColorRGBA uniformColor = {0, 0, 0, 0})
+{
+    float sa = NormalizedChannels[src.a] * opa;
+    float da = NormalizedChannels[dst.a];
 
     if (sa <= 0.001f)
         return dst;
-    if (sa >= 0.999f && mode == 0)
+    // The default straight-alpha modes also reduce exactly to a source copy
+    // for an opaque source at full opacity. Avoid their per-channel divisions.
+    if ((mode == 0 && sa >= 0.999f) || (src.a == 255 && opa == 1.0f && mode != 1 && mode != 3 &&
+                                        mode != 4 && mode != 6 && mode != 21))
         return src;
 
     if (mode == 21)
     {
         src = uniformColor;
         src.a = (uint8_t)(uniformColor.a * opa);
-        sa = src.a / 255.0f;
+        sa = NormalizedChannels[src.a];
     }
-    float sr = src.r / 255.0f, sg = src.g / 255.0f, sb = src.b / 255.0f;
-    float dr = dst.r / 255.0f, dg = dst.g / 255.0f, db = dst.b / 255.0f;
+    float sr = NormalizedChannels[src.r], sg = NormalizedChannels[src.g],
+          sb = NormalizedChannels[src.b];
+    float dr = NormalizedChannels[dst.r], dg = NormalizedChannels[dst.g],
+          db = NormalizedChannels[dst.b];
     float outR = 0, outG = 0, outB = 0, outA = 0;
 
     switch (mode)
     {
-        case 0:
-            outA = sa + da * (1.0f - sa);
-            if (outA > 0.001f)
-            {
-                outR = (sr * sa + dr * da * (1.0f - sa)) / outA;
-                outG = (sg * sa + dg * da * (1.0f - sa)) / outA;
-                outB = (sb * sa + db * da * (1.0f - sa)) / outA;
-            }
-            else
-            {
-                outR = sr;
-                outG = sg;
-                outB = sb;
-            }
-            outA = sa + da;
-            break;
         case 1:
         case 4:
             outR = sr * dr + dr;
@@ -89,19 +179,28 @@ static ColorRGBA BlendPixels(ColorRGBA src,
             break;
         case 3:
             outR = sr * sa + dr * (1 - sa);
-            outG = sg * sa + dg * (1 - sg);
-            outB = sb * sa + db * (1 - sb);
+            outG = sg * sa + dg * (1 - sa);
+            outB = sb * sa + db * (1 - sa);
             outA = std::max(sa, da);
             break;
         case 6:
             break;
+        case 0:
         default:
             outA = sa + da * (1.0f - sa);
             if (outA > 0.001f)
             {
-                outR = (sr * sa + dr * da * (1.0f - sa)) / outA;
-                outG = (sg * sa + dg * da * (1.0f - sa)) / outA;
-                outB = (sb * sa + db * da * (1.0f - sa)) / outA;
+                outR = sr * sa + dr * da * (1.0f - sa);
+                outG = sg * sa + dg * da * (1.0f - sa);
+                outB = sb * sa + db * da * (1.0f - sa);
+                // Opaque destinations commonly make the divisor exactly one.
+                // Skip those divisions without using an approximate reciprocal.
+                if (outA != 1.0f)
+                {
+                    outR /= outA;
+                    outG /= outA;
+                    outB /= outA;
+                }
             }
             else
             {
@@ -310,6 +409,7 @@ void SWRenderBackend::ClearTarget(bool clearColor)
     // 软件后端无深度缓冲：仅 clearColor=true 时清屏
     if (!currentTarget_ || !clearColor)
         return;
+    currentTarget_->opaque = false;
     std::memset(currentTarget_->pixels.data(), 0, currentTarget_->pixels.size());
 }
 
@@ -318,6 +418,7 @@ uint8_t* SWRenderBackend::LockTarget(void* handle, int& pitch)
     Target* target = FindTarget(handle);
     if (!target)
         return nullptr;
+    target->opaque = false;
     pitch = target->width * 4;
     return target->pixels.data();
 }
@@ -347,6 +448,7 @@ void SWRenderBackend::UpdateTargetTexture(void* handle,
         std::memcpy(target->pixels.data() + (size_t)y * target->width * 4,
                     pixels + (size_t)y * pitch, (size_t)width * 4);
     }
+    target->opaque = IsOpaqueBuffer(target->pixels);
 }
 
 //---------------------------------------------------------------------------
@@ -375,6 +477,7 @@ void SWRenderBackend::UpdateTexture(void* handle, const uint8_t* pixels, int wid
         std::memcpy(texture->pixels.data() + (size_t)y * texture->width * 4,
                     pixels + (size_t)y * pitch, (size_t)width * 4);
     }
+    texture->opaque = IsOpaqueBuffer(texture->pixels);
 }
 
 uint8_t* SWRenderBackend::LockTexture(void* handle, int& pitch)
@@ -382,6 +485,7 @@ uint8_t* SWRenderBackend::LockTexture(void* handle, int& pitch)
     Texture* texture = FindTexture(handle);
     if (!texture)
         return nullptr;
+    texture->opaque = false;
     pitch = texture->width * 4;
     return texture->pixels.data();
 }
@@ -449,6 +553,8 @@ void SWRenderBackend::DrawMesh(const float* vertices,
     const int texH = texture ? texture->height : targetAsTexture->height;
     if (!texData)
         return;
+    const bool sourceOpaque = texture ? texture->opaque : targetAsTexture->opaque;
+    currentTarget_->opaque = false;
     const bool hasStencil = (maskRowBase != nullptr);
     const int pitch = width;
 
@@ -456,6 +562,9 @@ void SWRenderBackend::DrawMesh(const float* vertices,
                               (uint8_t)(uniformColor_[2] * 255), (uint8_t)(uniformColor_[3] * 255)};
     const float whiteModulation[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     const float* modulation = colorModulation ? colorModulation : whiteModulation;
+    const bool modulated = modulation[0] != 1.0f || modulation[1] != 1.0f ||
+                           modulation[2] != 1.0f || modulation[3] != 1.0f;
+    const int blendMode = blendMode_;
 
     for (int idx = 0; idx + 2 < indexCount; idx += 3)
     {
@@ -507,54 +616,123 @@ void SWRenderBackend::DrawMesh(const float* vertices,
         float f01 = a01 * minX + b01 * minY + c01;
         float f12 = a12 * minX + b12 * minY + c12;
         float f20 = a20 * minX + b20 * minY + c20;
-        float df01_dx = a01, df12_dx = a12, df20_dx = a20;
         float df01_dy = b01, df12_dy = b12, df20_dy = b20;
 
-        int texW_1 = texW - 1, texH_1 = texH - 1;
-
-        for (int py = minY; py <= maxY; py++)
+        const int texW_1 = texW - 1, texH_1 = texH - 1;
+        const bool integralEdges = IsIntegralVertex(x0) && IsIntegralVertex(y0) &&
+                                   IsIntegralVertex(x1) && IsIntegralVertex(y1) &&
+                                   IsIntegralVertex(x2) && IsIntegralVertex(y2);
+        const bool separable = du_dy == 0.0f && dv_dx == 0.0f;
+        struct CopyRun
         {
-            float f01_row = f01, f12_row = f12, f20_row = f20;
-            float tu_row = tu0, tv_row = tv0;
+            int first, end, source;
+        };
+        std::vector<CopyRun> copyRuns;
+        const bool copySpan = separable && sourceOpaque && !hasStencil && !modulated &&
+                              opacity == 1.0f && blendMode != 1 && blendMode != 3 &&
+                              blendMode != 4 && blendMode != 6 && blendMode != 21 &&
+                              targetAsTexture != currentTarget_;
+        if (separable)
+        {
+            sampleColumns_.resize(maxX - minX + 1);
+            float tu = tu0;
+            for (int px = minX; px <= maxX; ++px, tu += du_dx)
+                sampleColumns_[px - minX] =
+                    std::max(0, std::min(texW_1, (int)(tu * texW_1 + 0.5f)));
+            if (copySpan)
+                for (int first = minX; first <= maxX;)
+                {
+                    int end = first + 1;
+                    while (end <= maxX &&
+                           sampleColumns_[end - minX] == sampleColumns_[end - minX - 1] + 1)
+                        ++end;
+                    copyRuns.push_back({first, end, sampleColumns_[first - minX]});
+                    if (copyRuns.size() > 32)
+                        break;
+                    first = end;
+                }
+        }
 
+        for (int py = minY; py <= maxY; ++py)
+        {
+            int64_t first = minX, last = maxX;
+            const int sign = ccw ? 1 : -1;
+            if (integralEdges)
+            {
+                ClipIntegralEdge((int64_t)a01 * sign, (int64_t)f01 * sign, minX, first, last);
+                ClipIntegralEdge((int64_t)a12 * sign, (int64_t)f12 * sign, minX, first, last);
+                ClipIntegralEdge((int64_t)a20 * sign, (int64_t)f20 * sign, minX, first, last);
+            }
+            else
+            {
+                const int length = maxX - minX + 1;
+                ClipFloatEdge(a01 * sign, f01 * sign, minX, length, first, last);
+                ClipFloatEdge(a12 * sign, f12 * sign, minX, length, first, last);
+                ClipFloatEdge(a20 * sign, f20 * sign, minX, length, first, last);
+            }
             ColorRGBA* row = (ColorRGBA*)(dst + (size_t)py * pitch);
             const uint32_t* maskRow = maskRowBase ? maskRowBase + (size_t)py * width : nullptr;
-
-            for (int px = minX; px <= maxX; px++)
+            const int rowY = std::max(0, std::min(texH_1, (int)(tv0 * texH_1 + 0.5f)));
+            if (copySpan)
             {
-                bool inside = ccw ? (f01_row >= 0 && f12_row >= 0 && f20_row >= 0)
-                                  : (f01_row <= 0 && f12_row <= 0 && f20_row <= 0);
-                if (inside)
+                const ColorRGBA* sourceRow = texData + (size_t)rowY * texW;
+                // Decimated/reversed mappings may contain many one-pixel runs.
+                // Gather those directly instead of issuing tiny memcpy calls.
+                if (copyRuns.size() > 32)
                 {
-                    int tx = (int)(tu_row * texW_1 + 0.5f);
-                    int ty = (int)(tv_row * texH_1 + 0.5f);
-                    if (tx < 0)
-                        tx = 0;
-                    else if (tx > texW_1)
-                        tx = texW_1;
-                    if (ty < 0)
-                        ty = 0;
-                    else if (ty > texH_1)
-                        ty = texH_1;
-
+                    for (int64_t px = first; px <= last; ++px)
+                        row[px] = sourceRow[sampleColumns_[px - minX]];
+                }
+                else
+                    for (const auto& run : copyRuns)
+                    {
+                        const int64_t begin = std::max(first, (int64_t)run.first);
+                        const int64_t end = std::min(last + 1, (int64_t)run.end);
+                        if (begin < end)
+                            std::memcpy(row + begin, sourceRow + run.source + begin - run.first,
+                                        (size_t)(end - begin) * sizeof(ColorRGBA));
+                    }
+            }
+            else
+            {
+                float tu_row = tu0, tv_row = tv0;
+                // Preserve repeated-addition rounding when entering a clipped span.
+                if (!separable && first <= last)
+                    for (int px = minX; px < first; ++px)
+                    {
+                        tu_row += du_dx;
+                        tv_row += dv_dx;
+                    }
+                for (int64_t px = first; px <= last; ++px)
+                {
                     if (!hasStencil || ((maskRow[px] >> 24) & 0xFF) >= 128)
                     {
+                        const int tx =
+                            separable
+                                ? sampleColumns_[px - minX]
+                                : std::max(0, std::min(texW_1, (int)(tu_row * texW_1 + 0.5f)));
+                        const int ty =
+                            separable
+                                ? rowY
+                                : std::max(0, std::min(texH_1, (int)(tv_row * texH_1 + 0.5f)));
                         ColorRGBA src = texData[(size_t)ty * texW + tx];
-                        src.r = static_cast<uint8_t>(src.r * modulation[0] + 0.5f);
-                        src.g = static_cast<uint8_t>(src.g * modulation[1] + 0.5f);
-                        src.b = static_cast<uint8_t>(src.b * modulation[2] + 0.5f);
-                        src.a = static_cast<uint8_t>(src.a * modulation[3] + 0.5f);
-                        row[px] = BlendPixels(src, row[px], blendMode_, opacity, uniformColor);
+                        if (modulated)
+                        {
+                            src.r = static_cast<uint8_t>(src.r * modulation[0] + 0.5f);
+                            src.g = static_cast<uint8_t>(src.g * modulation[1] + 0.5f);
+                            src.b = static_cast<uint8_t>(src.b * modulation[2] + 0.5f);
+                            src.a = static_cast<uint8_t>(src.a * modulation[3] + 0.5f);
+                        }
+                        if (src.a != 0)
+                            row[px] = BlendPixels(src, row[px], blendMode, opacity, uniformColor);
+                    }
+                    if (!separable)
+                    {
+                        tu_row += du_dx;
+                        tv_row += dv_dx;
                     }
                 }
-
-                f01_row += df01_dx;
-                f12_row += df12_dx;
-                f20_row += df20_dx;
-                tu_row += du_dx;
-                tv_row += dv_dx;
             }
-
             f01 += df01_dy;
             f12 += df12_dy;
             f20 += df20_dy;
@@ -586,15 +764,8 @@ void SWRenderBackend::LayerSetBlend(int method, float opacity, const float* unif
     }
 }
 
-void SWRenderBackend::LayerDrawRect(void* handle,
-                                    float x,
-                                    float y,
-                                    float w,
-                                    float h,
-                                    float u0,
-                                    float v0,
-                                    float u1,
-                                    float v1)
+void SWRenderBackend::LayerDrawRect(
+    void* handle, float x, float y, float w, float h, float u0, float v0, float u1, float v1)
 {
     if (!currentTarget_ || w <= 0.0f || h <= 0.0f)
         return;
@@ -604,8 +775,8 @@ void SWRenderBackend::LayerDrawRect(void* handle,
     if (!texture && !targetAsTexture)
         return;
 
-    const uint32_t* texData = (const uint32_t*)(texture ? texture->pixels.data()
-                                                        : targetAsTexture->pixels.data());
+    const uint32_t* texData =
+        (const uint32_t*)(texture ? texture->pixels.data() : targetAsTexture->pixels.data());
     const int texW = texture ? texture->width : targetAsTexture->width;
     const int texH = texture ? texture->height : targetAsTexture->height;
     if (!texData || texW <= 0 || texH <= 0)
@@ -614,6 +785,9 @@ void SWRenderBackend::LayerDrawRect(void* handle,
     const int width = currentTarget_->width;
     const int height = currentTarget_->height;
     uint32_t* dst = (uint32_t*)currentTarget_->pixels.data();
+
+    const bool sourceOpaque = texture ? texture->opaque : targetAsTexture->opaque;
+    currentTarget_->opaque = false;
 
     // 目标矩形（与软件 RenderManager 的 OperateRect 一样逐像素处理）
     int x0 = (int)std::floor(x);
@@ -630,9 +804,35 @@ void SWRenderBackend::LayerDrawRect(void* handle,
         y1 = height;
     if (x0 >= x1 || y0 >= y1)
         return;
+    const bool fillsOpaqueTarget =
+        x0 == 0 && y0 == 0 && x1 == width && y1 == height &&
+        ((layerMethod_ == LBM_COPY && sourceOpaque) || layerMethod_ == LBM_COPYOPAQUE);
+
+    // An unscaled copy maps each destination texel to the same source texel.
+    // Keep self-blits on the scalar path, which has defined traversal behavior.
+    if (layerMethod_ == LBM_COPY && targetAsTexture != currentTarget_ && w == texW && h == texH &&
+        x == std::floor(x) && y == std::floor(y) && u0 == 0.0f && v0 == 0.0f && u1 == 1.0f &&
+        v1 == 1.0f)
+    {
+        const int sourceX = x0 - (int)x, sourceY = y0 - (int)y;
+        for (int py = y0; py < y1; ++py)
+            std::memcpy(dst + (size_t)py * width + x0,
+                        texData + (size_t)(sourceY + py - y0) * texW + sourceX,
+                        (size_t)(x1 - x0) * sizeof(uint32_t));
+        currentTarget_->opaque = fillsOpaqueTarget;
+        return;
+    }
 
     // 采样：texel 中心映射（与 DrawMesh 的 (int)(tu * texW_1 + 0.5f) 一致）
     const int texW_1 = texW - 1, texH_1 = texH - 1;
+    // Horizontal sampling is independent of the destination row.
+    sampleColumns_.resize(x1 - x0);
+    for (int px = x0; px < x1; ++px)
+    {
+        const float tx = ((float)px - x + 0.5f) / w;
+        const int sx = (int)((u0 + (u1 - u0) * tx) * texW_1 + 0.5f);
+        sampleColumns_[px - x0] = std::max(0, std::min(texW_1, sx));
+    }
     const uint32_t fillColor = ((uint32_t)(layerColor_[3] * 255.0f + 0.5f) << 24) |
                                ((uint32_t)(layerColor_[2] * 255.0f + 0.5f) << 16) |
                                ((uint32_t)(layerColor_[1] * 255.0f + 0.5f) << 8) |
@@ -648,17 +848,17 @@ void SWRenderBackend::LayerDrawRect(void* handle,
             sy = texH_1;
         uint32_t* row = dst + (size_t)py * width;
         const uint32_t* texRow = texData + (size_t)sy * texW;
-        for (int px = x0; px < x1; px++)
+        if (layerMethod_ == LBM_COPY)
         {
-            float tx = ((float)px - x + 0.5f) / w;
-            int sx = (int)((u0 + (u1 - u0) * tx) * texW_1 + 0.5f);
-            if (sx < 0)
-                sx = 0;
-            else if (sx > texW_1)
-                sx = texW_1;
-            row[px] = LayerBlendPixel(layerMethod_, texRow[sx], row[px], layerOpa8_, fillColor);
+            for (int px = x0; px < x1; ++px)
+                row[px] = texRow[sampleColumns_[px - x0]];
         }
+        else
+            for (int px = x0; px < x1; ++px)
+                row[px] = LayerBlendPixel(layerMethod_, texRow[sampleColumns_[px - x0]], row[px],
+                                          layerOpa8_, fillColor);
     }
+    currentTarget_->opaque = fillsOpaqueTarget;
 }
 } // namespace krkrsdl3
 

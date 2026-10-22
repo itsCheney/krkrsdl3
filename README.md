@@ -31,7 +31,6 @@
 - 画面没有变化时跳过呈现，降低空闲时的 CPU 与发热。
 
 **Emote（E-mote / PSB）**
-- 新的 Emote 动画实现（实验性，默认关闭，仍使用原有实现），参考 AetherKrkr 的时间轴行为。
 - 共享资源缓存按设备内存调整大小，低内存时自动清理；PSB 解码减少读取次数；可直接渲染到图层纹理。
 
 **媒体与其他**
@@ -59,7 +58,6 @@
 ## 许可证
 
 - 引擎源码沿用 KiriKiri / 吉里吉里Z 的许可证及 krkrsdl3 补充条款，见 [LICENSE](LICENSE)。补充条款要求：分发用本软件运行的、并非基于本软件开发的商业游戏移植版二进制时，如有修改，修改部分必须全部开源。
-- `plugins/emoteplayer/` 中新的 Emote 动画实现以 GPL-3.0-or-later 发布，见 [AETHER-NOTICE.md](plugins/emoteplayer/AETHER-NOTICE.md) 与 [LICENSE-AETHER-GPL-3.0.txt](plugins/emoteplayer/LICENSE-AETHER-GPL-3.0.txt)。关闭该实现不会把这部分代码从二进制中移除。
 - `core/render/backend/` 中的 span 混合着色器部分源自 plutovg（MIT），见 [MetalSpanComposite-LICENSE.txt](core/render/backend/MetalSpanComposite-LICENSE.txt)。
 
 感谢 KiriKiri、吉里吉里Z 与 krkrsdl3 的所有贡献者。

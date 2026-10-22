@@ -79,11 +79,13 @@ private:
     {
         std::vector<uint8_t> pixels;
         int width = 0, height = 0;
+        bool opaque = false;
     };
     struct Texture
     {
         std::vector<uint8_t> pixels;
         int width = 0, height = 0;
+        bool opaque = false;
     };
 
     Target* FindTarget(void* handle) const;
@@ -99,5 +101,6 @@ private:
     float layerColor_[4] = {0, 0, 0, 0};
     std::vector<Target*> targets_;
     std::vector<Texture*> textures_;
+    std::vector<int> sampleColumns_;
 };
 } // namespace krkrsdl3

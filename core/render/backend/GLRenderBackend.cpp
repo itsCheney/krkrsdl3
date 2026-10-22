@@ -588,7 +588,6 @@ void* GLRenderBackend::CreateTarget(int width, int height)
     Target* target = new Target();
     target->width = width;
     target->height = height;
-    target->readback.resize((size_t)width * height * 4);
 
     // 颜色纹理
     glGenTextures(1, &target->colorTex);
@@ -706,6 +705,8 @@ uint8_t* GLRenderBackend::LockTarget(void* handle, int& pitch)
     Target* target = FindTarget(handle);
     if (!target)
         return nullptr;
+    // GPU-only targets do not need an additional full-size CPU image.
+    target->readback.resize((size_t)target->width * target->height * 4);
     glBindFramebuffer(GL_FRAMEBUFFER, target->fbo);
     glReadPixels(0, 0, target->width, target->height, GL_RGBA, GL_UNSIGNED_BYTE,
                  target->readback.data());

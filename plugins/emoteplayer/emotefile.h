@@ -10,6 +10,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
+#include "emotephysics.h"
 #include "psbfile/PSBData.h"
 #include "TVPCompositor.h"
 
@@ -22,10 +23,25 @@ struct emoteVar // 变量
     int32_t rangeEnd = 1;
     int32_t division = 0;
     std::string id;
+    // id without the trailing NUL the PSB strings carry: the key of the
+    // engine's control variables. Built on first use, then reused per frame.
+    const std::string& controlKey() const
+    {
+        if (!_controlKeyReady)
+        {
+            _controlKey = id.substr(0, id.find('\0'));
+            _controlKeyReady = true;
+        }
+        return _controlKey;
+    }
     float transToTick(float currVal)
     {
-        return division * ((currVal - rangeBegin) / (rangeEnd - rangeBegin));
+        return emoteParameterTick(currVal, rangeBegin, rangeEnd, division);
     }
+
+private:
+    mutable std::string _controlKey;
+    mutable bool _controlKeyReady = false;
 };
 
 class emotefile;
@@ -101,6 +117,7 @@ public:
     uint8_t type = 0;
     bool isParameterize = false;
     int32_t parameterIdx = -1;
+    int32_t transformOrder[4] = {0, 1, 2, 3};
     std::string label;
     std::vector<std::string> stencilCompositeMaskLayerList;
     std::vector<emoteframe*> frameList;
@@ -210,94 +227,6 @@ public:
     int32_t lastTime = -1;
     int32_t loopBegin = -1;
     int32_t loopEnd = -1;
-};
-
-struct Vector3
-{
-    double x, y, z;
-
-    Vector3() : x(0), y(0), z(0) {}
-    Vector3(double x, double y, double z) : x(x), y(y), z(z) {}
-
-    Vector3 operator+(const Vector3& other) const
-    {
-        return Vector3(x + other.x, y + other.y, z + other.z);
-    }
-    Vector3 operator-(const Vector3& other) const
-    {
-        return Vector3(x - other.x, y - other.y, z - other.z);
-    }
-    Vector3 operator*(double scalar) const { return Vector3(x * scalar, y * scalar, z * scalar); }
-    Vector3 operator/(double scalar) const { return Vector3(x / scalar, y / scalar, z / scalar); }
-
-    double dot(const Vector3& other) const { return x * other.x + y * other.y + z * other.z; }
-    double magnitude() const { return std::sqrt(x * x + y * y + z * z); }
-    Vector3 normalized() const
-    {
-        double m = magnitude();
-        return m > 0 ? *this / m : *this;
-    }
-
-    static Vector3 zero() { return Vector3(0, 0, 0); }
-};
-class bustControl
-{
-public:
-    bustControl(emotefile* filePtr, uint32_t startOffset);
-    ~bustControl();
-    struct BustState
-    {
-        Vector3 op; // 静止位置 (op)
-        Vector3 p;  // 当前位置 (p)
-        Vector3 pv; // 当前速度 (pv)
-        double ofs; // 偏移量 (ofs)
-    };
-
-    BustState param;
-    double spring;      // 弹簧系数
-    double friction;    // 摩擦力
-    double gravity;     // 重力
-    double scale_x;     // X轴缩放
-    double scale_y;     // Y轴缩放
-    std::string var_lr; // 左右变量名
-    std::string var_ud; // 上下变量名
-};
-struct uniSegment
-{
-public:
-    Vector3 bp;
-    Vector3 p;
-    Vector3 pv;
-    double scale_x;
-    double scale_y;
-    double length;
-};
-class uniControl
-{
-public:
-    uniControl(emotefile* filePtr, uint32_t startOffset);
-    ~uniControl();
-
-    std::vector<uniSegment> segments;
-
-    double b_rate;
-    double gravity;
-    double friction_x;
-    double friction_y;
-    double bend_spd;
-    double bend_vol;
-
-    double bendR;
-    double bendS;
-    double ofs;
-    Vector3 op;
-
-    double ud_eft;
-    double v_bound;
-
-    std::string var_lr;
-    std::string var_lrm;
-    std::string var_ud;
 };
 
 struct emoteattrcompRemoveItem
@@ -476,6 +405,15 @@ public:
     bool readIconTobuffer(uint8_t* buff, uint32_t buffSize, uint32_t pitch, emoteicon* ic);
     bool getTickByName(const std::string& name, float& ret);
     void setVariable(const std::string& name, tjs_real value);
+    // Whether a released file may be kept for another resource manager
+    // (the same conditions as the shared decoded cache), and its key.
+    bool IsPoolable() const { return _poolable; }
+    const std::string& PoolPath() const { return _poolPath; }
+    tjs_int PoolSeed() const { return _seed; }
+    std::uint64_t PoolGeneration() const { return _poolGeneration; }
+    // Puts variables, selectors and motion parameters back to their state
+    // right after load, before a pooled file goes to a new manager.
+    void ResetPlayState();
 
 private:
     void LoadDecodedResource(std::shared_ptr<const EmoteDecodedResource> resource);
@@ -488,12 +426,15 @@ private:
     void EnsureTJSNameTable();
     void EnsureTJSStringTable();
     bool _sharedCacheHit = false;
+    bool _poolable = false;
+    std::string _poolPath;
+    std::uint64_t _poolGeneration = 0; // shared cache generation at load
     bool _archiveFilterBypass = false;
     bool _fullTreeMaterialization = false;
     bool _tjsNameTableReady = false;
     bool _tjsStringTableReady = false;
-    std::vector<std::string> namesCacheTJS;
-    std::vector<std::string> stringsCacheTJS;
+    std::vector<ttstr> namesCacheTJS;
+    std::vector<tTJSVariant> stringsCacheTJS;
     tTJSBinaryStream* filePtr = nullptr;
     tjs_int _seed = 0;
     tTJSVariantClosure _decryptClo = NULL;
