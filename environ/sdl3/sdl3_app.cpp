@@ -335,7 +335,7 @@ enum TouchState
     STATE_IDLE,
     STATE_SINGLE_FINGER, // 单指状态（处理左键和移动）
     STATE_MULTI_FINGER,  // 多指状态（处理右键）
-    STATE_MENU
+    STATE_MENU           // The menu gesture or a cancelled touch: fingers click nothing until all lift
 };
 struct Finger
 {
@@ -369,6 +369,15 @@ void normalizedTouchToDrawable(float pX, float pY, int& pixelX, int& pixelY)
 }
 void handleFingerDown(const SDL_TouchFingerEvent& e)
 {
+    if (_state == STATE_MENU)
+    {
+        // The menu gesture owns every finger until the last one lifts, so
+        // the fourth and fifth fingers do not become clicks.
+        Finger f;
+        f.id = e.fingerID;
+        fingers[e.fingerID] = f;
+        return;
+    }
     if (_state == STATE_SINGLE_FINGER && fingers.size() == 1 && fingers.begin()->second.moved)
     {
         // A drag holds the left button; extra fingers do not turn it into
@@ -402,8 +411,6 @@ void handleFingerDown(const SDL_TouchFingerEvent& e)
         int pixelX = 0, pixelY = 0;
         normalizedTouchToDrawable(f.x, f.y, pixelX, pixelY);
         TVPInvokeMenu(pixelX, pixelY);
-        fingers.clear();
-        _state = STATE_IDLE;
     }
     else
     {
@@ -420,6 +427,13 @@ void handleFingerUp(const SDL_TouchFingerEvent& e)
     Finger& f = it->second;
     f.active = false;
 
+    if (_state == STATE_MENU)
+    {
+        fingers.erase(it);
+        if (fingers.empty())
+            _state = STATE_IDLE;
+        return;
+    }
     if (fingers.size() == 1)
     {
         if (_state == STATE_SINGLE_FINGER)
@@ -446,6 +460,22 @@ void handleFingerUp(const SDL_TouchFingerEvent& e)
     }
 
     fingers.erase(it);
+}
+void handleFingerCanceled(const SDL_TouchFingerEvent& e)
+{
+    // UIKit cancels touches when a system gesture takes them (five fingers,
+    // the home indicator) or another view claims them. A cancelled finger
+    // never lifts, so it has to leave the table here; a finger left behind
+    // turns every later tap into an unfinished two-finger touch. The rest
+    // of a cancelled touch clicks nothing.
+    auto it = fingers.find(e.fingerID);
+    if (it == fingers.end())
+        return;
+
+    if (_state == STATE_SINGLE_FINGER && it->second.moved)
+        sendMouseEvent(SDL_BUTTON_LEFT, SDL_EVENT_MOUSE_BUTTON_UP, it->second.x, it->second.y, false);
+    fingers.erase(it);
+    _state = fingers.empty() ? STATE_IDLE : STATE_MENU;
 }
 void handleFingerMotion(const SDL_TouchFingerEvent& e)
 {
@@ -641,6 +671,9 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event)
             break;
         case SDL_EVENT_FINGER_MOTION:
             handleFingerMotion(event->tfinger);
+            break;
+        case SDL_EVENT_FINGER_CANCELED:
+            handleFingerCanceled(event->tfinger);
             break;
 #endif
         default:
