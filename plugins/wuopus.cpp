@@ -124,6 +124,8 @@ public:
             else
             {
                 res = op_read(InputFile, Buffer, 5760 * Format.Channels, nullptr);
+                if (res <= 0)
+                    break; // end of stream or a decode error
                 if (res > remain)
                 {
                     memcpy(buf, Buffer, remain * Format.Channels * sizeof(opus_int16));
@@ -158,6 +160,9 @@ public:
         {
             return false;
         }
+        // drop PCM left over from before the seek
+        BufferRemain = 0;
+        pBuffer = nullptr;
 
         return true;
     }
