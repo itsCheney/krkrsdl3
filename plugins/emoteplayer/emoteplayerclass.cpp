@@ -1223,6 +1223,7 @@ void EmotePlayer::progress(tjs_real mstime)
     if (_isStop || !std::isfinite(mstime) || mstime < 0 || !std::isfinite(speedRatio) || speedRatio <= 0)
         return;
     const Uint64 profileStarted = SDL_GetTicksNS();
+    Uint64 controlNS = 0, sampleNS = 0, physicsNS = 0;
     if (emtEngine._mainfile != nullptr && emtEngine._mainmotion != nullptr && clockPassed > -1.0)
     {
         const double frames = mstime / speedRatio;
@@ -1242,8 +1243,10 @@ void EmotePlayer::progress(tjs_real mstime)
         if (!isMotion)
         {
             // 更新控制参数(通过引擎调用)
+            const Uint64 started = SDL_GetTicksNS();
             emtEngine.updateTimelineControl(emtEngine.controlTick, true);
             emtEngine.updateEyeControl(emtEngine.controlTick, true);
+            controlNS = SDL_GetTicksNS() - started;
         }
         // Physics samples model anchors before projection and the optional draw
         // affine. Sampling creates no textures or meshes and never advances time.
@@ -1262,8 +1265,12 @@ void EmotePlayer::progress(tjs_real mstime)
             if (physicsLimit.width <= 0) physicsLimit.width = emtEngine._mainfile->_screenSize.width;
             if (physicsLimit.height <= 0) physicsLimit.height = emtEngine._mainfile->_screenSize.height;
             const float tick = emtEngine._mainfile->_metadata->_varList.empty() ? clockPassed : 0;
+            const Uint64 sampleStarted = SDL_GetTicksNS();
             emtEngine.samplePhysics(tick, root, physicsLimit);
+            const Uint64 physicsStarted = SDL_GetTicksNS();
             emtEngine.updatePhysics(frames);
+            sampleNS = physicsStarted - sampleStarted;
+            physicsNS = SDL_GetTicksNS() - physicsStarted;
         }
         // 是否结束 —— 结束判定与 variableList 参数控制无关：
         // 若仅在 varList 为空分支判定，带眨眼/口型/时间线控制的立绘
@@ -1292,6 +1299,7 @@ void EmotePlayer::progress(tjs_real mstime)
             _pipoVal = 0;
     }
     emtEngine.recordAnimationProgress(mstime, clockPassed, _playing);
+    krkrsdl3::TVPRecordEmoteProgressDetail(controlNS, sampleNS, physicsNS);
     krkrsdl3::TVPRecordEmoteProgress(SDL_GetTicksNS() - profileStarted);
 }
 void EmotePlayer::prepareFrame()

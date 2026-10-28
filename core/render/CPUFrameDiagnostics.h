@@ -34,8 +34,9 @@ inline uint64_t Clock() noexcept { return uint64_t(std::chrono::duration_cast<st
     std::chrono::steady_clock::now().time_since_epoch()).count()); }
 inline uint64_t (*clockNS)()=Clock;
 inline void (*rawLine)(const char*)=nullptr;
-// Owner-thread-only stack capture, capped at 512 UTF-8 bytes and four frames.
+// Owner-thread-only stack capture, capped at 512 UTF-8 bytes and stackFrames frames.
 inline bool (*captureStack)(char*,size_t,unsigned)=nullptr;
+inline constexpr unsigned stackFrames=8;
 inline uint64_t epoch=0,windowID=0,nextStep=0,nextCall=0,nextScope=0,byteUsed=0;
 struct Emission {uint64_t time=0,bytes=0;};
 inline std::array<Emission,32> emissions{};
@@ -132,13 +133,21 @@ inline void Select(Detail value) noexcept {
     auto& slot=group->details[value.role];
     if(slot.used) {
         if(value.wallNS<=slot.wallNS) {Drop(window.frameDropped);return;}
+        // Scopes nest and are numbered on entry, so a slot with a higher scope
+        // number that finished first lies inside this one. Inner scopes finish
+        // first: keep the inner one while it holds at least half of each
+        // enclosing scope, so the stack shows where the time went instead of
+        // the outermost handler.
+        if(value.role==3 && slot.scope>value.scope && slot.wallNS*2>=value.wallNS) {
+            Drop(window.frameDropped);return;
+        }
         Drop(window.frameDropped);
     }
     const uint64_t savedEpoch=epoch;
     bool unavailable=false;
     emitting=true;
     if(captureStack) {
-        try {unavailable=!captureStack(value.stack,sizeof(value.stack),4);}
+        try {unavailable=!captureStack(value.stack,sizeof(value.stack),stackFrames);}
         catch(...) {unavailable=true;value.stack[0]=0;}
     } else unavailable=true;
     emitting=false;value.stack[512]=0;

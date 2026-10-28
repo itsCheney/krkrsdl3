@@ -3060,7 +3060,8 @@ emotemotion* emotefile::findmotionByName(const std::string& name)
                 return tmp1->second;
             }
         }
-        TVPConsoleLog("motion find failed!!!");
+        // A motion in an attached file is not in this one; the engine-level
+        // lookup reports names that no loaded file has.
     }
     else
     {

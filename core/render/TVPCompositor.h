@@ -364,6 +364,13 @@ struct TVPRuntimeProfileStats {
     uint64_t emoteDrawTimeNS = 0;
     uint64_t emoteCaptureProfileCalls = 0;
     uint64_t emoteCaptureTimeNS = 0;
+    // progress() parts: timeline/eye controls, the physics anchor sample
+    // (builds the sample tree on a new player) and the spring update.
+    // The slowest single progress() call is a high-water mark.
+    uint64_t emoteProgressControlTimeNS = 0;
+    uint64_t emoteProgressSampleTimeNS = 0;
+    uint64_t emoteProgressPhysicsTimeNS = 0;
+    uint64_t emoteProgressMaxTimeNS = 0;
 
     // M6.2 Emote prepare breakdown. Node time is local work only (recursive
     // children/submotions are measured by their own node records). Shape/mesh
@@ -439,6 +446,7 @@ struct TVPRuntimeProfileStats {
     uint64_t metalRingFallbackBytes = 0;
 };
 void TVPRecordEmoteProgress(uint64_t nanoseconds);
+void TVPRecordEmoteProgressDetail(uint64_t controlNS, uint64_t sampleNS, uint64_t physicsNS);
 void TVPRecordEmotePrepare(uint64_t nanoseconds);
 void TVPRecordEmoteDraw(uint64_t nanoseconds);
 void TVPRecordEmoteCaptureTime(uint64_t nanoseconds);

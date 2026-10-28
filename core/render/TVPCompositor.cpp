@@ -45,6 +45,8 @@ std::atomic<uint64_t> emoteCaptureGPUBytes{0};
 std::atomic<uint64_t> emoteCaptureSkipped{0}, emoteCaptureRegionPixels{0}, emoteCaptureFullPixels{0};
 
 std::atomic<uint64_t> profileEmoteProgressCalls{0}, profileEmoteProgressTimeNS{0};
+std::atomic<uint64_t> profileEmoteProgressControlTimeNS{0}, profileEmoteProgressSampleTimeNS{0};
+std::atomic<uint64_t> profileEmoteProgressPhysicsTimeNS{0}, profileEmoteProgressMaxTimeNS{0};
 std::atomic<uint64_t> profileEmotePrepareCalls{0}, profileEmotePrepareTimeNS{0};
 std::atomic<uint64_t> profileEmoteDrawCalls{0}, profileEmoteDrawTimeNS{0};
 std::atomic<uint64_t> profileEmoteCaptureCalls{0}, profileEmoteCaptureTimeNS{0};
@@ -164,6 +166,12 @@ void TVPResetEmoteCaptureStats() {
 void TVPRecordEmoteProgress(uint64_t ns) {
     profileEmoteProgressCalls.fetch_add(1,std::memory_order_relaxed);
     profileEmoteProgressTimeNS.fetch_add(ns,std::memory_order_relaxed);
+    AtomicMax(profileEmoteProgressMaxTimeNS, ns);
+}
+void TVPRecordEmoteProgressDetail(uint64_t controlNS, uint64_t sampleNS, uint64_t physicsNS) {
+    profileEmoteProgressControlTimeNS.fetch_add(controlNS,std::memory_order_relaxed);
+    profileEmoteProgressSampleTimeNS.fetch_add(sampleNS,std::memory_order_relaxed);
+    profileEmoteProgressPhysicsTimeNS.fetch_add(physicsNS,std::memory_order_relaxed);
 }
 void TVPRecordEmotePrepare(uint64_t ns) {
     profileEmotePrepareCalls.fetch_add(1,std::memory_order_relaxed);
@@ -351,6 +359,10 @@ TVPRuntimeProfileStats TVPGetRuntimeProfileStats() {
     TVPRuntimeProfileStats s;
     s.emoteProgressCalls=profileEmoteProgressCalls.load(std::memory_order_relaxed);
     s.emoteProgressTimeNS=profileEmoteProgressTimeNS.load(std::memory_order_relaxed);
+    s.emoteProgressControlTimeNS=profileEmoteProgressControlTimeNS.load(std::memory_order_relaxed);
+    s.emoteProgressSampleTimeNS=profileEmoteProgressSampleTimeNS.load(std::memory_order_relaxed);
+    s.emoteProgressPhysicsTimeNS=profileEmoteProgressPhysicsTimeNS.load(std::memory_order_relaxed);
+    s.emoteProgressMaxTimeNS=profileEmoteProgressMaxTimeNS.load(std::memory_order_relaxed);
     s.emotePrepareCalls=profileEmotePrepareCalls.load(std::memory_order_relaxed);
     s.emotePrepareTimeNS=profileEmotePrepareTimeNS.load(std::memory_order_relaxed);
     s.emoteDrawCalls=profileEmoteDrawCalls.load(std::memory_order_relaxed);
@@ -421,6 +433,10 @@ TVPRuntimeProfileStats TVPGetRuntimeProfileStats() {
 void TVPResetRuntimeProfileStats() {
     profileEmoteProgressCalls.store(0,std::memory_order_relaxed);
     profileEmoteProgressTimeNS.store(0,std::memory_order_relaxed);
+    profileEmoteProgressControlTimeNS.store(0,std::memory_order_relaxed);
+    profileEmoteProgressSampleTimeNS.store(0,std::memory_order_relaxed);
+    profileEmoteProgressPhysicsTimeNS.store(0,std::memory_order_relaxed);
+    profileEmoteProgressMaxTimeNS.store(0,std::memory_order_relaxed);
     profileEmotePrepareCalls.store(0,std::memory_order_relaxed);
     profileEmotePrepareTimeNS.store(0,std::memory_order_relaxed);
     profileEmoteDrawCalls.store(0,std::memory_order_relaxed);

@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <unordered_set>
 #include <iomanip>
 #include <locale>
 #include <SDL3/SDL.h>
@@ -1252,7 +1253,10 @@ emotemotion* emoteengine::findmotionByName(const std::string& name)
                 }
             }
         }
-        TVPConsoleLog("motion find failed!!!");
+        // Callers ask again on every new frame or player; report a name once.
+        static std::unordered_set<std::string> reported;
+        if (reported.insert(name).second)
+            TVPConsoleLog("motion find failed: %s", name.c_str());
     }
     else
     {
