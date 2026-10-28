@@ -863,11 +863,8 @@ EmotePlayer::~EmotePlayer()
 }
 int32_t EmotePlayer::get_loopTime()
 {
-    if (emtEngine._mainfile != nullptr && emtEngine._mainfile->_objects.size() > 0 &&
-        emtEngine._mainfile->_objects.begin()->second->motion.size() > 0)
-    {
-        return emtEngine._mainfile->_objects.begin()->second->motion.begin()->second->loopTime;
-    }
+    if (emtEngine._mainmotion != nullptr)
+        return (int32_t)emtEngine._mainmotion->loopTime;
     return 0;
 }
 tTJSVariant EmotePlayer::get_variableKeys()
@@ -905,7 +902,8 @@ tTJSVariant EmotePlayer::serialize()
     auto* transitionArray = TJSCreateArrayObject();
     int transitionIndex = 0;
     for (const auto* tween : {&coordX, &coordY, &rotation, &scale, &scaleY,
-                              &forces[0][0], &forces[0][1], &forces[1][0], &forces[1][1], &forces[2][0], &forces[2][1]})
+                              &forces[0][0], &forces[0][1], &forces[1][0], &forces[1][1], &forces[2][0], &forces[2][1],
+                              &colors[0], &colors[1], &colors[2], &colors[3]})
         for (double field : {tween->from, tween->to, tween->start, tween->duration, tween->easing})
         {
             tTJSVariant value(field);
@@ -949,7 +947,8 @@ void EmotePlayer::unserialize(tTJSVariant data)
     int transitionIndex = 0;
     if (transitionArray)
         for (auto* tween : {&coordX, &coordY, &rotation, &scale, &scaleY,
-                            &forces[0][0], &forces[0][1], &forces[1][0], &forces[1][1], &forces[2][0], &forces[2][1]})
+                            &forces[0][0], &forces[0][1], &forces[1][0], &forces[1][1], &forces[2][0], &forces[2][1],
+                            &colors[0], &colors[1], &colors[2], &colors[3]})
         {
             double fields[5]; bool valid = true;
             for (auto& field : fields)
@@ -962,6 +961,7 @@ void EmotePlayer::unserialize(tTJSVariant data)
             }
             if (valid) *tween = {fields[0], fields[1], fields[2], std::max(0.0, fields[3]), fields[4]};
         }
+    updateColor();
     updateTransMat();
 }
 void EmotePlayer::play(tTJSString name, int flag)
@@ -980,11 +980,11 @@ void EmotePlayer::play(tTJSString name, int flag)
                 emtEngine._mainmotion = it1->second;
             }
         }
-        // start
+        // start. Without a motion progress() never runs, so nothing would
+        // end the playing state and scripts waiting on animating would hang.
         clockPassed = 0.0;
         _motion = name;
-        _playing = true;
-        _allplaying = true;
+        _playing = _allplaying = emtEngine._mainmotion != nullptr;
         isSelfClear = true;
     }
     else if (_resourceManager->cacheData.size() > 0 && isMotion) // chara+motion启动方案
@@ -1012,8 +1012,7 @@ void EmotePlayer::play(tTJSString name, int flag)
         }
         // start
         clockPassed = 0.0;
-        _playing = true;
-        _allplaying = true;
+        _playing = _allplaying = emtEngine._mainmotion != nullptr;
         isSelfClear = true;
     }
     else // 群体启动模式，即对manager的所有file进行拼好件(其会存在互相索引的情况，结构可能得改改了)
@@ -1044,8 +1043,7 @@ void EmotePlayer::play(tTJSString name, int flag)
         // start
         clockPassed = 0.0;
         _motion = name;
-        _playing = true;
-        _allplaying = true;
+        _playing = _allplaying = emtEngine._mainmotion != nullptr;
         isSelfClear = false;
     }
     _isStop = false;
@@ -1055,6 +1053,9 @@ void EmotePlayer::play(tTJSString name, int flag)
     scale.set(currZx, currZx, 0); scaleY.set(currZy, currZy, 0);
     for (auto& force : forces)
         for (auto& axis : force) axis.set(axis.to, axis.to, 0);
+    // The colour is kept across motions; only its clock restarts.
+    for (auto& color : colors) color.set(color.to, color.to, 0);
+    updateColor();
     recordSlowEmoteOperation(false, started);
 }
 namespace
@@ -1211,6 +1212,8 @@ bool EmotePlayer::get_animating()
     if (emtEngine.controlsAnimating()) return true;
     for (const auto& force : forces)
         if (!force[0].done(tick) || !force[1].done(tick)) return true;
+    for (const auto& color : colors)
+        if (!color.done(tick)) return true;
     for (const auto& playing : emtEngine.currTimeline)
         if (!(playing.flags & 2) && playing.timeline->lastTime >= 0) return true;
     return false;
@@ -1229,6 +1232,7 @@ void EmotePlayer::progress(tjs_real mstime)
         currAngle = rotation.value(emtEngine.controlTick);
         currZx = scale.value(emtEngine.controlTick);
         currZy = scaleY.value(emtEngine.controlTick);
+        updateColor();
         Vector3* force[] = {&emtEngine.physics.bustForce, &emtEngine.physics.hairForce, &emtEngine.physics.partsForce};
         for (int i = 0; i < 3; ++i)
             *force[i] = Vector3(forces[i][0].value(emtEngine.controlTick), forces[i][1].value(emtEngine.controlTick));
@@ -1496,9 +1500,21 @@ void EmotePlayer::setRotate(tjs_real rotate, tjs_real time, tjs_real easing)
     if (time <= 0) currAngle = rotate;
     updateTransMat();
 }
-void EmotePlayer::setColor(tjs_uint32 color)
+void EmotePlayer::setColor(tjs_uint32 color, tjs_real time, tjs_real easing)
 {
-    TVPConsoleLog("EmotePlayer::setColor TODO");
+    // 0xAARRGGBB. RGB multiply with 0x80 as neutral (games reset a character
+    // with 0xFF808080, higher values brighten); alpha 0xFF is opaque.
+    const double target[4] = {((color >> 16) & 0xFF) / 128.0, ((color >> 8) & 0xFF) / 128.0,
+                              (color & 0xFF) / 128.0, ((color >> 24) & 0xFF) / 255.0};
+    const double tick = emtEngine.controlTick;
+    for (int i = 0; i < 4; ++i)
+        colors[i].set(colors[i].value(tick), target[i], tick, time, easing);
+    updateColor();
+}
+void EmotePlayer::updateColor()
+{
+    for (int i = 0; i < 4; ++i)
+        emtEngine.playerColor[i] = (float)colors[i].value(emtEngine.controlTick);
 }
 void EmotePlayer::setVariable(tTJSString name, tjs_real value, tjs_real time, tjs_real easing)
 {
@@ -1574,16 +1590,23 @@ void EmotePlayer::skip()
     currCoordx = coordX.value(tick); currCoordy = coordY.value(tick);
     currAngle = rotation.value(tick); currZx = scale.value(tick); currZy = scaleY.value(tick);
     for (auto& force : forces) force[0].duration = force[1].duration = 0;
+    for (auto& color : colors) color.duration = 0;
+    updateColor();
     emtEngine.skipControls();
     updateTransMat();
 }
 void EmotePlayer::skipToSync()
 {
-    if (emtEngine._mainmotion != nullptr)
-    {
-        clockPassed = emtEngine._mainfile->getSyncTime();
-    }
-    TVPConsoleLog("EmotePlayer::skipToSync TODO");
+    // The current motion's sync point, found in the order progress() uses to
+    // end a motion. The file's sync time is the largest of all its motions.
+    const auto* motion = emtEngine._mainmotion;
+    if (motion == nullptr)
+        return;
+    double sync = motion->syncTime;
+    if (sync <= 0.0) sync = motion->selfSyncTime;
+    if (sync <= 0.0 && motion->loopTime < 0) sync = motion->lastTime;
+    if (sync > clockPassed)
+        clockPassed = sync;
 }
 void EmotePlayer::pass()
 {
@@ -1597,7 +1620,6 @@ void EmotePlayer::stop()
     _isStop = true;
     _playing = false;
     _allplaying = false;
-    TVPConsoleLog("EmotePlayer::stop TODO");
 }
 void EmotePlayer::playTimeline(tTJSString name, tjs_int flags)
 {
@@ -1750,7 +1772,6 @@ tTJSVariant EmotePlayer::getVariableFrameList(tTJSString name)
     else
     {
         iTJSDispatch2* array = TJSCreateArrayObject();
-        TVPConsoleLog("EmotePlayer::getVariableFrameList TODO");
         tTJSVariant result(array, array);
         array->Release();
         return result;

@@ -142,6 +142,39 @@ NCB_REGISTER_CLASS(D3DPicture)
 //---------------------------------------------------------------------------
 // D3DEmotePlayer 脚本类（包装 emoteplayer 的 GPU 直通播放器）
 //---------------------------------------------------------------------------
+namespace
+{
+tjs_real d3dEmoteArg(tjs_int count, tTJSVariant** args, int index)
+{
+    return index < count && args[index]->Type() != tvtVoid ? (tjs_real)*args[index] : 0;
+}
+tTJSString d3dEmoteName(tjs_int count, tTJSVariant** args)
+{
+    return count > 0 && args[0]->Type() != tvtVoid ? tTJSString(*args[0]) : tTJSString();
+}
+// ncbind requires every native argument, default values included, so calls
+// with optional transition arguments are dispatched here (as emoteplayer does).
+template<int Operation>
+tjs_error d3dEmoteControl(tTJSVariant*, tjs_int count, tTJSVariant** args, D3DEmotePlayer* player)
+{
+    if (!player) return TJS_E_FAIL;
+    constexpr int required = Operation == 0 || Operation == 4 || Operation == 8 ? 2 : Operation == 6 ? 0 : 1;
+    if (count < required) return TJS_E_BADPARAMCOUNT;
+    auto number = [&](int index) { return d3dEmoteArg(count, args, index); };
+    if constexpr (Operation == 0) player->setCoord(number(0), number(1), number(2), number(3));
+    if constexpr (Operation == 1) player->setRot(number(0), number(1), number(2));
+    if constexpr (Operation == 2) player->setScale(number(0), number(1), number(2));
+    if constexpr (Operation == 3) player->setColor((tjs_uint32)args[0]->AsInteger(), number(1), number(2));
+    if constexpr (Operation == 4) player->setVariable(d3dEmoteName(count, args), number(1), number(2), number(3));
+    if constexpr (Operation == 5) player->playTimeline(d3dEmoteName(count, args), (tjs_int)number(1));
+    if constexpr (Operation == 6) player->stopTimeline(d3dEmoteName(count, args));
+    if constexpr (Operation == 7) player->fadeOutTimeline(d3dEmoteName(count, args), number(1), number(2));
+    if constexpr (Operation == 8)
+        player->setTimelineBlendRatio(d3dEmoteName(count, args), number(1), number(2), number(3), (tjs_int)number(4));
+    return TJS_S_OK;
+}
+}
+
 NCB_REGISTER_CLASS(D3DEmotePlayer)
 {
     NCB_CONSTRUCTOR((iTJSDispatch2*));
@@ -151,11 +184,11 @@ NCB_REGISTER_CLASS(D3DEmotePlayer)
     NCB_METHOD(skip);
     NCB_METHOD(pass);
     NCB_METHOD(progress);
-    NCB_METHOD(setCoord);
-    NCB_METHOD(setRot);
-    NCB_METHOD(setScale);
-    NCB_METHOD(setColor);
-    NCB_METHOD(setVariable);
+    RawCallback("setCoord", &d3dEmoteControl<0>, 0);
+    RawCallback("setRot", &d3dEmoteControl<1>, 0);
+    RawCallback("setScale", &d3dEmoteControl<2>, 0);
+    RawCallback("setColor", &d3dEmoteControl<3>, 0);
+    RawCallback("setVariable", &d3dEmoteControl<4>, 0);
     NCB_METHOD(getVariable);
     // contains(label, x, y)：触摸命中判定，脚本侧对层做触摸检测时调用；
     // RawCallback 以兼容 contains(x, y) 两参形式
@@ -163,10 +196,10 @@ NCB_REGISTER_CLASS(D3DEmotePlayer)
     NCB_METHOD_RAW_CALLBACK(hitTest, &D3DEmotePlayer::cb_hitTest, 0);
     NCB_METHOD(startWind);
     NCB_METHOD(stopWind);
-    NCB_METHOD(playTimeline);
-    NCB_METHOD(stopTimeline);
-    NCB_METHOD(fadeOutTimeline);
-    NCB_METHOD(setTimelineBlendRatio);
+    RawCallback("playTimeline", &d3dEmoteControl<5>, 0);
+    RawCallback("stopTimeline", &d3dEmoteControl<6>, 0);
+    RawCallback("fadeOutTimeline", &d3dEmoteControl<7>, 0);
+    RawCallback("setTimelineBlendRatio", &d3dEmoteControl<8>, 0);
     NCB_METHOD(isTimelinePlaying);
     NCB_METHOD(getTimelineBlendRatio);
     NCB_METHOD(countMainTimelines);

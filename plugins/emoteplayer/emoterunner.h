@@ -276,6 +276,10 @@ namespace emoteplayer
         bool getControlVariableByKey(const std::string& key, float& value) const;
         EmotePhysics physics;
         bool samplingPhysics = false;
+        // setColor(): RGB multiply (1 is neutral) and alpha for the whole player.
+        // Mask passes keep their coverage, so they are drawn untinted.
+        float playerColor[4] = {1, 1, 1, 1};
+        bool drawingMask = false;
         void samplePhysics(float tick, const emoteRender& root, emotelimit lim);
         void recordPhysicsAnchor(const std::string& name, const std::vector<emoteRender>& chain);
         // Whether physics sampling must evaluate this node: it is an anchor

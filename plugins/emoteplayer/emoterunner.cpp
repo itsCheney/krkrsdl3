@@ -646,6 +646,8 @@ bool emotenoderef::renderMask(krkrsdl3::iTVPRenderBackend* renderer, void* maskT
     renderer->ClearTarget(true);
     krkrsdl3::TVPRecordEmoteMaskClear();
     bool hasDraw = false;
+    const bool wasDrawingMask = refTop->drawingMask;
+    refTop->drawingMask = true;
     for (auto maskLayer : renderMethod.at(0).layerNode)
     {
         if (maskLayer != nullptr && maskLayer->currOpa > 0)
@@ -655,6 +657,7 @@ bool emotenoderef::renderMask(krkrsdl3::iTVPRenderBackend* renderer, void* maskT
                 krkrsdl3::TVPRecordEmoteMaskDraw();
         }
     }
+    refTop->drawingMask = wasDrawingMask;
     // 排除异常蒙版
     return hasDraw;
 }
@@ -696,6 +699,12 @@ bool emotenoderef::drawWithMask(krkrsdl3::iTVPRenderBackend* renderer, void* tar
         colorModulation[1] = ((tint >> 8) & 0xFF) / 255.0f;
         colorModulation[2] = ((tint >> 16) & 0xFF) / 255.0f;
         colorModulation[3] = ((tint >> 24) & 0xFF) / 255.0f;
+    }
+    if (refTop && !refTop->drawingMask)
+    {
+        for (int i = 0; i < 3; ++i)
+            colorModulation[i] *= refTop->playerColor[i];
+        totalOpa *= refTop->playerColor[3];
     }
     renderer->SetBlendMode(blendMode, blendMode == 21 ? uniformColor : nullptr);
     if (blendMode == 6 || totalOpa <= 0)
