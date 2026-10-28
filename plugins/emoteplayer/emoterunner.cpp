@@ -1481,18 +1481,30 @@ void emoteengine::samplePhysics(float tick, const emoteRender& root, emotelimit 
 bool emoteengine::leadsToPhysicsAnchor(emotenode* node, int depth)
 {
     if (node == nullptr || depth > 64) return false; // depth guards motion cycles
-    if (physics.needsAnchor(node->label)) return true;
+    if (_anchorLeadsKey != physicsAnchorKey())
+    {
+        _anchorLeadsKey = physicsAnchorKey();
+        _anchorLeads.clear();
+    }
+    if (const auto known = _anchorLeads.find(node); known != _anchorLeads.end())
+        return known->second;
+    bool leads = physics.needsAnchor(node->label);
     for (auto* child : node->children)
-        if (leadsToPhysicsAnchor(child, depth + 1)) return true;
+    {
+        if (leads) break;
+        leads = leadsToPhysicsAnchor(child, depth + 1);
+    }
     for (const auto* frame : node->frameList)
     {
+        if (leads) break;
         if (frame == nullptr || !frame->hasContent || node->_filePtr->findsourceByName(frame->src))
             continue;
         if (auto* motion = findmotionByName(frame->src))
             for (auto* inner : motion->nodeList)
-                if (leadsToPhysicsAnchor(inner, depth + 1)) return true;
+                if ((leads = leadsToPhysicsAnchor(inner, depth + 1))) break;
     }
-    return false;
+    _anchorLeads[node] = leads;
+    return leads;
 }
 
 void emoteengine::recordPhysicsAnchor(const std::string& name, const std::vector<emoteRender>& chain)

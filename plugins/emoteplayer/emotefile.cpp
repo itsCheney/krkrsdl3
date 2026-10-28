@@ -1735,8 +1735,9 @@ emoteicon::~emoteicon()
 }
 void emoteicon::ensureLoad()
 {
-    if (data == nullptr)
+    if (!loaded)
     {
+        loaded = true;
         // 基本创建
         int datasize = width * height * 4;
         data = new uint8_t[datasize];
@@ -1767,6 +1768,13 @@ void emoteicon::ensureLoad()
             selftexture = renderer->CreateTexture(width, height);
             if (selftexture)
                 renderer->UpdateTexture(selftexture, data, width, height, width * 4);
+        }
+        // UpdateTexture copies the pixels. Nothing reads them afterwards, and
+        // pooled and active files kept a second full copy of every icon.
+        if (selftexture)
+        {
+            delete[] data;
+            data = nullptr;
         }
     }
 }
