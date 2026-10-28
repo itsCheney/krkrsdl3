@@ -361,7 +361,7 @@ public:
             else
             {
                 // 削除に成功した場合はストレージキャッシュをクリア
-                TVPClearStorageCaches();
+                TVPStorageFileChanged(filePlacedPath);
             }
         }
         return r;
@@ -409,7 +409,8 @@ public:
             }
             else
             {
-                TVPClearStorageCaches();
+                TVPStorageFileChanged(from);
+                TVPStorageFileChanged(to);
             }
         }
         return r;
@@ -806,7 +807,7 @@ public:
         {
             ttstr fromFile(TVPGetLocallyAccessibleName(TVPGetPlacedPath(from)));
             ttstr toFile(TVPGetLocallyAccessibleName(TVPNormalizeStorageName(to)));
-            return _copyFile(fromFile, toFile);
+            return _copyFile(fromFile, toFile, to);
         }
         catch (...)
         {
@@ -815,13 +816,14 @@ public:
     }
 
 private:
-    static bool _copyFile(const ttstr& from, const ttstr& to)
+    // `changed` is the destination's storage name.
+    static bool _copyFile(const ttstr& from, const ttstr& to, const ttstr& changed)
     {
         if (from.length() && to.length())
         {
             if (TVPCopyFile(from.AsStdString(), to.AsStdString()))
             {
-                TVPClearStorageCaches();
+                TVPStorageFileChanged(changed);
                 return true;
             }
         }
@@ -845,7 +847,7 @@ public:
         {
             // ※指定次第で例外を発生させるためTVPGetLocallyAccessibleNameは使わない
             TVPGetLocalName(toFile);
-            return _copyFile(fromFile, toFile);
+            return _copyFile(fromFile, toFile, to);
         }
         return false;
     }

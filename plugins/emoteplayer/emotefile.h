@@ -293,6 +293,7 @@ private:
     emotefile* _filePtr = nullptr;
 };
 
+struct SharedIconTexture;
 class emoteicon
 {
 public:
@@ -328,6 +329,10 @@ public:
 
 private:
     emotefile* _filePtr = nullptr;
+    uint32_t _offset = 0;
+    // Shareable files (see emotefile::IsPoolable) give every player of the
+    // same model one texture per icon instead of one each.
+    std::shared_ptr<SharedIconTexture> _texture;
 };
 
 class emotesource

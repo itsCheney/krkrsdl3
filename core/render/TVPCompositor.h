@@ -371,6 +371,9 @@ struct TVPRuntimeProfileStats {
     uint64_t emoteProgressSampleTimeNS = 0;
     uint64_t emoteProgressPhysicsTimeNS = 0;
     uint64_t emoteProgressMaxTimeNS = 0;
+    uint64_t emoteIconTextures = 0;
+    uint64_t emoteIconTextureBytes = 0;
+    uint64_t emoteIconTextureShares = 0;
 
     // M6.2 Emote prepare breakdown. Node time is local work only (recursive
     // children/submotions are measured by their own node records). Shape/mesh
@@ -447,6 +450,10 @@ struct TVPRuntimeProfileStats {
 };
 void TVPRecordEmoteProgress(uint64_t nanoseconds);
 void TVPRecordEmoteProgressDetail(uint64_t controlNS, uint64_t sampleNS, uint64_t physicsNS);
+// Live E-mote icon textures (count and bytes change by the deltas) and icons
+// that reused another player's texture of the same model.
+void TVPRecordEmoteIconTexture(int64_t textures, int64_t bytes);
+void TVPRecordEmoteIconTextureShare();
 void TVPRecordEmotePrepare(uint64_t nanoseconds);
 void TVPRecordEmoteDraw(uint64_t nanoseconds);
 void TVPRecordEmoteCaptureTime(uint64_t nanoseconds);

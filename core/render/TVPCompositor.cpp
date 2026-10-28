@@ -47,6 +47,8 @@ std::atomic<uint64_t> emoteCaptureSkipped{0}, emoteCaptureRegionPixels{0}, emote
 std::atomic<uint64_t> profileEmoteProgressCalls{0}, profileEmoteProgressTimeNS{0};
 std::atomic<uint64_t> profileEmoteProgressControlTimeNS{0}, profileEmoteProgressSampleTimeNS{0};
 std::atomic<uint64_t> profileEmoteProgressPhysicsTimeNS{0}, profileEmoteProgressMaxTimeNS{0};
+std::atomic<int64_t> emoteIconTextures{0}, emoteIconTextureBytes{0};
+std::atomic<uint64_t> emoteIconTextureShares{0};
 std::atomic<uint64_t> profileEmotePrepareCalls{0}, profileEmotePrepareTimeNS{0};
 std::atomic<uint64_t> profileEmoteDrawCalls{0}, profileEmoteDrawTimeNS{0};
 std::atomic<uint64_t> profileEmoteCaptureCalls{0}, profileEmoteCaptureTimeNS{0};
@@ -167,6 +169,13 @@ void TVPRecordEmoteProgress(uint64_t ns) {
     profileEmoteProgressCalls.fetch_add(1,std::memory_order_relaxed);
     profileEmoteProgressTimeNS.fetch_add(ns,std::memory_order_relaxed);
     AtomicMax(profileEmoteProgressMaxTimeNS, ns);
+}
+void TVPRecordEmoteIconTexture(int64_t textures, int64_t bytes) {
+    emoteIconTextures.fetch_add(textures,std::memory_order_relaxed);
+    emoteIconTextureBytes.fetch_add(bytes,std::memory_order_relaxed);
+}
+void TVPRecordEmoteIconTextureShare() {
+    emoteIconTextureShares.fetch_add(1,std::memory_order_relaxed);
 }
 void TVPRecordEmoteProgressDetail(uint64_t controlNS, uint64_t sampleNS, uint64_t physicsNS) {
     profileEmoteProgressControlTimeNS.fetch_add(controlNS,std::memory_order_relaxed);
@@ -363,6 +372,10 @@ TVPRuntimeProfileStats TVPGetRuntimeProfileStats() {
     s.emoteProgressSampleTimeNS=profileEmoteProgressSampleTimeNS.load(std::memory_order_relaxed);
     s.emoteProgressPhysicsTimeNS=profileEmoteProgressPhysicsTimeNS.load(std::memory_order_relaxed);
     s.emoteProgressMaxTimeNS=profileEmoteProgressMaxTimeNS.load(std::memory_order_relaxed);
+    // Live gauges: not cleared by the profile reset.
+    s.emoteIconTextures=uint64_t(std::max<int64_t>(0,emoteIconTextures.load(std::memory_order_relaxed)));
+    s.emoteIconTextureBytes=uint64_t(std::max<int64_t>(0,emoteIconTextureBytes.load(std::memory_order_relaxed)));
+    s.emoteIconTextureShares=emoteIconTextureShares.load(std::memory_order_relaxed);
     s.emotePrepareCalls=profileEmotePrepareCalls.load(std::memory_order_relaxed);
     s.emotePrepareTimeNS=profileEmotePrepareTimeNS.load(std::memory_order_relaxed);
     s.emoteDrawCalls=profileEmoteDrawCalls.load(std::memory_order_relaxed);
