@@ -412,6 +412,9 @@ struct t2DAffineMatrix
 extern tTVPGLGammaAdjustData TVPIntactGammaAdjustData;
 extern tjs_int TVPDrawThreadNum;
 extern tjs_int TVPGetProcessorNum(void);
+// The Blt method a Layer of this type draws with; false for types that draw
+// nothing (ltBinder) or have no method.
+bool TVPLayerTypeToBltMethod(tTVPLayerType type, tjs_int opa, bool hda, tTVPBBBltMethod& out);
 //---------------------------------------------------------------------------
 
 //---------------------------------------------------------------------------

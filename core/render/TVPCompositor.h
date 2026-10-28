@@ -141,6 +141,18 @@ public:
     // 混合模式：0 普通 alpha / 1,4 乘色 / 3 加色 / 6 跳过 / 21 纯色替换；
     // uniformColor 仅 mode 21 使用，可为 nullptr
     virtual void SetBlendMode(int mode, const float* uniformColor = nullptr) = 0;
+    // Layer-type blends for DrawDeviceD3D's transformed pictures, following the
+    // LBM_* formulas (destination alpha held). Backends without them draw the
+    // ordinary alpha blend, as for any unknown mode.
+    enum MeshLayerBlendMode
+    {
+        MBM_LAYER_COPY = 100, // dest.RGB = src.RGB, constant opacity
+        MBM_LAYER_ADD,        // dest.RGB = sat(dest + src * opa)
+        MBM_LAYER_SUB,        // dest.RGB = sat(dest - (1 - src) * opa)
+        MBM_LAYER_MUL,        // dest.RGB = dest * (1 - (1 - src) * opa)
+        MBM_LAYER_ADDALPHA,   // premultiplied: dest.RGB = dest * (1 - src.a * opa) + src * opa
+        MBM_LAYER_END
+    };
     // vertices: 交错 (x, y, u, v)，每顶点 4 个 float（NDC + UV）
     // colorModulation：采样后乘到纹素上；nullptr 视为 (1,1,1,1)。
     // emote PSB 的中性 frame.color 是 0xff808080，调用方应传 identity，不要把 128/255 当染色。

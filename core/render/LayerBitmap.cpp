@@ -1013,6 +1013,152 @@ bool iTVPBaseBitmap::Blt(tjs_int x,
 }
 
 //---------------------------------------------------------------------------
+bool TVPLayerTypeToBltMethod(tTVPLayerType type, tjs_int opa, bool hda, tTVPBBBltMethod& out)
+{
+    switch (type)
+    {
+        case ltBinder:
+            // no action
+            return false;
+
+        case ltOpaque: // formerly ltCoverRect
+                       // copy
+            out = opa == 255 ? bmCopy : bmCopyOnAlpha;
+            break;
+
+        case ltAlpha: // formerly ltTransparent
+                      // alpha blend
+            out = hda ? bmAlpha : bmAlphaOnAlpha;
+            break;
+
+        case ltAdditive:
+            // additive blend
+            // hda = true if destination has alpha
+            // ( preserving mask )
+            out = bmAdd;
+            break;
+
+        case ltSubtractive:
+            // subtractive blend
+            out = bmSub;
+            break;
+
+        case ltMultiplicative:
+            // multiplicative blend
+            out = bmMul;
+            break;
+
+        case ltDodge:
+            // color dodge ( "Ooi yaki" in Japanese )
+            out = bmDodge;
+            break;
+
+        case ltDarken:
+            // darken blend (select lower luminosity)
+            out = bmDarken;
+            break;
+
+        case ltLighten:
+            // lighten blend (select higher luminosity)
+            out = bmLighten;
+            break;
+
+        case ltScreen:
+            // screen multiplicative blend
+            out = bmScreen;
+            break;
+
+        case ltAddAlpha:
+            // alpha blend
+            out = bmAddAlpha;
+            break;
+
+        case ltPsNormal:
+            // Photoshop compatible normal blend
+            out = bmPsNormal;
+            break;
+
+        case ltPsAdditive:
+            // Photoshop compatible additive blend
+            out = bmPsAdditive;
+            break;
+
+        case ltPsSubtractive:
+            // Photoshop compatible subtractive blend
+            out = bmPsSubtractive;
+            break;
+
+        case ltPsMultiplicative:
+            // Photoshop compatible multiplicative blend
+            out = bmPsMultiplicative;
+            break;
+
+        case ltPsScreen:
+            // Photoshop compatible screen blend
+            out = bmPsScreen;
+            break;
+
+        case ltPsOverlay:
+            // Photoshop compatible overlay blend
+            out = bmPsOverlay;
+            break;
+
+        case ltPsHardLight:
+            // Photoshop compatible hard light blend
+            out = bmPsHardLight;
+            break;
+
+        case ltPsSoftLight:
+            // Photoshop compatible soft light blend
+            out = bmPsSoftLight;
+            break;
+
+        case ltPsColorDodge:
+            // Photoshop compatible color dodge blend
+            out = bmPsColorDodge;
+            break;
+
+        case ltPsColorDodge5:
+            // Photoshop 5.x compatible color dodge blend
+            out = bmPsColorDodge5;
+            break;
+
+        case ltPsColorBurn:
+            // Photoshop compatible color burn blend
+            out = bmPsColorBurn;
+            break;
+
+        case ltPsLighten:
+            // Photoshop compatible compare (lighten) blend
+            out = bmPsLighten;
+            break;
+
+        case ltPsDarken:
+            // Photoshop compatible compare (darken) blend
+            out = bmPsDarken;
+            break;
+
+        case ltPsDifference:
+            // Photoshop compatible difference blend
+            out = bmPsDifference;
+            break;
+
+        case ltPsDifference5:
+            // Photoshop 5.x compatible difference blend
+            out = bmPsDifference5;
+            break;
+
+        case ltPsExclusion:
+            // Photoshop compatible exclusion blend
+            out = bmPsExclusion;
+            break;
+
+        default:
+            return false;
+    }
+    return true;
+}
+//---------------------------------------------------------------------------
 bool iTVPBaseBitmap::Blt(tjs_int x,
                          tjs_int y,
                          const iTVPBaseBitmap* ref,
@@ -1023,148 +1169,8 @@ bool iTVPBaseBitmap::Blt(tjs_int x,
 {
 
     tTVPBBBltMethod met;
-    switch (type)
-    {
-        case ltBinder:
-            // no action
-            return false;
-
-        case ltOpaque: // formerly ltCoverRect
-                       // copy
-            met = opa == 255 ? bmCopy : bmCopyOnAlpha;
-            break;
-
-        case ltAlpha: // formerly ltTransparent
-                      // alpha blend
-            met = hda ? bmAlpha : bmAlphaOnAlpha;
-            break;
-
-        case ltAdditive:
-            // additive blend
-            // hda = true if destination has alpha
-            // ( preserving mask )
-            met = bmAdd;
-            break;
-
-        case ltSubtractive:
-            // subtractive blend
-            met = bmSub;
-            break;
-
-        case ltMultiplicative:
-            // multiplicative blend
-            met = bmMul;
-            break;
-
-        case ltDodge:
-            // color dodge ( "Ooi yaki" in Japanese )
-            met = bmDodge;
-            break;
-
-        case ltDarken:
-            // darken blend (select lower luminosity)
-            met = bmDarken;
-            break;
-
-        case ltLighten:
-            // lighten blend (select higher luminosity)
-            met = bmLighten;
-            break;
-
-        case ltScreen:
-            // screen multiplicative blend
-            met = bmScreen;
-            break;
-
-        case ltAddAlpha:
-            // alpha blend
-            met = bmAddAlpha;
-            break;
-
-        case ltPsNormal:
-            // Photoshop compatible normal blend
-            met = bmPsNormal;
-            break;
-
-        case ltPsAdditive:
-            // Photoshop compatible additive blend
-            met = bmPsAdditive;
-            break;
-
-        case ltPsSubtractive:
-            // Photoshop compatible subtractive blend
-            met = bmPsSubtractive;
-            break;
-
-        case ltPsMultiplicative:
-            // Photoshop compatible multiplicative blend
-            met = bmPsMultiplicative;
-            break;
-
-        case ltPsScreen:
-            // Photoshop compatible screen blend
-            met = bmPsScreen;
-            break;
-
-        case ltPsOverlay:
-            // Photoshop compatible overlay blend
-            met = bmPsOverlay;
-            break;
-
-        case ltPsHardLight:
-            // Photoshop compatible hard light blend
-            met = bmPsHardLight;
-            break;
-
-        case ltPsSoftLight:
-            // Photoshop compatible soft light blend
-            met = bmPsSoftLight;
-            break;
-
-        case ltPsColorDodge:
-            // Photoshop compatible color dodge blend
-            met = bmPsColorDodge;
-            break;
-
-        case ltPsColorDodge5:
-            // Photoshop 5.x compatible color dodge blend
-            met = bmPsColorDodge5;
-            break;
-
-        case ltPsColorBurn:
-            // Photoshop compatible color burn blend
-            met = bmPsColorBurn;
-            break;
-
-        case ltPsLighten:
-            // Photoshop compatible compare (lighten) blend
-            met = bmPsLighten;
-            break;
-
-        case ltPsDarken:
-            // Photoshop compatible compare (darken) blend
-            met = bmPsDarken;
-            break;
-
-        case ltPsDifference:
-            // Photoshop compatible difference blend
-            met = bmPsDifference;
-            break;
-
-        case ltPsDifference5:
-            // Photoshop 5.x compatible difference blend
-            met = bmPsDifference5;
-            break;
-
-        case ltPsExclusion:
-            // Photoshop compatible exclusion blend
-            met = bmPsExclusion;
-            break;
-
-        default:
-            return false;
-    }
-
+    if (!TVPLayerTypeToBltMethod(type, opa, hda, met))
+        return false;
     return Blt(x, y, ref, refrect, met, opa, hda);
 }
 //---------------------------------------------------------------------------
