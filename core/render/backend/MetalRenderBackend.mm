@@ -176,6 +176,21 @@ fragment float4 meshMain(Varying v [[stage_in]], constant Params& p [[buffer(0)]
     c.a *= p.values.x;
     return c;
 }
+// D3D picture blends (MBM_LAYER_*). The attachment blend state applies the
+// result; destination alpha is always held.
+fragment float4 layerMeshMain(Varying v [[stage_in]], constant Params& p [[buffer(0)]],
+                              texture2d<float> src [[texture(0)]]) {
+    constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
+    float4 c = src.sample(s, v.uv) * p.modulation;
+    float o = p.values.x;
+    switch (p.flags.x) {
+        case 100: return float4(c.rgb, o);
+        case 101: return float4(c.rgb * o, 0.0);
+        case 102: return float4((1.0 - c.rgb) * o, 0.0);
+        case 103: return float4(1.0 - (1.0 - c.rgb) * o, 0.0);
+        default: return c * o;
+    }
+}
 // Layer formulas use byte arithmetic, rather than approximate fixed-function
 // alpha blending (which changes source alpha and signed >>8 rounding).
 kernel void layerMain(uint2 tid [[thread_position_in_grid]], constant Params& p [[buffer(0)]],
@@ -467,6 +482,8 @@ struct MetalRenderBackend::Impl
     id<MTLRenderPipelineState> windowPipeline = nil, capturePipeline = nil;
     id<MTLRenderPipelineState> meshPipelines[3] = {nil, nil, nil};
     id<MTLRenderPipelineState> deformPipelines[3] = {nil, nil, nil};
+    static constexpr int kLayerMeshModes = iTVPRenderBackend::MBM_LAYER_END - iTVPRenderBackend::MBM_LAYER_COPY;
+    id<MTLRenderPipelineState> layerMeshPipelines[kLayerMeshModes] = {};
     struct DeformTopology {
         id<MTLBuffer> uv = nil;
         id<MTLBuffer> indices = nil;
@@ -1524,6 +1541,40 @@ struct MetalRenderBackend::Impl
         if (!p) SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Metal pipeline: %s", error.localizedDescription.UTF8String);
         return p;
     }
+    id<MTLRenderPipelineState> LayerMeshPipeline(id<MTLLibrary> lib, int mode)
+    {
+        MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [lib newFunctionWithName:@"vertexMain"];
+        d.fragmentFunction = [lib newFunctionWithName:@"layerMeshMain"];
+        auto a = d.colorAttachments[0];
+        a.pixelFormat = MTLPixelFormatRGBA8Unorm;
+        a.blendingEnabled = YES;
+        a.sourceAlphaBlendFactor = MTLBlendFactorZero;
+        a.destinationAlphaBlendFactor = MTLBlendFactorOne;
+        a.sourceRGBBlendFactor = MTLBlendFactorOne;
+        a.destinationRGBBlendFactor = MTLBlendFactorOne;
+        switch (mode) {
+            case iTVPRenderBackend::MBM_LAYER_COPY:
+                a.sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+                a.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+                break;
+            case iTVPRenderBackend::MBM_LAYER_SUB:
+                a.rgbBlendOperation = MTLBlendOperationReverseSubtract;
+                break;
+            case iTVPRenderBackend::MBM_LAYER_MUL:
+                a.sourceRGBBlendFactor = MTLBlendFactorDestinationColor;
+                a.destinationRGBBlendFactor = MTLBlendFactorZero;
+                break;
+            case iTVPRenderBackend::MBM_LAYER_ADDALPHA:
+                a.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+                break;
+            default: break; // MBM_LAYER_ADD
+        }
+        NSError* error = nil;
+        id<MTLRenderPipelineState> p = [device newRenderPipelineStateWithDescriptor:d error:&error];
+        if (!p) SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Metal layer mesh pipeline: %s", error.localizedDescription.UTF8String);
+        return p;
+    }
     DeformTopology* DeformGrid(int divX, int divY)
     {
         if (divX < 1 || divY < 1 || divX > 254 || divY > 254) return nullptr;
@@ -1603,6 +1654,8 @@ struct MetalRenderBackend::Impl
             meshPipelines[i] = Pipeline(lib, @"vertexMain", @"meshMain", MTLPixelFormatRGBA8Unorm, i);
             deformPipelines[i] = Pipeline(lib, @"deformVertexMain", @"meshMain", MTLPixelFormatRGBA8Unorm, i);
         }
+        for (int i = 0; i < kLayerMeshModes; ++i)
+            layerMeshPipelines[i] = LayerMeshPipeline(lib, iTVPRenderBackend::MBM_LAYER_COPY + i);
         layerPipeline = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"layerMain"] error:&error];
         if (!layerPipeline) SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Metal layer pipeline: %s", error.localizedDescription.UTF8String);
         if (layerPipeline && device.readWriteTextureSupport == MTLReadWriteTextureTier2) {
@@ -2007,8 +2060,11 @@ void MetalRenderBackend::DrawMesh(const float* vertices, int vertexCount, const 
         uniforms.flags.y = p.mask != nullptr;
         uniforms.values = simd_make_float4(std::clamp(opacity, 0.0f, 1.0f), p.current->width, p.current->height, 0);
         int pipeline = (uniforms.flags.x == 1 || uniforms.flags.x == 4) ? 1 : uniforms.flags.x == 21 ? 2 : 0;
+        const int layerMode = uniforms.flags.x - MBM_LAYER_COPY;
+        id<MTLRenderPipelineState> state = layerMode >= 0 && layerMode < Impl::kLayerMeshModes &&
+            p.layerMeshPipelines[layerMode] ? p.layerMeshPipelines[layerMode] : p.meshPipelines[pipeline];
         id<MTLRenderCommandEncoder> e = p.MeshPass(p.current);
-        [e setRenderPipelineState:p.meshPipelines[pipeline]];
+        [e setRenderPipelineState:state];
         [e setVertexBuffer:upload.buffer offset:upload.offset atIndex:0];
         [e setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
         [e setFragmentTexture:source atIndex:0];

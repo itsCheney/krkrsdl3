@@ -14,6 +14,10 @@
 #include <zlib.h>
 
 #include <sstream>
+#include <map>
+#include <tuple>
+#include <optional>
+#include <unordered_set>
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -405,6 +409,12 @@ static EmoteDecodedCache& SharedEmoteCache()
 }
 namespace
 {
+// Archive files that shareable E-mote files were loaded from.
+std::unordered_set<std::string>& SharedEmoteArchives()
+{
+    static std::unordered_set<std::string> archives;
+    return archives;
+}
 // Most recently released first.
 std::vector<std::unique_ptr<emotefile>>& EmoteFilePool()
 {
@@ -478,6 +488,12 @@ void TrimSharedEmoteResourceCache(const char* reason)
 }
 void InvalidateSharedEmoteResource(const std::string& canonicalPath)
 {
+    // Only archive members are shared and members cannot be written, so a
+    // write matters only to an archive a shared file came from. Save files
+    // are written all the time; they must not flush every decoded model.
+    if (canonicalPath.find(TVPArchiveDelimiter) == std::string::npos &&
+        !SharedEmoteArchives().count(canonicalPath))
+        return;
     // The generation bump below also keeps files loaded before it out of the pool.
     ClearEmoteFilePool(0);
     SharedEmoteCache().EraseIf([&](const auto& key) {
@@ -1670,7 +1686,7 @@ emotemetadata::~emotemetadata()
     }
 }
 
-emoteicon::emoteicon(emotefile* filePtr, uint32_t startOffset) : _filePtr(filePtr)
+emoteicon::emoteicon(emotefile* filePtr, uint32_t startOffset) : _filePtr(filePtr), _offset(startOffset)
 {
     // dic
     std::map<std::string, uint32_t> _rootData;
@@ -1720,23 +1736,60 @@ emoteicon::emoteicon(emotefile* filePtr, uint32_t startOffset) : _filePtr(filePt
         filePtr->parseReal(_clip.top, _rootData["top"]);
     }
 }
+struct SharedIconTexture
+{
+    void* texture = nullptr;
+    std::uint64_t bytes = 0;
+    ~SharedIconTexture()
+    {
+        // 纹理由 core/render 的 2D 渲染器统一管理
+        if (!texture) return;
+        if (krkrsdl3::iTVPRenderBackend* renderer = krkrsdl3::TVPGetRenderBackend())
+            renderer->DestroyTexture(texture);
+        krkrsdl3::TVPRecordEmoteIconTexture(-1, -static_cast<std::int64_t>(bytes));
+    }
+};
+namespace
+{
+// (placed path, seed, cache generation, icon offset): the same icon of the same
+// file version. Entries expire with their last icon.
+using IconTextureKey = std::tuple<std::string, tjs_int, std::uint64_t, uint32_t>;
+std::map<IconTextureKey, std::weak_ptr<SharedIconTexture>>& SharedIconTextures()
+{
+    static std::map<IconTextureKey, std::weak_ptr<SharedIconTexture>> textures;
+    return textures;
+}
+} // namespace
+
 emoteicon::~emoteicon()
 {
     if (data != nullptr)
         delete[] data;
-    // 纹理由 core/render 的 2D 渲染器统一管理
-    if (selftexture != nullptr)
-    {
-        krkrsdl3::iTVPRenderBackend* renderer = krkrsdl3::TVPGetRenderBackend();
-        if (renderer)
-            renderer->DestroyTexture(selftexture);
-        selftexture = nullptr;
-    }
+    selftexture = nullptr;
+    _texture.reset();
 }
 void emoteicon::ensureLoad()
 {
-    if (data == nullptr)
+    if (!loaded)
     {
+        loaded = true;
+        std::optional<IconTextureKey> key;
+        if (_filePtr->IsPoolable())
+        {
+            key.emplace(_filePtr->PoolPath(), _filePtr->PoolSeed(), _filePtr->PoolGeneration(), _offset);
+            auto& textures = SharedIconTextures();
+            const auto found = textures.find(*key);
+            if (found != textures.end())
+            {
+                if ((_texture = found->second.lock()))
+                {
+                    selftexture = _texture->texture;
+                    krkrsdl3::TVPRecordEmoteIconTextureShare();
+                    return;
+                }
+                textures.erase(found);
+            }
+        }
         // 基本创建
         int datasize = width * height * 4;
         data = new uint8_t[datasize];
@@ -1766,7 +1819,29 @@ void emoteicon::ensureLoad()
         {
             selftexture = renderer->CreateTexture(width, height);
             if (selftexture)
+            {
                 renderer->UpdateTexture(selftexture, data, width, height, width * 4);
+                _texture = std::make_shared<SharedIconTexture>();
+                _texture->texture = selftexture;
+                _texture->bytes = static_cast<std::uint64_t>(datasize);
+                krkrsdl3::TVPRecordEmoteIconTexture(1, datasize);
+                if (key)
+                {
+                    auto& textures = SharedIconTextures();
+                    // Drop expired entries now and then so the map tracks live icons.
+                    if (textures.size() > 4096)
+                        for (auto it = textures.begin(); it != textures.end();)
+                            it = it->second.expired() ? textures.erase(it) : std::next(it);
+                    textures[*key] = _texture;
+                }
+            }
+        }
+        // UpdateTexture copies the pixels. Nothing reads them afterwards, and
+        // pooled and active files kept a second full copy of every icon.
+        if (selftexture)
+        {
+            delete[] data;
+            data = nullptr;
         }
     }
 }
@@ -1932,6 +2007,8 @@ bool emotefile::load(const ttstr& filePath)
     _poolable = cacheable;
     _poolPath = canonicalPath;
     _poolGeneration = generation;
+    if (cacheable)
+        SharedEmoteArchives().insert(canonicalPath.substr(0, canonicalPath.find(TVPArchiveDelimiter)));
     if (cacheable) {
         if (auto resource = SharedEmoteCache().Find(key)) {
             LoadDecodedResource(std::move(resource));
@@ -3052,7 +3129,8 @@ emotemotion* emotefile::findmotionByName(const std::string& name)
                 return tmp1->second;
             }
         }
-        TVPConsoleLog("motion find failed!!!");
+        // A motion in an attached file is not in this one; the engine-level
+        // lookup reports names that no loaded file has.
     }
     else
     {

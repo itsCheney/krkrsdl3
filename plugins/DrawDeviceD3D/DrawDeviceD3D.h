@@ -18,12 +18,13 @@
 //      / checkEnable / getModule / maskMode
 //   3. 独立 D3D 层（D3DLayer + D3DPicture）的 GPU 合成管理：
 //      D3D 层走渲染后端的 Layer 合成路径（软件 RenderManager 混合语义）；
-//      普通 Layer 树保持完全软渲染（tjsNativeLayer 无 GPU 路径），
-//      其 DrawBuffer 每帧作为贴图上传并与 D3D 层合成到合成目标。
+//      普通 Layer 树由当前 RenderManager 合成（Metal 时在 GPU 上），
+//      其 DrawBuffer 与 D3D 层合成到合成目标。
 //
 // 呈现模型：
-//   - 每个 LayerManager 的 DrawBuffer 为软件位图（与渲染基准一致）
-//   - 每帧：软件 DrawBuffer 上传 → 与独立 D3D 层（drawPlane Both/Front/Back、
+//   - 每个 LayerManager 的 DrawBuffer 只重绘其更新区域；GPU 驻留时直接
+//     作为贴图使用，软件位图才上传
+//   - 每帧：DrawBuffer 与独立 D3D 层（drawPlane Both/Front/Back、
 //     frontIndex 排序）合成到合成目标；D3DEmotePlayer 先绘制到所属 D3DLayer
 //     → 转场交叉淡化
 //   - 合成目标作为窗口贴图交给后端上屏（GPU 后端零拷贝；
@@ -48,6 +49,10 @@ class DrawDeviceD3D : public iTVPDrawDevice
     {
         iTVPLayerManager* Manager = nullptr;
         tTJSNI_BaseLayer* Primary = nullptr;
+        // The DrawBuffer as last composed. Another buffer or size means its
+        // contents are not ours, so the next composition redraws all of it.
+        const void* ComposedBuffer = nullptr;
+        tjs_int ComposedW = 0, ComposedH = 0;
     };
     std::vector<ManagerInfo> Managers;
 
@@ -76,6 +81,7 @@ class DrawDeviceD3D : public iTVPDrawDevice
     void* PresentScratchTexture = nullptr; // SW 后端呈现中转用贴图（目标 → 一般贴图）
     void* PrevCompositeTarget = nullptr;  // 转场快照（crossfade 用）
     void* ScratchTexture = nullptr;       // 软件 DrawBuffer 上传用的一般贴图
+    tjs_int ScratchW = 0, ScratchH = 0;
     bool TransitionActive = false;
     tjs_real TransitionProgress = 1.0;
 
@@ -196,10 +202,13 @@ private:
     void EnsureBackend();
     void RenderFrame();
     void ComposeLayerManager(int index, void* target);
+    tTVPBaseTexture* RefreshDrawBuffer(size_t index);
+    void ReleaseBackendResources();
     void PresentToWindow();
     bool IsSoftwareBackend() const;
     void DrawQuadTo(void* target, void* srcTexture, float x, float y, float w, float h,
-                    int blendMode, float opacity, const float matrix[16] = nullptr);
+                    int blendMode, float opacity, const float matrix[16] = nullptr,
+                    float u1 = 1.0f, float v1 = 1.0f);
 };
 
 //---------------------------------------------------------------------------
@@ -261,7 +270,8 @@ class D3DImage
 {
 public:
     DrawDeviceD3D* Device = nullptr;
-    void* Texture = nullptr; // 后端一般贴图（CreateTexture）
+    void* Texture = nullptr; // 采样用后端贴图（CreateTexture，或 GPU 拷贝目标的 GetTargetTexture）
+    void* Target = nullptr;  // GPU 拷贝时持有的 CreateTarget 句柄
     tjs_int Width = 0, Height = 0;
 
     D3DImage(iTJSDispatch2* drawDeviceObj);
@@ -271,6 +281,9 @@ public:
     tjs_int getHeight() { return Height; }
     void* GetTexture() { return Texture; }
     void finalize();
+
+private:
+    void ReleaseTexture();
 };
 
 //---------------------------------------------------------------------------

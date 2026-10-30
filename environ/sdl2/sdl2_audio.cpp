@@ -192,7 +192,7 @@ public:
         switch (fmt.BitsPerSample)
         {
             case 8:
-                spec.format = AUDIO_S8;
+                spec.format = AUDIO_U8; // 8-bit PCM is unsigned (WAV, FFmpeg U8)
                 break;
             case 16:
                 spec.format = AUDIO_S16SYS;

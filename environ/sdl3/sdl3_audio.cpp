@@ -99,7 +99,8 @@ public:
         switch (fmt.BitsPerSample)
         {
             case 8:
-                spec.format = SDL_AUDIO_S8;
+                // 8-bit PCM is unsigned (WAV, FFmpeg U8)
+                spec.format = SDL_AUDIO_U8;
                 break;
             case 16:
                 spec.format = SDL_AUDIO_S16LE;

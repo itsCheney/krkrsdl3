@@ -268,7 +268,7 @@ public:
     void setCoord(tjs_real x, tjs_real y, tjs_real time = 0, tjs_real easing = 0);
     void setScale(tjs_real scale, tjs_real time = 0, tjs_real easing = 0);
     void setRotate(tjs_real rotate, tjs_real time = 0, tjs_real easing = 0);
-    void setColor(tjs_uint32 color);
+    void setColor(tjs_uint32 color, tjs_real time = 0, tjs_real easing = 0);
     void setVariable(tTJSString name, tjs_real value, tjs_real time = 0, tjs_real easing = 0);
     tjs_real getVariable(tTJSString name);
     void setOuterForce(tTJSString name, tjs_real ofx, tjs_real ofy, tjs_real time = 0, tjs_real easing = 0);
@@ -347,6 +347,9 @@ private:
     tjs_real speedRatio = 1000.0 / 60.0;
     EmoteTween coordX, coordY, rotation, scale{1, 1}, scaleY{1, 1};
     EmoteTween forces[3][2];
+    // setColor() channels R, G, B, A; 1 is neutral (0xFF808080).
+    EmoteTween colors[4]{{1, 1}, {1, 1}, {1, 1}, {1, 1}};
+    void updateColor();
     bool isSelfClear = false; // true:draw使用完全copy(以实现自主clear) false:通过clear函数间接完成
                               // 其分别对应了两种emote的运行模式
     // canvas（渲染目标句柄，由 core/render 的 2D 渲染器管理）

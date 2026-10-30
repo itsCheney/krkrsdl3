@@ -153,9 +153,9 @@ bool VorbisWaveDecoder::Render(void* buf, tjs_uint bufsamplelen, tjs_uint& rende
                     {
                         *p++ = pcm[i][j];
                     }
-            } while (samples < 0); // ov_read would return a negative number
-            // if the decoding is not ready
-            if (samples == 0)
+            } while (samples == OV_HOLE); // a gap in the data; decoding can go on
+            // end of stream, or an error that retrying won't fix
+            if (samples <= 0)
                 break;
             pos += samples;
             remain -= samples;
@@ -171,9 +171,9 @@ bool VorbisWaveDecoder::Render(void* buf, tjs_uint bufsamplelen, tjs_uint& rende
             {
                 res = ov_read(&InputFile, ((char*)buf + pos), remain, 0, pcmsize, 1,
                               &CurrentSection); // decode via ov_read
-            } while (res < 0);                  // ov_read would return a negative number
-            // if the decoding is not ready
-            if (res == 0)
+            } while (res == OV_HOLE);           // a gap in the data; decoding can go on
+            // end of stream, or an error that retrying won't fix
+            if (res <= 0)
                 break;
             pos += res;
             remain -= res;

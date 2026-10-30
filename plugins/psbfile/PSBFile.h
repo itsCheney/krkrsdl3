@@ -49,6 +49,8 @@ private:
     ttstr _mediaKey;
 
     void releaseLoad();
+    // Drops the tree; its containers are freed over the next frames.
+    void releaseTree();
     void detachMedia();
     void dropMedia();
     // Reads the header and tables of filePtr; false if they are unusable.
@@ -69,6 +71,14 @@ private:
 
     PSB::PSBMediaInfo _resources;
     tTJSVariant _root;
+    // Every array and dictionary of the tree, each with a reference of its
+    // own. Releasing the root then frees only the root's storage, and the
+    // rest goes one container at a time instead of one 125 ms cascade.
+    std::vector<iTJSDispatch2*> _containers;
+    // String values by string table index, built once per load. Scenario
+    // files repeat the same strings many times.
+    std::vector<tTJSVariant> _stringValues;
+    std::vector<bool> _stringBuilt;
 };
 
 //---------------------------------------------------------------------------

@@ -397,6 +397,7 @@ bool FFWaveDecoder::ReadPacket()
             av_packet_unref(&Packet);
             return true;
         }
+        av_packet_unref(&Packet); // a packet of another stream (cover art, video)
     }
     return false;
 }

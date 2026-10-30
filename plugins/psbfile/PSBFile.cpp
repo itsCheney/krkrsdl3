@@ -5,12 +5,99 @@
 #include "TVPStorage.h"
 #include "UtilStreams.h"
 #include "tjsArray.h"
+#include "TVPEvent.h"
+#include "psbsession.h"
 #include "../../core/render/CPUFrameDiagnostics.h"
 
 #include <zlib.h>
 
+#include <chrono>
+#include <cstring>
+#include <deque>
 #include <memory>
 #include <vector>
+
+namespace
+{
+// Freeing a scenario tree in one go took 125-130 ms on device (one frame).
+// Each queued container holds the only native reference, and the queue is in
+// creation order (parents first), so each release frees one container.
+class PSBDeferredRelease : public tTVPContinuousEventCallbackIntf
+{
+public:
+    bool enabled = true;
+
+    void Add(std::vector<iTJSDispatch2*>& objects)
+    {
+        if (!enabled)
+        {
+            for (auto* object : objects) object->Release();
+            objects.clear();
+            return;
+        }
+        if (objects.empty()) return;
+        _queue.insert(_queue.end(), objects.begin(), objects.end());
+        objects.clear();
+        if (!_hooked)
+        {
+            TVPAddContinuousEventHook(this);
+            _hooked = true;
+        }
+    }
+    void OnContinuousCallback(tjs_uint64) override
+    {
+        using clock = std::chrono::steady_clock;
+        const auto deadline = clock::now() + std::chrono::microseconds(2000);
+        size_t released = 0;
+        while (!_queue.empty())
+        {
+            iTJSDispatch2* object = _queue.front();
+            _queue.pop_front();
+            object->Release();
+            if ((++released & 31) == 0 && clock::now() >= deadline) break;
+        }
+        if (_queue.empty()) Unhook();
+    }
+    void Flush()
+    {
+        while (!_queue.empty())
+        {
+            iTJSDispatch2* object = _queue.front();
+            _queue.pop_front();
+            object->Release();
+        }
+        Unhook();
+    }
+
+private:
+    std::deque<iTJSDispatch2*> _queue;
+    bool _hooked = false;
+
+    void Unhook()
+    {
+        if (!_hooked) return;
+        TVPRemoveContinuousEventHook(this);
+        _hooked = false;
+    }
+};
+
+PSBDeferredRelease& DeferredRelease()
+{
+    static auto* release = new PSBDeferredRelease();
+    return *release;
+}
+} // namespace
+
+void TVPSetPSBDeferredRelease(bool enabled)
+{
+    DeferredRelease().enabled = enabled;
+    if (!enabled) DeferredRelease().Flush();
+}
+
+void TVPFlushPSBDeferredRelease()
+{
+    DeferredRelease().Flush();
+}
 
 //---------------------------------------------------------------------------
 // tTJSNI_PsbFile : PsbFile TJS native instance
@@ -45,9 +132,18 @@ void tTJSNI_PsbFile::Invalidate()
     releaseLoad();
     detachMedia();
     _resources._resources.clear();
-    // _root is released by the destructor, inside the PSBDestroy scope.
+    // The tree is released by Destruct, inside the PSBDestroy scope.
     Owner = NULL;
     inherited::Invalidate();
+}
+
+void tTJSNI_PsbFile::releaseTree()
+{
+    // Every container still holds its own reference, so this frees nothing.
+    _root.Clear();
+    DeferredRelease().Add(_containers);
+    _stringValues.clear();
+    _stringBuilt.clear();
 }
 
 void tTJSNI_PsbFile::releaseLoad()
@@ -137,6 +233,7 @@ void tTJSNI_PsbFile::Destruct()
     // The scope must surround deletion: a destructor-body scope would finish
     // before _root's member destructor releases its TJS object tree.
     krkrsdl3::cpu_frame::EventScope cpuDestroy(krkrsdl3::cpu_frame::Kind::PSBDestroy);
+    releaseTree();
     delete this;
 }
 
@@ -296,7 +393,7 @@ bool tTJSNI_PsbFile::loadFromStream(tTJSBinaryStream* _filePtr, const ttstr& fil
     chunkLengths.clear();
     extraChunkOffsets.clear();
     extraChunkLengths.clear();
-    _root.Clear();
+    releaseTree();
 
     cpuLoad.SetWorkBytes(_filePtr->GetSize());
     tTVPMemoryStream* memory;
@@ -330,6 +427,8 @@ bool tTJSNI_PsbFile::loadFromStream(tTJSBinaryStream* _filePtr, const ttstr& fil
             return false;
         }
     }
+    _stringValues.assign(stringsOffset.size(), tTJSVariant());
+    _stringBuilt.assign(stringsOffset.size(), false);
 
     // Time only the outer materialization, not each recursive node/dispatch.
     try
@@ -340,10 +439,13 @@ bool tTJSNI_PsbFile::loadFromStream(tTJSBinaryStream* _filePtr, const ttstr& fil
     catch (...)
     {
         releaseLoad();
+        releaseTree();
         _resources._resources.clear();
         dropMedia();
         throw;
     }
+    _stringValues.clear();
+    _stringBuilt.clear();
     // The tree is complete and holds every resource as an octet; the
     // decompressed file is no longer needed.
     releaseLoad();
@@ -523,12 +625,12 @@ tTJSVariant tTJSNI_PsbFile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
             PSB::parsePSBArray(&tmp, typeByte - static_cast<tjs_int8>(PSB::PSBObjType::ArrayN1) + 1,
                                filePtr);
             iTJSDispatch2* array = TJSCreateArrayObject();
-            for (auto i : tmp)
+            array->AddRef();
+            _containers.push_back(array);
+            for (tjs_int i = 0; i < (tjs_int)tmp.size(); i++)
             {
-                tTJSVariant tmp(static_cast<tjs_int32>(i));
-                tTJSVariant* args[] = {&tmp};
-                static tjs_uint addHint = 0;
-                array->FuncCall(0, TJS_N("add"), &addHint, nullptr, 1, args, array);
+                tTJSVariant value(static_cast<tjs_int32>(tmp[i]));
+                array->PropSetByNum(TJS_MEMBERENSURE, i, &value, array);
             }
             tTJSVariant result(array, array);
             array->Release();
@@ -546,22 +648,21 @@ tTJSVariant tTJSNI_PsbFile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
                                 typeByte - static_cast<tjs_int8>(PSB::PSBObjType::StringN1) + 1);
             if (idx < 0 || (size_t)idx >= stringsOffset.size())
                 return tTJSVariant("");
-            filePtr->SetPosition(_header.offsetStringsData + stringsOffset[idx]);
-            std::string str;
-            tjs_uint8 val8 = 0;
-            while (true)
+            if (_stringBuilt[idx])
+                return _stringValues[idx];
+            // A string runs to its NUL; one cut off by the end of the file
+            // reads as empty, as before.
+            tTJSVariant value("");
+            const tjs_uint64 start = (tjs_uint64)_header.offsetStringsData + stringsOffset[idx];
+            if (start < fileSize)
             {
-                if (filePtr->Read(&val8, 1) == 0)
-                    break;
-
-                if (val8 == '\0')
-                {
-                    str.append(1, val8);
-                    return tTJSVariant(str);
-                }
-                str.append(1, val8);
+                const auto* begin = reinterpret_cast<const char*>(fileData + start);
+                if (const auto* end = static_cast<const char*>(std::memchr(begin, 0, (size_t)(fileSize - start))))
+                    value = tTJSVariant(ttstr(std::string(begin, end)));
             }
-            return tTJSVariant("");
+            _stringValues[idx] = value;
+            _stringBuilt[idx] = true;
+            return value;
         }
         case PSB::PSBObjType::ResourceN1:
         case PSB::PSBObjType::ResourceN2:
@@ -628,12 +729,12 @@ tTJSVariant tTJSNI_PsbFile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
                 return tTJSVariant();
             }
             iTJSDispatch2* array = TJSCreateArrayObject();
-            for (auto _offset : _objsOffset)
+            array->AddRef();
+            _containers.push_back(array);
+            for (tjs_int i = 0; i < (tjs_int)_objsOffset.size(); i++)
             {
-                tTJSVariant obj = readAllObjs(ttstr(), _tmpOffset + _offset);
-                tTJSVariant* args[] = {&obj};
-                static tjs_uint addHint = 0;
-                array->FuncCall(0, TJS_N("add"), &addHint, nullptr, 1, args, array);
+                tTJSVariant obj = readAllObjs(ttstr(), _tmpOffset + _objsOffset[i]);
+                array->PropSetByNum(TJS_MEMBERENSURE, i, &obj, array);
             }
             tTJSVariant result(array, array);
             array->Release();
@@ -661,11 +762,17 @@ tTJSVariant tTJSNI_PsbFile::readAllObjs(const ttstr& key, tjs_uint32 _objOffset)
                 return tTJSVariant();
             }
             iTJSDispatch2* dsp = TJSCreateDictionaryObject();
+            dsp->AddRef();
+            _containers.push_back(dsp);
             for (tjs_int i = 0; i < _objsNamesIdx.size(); i++)
             {
-                ttstr keyName = namesCache.at(_objsNamesIdx.at(i));
+                const ttstr& keyName = namesCache.at(_objsNamesIdx.at(i));
                 tTJSVariant obj = readAllObjs(keyName, _tmpOffset + _objsOffset.at(i));
-                dsp->PropSet(TJS_MEMBERENSURE, keyName.c_str(), nullptr, &obj, dsp);
+                // The shared name string carries its hash, and every
+                // dictionary with this key references it instead of a copy.
+                tTJSVariantString* name = keyName.AsVariantStringNoAddRef();
+                if (!name || TJS_FAILED(dsp->PropSetByVS(TJS_MEMBERENSURE, name, &obj, dsp)))
+                    dsp->PropSet(TJS_MEMBERENSURE, keyName.c_str(), nullptr, &obj, dsp);
             }
             tTJSVariant result(dsp, dsp);
             dsp->Release();

@@ -185,6 +185,10 @@ tTJSBinaryStream* TVPCreateStream(const ttstr& name, tjs_uint32 flags = 0);
 void TVPClearStorageCaches();
 // clear all internal storage related caches.
 void TVPRemoveFromStorageCache(const ttstr& name);
+// One file was created, replaced or deleted: drops the auto path cache and any
+// E-mote resource decoded from that file, and keeps everything else (a game
+// that rewrites its save files must not flush every decoded model).
+void TVPStorageFileChanged(const ttstr& storageName);
 
 ttstr TVPGetTemporaryName();
 // retrieve file name to store temporary data ( must be unique, local name )

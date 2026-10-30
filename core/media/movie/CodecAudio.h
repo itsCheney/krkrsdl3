@@ -22,8 +22,6 @@ typedef struct stDVDAudioFrame
     enum AVSampleFormat m_dataFormat;
     unsigned int m_sampleRate;
     int m_channelCount;
-    unsigned int m_frames;
-    unsigned int m_frameSize;
 
     int bits_per_sample;
 } DVDAudioFrame;
