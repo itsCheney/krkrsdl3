@@ -276,11 +276,21 @@ namespace emoteplayer
         bool getControlVariableByKey(const std::string& key, float& value) const;
         EmotePhysics physics;
         bool samplingPhysics = false;
+        // setColor(): RGB multiply (1 is neutral) and alpha for the whole player.
+        // Mask passes keep their coverage, so they are drawn untinted.
+        float playerColor[4] = {1, 1, 1, 1};
+        bool drawingMask = false;
         void samplePhysics(float tick, const emoteRender& root, emotelimit lim);
         void recordPhysicsAnchor(const std::string& name, const std::vector<emoteRender>& chain);
         // Whether physics sampling must evaluate this node: it is an anchor
         // layer, or one is below it (children or a motion its frames show).
         bool leadsToPhysicsAnchor(emotenode* node, int depth = 0);
+        // leadsToPhysicsAnchor answers per node, for one physicsAnchorKey. Each
+        // node ref asks for its own node, and every answer walks the whole
+        // subtree and the motions its frames show, so a new player repeated
+        // the same walks for each node of its model.
+        std::unordered_map<const emotenode*, bool> _anchorLeads;
+        std::uint64_t _anchorLeadsKey = ~std::uint64_t(0);
         std::uint64_t physicsAnchorKey() const { return physics.anchorGeneration * 1024 + _attach.size(); }
         emotemotionref* physicsSample() const { return _physicsRef.get(); }
         void updatePhysics(float frames);

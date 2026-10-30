@@ -682,7 +682,7 @@ public:
     {
         if (!output || !capacity) return false;
         capacity = std::min<tjs_uint>(capacity, 513);
-        frames = std::min<tjs_uint>(frames, 4);
+        frames = std::min<tjs_uint>(frames, 8);
         tjs_uint used = 0;
         output[0] = 0;
         auto append = [&](const tjs_char* text, tjs_uint fieldLimit) {

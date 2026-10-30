@@ -141,6 +141,18 @@ public:
     // 混合模式：0 普通 alpha / 1,4 乘色 / 3 加色 / 6 跳过 / 21 纯色替换；
     // uniformColor 仅 mode 21 使用，可为 nullptr
     virtual void SetBlendMode(int mode, const float* uniformColor = nullptr) = 0;
+    // Layer-type blends for DrawDeviceD3D's transformed pictures, following the
+    // LBM_* formulas (destination alpha held). Backends without them draw the
+    // ordinary alpha blend, as for any unknown mode.
+    enum MeshLayerBlendMode
+    {
+        MBM_LAYER_COPY = 100, // dest.RGB = src.RGB, constant opacity
+        MBM_LAYER_ADD,        // dest.RGB = sat(dest + src * opa)
+        MBM_LAYER_SUB,        // dest.RGB = sat(dest - (1 - src) * opa)
+        MBM_LAYER_MUL,        // dest.RGB = dest * (1 - (1 - src) * opa)
+        MBM_LAYER_ADDALPHA,   // premultiplied: dest.RGB = dest * (1 - src.a * opa) + src * opa
+        MBM_LAYER_END
+    };
     // vertices: 交错 (x, y, u, v)，每顶点 4 个 float（NDC + UV）
     // colorModulation：采样后乘到纹素上；nullptr 视为 (1,1,1,1)。
     // emote PSB 的中性 frame.color 是 0xff808080，调用方应传 identity，不要把 128/255 当染色。
@@ -352,6 +364,16 @@ struct TVPRuntimeProfileStats {
     uint64_t emoteDrawTimeNS = 0;
     uint64_t emoteCaptureProfileCalls = 0;
     uint64_t emoteCaptureTimeNS = 0;
+    // progress() parts: timeline/eye controls, the physics anchor sample
+    // (builds the sample tree on a new player) and the spring update.
+    // The slowest single progress() call is a high-water mark.
+    uint64_t emoteProgressControlTimeNS = 0;
+    uint64_t emoteProgressSampleTimeNS = 0;
+    uint64_t emoteProgressPhysicsTimeNS = 0;
+    uint64_t emoteProgressMaxTimeNS = 0;
+    uint64_t emoteIconTextures = 0;
+    uint64_t emoteIconTextureBytes = 0;
+    uint64_t emoteIconTextureShares = 0;
 
     // M6.2 Emote prepare breakdown. Node time is local work only (recursive
     // children/submotions are measured by their own node records). Shape/mesh
@@ -427,6 +449,11 @@ struct TVPRuntimeProfileStats {
     uint64_t metalRingFallbackBytes = 0;
 };
 void TVPRecordEmoteProgress(uint64_t nanoseconds);
+void TVPRecordEmoteProgressDetail(uint64_t controlNS, uint64_t sampleNS, uint64_t physicsNS);
+// Live E-mote icon textures (count and bytes change by the deltas) and icons
+// that reused another player's texture of the same model.
+void TVPRecordEmoteIconTexture(int64_t textures, int64_t bytes);
+void TVPRecordEmoteIconTextureShare();
 void TVPRecordEmotePrepare(uint64_t nanoseconds);
 void TVPRecordEmoteDraw(uint64_t nanoseconds);
 void TVPRecordEmoteCaptureTime(uint64_t nanoseconds);

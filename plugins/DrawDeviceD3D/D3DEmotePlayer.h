@@ -36,7 +36,7 @@ class D3DEmotePlayer
 
 public:
     D3DEmotePlayer(iTJSDispatch2* d3dlayer);
-    D3DEmotePlayer(iTJSDispatch2* d3dlayer, emoteplayer::ResourceManager* sharedRM, emoteplayer::EmotePlayer* sharedPlayer);
+    D3DEmotePlayer(iTJSDispatch2* d3dlayer, emoteplayer::ResourceManager* sharedRM);
     ~D3DEmotePlayer();
 
     static tjs_error load(tTJSVariant* result,

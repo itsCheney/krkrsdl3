@@ -49,21 +49,10 @@ CVideoPlayerAudio::CVideoPlayerAudio(CDVDClock* pClock, CDVDMessageQueue& parent
 
 CVideoPlayerAudio::~CVideoPlayerAudio()
 {
-    if (swr_ctx)
-    {
-        swr_free(&swr_ctx);
-    }
-    if (audio_buf)
-    {
-        av_freep(&audio_buf);
-    }
-    if (m_soundDevice)
-    {
-        delete m_soundDevice;
-        m_soundDevice = nullptr;
-    }
-
+    // the decode thread uses everything below
     StopThread();
+
+    Destroy();
 
     // close the stream, and don't wait for the audio to be finished
     // CloseStream(true);
@@ -126,7 +115,7 @@ void CVideoPlayerAudio::OpenStream(CDVDStreamInfo& hints, CDVDAudioCodec* codec)
 
 void CVideoPlayerAudio::CloseStream(bool bWaitForBuffers)
 {
-    bool bWait = bWaitForBuffers && m_speed > 0 && m_soundDevice->IsPlaying();
+    bool bWait = bWaitForBuffers && m_speed > 0 && m_soundDevice && m_soundDevice->IsPlaying();
 
     // wait until buffers are empty
     if (bWait)
@@ -170,7 +159,7 @@ void CVideoPlayerAudio::UpdatePlayerInfo()
 
 void CVideoPlayerAudio::Execute()
 {
-    DVDAudioFrame audioframe;
+    DVDAudioFrame audioframe{};
 
     while (!GetTerminated())
     {
@@ -306,6 +295,7 @@ void CVideoPlayerAudio::Execute()
                     audioframe.nb_frames = 0;
                 }
                 m_syncState = IDVDStreamPlayer::SYNC_STARTING;
+                pMsg->Release();
                 continue;
             }
 
@@ -384,9 +374,11 @@ bool CVideoPlayerAudio::ProcessDecoderOutput(DVDAudioFrame& audioframe)
 
         Destroy();
 
+        // On failure (no audio device, e.g. during an interruption) the movie
+        // goes on silently and the next frame tries again.
         Create(audioframe, m_streaminfo.codec, m_setsynctype == SYNC_RESAMPLE);
 
-        if (m_syncState == IDVDStreamPlayer::SYNC_INSYNC)
+        if (m_soundDevice && m_syncState == IDVDStreamPlayer::SYNC_INSYNC)
             m_soundDevice->Play();
 
         m_streaminfo.channels = audioframe.m_channelCount;
@@ -412,7 +404,8 @@ bool CVideoPlayerAudio::ProcessDecoderOutput(DVDAudioFrame& audioframe)
     // signal to our parent that we have initialized
     if (m_syncState == IDVDStreamPlayer::SYNC_STARTING)
     {
-        double cachetotal = DVD_SEC_TO_TIME(m_soundDevice->GetLatencySeconds());
+        double cachetotal =
+            m_soundDevice ? DVD_SEC_TO_TIME(m_soundDevice->GetLatencySeconds()) : 0.0;
         {
             m_syncState = IDVDStreamPlayer::SYNC_WAITSYNC;
 
@@ -560,6 +553,9 @@ void CVideoPlayerAudio::Destroy()
     {
         av_freep(&audio_buf);
     }
+    // av_fast_malloc trusts the size: a stale one skips the allocation
+    // and asserts on the null buffer.
+    audio_buf_size = 0;
     if (m_soundDevice)
     {
         delete m_soundDevice;
@@ -613,7 +609,7 @@ unsigned int CVideoPlayerAudio::AddPackets(const DVDAudioFrame& audioframe)
 
             if (swr_ctx)
             {
-                uint32_t srcoff = offset * (audioframe.m_frameSize / src_buffer_count);
+                uint32_t srcoff = offset * (audioframe.framesize / src_buffer_count);
                 const uint8_t* in[8];
                 for (unsigned int i = 0; i < src_buffer_count; ++i)
                 {
@@ -622,8 +618,24 @@ unsigned int CVideoPlayerAudio::AddPackets(const DVDAudioFrame& audioframe)
                 int out_count = frames + 256;
                 int out_size = av_samples_get_buffer_size(NULL, audioframe.m_channelCount,
                                                           out_count, swr_tgtFormat, 0);
+                // a frame that can't be converted is dropped
+                if (out_size <= 0)
+                {
+                    copied = frames;
+                    break;
+                }
                 av_fast_malloc(&audio_buf, &audio_buf_size, out_size);
+                if (!audio_buf)
+                {
+                    copied = frames;
+                    break;
+                }
                 int len2 = swr_convert(swr_ctx, &audio_buf, out_count, in, frames);
+                if (len2 < 0)
+                {
+                    copied = frames;
+                    break;
+                }
                 if (len2 == out_count)
                 {
                     av_log(NULL, AV_LOG_WARNING, "audio buffer is probably too small\n");
@@ -633,8 +645,8 @@ unsigned int CVideoPlayerAudio::AddPackets(const DVDAudioFrame& audioframe)
             }
             else
             {
-                m_soundDevice->AppendBuffer(audioframe.data[0] + offset * audioframe.m_frameSize,
-                                            frames * audioframe.m_frameSize);
+                m_soundDevice->AppendBuffer(audioframe.data[0] + offset * audioframe.framesize,
+                                            frames * audioframe.framesize);
             }
 
             if (!m_soundDevice->IsPlaying())

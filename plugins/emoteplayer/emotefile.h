@@ -293,6 +293,7 @@ private:
     emotefile* _filePtr = nullptr;
 };
 
+struct SharedIconTexture;
 class emoteicon
 {
 public:
@@ -321,11 +322,17 @@ public:
     double texWidth = 0;
     double texHeight = 0;
 
-    uint8_t* data = nullptr; // icon数据（RGBA，统一字节序）
+    // RGBA pixels, kept only while no texture holds them (GPU textures own a copy).
+    uint8_t* data = nullptr;
+    bool loaded = false;
     void* selftexture = nullptr; // 纹理句柄（由 core/render 的 2D 渲染器管理）
 
 private:
     emotefile* _filePtr = nullptr;
+    uint32_t _offset = 0;
+    // Shareable files (see emotefile::IsPoolable) give every player of the
+    // same model one texture per icon instead of one each.
+    std::shared_ptr<SharedIconTexture> _texture;
 };
 
 class emotesource

@@ -1143,8 +1143,10 @@ tTJSBinaryStream* TVPCreateStream(const ttstr& _name, tjs_uint32 flags)
 //---------------------------------------------------------------------------
 void TVPClearStorageCaches()
 {
-    // clear all storage related caches
-    emoteplayer::ClearSharedEmoteResourceCache("storageCaches");
+    // clear all storage related caches. The shared E-mote cache keeps only
+    // archive members under their placed path, and rewriting an archive file
+    // invalidates its members when the file is opened for writing, so path
+    // changes leave it valid. Games call this after every save-file move.
     TVPClearAutoPathCache();
 }
 //---------------------------------------------------------------------------
@@ -1152,6 +1154,13 @@ void TVPClearStorageCaches()
 void TVPRemoveFromStorageCache(const ttstr& name)
 {
     TVPAutoPathCache.Delete(name);
+}
+
+void TVPStorageFileChanged(const ttstr& storageName)
+{
+    TVPClearAutoPathCache();
+    if (!storageName.IsEmpty())
+        emoteplayer::InvalidateSharedEmoteResource(TVPNormalizeStorageName(storageName).AsStdString());
 }
 
 //---------------------------------------------------------------------------

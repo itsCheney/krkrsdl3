@@ -28,6 +28,7 @@
 #include "tjsNativeVideoOverlay.h"
 #include "emoteplayer/emoteresourcecache.h"
 #include "emoteplayer/emotesession.h"
+#include "psbfile/psbsession.h"
 #include "xp3filter.h"
 
 #include "TVPStorage.h"
@@ -237,6 +238,8 @@ void RunExitStage(const char* name, Stage&& stage)
 
 void tTVPApplication::OnExit()
 {
+    // From here on a released PSB tree is freed at once: no later frame comes.
+    TVPSetPSBDeferredRelease(false);
     // Invalidate decoder callbacks and synchronously release all movie players
     // while their event hooks, renderer and SDL devices are still alive.
     RunExitStage("movies", [] {
@@ -279,6 +282,7 @@ void tTVPApplication::OnExit()
     TVPProjectDirSelected = false;
     // Save callbacks and script finalizers may load resources during shutdown.
     emoteplayer::ClearSharedEmoteResourceCache("sessionExit");
+    TVPSetPSBDeferredRelease(true);
 }
 
 void tTVPApplication::LoadImageRequest(class iTJSDispatch2* owner,

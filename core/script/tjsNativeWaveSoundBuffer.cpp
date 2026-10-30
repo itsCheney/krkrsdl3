@@ -1320,11 +1320,17 @@ void tTJSNI_WaveSoundBuffer::Clear()
     Stop();
     ThreadCallbackEnabled = false;
     DecodeActive.store(false, std::memory_order_release);
-    if (LoopManager)
-        delete LoopManager, LoopManager = NULL;
-    ClearFilterChain();
-    if (Decoder)
-        delete Decoder, Decoder = NULL;
+    {
+        // A decode worker runs FillL2Buffer under L2BufferCS; holding it
+        // here waits for an in-flight decode before its objects go away.
+        tTJSCriticalSectionHolder holder(BufferCS);
+        tTJSCriticalSectionHolder l2holder(L2BufferCS);
+        if (LoopManager)
+            delete LoopManager, LoopManager = NULL;
+        ClearFilterChain();
+        if (Decoder)
+            delete Decoder, Decoder = NULL;
+    }
     BufferPlaying = false;
     DSBufferPlaying = false;
     Paused = false;
@@ -1358,6 +1364,12 @@ tjs_uint tTJSNI_WaveSoundBuffer::Decode(void* buffer,
 bool tTJSNI_WaveSoundBuffer::FillL2Buffer(bool firstwrite, bool fromdecodethread)
 {
     tTJSCriticalSectionHolder holder(L2BufferCS);
+
+    // The pool picks a buffer before taking the lock, so Stop or Clear may
+    // have run in between.
+    if (fromdecodethread &&
+        (!DecodeActive.load(std::memory_order_acquire) || !Decoder || !LoopManager))
+        return false;
 
     if (firstwrite)
     {
@@ -1547,7 +1559,10 @@ bool tTJSNI_WaveSoundBuffer::FillBuffer(bool firstwrite, bool allowpause)
                 DSBufferPlaying = false;
                 BufferPlaying = false;
                 if (LoopManager)
+                {
+                    tTJSCriticalSectionHolder l2holder(L2BufferCS);
                     LoopManager->SetPosition(0);
+                }
                 return true;
             }
         }
@@ -1810,7 +1825,11 @@ void tTJSNI_WaveSoundBuffer::Stop()
 
     // rewind
     if (LoopManager)
+    {
+        tTJSCriticalSectionHolder holder(BufferCS);
+        tTJSCriticalSectionHolder l2holder(L2BufferCS);
         LoopManager->SetPosition(0);
+    }
 }
 
 void tTJSNI_WaveSoundBuffer::SetBufferPaused(bool bPaused)
@@ -1962,14 +1981,23 @@ void tTJSNI_WaveSoundBuffer::SetSamplePosition(tjs_uint64 pos)
     if (InputFormat.TotalSamples && InputFormat.TotalSamples <= possamples)
         return;
 
+    if (!LoopManager)
+        return;
+
     if (BufferPlaying && DSBufferPlaying)
     {
         StopPlay();
-        LoopManager->SetPosition(possamples);
+        {
+            tTJSCriticalSectionHolder holder(BufferCS);
+            tTJSCriticalSectionHolder l2holder(L2BufferCS);
+            LoopManager->SetPosition(possamples);
+        }
         StartPlay();
     }
     else
     {
+        tTJSCriticalSectionHolder holder(BufferCS);
+        tTJSCriticalSectionHolder l2holder(L2BufferCS);
         LoopManager->SetPosition(possamples);
     }
 }

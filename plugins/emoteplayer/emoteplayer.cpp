@@ -40,6 +40,7 @@ tjs_error controlCall(tTJSVariant* result, tjs_int count, tTJSVariant** args, P*
         if (result) *result = playing;
     }
     if constexpr (Operation == 10) player->playTimeline(tTJSString(*args[0]), (tjs_int)number(1));
+    if constexpr (Operation == 11) player->setColor((tjs_uint32)args[0]->AsInteger(), number(1), number(2));
     return TJS_S_OK;
 }
 // load() returns the file's whole PSB tree as a fresh dictionary, which
@@ -104,7 +105,7 @@ NCB_REGISTER_SUBCLASS(EmotePlayer)
     CONTROL_METHOD(setCoord, EmotePlayer, 0);
     CONTROL_METHOD(setScale, EmotePlayer, 1);
     CONTROL_METHOD(setRotate, EmotePlayer, 2);
-    NCB_METHOD(setColor);
+    CONTROL_METHOD(setColor, EmotePlayer, 11);
     CONTROL_METHOD(setVariable, EmotePlayer, 3);
     NCB_METHOD(getVariable);
     CONTROL_METHOD(setOuterForce, EmotePlayer, 4);
@@ -162,7 +163,7 @@ NCB_REGISTER_SUBCLASS(Player)
     CONTROL_METHOD(setCoord, Player, 0);
     CONTROL_METHOD(setScale, Player, 1);
     CONTROL_METHOD(setRotate, Player, 2);
-    NCB_METHOD(setColor);
+    CONTROL_METHOD(setColor, Player, 11);
     CONTROL_METHOD(setVariable, Player, 3);
     NCB_METHOD(getVariable);
     CONTROL_METHOD(setOuterForce, Player, 4);

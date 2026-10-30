@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <unordered_set>
 #include <iomanip>
 #include <locale>
 #include <SDL3/SDL.h>
@@ -646,6 +647,8 @@ bool emotenoderef::renderMask(krkrsdl3::iTVPRenderBackend* renderer, void* maskT
     renderer->ClearTarget(true);
     krkrsdl3::TVPRecordEmoteMaskClear();
     bool hasDraw = false;
+    const bool wasDrawingMask = refTop->drawingMask;
+    refTop->drawingMask = true;
     for (auto maskLayer : renderMethod.at(0).layerNode)
     {
         if (maskLayer != nullptr && maskLayer->currOpa > 0)
@@ -655,6 +658,7 @@ bool emotenoderef::renderMask(krkrsdl3::iTVPRenderBackend* renderer, void* maskT
                 krkrsdl3::TVPRecordEmoteMaskDraw();
         }
     }
+    refTop->drawingMask = wasDrawingMask;
     // 排除异常蒙版
     return hasDraw;
 }
@@ -696,6 +700,12 @@ bool emotenoderef::drawWithMask(krkrsdl3::iTVPRenderBackend* renderer, void* tar
         colorModulation[1] = ((tint >> 8) & 0xFF) / 255.0f;
         colorModulation[2] = ((tint >> 16) & 0xFF) / 255.0f;
         colorModulation[3] = ((tint >> 24) & 0xFF) / 255.0f;
+    }
+    if (refTop && !refTop->drawingMask)
+    {
+        for (int i = 0; i < 3; ++i)
+            colorModulation[i] *= refTop->playerColor[i];
+        totalOpa *= refTop->playerColor[3];
     }
     renderer->SetBlendMode(blendMode, blendMode == 21 ? uniformColor : nullptr);
     if (blendMode == 6 || totalOpa <= 0)
@@ -1243,7 +1253,10 @@ emotemotion* emoteengine::findmotionByName(const std::string& name)
                 }
             }
         }
-        TVPConsoleLog("motion find failed!!!");
+        // Callers ask again on every new frame or player; report a name once.
+        static std::unordered_set<std::string> reported;
+        if (reported.insert(name).second)
+            TVPConsoleLog("motion find failed: %s", name.c_str());
     }
     else
     {
@@ -1472,18 +1485,30 @@ void emoteengine::samplePhysics(float tick, const emoteRender& root, emotelimit 
 bool emoteengine::leadsToPhysicsAnchor(emotenode* node, int depth)
 {
     if (node == nullptr || depth > 64) return false; // depth guards motion cycles
-    if (physics.needsAnchor(node->label)) return true;
+    if (_anchorLeadsKey != physicsAnchorKey())
+    {
+        _anchorLeadsKey = physicsAnchorKey();
+        _anchorLeads.clear();
+    }
+    if (const auto known = _anchorLeads.find(node); known != _anchorLeads.end())
+        return known->second;
+    bool leads = physics.needsAnchor(node->label);
     for (auto* child : node->children)
-        if (leadsToPhysicsAnchor(child, depth + 1)) return true;
+    {
+        if (leads) break;
+        leads = leadsToPhysicsAnchor(child, depth + 1);
+    }
     for (const auto* frame : node->frameList)
     {
+        if (leads) break;
         if (frame == nullptr || !frame->hasContent || node->_filePtr->findsourceByName(frame->src))
             continue;
         if (auto* motion = findmotionByName(frame->src))
             for (auto* inner : motion->nodeList)
-                if (leadsToPhysicsAnchor(inner, depth + 1)) return true;
+                if ((leads = leadsToPhysicsAnchor(inner, depth + 1))) break;
     }
-    return false;
+    _anchorLeads[node] = leads;
+    return leads;
 }
 
 void emoteengine::recordPhysicsAnchor(const std::string& name, const std::vector<emoteRender>& chain)

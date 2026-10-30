@@ -7,8 +7,10 @@
 #include "tjsNativeLayer.h"
 #include "TVPSystem.h"
 #include "TVPDebug.h"
+#include "RenderManager.h"
 
 #include <algorithm>
+#include <cmath>
 #include <typeinfo>
 
 
@@ -18,24 +20,32 @@
 namespace drawdevice
 {
 
-// 后端混合模式映射（Layer.type 常量 → 后端 SetBlendMode）
-static int MapLayerTypeToBlendMode(int type)
+// D3D picture blend for a Layer.type: the LayerDrawRect method used when the
+// backend has no ordinary Layer operations, and the mesh mode for transformed
+// pictures. Types without an exact equivalent there approximate alpha.
+struct PictureBlend
 {
+    int lbm;
+    int mesh;
+};
+static PictureBlend PictureBlendFor(int type, int opacity)
+{
+    using B = krkrsdl3::iTVPRenderBackend;
     switch (type)
     {
         case 0: // ltBinder
         case 1: // ltOpaque
-            return 2; // 覆盖
-        case 2: // ltAlpha
-            return 0;
+            return {opacity >= 255 ? B::LBM_COPY : B::LBM_CONSTALPHA, B::MBM_LAYER_COPY};
         case 3: // ltAdditive
-            return 3;
+            return {B::LBM_ADD, B::MBM_LAYER_ADD};
+        case 4: // ltSubtractive
+            return {B::LBM_SUB, B::MBM_LAYER_SUB};
         case 5: // ltMultiplicative
-            return 1;
+            return {B::LBM_MUL_HDA, B::MBM_LAYER_MUL};
         case 12: // ltAddAlpha
-            return 3;
-        default:
-            return 0; // 其余类型近似 alpha（正确性由软件回退保证的场景极少）
+            return {B::LBM_ALPHA, B::MBM_LAYER_ADDALPHA};
+        default: // ltAlpha and the rest
+            return {B::LBM_ALPHA, 0};
     }
 }
 
@@ -46,17 +56,47 @@ static int LayerToMeshBlendMode(int lbm)
     switch (lbm)
     {
         case iTVPRenderBackend::LBM_COPY:
-        case iTVPRenderBackend::LBM_ALPHA:
         case iTVPRenderBackend::LBM_CONSTALPHA:
-            return 0;
+            return iTVPRenderBackend::MBM_LAYER_COPY;
         case iTVPRenderBackend::LBM_ADD:
-            return 3;
+            return iTVPRenderBackend::MBM_LAYER_ADD;
+        case iTVPRenderBackend::LBM_SUB:
+            return iTVPRenderBackend::MBM_LAYER_SUB;
         case iTVPRenderBackend::LBM_MUL:
         case iTVPRenderBackend::LBM_MUL_HDA:
-            return 1;
+            return iTVPRenderBackend::MBM_LAYER_MUL;
         default:
             return 0;
     }
+}
+
+// Draws a picture with the software Layer formula for its type, exactly as a
+// Layer would blend it. Only integer placements qualify, and backends without
+// ordinary Layer operations refuse, leaving the approximate paths.
+static bool OperatePictureRect(krkrsdl3::iTVPRenderBackend* backend, void* target, int targetW,
+                               int targetH, D3DPicture* pic, int x, int y)
+{
+    int type = pic->blendMode == ltBinder ? ltOpaque : pic->blendMode;
+    tTVPBBBltMethod method;
+    if (!TVPLayerTypeToBltMethod((tTVPLayerType)type, pic->opacity, true, method))
+        return false;
+    iTVPRenderMethod* rmethod = TVPGetRenderManager()->GetRenderMethod(pic->opacity, true, method);
+    TVPLayerOperation op;
+    if (!rmethod || !rmethod->DescribeGpuOperation(op) || op.kind == TVPLayerOperationKind::Unsupported)
+        return false;
+    TVPLayerRect src{std::max(0, pic->SrcX), std::max(0, pic->SrcY),
+                     std::min((int)pic->Image->Width, pic->SrcX + pic->SrcW),
+                     std::min((int)pic->Image->Height, pic->SrcY + pic->SrcH)};
+    x += src.left - pic->SrcX;
+    y += src.top - pic->SrcY;
+    TVPLayerRect dst{x, y, x + src.Width(), y + src.Height()};
+    if (dst.left < 0) { src.left -= dst.left; dst.left = 0; }
+    if (dst.top < 0) { src.top -= dst.top; dst.top = 0; }
+    if (dst.right > targetW) { src.right -= dst.right - targetW; dst.right = targetW; }
+    if (dst.bottom > targetH) { src.bottom -= dst.bottom - targetH; dst.bottom = targetH; }
+    if (src.Width() <= 0 || src.Height() <= 0)
+        return true; // nothing visible
+    return backend->OperateLayerRect(op, target, dst, pic->Image->Texture, src, 0);
 }
 
 // ===========================================================================
@@ -69,9 +109,8 @@ DrawDeviceD3D::DrawDeviceD3D(tjs_int w, tjs_int h) : Width(w), Height(h)
     EnsureBackend();
     TVPAddImportantLog(ttstr("DrawDevice: DrawDeviceD3D created (") + ttstr(w) + TJS_N("x") + ttstr(h) + TJS_N(")"));
 
-    // 注意：不切换全局渲染管理器——Layer 树保持完全软渲染
-    // （tjsNativeLayer 无 GPU 路径），以保证与渲染基准一致；
-    // GPU 加速只发生在独立 D3D 层（D3DLayer）与合成目标上。
+    // 不切换全局渲染管理器：Layer 树由当前 RenderManager 合成（Metal 后端时
+    // 为 GPU Layer 合成），DrawBuffer 驻留 GPU 时直接作为贴图合成。
 }
 
 DrawDeviceD3D::~DrawDeviceD3D()
@@ -80,6 +119,30 @@ DrawDeviceD3D::~DrawDeviceD3D()
     // Window 析构时已经 SetWindowInterface(nullptr) 解除引用，此处安全
     if (Window)
         Window->ReleaseBorrowedTexture();
+    ReleaseBackendResources();
+    for (auto& mi : Managers)
+    {
+        if (mi.Manager)
+        {
+            if (auto* manager = dynamic_cast<tTVPLayerManager*>(mi.Manager))
+            {
+                manager->SetPointerPresentationHitTestingEnabled(true);
+                manager->SetHoldAlpha(true);
+            }
+            mi.Manager->Release();
+        }
+    }
+    Managers.clear();
+}
+
+void DrawDeviceD3D::Destruct()
+{
+    delete this;
+}
+
+// Every handle is destroyed through the backend that created it.
+void DrawDeviceD3D::ReleaseBackendResources()
+{
     if (Backend)
     {
         if (PresentScratchTexture)
@@ -91,21 +154,11 @@ DrawDeviceD3D::~DrawDeviceD3D()
         if (ScratchTexture)
             Backend->DestroyTexture(ScratchTexture);
     }
-    for (auto& mi : Managers)
-    {
-        if (mi.Manager)
-        {
-            if (auto* manager = dynamic_cast<tTVPLayerManager*>(mi.Manager))
-                manager->SetPointerPresentationHitTestingEnabled(true);
-            mi.Manager->Release();
-        }
-    }
-    Managers.clear();
-}
-
-void DrawDeviceD3D::Destruct()
-{
-    delete this;
+    PresentScratchTexture = nullptr;
+    CompositeTarget = nullptr;
+    PrevCompositeTarget = nullptr;
+    ScratchTexture = nullptr;
+    ScratchW = ScratchH = 0;
 }
 
 void DrawDeviceD3D::EnsureBackend()
@@ -164,7 +217,10 @@ void DrawDeviceD3D::RemoveLayerManager(iTVPLayerManager* manager)
         if (it->Manager == manager)
         {
             if (auto* concrete = dynamic_cast<tTVPLayerManager*>(it->Manager))
+            {
                 concrete->SetPointerPresentationHitTestingEnabled(true);
+                concrete->SetHoldAlpha(true);
+            }
             it->Manager->Release();
             Managers.erase(it);
             break;
@@ -367,7 +423,9 @@ void DrawDeviceD3D::DrawQuadTo(void* target,
                                float h,
                                int blendMode,
                                float opacity,
-                               const float matrix[16])
+                               const float matrix[16],
+                               float u1,
+                               float v1)
 {
     if (!Backend || !target || !srcTexture)
         return;
@@ -413,9 +471,9 @@ void DrawDeviceD3D::DrawQuadTo(void* target,
         float tw = (float)Width, th = (float)Height;
         float v[16] = {
             cx0 / tw * 2.f, cy0 / th * 2.f, 0.f, 0.f, //
-            cx1 / tw * 2.f, cy1 / th * 2.f, 1.f, 0.f, //
-            cx2 / tw * 2.f, cy2 / th * 2.f, 1.f, 1.f, //
-            cx3 / tw * 2.f, cy3 / th * 2.f, 0.f, 1.f, //
+            cx1 / tw * 2.f, cy1 / th * 2.f, u1, 0.f, //
+            cx2 / tw * 2.f, cy2 / th * 2.f, u1, v1, //
+            cx3 / tw * 2.f, cy3 / th * 2.f, 0.f, v1, //
         };
         uint16_t idx[] = {0, 1, 2, 2, 3, 0};
         Backend->SetBlendMode(LayerToMeshBlendMode(lbm), nullptr);
@@ -423,125 +481,187 @@ void DrawDeviceD3D::DrawQuadTo(void* target,
     }
     else
     {
-        Backend->LayerDrawRect(srcTexture, l, t, r - l, b - t);
+        Backend->LayerDrawRect(srcTexture, l, t, r - l, b - t, 0.f, 0.f, u1, v1);
     }
+}
+
+tTVPBaseTexture* DrawDeviceD3D::RefreshDrawBuffer(size_t index)
+{
+    // Brings the manager's DrawBuffer (FrontBuff) up to date:
+    //  1) SetHoldAlpha(false): ltAlpha layers composite with bmAlphaOnAlpha, so
+    //     the buffer keeps real alpha and its transparent areas show the D3D
+    //     world layers below;
+    //  2) that also means drawing over old pixels would blend with them, so
+    //     each rectangle about to be redrawn is cleared to 0,0,0,0 first;
+    //  3) only the manager's update region is redrawn. A buffer we did not
+    //     compose (new, replaced or resized; the manager fills those with
+    //     opaque black) is cleared and redrawn whole.
+    if (index >= Managers.size())
+        return nullptr;
+    tTVPLayerManager* lm = dynamic_cast<tTVPLayerManager*>(Managers[index].Manager);
+    if (!lm)
+        return nullptr;
+    lm->SetHoldAlpha(false);
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        tTVPBaseTexture* buf = lm->GetOrCreateDrawBuffer();
+        if (!buf)
+            return nullptr;
+        auto& info = Managers[index];
+        const tjs_int pw = buf->GetWidth(), ph = buf->GetHeight();
+        tjs_int lw = 0, lh = 0;
+        lm->GetPrimaryLayerSize(lw, lh);
+        // A primary larger than the buffer makes the manager grow (and black
+        // fill) it mid-composition; redraw everything after that.
+        const bool full = buf != info.ComposedBuffer || pw != info.ComposedW || ph != info.ComposedH ||
+                          lw > pw || lh > ph;
+        tTVPComplexRect& region = lm->GetUpdateRegionForCompletion();
+        if (!full && !region.GetCount())
+            return buf;
+        {
+            // This invalidation is consumed by the composition immediately below.
+            // Do not turn it into another window update while delivering this one.
+            struct RestoreFlag
+            {
+                bool& flag;
+                bool previous;
+                ~RestoreFlag() { flag = previous; }
+            } restore{RequestingComposition, RequestingComposition};
+            RequestingComposition = true;
+            if (full)
+            {
+                buf->Fill(tTVPRect(0, 0, pw, ph), 0x00000000);
+                lm->RequestInvalidation(tTVPRect(0, 0, pw, ph));
+            }
+            else
+            {
+                // Completion merges the region before drawing it. Merge it here
+                // first (merging is idempotent) so exactly the drawn rectangles
+                // are cleared.
+                lm->NotifyUpdateRegionFixed();
+                tTVPRect offset(0, 0, 0, 0);
+                if (tTJSNI_BaseLayer* primary = lm->GetPrimaryLayer())
+                    offset = primary->GetRect();
+                tTVPComplexRect::tIterator it = region.GetIterator();
+                while (it.Step())
+                {
+                    tTVPRect r(*it);
+                    r.add_offsets(offset.left, offset.top);
+                    tTVPRect clipped;
+                    if (TVPIntersectRect(&clipped, r, tTVPRect(0, 0, pw, ph)))
+                        buf->Fill(clipped, 0x00000000);
+                }
+            }
+        }
+        lm->UpdateToDrawDevice();
+        tTVPBaseTexture* composed = lm->GetOrCreateDrawBuffer();
+        if (!composed)
+            return nullptr;
+        // Script run during composition may have changed the manager list.
+        if (index >= Managers.size() || Managers[index].Manager != lm)
+            return composed;
+        auto& after = Managers[index];
+        after.ComposedBuffer = composed;
+        after.ComposedW = composed->GetWidth();
+        after.ComposedH = composed->GetHeight();
+        if (composed == buf && after.ComposedW == pw && after.ComposedH == ph)
+            return composed;
+        // The manager replaced or grew the buffer while drawing.
+        after.ComposedBuffer = nullptr;
+    }
+    return lm->GetOrCreateDrawBuffer();
 }
 
 void DrawDeviceD3D::ComposeLayerManager(int index, void* target)
 {
-    if (index < 0 || index >= (tjs_int)Managers.size())
+    if (index < 0 || index >= (tjs_int)Managers.size() || !Managers[index].Manager || !Backend)
         return;
-    iTVPLayerManager* mgr = Managers[index].Manager;
-    if (!mgr || !Backend)
-        return;
-    // 合成图层树到 DrawBuffer（FrontBuff）：
-    //  1) 先清为全透明 0,0,0,0 —— 空区域不留不透明黑（uibase 等独立 primary 的
-    //     DrawBuffer 初始为 0xFF000000，直接整幅 LBM_COPY 上传会得到"黑白表面"）；
-    //  2) SetHoldAlpha(false) —— ltAlpha 图层以 bmAlphaOnAlpha（src-over，写入 alpha）
-    //     合成，而不是 bmAlpha（保持目标 alpha=255 的不透明叠加）；
-    //  3) 强制全矩形失效重绘 —— 否则旧帧内容残留在 DrawBuffer 里与本次绘制重叠。
-    // 结果：DrawBuffer 的透明区域在 GPU 侧用 LBM_ALPHA 上传，露出下层
-    // （D3D 世界层）内容。
-    tTVPLayerManager* lm = dynamic_cast<tTVPLayerManager*>(mgr);
-    if (!lm)
-        return;
-    lm->SetHoldAlpha(false);
-    tTVPBaseTexture* buf = lm->GetOrCreateDrawBuffer();
-    if (!buf)
-        return;
-    tjs_int pw = buf->GetWidth(), ph = buf->GetHeight();
-    buf->Fill(tTVPRect(0, 0, pw, ph), 0x00000000);
-    {
-        // This invalidation is consumed by the composition immediately below.
-        // Do not turn it into another window update while delivering this one.
-        struct RestoreFlag
-        {
-            bool& flag;
-            bool previous;
-            ~RestoreFlag() { flag = previous; }
-        } restore{RequestingComposition, RequestingComposition};
-        RequestingComposition = true;
-        mgr->RequestInvalidation(tTVPRect(0, 0, pw, ph));
-    }
-    mgr->UpdateToDrawDevice();
-
-    iTVPTexture2D* tex = buf->GetTexture();
+    tjs_int lw = 0, lh = 0;
+    Managers[index].Manager->GetPrimaryLayerSize(lw, lh);
+    tTVPBaseTexture* buf = RefreshDrawBuffer(index);
+    iTVPTexture2D* tex = buf ? buf->GetTexture() : nullptr;
     if (!tex)
         return;
-    // DrawBuffer（软渲染位图）作为贴图画到合成目标（带 alpha）：
-    // Layer 树在 CPU 上精细合成后，每帧只做一次 CPU→GPU 上传
+    const int bufW = tex->GetWidth(), bufH = tex->GetHeight();
+    if (bufW <= 0 || bufH <= 0)
+        return;
+    // Sample only the primary's part of a buffer that may be larger.
+    lw = lw > 0 ? std::min<tjs_int>(lw, bufW) : bufW;
+    lh = lh > 0 ? std::min<tjs_int>(lh, bufH) : bufH;
     void* srcTex = nullptr;
-    int bufW = tex->GetWidth(), bufH = tex->GetHeight();
+    // A GPU-resident buffer (the Metal Layer manager) is drawn directly. Its
+    // handle uploads pending CPU writes, if any.
+    if (!tex->IsCPUResident())
+        srcTex = tex->GetTextureHandle();
+    if (!srcTex)
     {
-        // 软件贴图：读 CPU 像素 → 上传后端一般贴图
-        tjs_uint8* data = nullptr;
-        tjs_int pitch = 0;
-        tex->GetTextureData(&data, pitch);
-        if (data && bufW > 0 && bufH > 0)
+        // Software buffer: copy its pixels into a backend texture of its size.
+        if (!ScratchTexture || ScratchW != bufW || ScratchH != bufH)
         {
-            if (!ScratchTexture)
-                ScratchTexture = Backend->CreateTexture(bufW, bufH);
             if (ScratchTexture)
-            {
-                Backend->UpdateTexture(ScratchTexture, data, bufW, bufH, pitch);
-                srcTex = ScratchTexture;
-            }
+                Backend->DestroyTexture(ScratchTexture);
+            ScratchTexture = Backend->CreateTexture(bufW, bufH);
+            ScratchW = ScratchTexture ? bufW : 0;
+            ScratchH = ScratchTexture ? bufH : 0;
         }
+        if (!ScratchTexture)
+            return;
+        // A scoped lock, never GetTextureData: that pins the texture to the CPU.
+        const void* pixels = tex->LockCPURead();
+        if (pixels)
+            Backend->UpdateTexture(ScratchTexture, (const uint8_t*)pixels, bufW, bufH, tex->GetPitch());
+        tex->UnlockCPU();
+        if (!pixels)
+            return;
+        srcTex = ScratchTexture;
     }
-
-    if (srcTex)
-        // mode 0 = LBM_ALPHA：透明区域露出下层（D3D 世界层等）
-        DrawQuadTo(target, srcTex, 0, 0, (float)Width, (float)Height, 0, 1.0f);
+    // mode 0 = LBM_ALPHA：透明区域露出下层（D3D 世界层等）
+    DrawQuadTo(target, srcTex, 0, 0, (float)Width, (float)Height, 0, 1.0f, nullptr,
+               (float)lw / bufW, (float)lh / bufH);
 }
 
 // 绘制单个 D3D 层（Back/Front 平面共用）。
-// D3D 层是 GPU 直通的"图层"，混合语义走渲染后端的 Layer 合成路径
-// （软件 RenderManager bm* 语义，与普通 Layer 的合成基准一致）；
-// 带仿射矩阵时退回网格路径（近似混合）。
+// D3D 层坐标以画面中心为原点（与网格 NDC 一致）。平移且落在整数像素上的
+// 图片走后端的普通 Layer 合成（与 Layer 完全相同的混合公式）；其余（仿射、
+// 亚像素位置、无该能力的后端）走网格路径，混合由 MBM_LAYER_* 模式给出。
 static void DrawD3DLayerPictures(DrawDeviceD3D* dev, void* target, D3DLayer* layer,
                                  float offsetX, float offsetY)
 {
+    krkrsdl3::iTVPRenderBackend* backend = dev->GetBackend();
+    const float tw = (float)dev->GetWidth(), th = (float)dev->GetHeight();
+    const float* m = layer->Matrix;
+    const bool translateOnly = m[0] == 1.0f && m[1] == 0.0f && m[4] == 0.0f && m[5] == 1.0f;
     for (auto* pic : layer->Pictures)
     {
-        if (!pic || !pic->Image || !pic->Image->Texture)
+        if (!pic || !pic->Image || !pic->Image->Texture || pic->opacity <= 0)
             continue;
-        int mode = MapLayerTypeToBlendMode(pic->blendMode);
-        int lbm = krkrsdl3::iTVPRenderBackend::LBM_ALPHA;
-        switch (mode)
-        {
-            case 2:
-                lbm = krkrsdl3::iTVPRenderBackend::LBM_COPY;
-                break;
-            case 3:
-                lbm = krkrsdl3::iTVPRenderBackend::LBM_ADD;
-                break;
-            case 1:
-                lbm = krkrsdl3::iTVPRenderBackend::LBM_MUL;
-                break;
-            default:
-                lbm = krkrsdl3::iTVPRenderBackend::LBM_ALPHA;
-                break;
-        }
-        float opa = (float)pic->opacity / 255.0f;
+        const PictureBlend blend = PictureBlendFor(pic->blendMode, pic->opacity);
+        const int opacity = std::min<tjs_int>(pic->opacity, 255);
+        float opa = (float)opacity / 255.0f;
         float px = (float)pic->DstX + pic->CoordX + offsetX;
         float py = (float)pic->DstY + pic->CoordY + offsetY;
         float pw = (float)pic->SrcW, ph = (float)pic->SrcH;
         float sw = (float)pic->Image->Width, sh = (float)pic->Image->Height;
+        if (pw <= 0 || ph <= 0 || sw <= 0 || sh <= 0)
+            continue;
         float u0 = (float)pic->SrcX / sw, v0 = (float)pic->SrcY / sh;
         float u1 = (float)(pic->SrcX + pic->SrcW) / sw, v1 = (float)(pic->SrcY + pic->SrcH) / sh;
 
-        krkrsdl3::iTVPRenderBackend* backend = dev->GetBackend();
         backend->SetTarget(target);
         backend->ClearTarget(false);
 
-        // 仿射矩阵是否为单位阵（仅平移/缩放可由 LayerDrawRect 直接表达；
-        // 一般仿射走 DrawMesh）
-        const float* m = layer->Matrix;
-        bool affine = (m[0] != 1.0f || m[1] != 0.0f || m[4] != 0.0f || m[5] != 1.0f ||
-                       m[12] != 0.0f || m[13] != 0.0f);
-        if (!affine)
+        if (translateOnly)
         {
-            //加速在渲染侧做判断更好吧
+            // Screen pixel of the picture's top-left corner.
+            const float x = px + m[12] + tw * 0.5f, y = py + m[13] + th * 0.5f;
+            if (x == std::floor(x) && y == std::floor(y) && std::abs(x) < 1e6f && std::abs(y) < 1e6f)
+            {
+                if (OperatePictureRect(backend, target, (int)tw, (int)th, pic, (int)x, (int)y))
+                    continue;
+                backend->LayerSetBlend(blend.lbm, opa, nullptr);
+                backend->LayerDrawRect(pic->Image->Texture, x, y, pw, ph, u0, v0, u1, v1);
+                continue;
+            }
         }
 
         // 仿射：4 角经矩阵变换 → NDC（内容坐标 y 向下，顶=NDC -1，与 Layer 路径一致）
@@ -554,7 +674,6 @@ static void DrawD3DLayerPictures(DrawDeviceD3D* dev, void* target, D3DLayer* lay
         float cy2 = m[1] * r + m[5] * b + m[13];
         float cx3 = m[0] * l + m[4] * b + m[12];
         float cy3 = m[1] * l + m[5] * b + m[13];
-        float tw = (float)dev->GetWidth(), th = (float)dev->GetHeight();
         float v[16] = {
             cx0 / tw * 2.f, cy0 / th * 2.f, u0, v0, //
             cx1 / tw * 2.f, cy1 / th * 2.f, u1, v0, //
@@ -562,7 +681,7 @@ static void DrawD3DLayerPictures(DrawDeviceD3D* dev, void* target, D3DLayer* lay
             cx3 / tw * 2.f, cy3 / th * 2.f, u0, v1, //
         };
         uint16_t idx[] = {0, 1, 2, 2, 3, 0};
-        backend->SetBlendMode(LayerToMeshBlendMode(lbm), nullptr);
+        backend->SetBlendMode(blend.mesh, nullptr);
         backend->DrawMesh(v, 4, idx, 6, pic->Image->Texture, opa);
     }
 }
@@ -764,13 +883,11 @@ void DrawDeviceD3D::capture(iTJSDispatch2* layerObj, tjs_int index)
         mi = (size_t)(index - 5000000);
     else
         mi = (size_t)index;
-    if (mi >= Managers.size())
+    if (mi >= Managers.size() || !Managers[mi].Manager)
         return;
-    iTVPLayerManager* mgr = Managers[mi].Manager;
-    if (!mgr)
-        return;
-    mgr->UpdateToDrawDevice();
-    iTVPBaseBitmap* buf = mgr->GetDrawBuffer();
+    // The same partial redraw as presentation, so neither leaves the other a
+    // consumed update region over uncleared pixels.
+    iTVPBaseBitmap* buf = RefreshDrawBuffer(mi);
     if (!buf)
         return;
     iTVPTexture2D* tex = buf->GetTexture();
@@ -850,13 +967,13 @@ void DrawDeviceD3D::setOffset(tjs_int x, tjs_int y)
 
 void DrawDeviceD3D::recreate()
 {
-    // 设备重建（窗口重建时）：重取后端
+    // 设备重建（窗口重建时）：先经旧后端释放本设备的全部句柄，再重取后端。
+    // A transition snapshot does not survive this, so the transition ends.
+    stopTransition();
+    if (Window)
+        Window->ReleaseBorrowedTexture();
+    ReleaseBackendResources();
     Backend = krkrsdl3::TVPGetRenderBackend();
-    if (CompositeTarget)
-    {
-        Backend->DestroyTarget(CompositeTarget);
-        CompositeTarget = nullptr;
-    }
 }
 
 void DrawDeviceD3D::finalize()
@@ -1050,9 +1167,20 @@ D3DImage::D3DImage(iTJSDispatch2* drawDeviceObj)
 
 D3DImage::~D3DImage()
 {
-    if (Device && Device->GetBackend() && Texture)
-        Device->GetBackend()->DestroyTexture(Texture);
+    ReleaseTexture();
+}
+
+void D3DImage::ReleaseTexture()
+{
+    if (Device && Device->GetBackend())
+    {
+        if (Target)
+            Device->GetBackend()->DestroyTarget(Target);
+        else if (Texture)
+            Device->GetBackend()->DestroyTexture(Texture);
+    }
     Texture = nullptr;
+    Target = nullptr;
 }
 
 void D3DImage::load(iTJSDispatch2* layerObj)
@@ -1070,26 +1198,42 @@ void D3DImage::load(iTJSDispatch2* layerObj)
     if (w <= 0 || h <= 0)
         return;
 
-    if (Texture)
-        Device->GetBackend()->DestroyTexture(Texture);
-    Texture = Device->GetBackend()->CreateTexture(w, h);
-    if (!Texture)
-        return;
+    krkrsdl3::iTVPRenderBackend* backend = Device->GetBackend();
+    ReleaseTexture();
     Width = w;
     Height = h;
 
-    // 从 Layer 主图像拷贝像素（CPU 回读后上传；load 不频繁可接受）
     iTVPTexture2D* tex = main->GetTexture();
-    if (tex)
+    if (!tex)
     {
-        tjs_uint8* data = nullptr;
-        tjs_int pitch = 0;
-        tex->GetTextureData(&data, pitch); // 返回值=是否需要释放，非失败标志
-        if (data)
-        {
-            Device->GetBackend()->UpdateTexture(Texture, data, w, h, pitch);
-        }
+        Texture = backend->CreateTexture(w, h);
+        return;
     }
+    // A GPU-resident Layer image (Metal Layer manager) is copied on the GPU.
+    // Reading it back would stall, and GetTextureData would also pin it to the
+    // CPU, sending that Layer's own drawing to software for a while.
+    if (!tex->IsCPUResident() && tex->GetFormat() == TVPTextureFormat::RGBA)
+    {
+        void* source = tex->GetTextureHandle();
+        void* copy = source ? backend->CreateTarget(w, h) : nullptr;
+        void* sampled = copy ? backend->GetTargetTexture(copy) : nullptr;
+        if (sampled && backend->CopyTargetToLayerTexture(source, copy))
+        {
+            Target = copy;
+            Texture = sampled;
+            return;
+        }
+        if (copy)
+            backend->DestroyTarget(copy);
+    }
+    // 从 Layer 主图像拷贝像素（CPU 读取后上传；scoped lock, so nothing stays pinned）
+    Texture = backend->CreateTexture(w, h);
+    if (!Texture)
+        return;
+    const void* pixels = tex->LockCPURead();
+    if (pixels)
+        backend->UpdateTexture(Texture, (const uint8_t*)pixels, w, h, tex->GetPitch());
+    tex->UnlockCPU();
 }
 
 void D3DImage::finalize()
