@@ -222,17 +222,28 @@ public:
 
 bool Layer_FetchImageSize(ttstr imageName, int& w, int& h)
 {
+    if (!TVPTempBitmapHolder)
+        return false;
+
     iTVPBaseBitmap* dest = new tTVPBaseTexture(*TVPTempBitmapHolder->Get());
-    if (dest)
+    if (!dest)
+        return false;
+
+    bool loaded = false;
+    try
     {
         ttstr provincename;
         iTJSDispatch2* metainfo = NULL;
         TVPLoadGraphic(dest, imageName, TVP_clNone, 0, 0, glmNormal, &provincename, &metainfo);
         w = dest->GetTexture()->GetWidth(), h = dest->GetTexture()->GetHeight();
-        delete dest;
-        return true;
+        loaded = true;
     }
-    return false;
+    catch (...)
+    {
+        loaded = false;
+    }
+    delete dest;
+    return loaded;
 }
 
 //---------------------------------------------------------------------------
@@ -11554,8 +11565,6 @@ TJS_END_NATIVE_PROP_DECL(provinceImageBufferPitch)
 //----------------------------------------------------------------------
 TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ fetchImageSize)
 {
-    TJS_GET_NATIVE_INSTANCE(/*var. name*/ _this, /*var. type*/ tTJSNI_Layer);
-
     if (numparams < 1)
         return TJS_E_BADPARAMCOUNT;
 

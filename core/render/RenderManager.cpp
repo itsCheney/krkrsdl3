@@ -1398,6 +1398,10 @@ public:
                           iTVPTexture2D* rule,
                           const tTVPRect& rcrule)
     {
+        if (!_tar || !_dst || !_src)
+            return;
+        if (!_tar->GetPixelData() || !_src->GetPixelData())
+            return;
         int pixelsize =
             _tar->GetFormat() == TVPTextureFormat::Gray ? sizeof(tjs_uint8) : sizeof(tjs_uint32);
         if (rcsrc.top > rcsrc.bottom)
@@ -1406,6 +1410,8 @@ public:
             tjs_int w = rctar.get_width(), h = rctar.get_height();
             assert(rcsrc.get_width() == w && rcsrc.get_height() == -h);
             tjs_int wbytes = w * pixelsize;
+            if (w <= 0 || h <= 0 || wbytes <= 0)
+                return;
             if (pixelsize == 1)
             { // 8bit
                 for (int y = 0; y < h; ++y)
@@ -1433,6 +1439,8 @@ public:
             tjs_int w = rctar.get_width(), h = rctar.get_height();
             assert(rcsrc.get_width() == -w && rcsrc.get_height() == h);
             tjs_int wbytes = w * pixelsize;
+            if (w <= 0 || h <= 0 || wbytes <= 0)
+                return;
             tjs_int srcright = rcsrc.right; // half-open reversed rectangle: no read before its left edge
             if (pixelsize == 4)
             { // 32bpp
@@ -1464,6 +1472,8 @@ public:
             tjs_int h = rcsrc.bottom - rcsrc.top;
             tjs_int w = rcsrc.right - rcsrc.left;
             assert(w == rctar.get_width() && h == rctar.get_height());
+            if (w <= 0 || h <= 0)
+                return;
             bool backwardCopy = (_tar == _src && rctar.top > rcsrc.top);
 
             tjs_int taskNum = _src == _tar ? 1 : GetAdaptiveThreadNum(w * h, 66);
@@ -1474,7 +1484,7 @@ public:
                                   tjs_int y1 = h * (i + 1) / taskNum;
                                   this->PartialCopy(_tar, rctar.left, rctar.top + y0, _src,
                                                     rcsrc.left, rcsrc.top + y0, w, y1 - y0,
-                                                    backwardCopy);
+                                                    backwardCopy, pixelsize);
                               });
         }
     }
@@ -1487,9 +1497,10 @@ public:
                      tjs_int sy,
                      tjs_int w,
                      tjs_int h,
-                     bool backwardCopy)
+                     bool backwardCopy,
+                     int pixelsize)
     {
-        const int pixelSize = dst->GetFormat()==TVPTextureFormat::Gray ? 1 : 4;
+        const int pixelSize = pixelsize;
         w *= pixelSize;
         if (backwardCopy)
         {
@@ -3212,6 +3223,26 @@ public:
                      iTVPTexture2D* src,
                      tTVPRect rcsrc)
     {
+        if (!method || !tar || !src)
+            return;
+        if (!tar->GetPixelData() || !src->GetPixelData())
+            return;
+        // Reject rects that would read outside the source/target texture.
+        // The save-snapshot path can pass a rect one row taller than the
+        // province image, which otherwise reads past its allocation.
+        const int sl = std::min(rcsrc.left, rcsrc.right);
+        const int sr = std::max(rcsrc.left, rcsrc.right);
+        const int st = std::min(rcsrc.top, rcsrc.bottom);
+        const int sb = std::max(rcsrc.top, rcsrc.bottom);
+        const int tl = std::min(rctar.left, rctar.right);
+        const int tr = std::max(rctar.left, rctar.right);
+        const int tt = std::min(rctar.top, rctar.bottom);
+        const int tb = std::max(rctar.top, rctar.bottom);
+        if (sl < 0 || st < 0 || sr > (int)src->GetWidth() || sb > (int)src->GetHeight() ||
+            tl < 0 || tt < 0 || tr > (int)tar->GetWidth() || tb > (int)tar->GetHeight())
+        {
+            return;
+        }
         int sw = rcsrc.get_width(), sh = rcsrc.get_height(), dw = rctar.get_width(),
             dh = rctar.get_height();
         if (dw == 0 || dh == 0 || sw == 0 || sh == 0)
@@ -3280,9 +3311,26 @@ public:
                              const tTVPRect& rctar,
                              const tRenderTexRectArray& textures) override
     {
+        if (!method || !tar)
+            return;
+        if (rctar.left < 0 || rctar.top < 0 || rctar.right > (int)tar->GetWidth() ||
+            rctar.bottom > (int)tar->GetHeight())
+            return;
         for (int i = 0; i < textures.size(); ++i)
         {
-            textures[i].first->GetScanLineForRead(0); // prepare pixel data for compressed texture
+            iTVPTexture2D* tex = textures[i].first;
+            if (!tex)
+                return;
+            const tTVPRect& rc = textures[i].second;
+            const int l = std::min(rc.left, rc.right);
+            const int r = std::max(rc.left, rc.right);
+            const int t = std::min(rc.top, rc.bottom);
+            const int b = std::max(rc.top, rc.bottom);
+            if (l < 0 || t < 0 || r > (int)tex->GetWidth() || b > (int)tex->GetHeight())
+            {
+                return;
+            }
+            tex->GetScanLineForRead(0); // prepare pixel data for compressed texture
         }
 
         ++_drawCount;
