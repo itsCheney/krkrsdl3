@@ -3230,6 +3230,11 @@ public:
         // Reject rects that would read outside the source/target texture.
         // The save-snapshot path can pass a rect one row taller than the
         // province image, which otherwise reads past its allocation.
+        // A stretched copy is clipped to the target below, so only an
+        // unscaled one has to fit the target.
+        const bool stretched = rcsrc.get_width() > 0 && rcsrc.get_height() > 0 &&
+                               (rcsrc.get_width() != rctar.get_width() ||
+                                rcsrc.get_height() != rctar.get_height());
         const int sl = std::min(rcsrc.left, rcsrc.right);
         const int sr = std::max(rcsrc.left, rcsrc.right);
         const int st = std::min(rcsrc.top, rcsrc.bottom);
@@ -3239,7 +3244,8 @@ public:
         const int tt = std::min(rctar.top, rctar.bottom);
         const int tb = std::max(rctar.top, rctar.bottom);
         if (sl < 0 || st < 0 || sr > (int)src->GetWidth() || sb > (int)src->GetHeight() ||
-            tl < 0 || tt < 0 || tr > (int)tar->GetWidth() || tb > (int)tar->GetHeight())
+            (!stretched &&
+             (tl < 0 || tt < 0 || tr > (int)tar->GetWidth() || tb > (int)tar->GetHeight())))
         {
             return;
         }
