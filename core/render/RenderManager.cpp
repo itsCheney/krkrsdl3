@@ -3319,8 +3319,11 @@ public:
     {
         if (!method || !tar)
             return;
-        if (rctar.left < 0 || rctar.top < 0 || rctar.right > (int)tar->GetWidth() ||
-            rctar.bottom > (int)tar->GetHeight())
+        // A single-source copy checks its own target (stretched copies are
+        // clipped there); the other forms need the target rect in bounds.
+        if (textures.size() != 1 &&
+            (rctar.left < 0 || rctar.top < 0 || rctar.right > (int)tar->GetWidth() ||
+             rctar.bottom > (int)tar->GetHeight()))
             return;
         for (int i = 0; i < textures.size(); ++i)
         {
