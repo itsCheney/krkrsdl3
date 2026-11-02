@@ -1398,9 +1398,13 @@ public:
                           iTVPTexture2D* rule,
                           const tTVPRect& rcrule)
     {
-        if (!_tar || !_dst || !_src)
+        // _dst is null for the fill form (ApplySelf/DoGrayScale copy the
+        // reference into the target); only the mirrored copies write to it.
+        if (!_tar || !_src)
             return;
         if (!_tar->GetPixelData() || !_src->GetPixelData())
+            return;
+        if (!_dst && (rcsrc.top > rcsrc.bottom || rcsrc.left > rcsrc.right))
             return;
         int pixelsize =
             _tar->GetFormat() == TVPTextureFormat::Gray ? sizeof(tjs_uint8) : sizeof(tjs_uint32);
