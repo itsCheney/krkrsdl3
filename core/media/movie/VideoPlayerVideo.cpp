@@ -78,6 +78,9 @@ CVideoPlayerVideo::CVideoPlayerVideo(CDVDClock* pClock,
     m_iDroppedFrames = 0;
     m_bAllowDrop = false;
     m_bFpsInvalid = false;
+    // 由 Flush() 在播放线程置位，由解码线程消费。
+    m_bAbortOutput = false;
+    m_drainComplete = false;
 }
 
 CVideoPlayerVideo::~CVideoPlayerVideo()
@@ -136,6 +139,8 @@ void CVideoPlayerVideo::OpenStream(CDVDStreamInfo& hint, CDVDVideoCodec* codec)
         m_bFpsInvalid = true;
     }
 
+    // 上一段片子留下的完成标记不能终止这一段。
+    m_drainComplete = false;
     ResetFrameRateCalc();
 
     m_iDroppedRequest = 0;
@@ -253,23 +258,10 @@ void CVideoPlayerVideo::Execute()
             if (iPriority)
                 continue;
 
-            // check if decoder has produced some output
+            // 等待超时时解码器可能仍能产出帧，但不能用上一帧伪造重复画面，
+            // 否则画面会停在同一张上。
+            if (m_drainComplete) continue;
             ProcessDecoderOutput(frametime, pts);
-
-            // Okey, start rendering at stream fps now instead, we are likely in a stillframe
-            if (!m_stalled)
-            {
-                m_stalled = true;
-                pts += frametime * 4;
-            }
-
-            // Waiting timed out, output last picture
-            if (m_picture.iFlags & DVP_FLAG_ALLOCATED)
-            {
-                OutputPicture(&m_picture, pts);
-                pts += frametime;
-            }
-
             continue;
         }
 
@@ -283,6 +275,22 @@ void CVideoPlayerVideo::Execute()
                     pMsg->AddRef(),
                     1); /* push back as prio message, to process other prio messages */
             m_droppingStats.Reset();
+        }
+        else if (pMsg->IsType(CDVDMsg::GENERAL_EOF))
+        {
+            // demux 报 EOF 时解码器内部可能还有没取出的帧，先排空再确认结束。
+            if (m_pVideoCodec)
+            {
+                while (!GetTerminated() && ProcessDecoderOutput(frametime, pts))
+                {
+                }
+                m_pVideoCodec->Drain();
+                while (!GetTerminated() && ProcessDecoderOutput(frametime, pts))
+                {
+                }
+                m_drainComplete = m_pVideoCodec->IsEOF();
+            }
+            m_picture.iFlags &= ~DVP_FLAG_ALLOCATED;
         }
         else if (pMsg->IsType(CDVDMsg::GENERAL_RESYNC))
         {
@@ -298,6 +306,9 @@ void CVideoPlayerVideo::Execute()
         }
         else if (pMsg->IsType(CDVDMsg::GENERAL_RESET))
         {
+            // 倒带/重置开启新的解码周期。
+            m_drainComplete = false;
+            m_bAbortOutput = false;
             if (m_pVideoCodec)
                 m_pVideoCodec->Reset();
             m_picture.iFlags &= ~DVP_FLAG_ALLOCATED;
@@ -308,6 +319,10 @@ void CVideoPlayerVideo::Execute()
         }
         else if (pMsg->IsType(CDVDMsg::GENERAL_FLUSH))
         {
+            // 触发中止的那个 flush 负责清掉中止标记；排在它后面的消息
+            // 都属于新位置，不能让它们把新位置判为结束。
+            m_drainComplete = false;
+            m_bAbortOutput = false;
             bool sync = static_cast<CDVDMsgBool*>(pMsg)->m_value;
             if (m_pVideoCodec)
                 m_pVideoCodec->Reset();
@@ -517,9 +532,17 @@ void CVideoPlayerVideo::Flush(bool sync)
     /* flush using message as this get's called from VideoPlayer thread */
     /* and any demux packet that has been taken out of queue need to */
     /* be disposed of before we flush */
-    m_messageQueue.Flush();
-    m_messageQueue.Put(new CDVDMsgBool(CDVDMsg::GENERAL_FLUSH, sync), 1);
+    // 先置中止标记再清空队列，避免解码线程在收到 GENERAL_FLUSH 之前继续输出旧帧。
     m_bAbortOutput = true;
+    m_messageQueue.Flush();
+    // 很短的小片段在 prepare() 倒带之前就读到文件末尾了，那条 GENERAL_EOF
+    // 可能已经排在队列里。如果它穿过 flush 被处理，会把刚重置的解码器判为结束，
+    // 导致整段动画只显示第一帧。播放器会在新位置重新发送 EOF。
+    m_messageQueue.Flush(CDVDMsg::GENERAL_EOF);
+    m_messageQueue.Put(new CDVDMsgBool(CDVDMsg::GENERAL_FLUSH, sync), 1);
+    // 解码线程可能正阻塞在渲染器的缓冲区等待中，需要主动唤醒它处理 flush。
+    if (m_pRenderer)
+        m_pRenderer->WakeOutput();
 }
 
 std::string CVideoPlayerVideo::GetStereoMode()
@@ -530,8 +553,6 @@ std::string CVideoPlayerVideo::GetStereoMode()
 
 int CVideoPlayerVideo::OutputPicture(const DVDVideoPicture* src, double pts)
 {
-    m_bAbortOutput = false;
-
     /* picture buffer is not allowed to be modified in this call */
     DVDVideoPicture picture(*src);
     DVDVideoPicture* pPicture = &picture;
@@ -901,7 +922,8 @@ void CVideoPlayerVideo::FrameMove()
             if (!Configure())
                 return;
 
-            FrameWait(50);
+            // The next continuous callback observes the published state/frame.
+
         }
     }
     {

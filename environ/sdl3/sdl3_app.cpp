@@ -6,6 +6,7 @@
 #include <SDL3/SDL_main.h>
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_render.h>
+#include <SDL3/SDL_hints.h>
 #include <SDL3/SDL_log.h>
 #include <SDL3/SDL_timer.h>
 
@@ -18,6 +19,7 @@
 #include "TVPApplication.h"
 #include "TVPWindow.h"
 #include "Platform.h"
+#include "PlatformAutoTest.h"
 #include "WindowManager.h"
 #include "TVPSettings.h"
 #include "TVPCompositor.h"
@@ -86,6 +88,9 @@ static bool TVPCreateWindowForBackend(const std::string& renderer)
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, TVPSettings.window_width);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, TVPSettings.window_height);
     Uint64 flags = SDL_WINDOW_RESIZABLE;
+    // -offscreen：窗口自始至终不显示，只保留渲染目标（测试宿主离屏跑）
+    if (krkrsdl3::TVPAutoTestOffscreen())
+        flags |= SDL_WINDOW_HIDDEN;
 #if defined(_KRKRSDL3_IOS)
     flags |= SDL_WINDOW_FULLSCREEN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     flags &= ~SDL_WINDOW_RESIZABLE;
@@ -276,6 +281,11 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
     if (!TVPParseArguments(argc, argv))
         return SDL_APP_FAILURE;
 
+    // 测试宿主开关（-offscreen / -silent / -frames / -dump / -at_harness）
+    krkrsdl3::TVPAutoTestSetup();
+    if (krkrsdl3::TVPAutoTestSilent())
+        SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "dummy");
+
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO))
     { // for format converter
         SDL_Log("Fail to initialize SDL.");
@@ -314,13 +324,18 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
         return SDL_APP_FAILURE;
     }
 
-    // 隐藏命令行
+    // -at_harness=PATH：游戏正常启动后接管，跑脚本宿主写的旅程
+    krkrsdl3::TVPAutoTestRunHarness();
+
+    // 隐藏命令行（离屏跑要留着 stdout 给测试宿主收日志）
 #ifndef _DEBUG
 #ifdef _KRKRSDL3_WINDOWS
-    ShowWindow(GetConsoleWindow(), SW_HIDE);
+    if (!krkrsdl3::TVPAutoTestOffscreen())
+        ShowWindow(GetConsoleWindow(), SW_HIDE);
 #endif
 #endif
-    SDL_ShowWindow(tvp_window);
+    if (!krkrsdl3::TVPAutoTestOffscreen())
+        SDL_ShowWindow(tvp_window);
 
     // 初始帧数
     SDL_AppIterate(NULL);
@@ -701,6 +716,14 @@ SDL_AppResult SDL_AppIterate(void* appstate)
     SDL_GetWindowSizeInPixels(tvp_window, &RW, &RH);
     // 合成器完成渲染（清屏/绘制/呈现全部由当前渲染后端负责）
     krkrsdl3::TVPRenderOnce(RW, RH);
+    // 自动测试分支
+    if (krkrsdl3::TVPAutoTestActive())
+    {
+        krkrsdl3::TVPAutoTestNoteFrame();
+        const tjs_uint64 budget = krkrsdl3::TVPAutoTestFrameBudget();
+        if (budget && krkrsdl3::TVPAutoTestFrameCount() >= budget)
+            return SDL_APP_SUCCESS;
+    }
     return SDL_APP_CONTINUE;
 }
 
@@ -712,6 +735,11 @@ SDL_AppResult SDL_Fail()
 
 void SDL_AppQuit(void* appstate, SDL_AppResult result)
 {
+    // -dump=PATH：退出前把最后一帧落盘
+    const char* dumpPath = krkrsdl3::TVPAutoTestDumpPath();
+    if (dumpPath && *dumpPath && !krkrsdl3::TVPAutoTestSaveFrame(dumpPath))
+        SDL_Log("Dump frame '%s' failed: %s", dumpPath, krkrsdl3::TVPAutoTestLastError());
+
     // 启动早期失败时 Application 可能尚未创建
     if (Application)
     {

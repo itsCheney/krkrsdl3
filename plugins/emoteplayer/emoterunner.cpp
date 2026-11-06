@@ -1319,6 +1319,7 @@ void emoteengine::resetControls()
     controlVariables = baseVariables;
     for (const auto* eye : metadata._eyeControl)
     {
+        if (!eye->enabled || !eye->blinkEnabled) continue;
         eyes.push_back(*eye);
         auto& copy = eyes.back();
         copy.hasStart = copy.isBlinking = false;
@@ -1356,6 +1357,11 @@ void emoteengine::updateEyeControl(float tick, bool isMain)
         if (!eye.isBlinking)
         {
             if (tick - eye.lastTick < eye.currWaitInterval) continue;
+            // Don't start a blink while the expression already holds the eye
+            // past its closed frame.
+            const auto active = controlVariables.find(key);
+            const double current = active == controlVariables.end() ? eye.beginFrame : active->second;
+            if (current > eye.endFrame) continue;
             eye.isBlinking = true;
             eye.lastTick = tick;
         }
@@ -1368,7 +1374,7 @@ void emoteengine::updateEyeControl(float tick, bool isMain)
         const double ratio = 1 - std::abs(2 * elapsed / eye.blinkFrameCount - 1);
         // Compose with this frame's expression, so a closed-eye pose stays closed.
         auto& value = controlVariables[key];
-        value += (eye.endFrame - value) * ratio;
+        if (value <= eye.endFrame) value += (eye.endFrame - value) * ratio;
     }
 }
 
