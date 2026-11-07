@@ -10,6 +10,7 @@
 #include <SDL3/SDL_log.h>
 #include <SDL3/SDL_timer.h>
 
+#include <algorithm>
 #include <map>
 #include <vector>
 #ifdef _KRKRSDL3_EMSCRIPTEN
@@ -371,6 +372,13 @@ static std::map<SDL_FingerID, Finger> fingers;
 static float rightClickX, rightClickY;
 static Uint64 rightClickStartTime;
 static const Uint32 RIGHT_CLICK_CONFIRM_DELAY = 150;
+// Two fingers held and moved vertically act as a mouse wheel (from upstream
+// be6db96): one notch per SCROLL_STEP_PIXELS points of the fingers' mean.
+static const float SCROLL_STEP_PIXELS = 40.0f;
+static float twoFingerAnchorY = 0.0f;
+static float scrollAccumPx = 0.0f;
+static bool twoFingerScrolled = false;
+void sendMouseScroll(int dx, int dy, float pX, float pY);
 void sendMouseEvent(int button, int eventType, float pX, float pY, bool click = true);
 void sendMouseMotion(float pX, float pY);
 void normalizedTouchToDrawable(float pX, float pY, int& pixelX, int& pixelY)
@@ -416,8 +424,14 @@ void handleFingerDown(const SDL_TouchFingerEvent& e)
     }
     else if (fingers.size() == 2)
     {
-        // 双击->右键
+        // 双击->右键；双指上下拖动->滚轮
         _state = STATE_MULTI_FINGER;
+        float sumY = 0.0f;
+        for (auto& kv : fingers)
+            sumY += kv.second.y;
+        twoFingerAnchorY = sumY / fingers.size();
+        scrollAccumPx = 0.0f;
+        twoFingerScrolled = false;
     }
     else if (tvp_hostMenuGestureEnabled)
     {
@@ -465,13 +479,16 @@ void handleFingerUp(const SDL_TouchFingerEvent& e)
                 sendMouseEvent(SDL_BUTTON_LEFT, SDL_EVENT_MOUSE_BUTTON_UP, f.x, f.y, false);
             }
         }
-        else if (_state == STATE_MULTI_FINGER)
+        else if (_state == STATE_MULTI_FINGER && !twoFingerScrolled)
         {
+            // A two-finger scroll is not also a right click.
             if (!f.moved)
                 sendMouseEvent(SDL_BUTTON_RIGHT, SDL_EVENT_MOUSE_BUTTON_DOWN, f.x, f.y);
             sendMouseEvent(SDL_BUTTON_RIGHT, SDL_EVENT_MOUSE_BUTTON_UP, f.x, f.y);
         }
         _state = STATE_IDLE;
+        scrollAccumPx = 0.0f;
+        twoFingerScrolled = false;
     }
 
     fingers.erase(it);
@@ -503,6 +520,39 @@ void handleFingerMotion(const SDL_TouchFingerEvent& e)
     // 检查是否移动（以点为单位，与屏幕尺寸无关）
     int windowWidth = 1, windowHeight = 1;
     SDL_GetWindowSize(tvp_window, &windowWidth, &windowHeight);
+    if (_state == STATE_MULTI_FINGER && fingers.size() == 2)
+    {
+        // 双指按住并移动 -> 滚轮. At most one notch per motion event; the
+        // rest stays in the accumulator so a fast flick does not burst.
+        f.x = e.x;
+        f.y = e.y;
+        float avgX = 0.0f, avgY = 0.0f;
+        for (auto& kv : fingers)
+        {
+            avgX += kv.second.x;
+            avgY += kv.second.y;
+        }
+        avgX /= fingers.size();
+        avgY /= fingers.size();
+        scrollAccumPx += (avgY - twoFingerAnchorY) * windowHeight;
+        twoFingerAnchorY = avgY;
+        if (scrollAccumPx >= SCROLL_STEP_PIXELS)
+        {
+            // Fingers moving down pull the content down: wheel up.
+            sendMouseMotion(avgX, avgY);
+            sendMouseScroll(0, 1, avgX, avgY);
+            scrollAccumPx -= SCROLL_STEP_PIXELS;
+            twoFingerScrolled = true;
+        }
+        else if (scrollAccumPx <= -SCROLL_STEP_PIXELS)
+        {
+            sendMouseMotion(avgX, avgY);
+            sendMouseScroll(0, -1, avgX, avgY);
+            scrollAccumPx += SCROLL_STEP_PIXELS;
+            twoFingerScrolled = true;
+        }
+        scrollAccumPx = std::clamp(scrollAccumPx, -SCROLL_STEP_PIXELS, SCROLL_STEP_PIXELS);
+    }
     float dx = (e.x - f.startX) * windowWidth;
     float dy = (e.y - f.startY) * windowHeight;
 
@@ -568,6 +618,14 @@ void sendMouseMotion(float pX, float pY)
     int pixelX = 0, pixelY = 0;
     normalizedTouchToDrawable(pX, pY, pixelX, pixelY);
     krkrsdl3::KRKR_Trig_MouseMove(pixelX,pixelY);
+}
+// dx / dy are wheel notches (as SDL's wheel.x / wheel.y); pX / pY the
+// normalized pointer position.
+void sendMouseScroll(int dx, int dy, float pX, float pY)
+{
+    int pixelX = 0, pixelY = 0;
+    normalizedTouchToDrawable(pX, pY, pixelX, pixelY);
+    krkrsdl3::KRKR_Trig_MouseScroll(dx, dy, pixelX, pixelY);
 }
 #endif
 
